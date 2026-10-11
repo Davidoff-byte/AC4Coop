@@ -1,0 +1,6 @@
+/.vs
+*.user
+/bin
+/obj
+build.bat
+HANDOFF.md

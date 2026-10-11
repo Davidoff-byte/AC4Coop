@@ -1,0 +1,156 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <!-- AC4Coop ASI (x86 DLL). Mirrors build.bat: /MT /EHsc /O2, links user32 + ws2_32,
+       output bin\AC4Coop.asi. Open AC4Coop.sln in VS2022 to edit and compile. -->
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|Win32">
+      <Configuration>Debug</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|Win32">
+      <Configuration>Release</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion>
+    <ProjectGuid>{A1B2C3D4-E5F6-4789-ABCD-1234567890AB}</ProjectGuid>
+    <RootNamespace>AC4Coop</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)'=='Debug'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+    <CharacterSet>NotSet</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)'=='Release'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>NotSet</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup Label="UserMacros" />
+  <!-- Output straight to bin\AC4Coop.asi, exactly like build.bat. -->
+  <PropertyGroup>
+    <OutDir>$(ProjectDir)bin\</OutDir>
+    <IntDir>$(ProjectDir)obj\$(Configuration)\</IntDir>
+    <TargetName>AC4Coop</TargetName>
+    <TargetExt>.asi</TargetExt>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <Optimization>Disabled</Optimization>
+      <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <PreprocessorDefinitions>WIN32;_DEBUG;_WINDOWS;_USRDLL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <EnableParallelCodeGeneration Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">true</EnableParallelCodeGeneration>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalDependencies>user32.lib;ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Release'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <Optimization>MaxSpeed</Optimization>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <PreprocessorDefinitions>WIN32;NDEBUG;_WINDOWS;_USRDLL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <EnableParallelCodeGeneration Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">true</EnableParallelCodeGeneration>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalDependencies>user32.lib;ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="src\dllmain.cpp" />
+    <ClCompile Include="src\Hook.cpp" />
+    <ClCompile Include="src\HookMath.cpp" />
+    <ClCompile Include="src\Scimitar\AI\AIActor.cpp" />
+    <ClCompile Include="src\Scimitar\AI\AIEntityHelper.cpp" />
+    <ClCompile Include="src\Scimitar\AI\Human.cpp" />
+    <ClCompile Include="src\Scimitar\BoneHandle.cpp" />
+    <ClCompile Include="src\Scimitar\CollisionFilterInfo.cpp" />
+    <ClCompile Include="src\Scimitar\Components\ActionComponent.cpp" />
+    <ClCompile Include="src\Scimitar\Components\AIComponent.cpp" />
+    <ClCompile Include="src\Scimitar\Components\Component.cpp" />
+    <ClCompile Include="src\Scimitar\DuplicationManager.cpp" />
+    <ClCompile Include="src\Scimitar\Entity.cpp" />
+    <ClCompile Include="src\Scimitar\EntityBuilder.cpp" />
+    <ClCompile Include="src\Scimitar\HandleManager.cpp" />
+    <ClCompile Include="src\Scimitar\Hierarchy.cpp" />
+    <ClCompile Include="src\Scimitar\LoadingManager.cpp" />
+    <ClCompile Include="src\Scimitar\LoadingThread.cpp" />
+    <ClCompile Include="src\Scimitar\ManagedObject.cpp" />
+    <ClCompile Include="src\Scimitar\Memory.cpp" />
+    <ClCompile Include="src\Scimitar\PlayerPadManager.cpp" />
+    <ClCompile Include="src\Scimitar\RowSelector.cpp" />
+    <ClCompile Include="src\Scimitar\Statechart.cpp" />
+    <ClCompile Include="src\Scimitar\World.cpp" />
+    <ClCompile Include="src\windowed.cpp" />
+    <ClCompile Include="src\phase1.cpp" />
+    <ClCompile Include="src\net.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="src\Hook.h" />
+    <ClInclude Include="src\HookMath.h" />
+    <ClInclude Include="src\phase1.h" />
+    <ClInclude Include="src\net.h" />
+    <ClInclude Include="src\netstate.h" />
+    <ClInclude Include="src\Scimitar\AI\AbstractEntityAI.h" />
+    <ClInclude Include="src\Scimitar\AI\AIActor.h" />
+    <ClInclude Include="src\Scimitar\AI\AIEntityHelper.h" />
+    <ClInclude Include="src\Scimitar\AI\Human.h" />
+    <ClInclude Include="src\Scimitar\AI\HumanSwimFSM.h" />
+    <ClInclude Include="src\Scimitar\BaseTypes.h" />
+    <ClInclude Include="src\Scimitar\BoneHandle.h" />
+    <ClInclude Include="src\Scimitar\ClassDescriptor.h" />
+    <ClInclude Include="src\Scimitar\CollisionFilterInfo.h" />
+    <ClInclude Include="src\Scimitar\Components\ActionComponent.h" />
+    <ClInclude Include="src\Scimitar\Components\AIComponent.h" />
+    <ClInclude Include="src\Scimitar\Components\BipedComponent.h" />
+    <ClInclude Include="src\Scimitar\Components\CharacterController.h" />
+    <ClInclude Include="src\Scimitar\Components\Component.h" />
+    <ClInclude Include="src\Scimitar\Components\PhysicComponent.h" />
+    <ClInclude Include="src\Scimitar\DuplicationManager.h" />
+    <ClInclude Include="src\Scimitar\Entity.h" />
+    <ClInclude Include="src\Scimitar\EntityBuilder.h" />
+    <ClInclude Include="src\Scimitar\Enums.h" />
+    <ClInclude Include="src\Scimitar\GraphicTypes.h" />
+    <ClInclude Include="src\Scimitar\HandleManager.h" />
+    <ClInclude Include="src\Scimitar\Hierarchy.h" />
+    <ClInclude Include="src\Scimitar\InventoryContainer.h" />
+    <ClInclude Include="src\Scimitar\LoadingManager.h" />
+    <ClInclude Include="src\Scimitar\LoadingThread.h" />
+    <ClInclude Include="src\Scimitar\ManagedObject.h" />
+    <ClInclude Include="src\Scimitar\Memory.h" />
+    <ClInclude Include="src\Scimitar\Object.h" />
+    <ClInclude Include="src\Scimitar\ObjectShape.h" />
+    <ClInclude Include="src\Scimitar\PlayerPadManager.h" />
+    <ClInclude Include="src\Scimitar\PlayerProgression.h" />
+    <ClInclude Include="src\Scimitar\RowSelector.h" />
+    <ClInclude Include="src\Scimitar\Statechart.h" />
+    <ClInclude Include="src\Scimitar\WhiteRoomManager.h" />
+    <ClInclude Include="src\Scimitar\World.h" />
+    <ClInclude Include="src\windowed.h" />
+    <ClInclude Include="src\scimitarCommandLineOptions.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="AC4Coop.ini" />
+    <None Include="HANDOFF.md" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>
