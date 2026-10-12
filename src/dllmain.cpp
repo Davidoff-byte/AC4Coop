@@ -174,8 +174,12 @@ BOOL APIENTRY DllMain(HMODULE hMod, DWORD reason, LPVOID)
         // Phase 1: hook the per-frame Human update so spawns/drives run on the game's main thread.
         Phase1::InstallFrameHook();
 
-        // Front B: bring up the peer-to-peer UDP link (no-op unless [Net] Enabled=1).
-        Net::Init();
+        // Front B (peer-to-peer UDP link) is started on the first in-world frame instead of at
+        // DLL attach. The game's launch chain (Steam -> Ubisoft -> DRM -> real game) starts more
+        // than one process that loads this ASI, and the transient one binds the UDP port and then
+        // dies - so the LIVE game's bind fails and it never gets a socket. The transient processes
+        // never reach a player frame, so starting the link here means only the live game binds.
+        (void)0;
 
         CreateThread(nullptr, 0, PollThread, nullptr, 0, nullptr);
     } else if (reason == DLL_PROCESS_DETACH) {

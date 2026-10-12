@@ -1012,6 +1012,14 @@ static bool engineLoading() {
 // Runs on the main thread once per frame (only for the player's Human update).
 static void __cdecl OnFrame(Human* updatedHuman) {
     if (!isPlayerUpdate(base(), updatedHuman)) return;
+
+    // Start the UDP link on the first REAL in-world frame, not at DLL attach: the launch chain's
+    // transient processes bind the port and die (the live game's bind then fails with 10048 and
+    // it gets no socket). They never reach a player frame, so binding here means only the live
+    // game ever opens the socket, and there is no corpse socket to steal its datagrams.
+    static bool s_netStarted = false;
+    if (!s_netStarted) { s_netStarted = true; Net::Init(); }
+
     if (g_dumpReq) { g_dumpReq = 0; Phase1::DumpPlayerInfo(); }   // F7: works in net + local modes
     if (Net::Enabled()) {
         // Capture only succeeds in a real playable world (not title/whiteroom). Require it to be

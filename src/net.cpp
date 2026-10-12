@@ -54,6 +54,12 @@ bool Init() {
     g_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (g_sock == INVALID_SOCKET) { dbg("[Net] socket failed\n"); return false; }
 
+    // Bind even if another socket already holds the port (a leftover/transient process from a
+    // previous run or the launch chain). With the link started only on the first in-world frame,
+    // the LIVE game is always the last to bind - and on Windows the last binder wins the incoming
+    // datagrams - so the live game always receives, whatever else is holding the port.
+    { BOOL reuse = TRUE; setsockopt(g_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse)); }
+
     // Bind LocalPort; if it's already taken (2nd instance on the same PC sharing this ini), bind
     // PeerPort instead and send to LocalPort. Two-PC setups use LocalPort==PeerPort and just bind.
     int bindPort = localPort, sendPort = peerPort;
