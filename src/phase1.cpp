@@ -377,8 +377,28 @@ void Phase1::ToggleVirtualPad() {
     s_posProbeFrames = 120;
 }
 
-static void FinishPadProbe() {
-    World* world = World::GetCurrentWorld();
+// Route B: force the puppet to move from the pad-1 test state using its OWN ground data — the same seam
+// the network puppet uses (m_IsSet + m_DestSpeedRatio + m_DestHeading). If this walks, the real co-op
+// input path is "peer pad -> our drive -> puppet", independent of the engine granting a second player.
+static void DrivePuppetFromPad() {
+    if (!s_vpadTest || !g_padGatePuppet) return;
+    Entity* pe = (Entity*)g_padGatePuppet;
+    if (!readable(pe, 4)) return;
+    Human* h = AIEntityHelper::GetHuman(pe);
+    if (!h || !readable(h, 4)) return;
+    HumanDataBundle* b = h->m_Data.m_HumanDataBundle;
+    if (!b || !readable(b, 0x400)) return;
+    HookMath::Vector4 fwd;
+    fwd.x = pe->m_GlobalMatrix.M11;
+    fwd.y = pe->m_GlobalMatrix.M12;
+    fwd.z = pe->m_GlobalMatrix.M13;
+    fwd.w = 0.0f;
+    b->m_GroundData.m_DestHeading = fwd;
+    b->m_GroundData.m_IsSet = true;
+    b->m_GroundData.m_DestSpeedRatio = 1.0f;
+}
+
+static void FinishPadProbe() {    World* world = World::GetCurrentWorld();
     Entity* player = world ? world->GetPlayer() : nullptr;
     if (player && readable(player, 4)) {
         float dx = player->m_GlobalMatrix.M41 - s_p0Start[0];
@@ -4628,6 +4648,7 @@ static void __cdecl OnFrame(Human* updatedHuman) {
     if (g_mapReq) { g_mapReq = 0; SimulatePeerKill(); }     // F1: self-test the position-based peer-kill path
     if (g_padGateFrames > 0 && --g_padGateFrames == 0) ProbePadGate();   // PLAN-v3 gate G1/G2
     if (s_posProbeFrames > 0 && --s_posProbeFrames == 0) FinishPadProbe(); // pad-1 ownership comparison
+    DrivePuppetFromPad();                                                // Route B: pad-1 -> puppet ground data
     // NOTE: the die-clip watchers (TickDieClipWatch / PollTrackedGuards) are intentionally DISABLED.
     // They did their job (captured the death clip alias 1818493434 and the dead-flag semantics), but
     // running a full entity scan + engine calls every few frames caused intermittent crashes during

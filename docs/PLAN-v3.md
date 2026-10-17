@@ -83,3 +83,16 @@ v2 relay is the ceiling for this engine and we keep hardening it.
 - Practical path forward: keep v2, and if guest input is wanted, feed it to **our own** puppet drive
   (HumanGroundData / action replication â€” already implemented) instead of trying to make the engine treat
   it as player 2. Combat for the peer then stays with the event lane (P1), not native engine combat.
+
+## Update (after the Route B test)
+
+**Route B WORKS.** With pad-1 state applied to the puppet's own `HumanGroundData` (`m_IsSet`,
+`m_DestSpeedRatio`, `m_DestHeading`), the puppet **travelled across the ground, played a walk animation
+and interacted with its surroundings** (user-observed).
+
+- The 2-second position probe read `PUPPET moved2=0.00` while the user saw it walk — the probe is
+  measuring the wrong entity/window and must be fixed before it is trusted again. Observation > probe here.
+- Native second-player routing remains closed (sub_18317F0's controller binding), but it is no longer
+  needed: input relay can go peer pad -> our drive -> puppet.
+- Next: map the pad axes properly (stick magnitude -> speed ratio, direction -> heading) instead of the
+  constant full-forward test vector, then this is real input relay.
