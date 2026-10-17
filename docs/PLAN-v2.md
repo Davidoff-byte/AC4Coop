@@ -26,7 +26,7 @@ input.
 | death service | vtable `0x02722528`, reached only virtually (one file references the vtable: its dtor) | decomp |
 | ragdoll pipeline | `Anim::*ForRagdoll`, `PhysicForRagdollUpdate`, `ActionPostUpdateForRagdoll` in `5863D0.c` | decomp |
 | input devices | 560-byte entries at `devMgr+1896`, counts `+1902/+1908`, XInput slot `+532`; `XInputGetState` called in `0xA065D0`, `0xA28A50`, `0xABF21A` | decomp |
-| kill recipe (current) | `SetLife(-1)` + dead flag + death clip `1818493434` + `SetLayer(&cc->m_FilterInfo, 0x29)` | verified live (real death, falls, no collision). NOTE: `ai+0x8C=1` also set today, but the audit shows it is redundant (AI-side predicate only); to be dropped after re-test |
+| kill recipe (current) | `SetLife(-1)` + flags + **is-alive service `+4 |= 0x1000`** + death clip `1818493434` + `SetLayer(0x29)` (+ `ai+0x8C=1` as AI-side stop) | verified live: engine is-alive flips to 0, guard dies, falls, no collision |
 | ship hull HP | **unknown** — not a health object, not in the ship AI service table | open |
 
 ## Architecture

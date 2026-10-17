@@ -1946,6 +1946,13 @@ static void ApplyShips(const EntityPacket& pkt) {
 // entity -> health while it is alive and keep using the cached service afterwards.
 static unsigned int FindHealthInAI(unsigned int ai);          // defined later
 
+// Engine's authoritative combat is-alive (sub_133F550). Returns false when the entity is dead by either
+// term: ai+0xB8 & 0xC == 4, or bit 0x1000 on the ai+0x5C service with class id 0x5EB03CEC.
+static bool EngineIsAlive(unsigned int ent) {
+    if (!ent) return true;
+    return ((bool (__cdecl*)(int))0x133F550)((int)ent);
+}
+
 struct EntHealth { unsigned int ent; unsigned int hp; };
 static EntHealth s_entHealth[256];
 static int s_entHealthN = 0;
@@ -2065,7 +2072,6 @@ static void CaptureGuards(EntityPacket& pkt) {
             // The old +0xB8 test is wrong — a genuine death never touches +0xB8, so es.dead stayed 0
             // and host kills were never replicated to the peer.
             AbstractEntityAI* ai = AIEntityHelper::GetEntityAI(e);
-            es.dead = (ai && readable(ai, 0xC0) && *(unsigned char*)((char*)ai + 0x8C)) ? 1 : 0;
             // P0: identity + health that survive the AI being torn down after death.
             unsigned int hpSvc = FindHealthInAI((unsigned int)ai);
             if (hpSvc) RememberEntityHealth((unsigned int)e, hpSvc);
@@ -2073,9 +2079,14 @@ static void CaptureGuards(EntityPacket& pkt) {
             es.objId = hc->GetObjectID();
             if (hpSvc && readable((void*)hpSvc, 0x70)) {
                 es.hp = *(unsigned short*)(hpSvc + 0x5C);
-                if (*(unsigned int*)(hpSvc + 0x60) & 0x01000000u) es.dead = 1;   // authoritative dead flag
+                // Dead = the engine's own answer. Primary: the health dead flag (set by the engine on a
+                // real death); secondary: combat is-alive. Do NOT use ai+0x8C here — that is a different
+                // (AI-side) predicate, not the combat one.
+                bool flagsDead = (*(unsigned int*)(hpSvc + 0x60) & 0x01000000u) != 0;
+                es.dead = (flagsDead || !EngineIsAlive((unsigned int)e)) ? 1 : 0;
             } else {
                 es.hp = 0;
+                es.dead = EngineIsAlive((unsigned int)e) ? 0 : 1;
             }
             ObjMapAdd(es.objId, (unsigned int)e, hpSvc);
             if (es.dead) {
@@ -2123,6 +2134,7 @@ static unsigned int FindHealthInAI(unsigned int ai);     // defined further belo
 // P0/P1: peer -> host health event. objId is the host-assigned identity; position is a fallback only.
 static void ApplyPeerHealth(uint64_t objId, unsigned short life, float x, float y, float z);  // below
 static bool SelfTestModeActive();                        // defined below
+static void KillGuardEntity(Entity* e);                  // defined below
 
 // Re-entrancy guard shared by both event lanes (self-test loopback must not ping-pong).
 static bool s_inEventLoop = false;
@@ -2334,14 +2346,13 @@ static void ApplyGuards(const EntityPacket& pkt) {
                     }
                 }
             }
-            // (4) Death: the host's guard fell (or THIS peer killed the mirror) — mark it dead so it drops
-            //     out of the local fight. es.dead now comes from the verified ai+0x8C predicate.
-            if (es.dead || locallyDead) {
-                AbstractEntityAI* bai = AIEntityHelper::GetEntityAI(best);
-                if (bai && readable(bai, 0xC0)) {
-                    unsigned char* f = (unsigned char*)((char*)bai + 0xB8);
-                    *f = (*f & ~0xC) | 4;
-                }
+            // (4) Death: reproduce the REAL death locally instead of hand-writing AI flags. Once per
+            //     entity. The old `ai+0xB8 |= 4` write is removed — it is only one of the two terms of
+            //     the engine's is-alive test and left the mirror in a half-dead state.
+            if (es.dead && !MirrorKilledLocally(best)) {
+                MarkMirrorKilledLocally(best);
+                L("[Mirror] ent=%08X host says dead -> applying the real death locally\n", best);
+                KillGuardEntity(best);
             }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
@@ -3479,8 +3490,7 @@ static void KillGuardEntity(Entity* e) {
       e, ai, hp, e->m_GlobalMatrix.M41, e->m_GlobalMatrix.M42, e->m_GlobalMatrix.M43);
     if (!ai || !readable((void*)ai, 0xC0)) { L("[KF] ai unreadable\n"); return; }
 
-    unsigned char deadByte = *(unsigned char*)(ai + 0x8C);
-    L("[KF] before: AI+8C=%02X  health life=%u/%u flags=%08X\n", deadByte,
+    L("[KF] before: alive=%d  health life=%u/%u flags=%08X\n", (int)EngineIsAlive((unsigned int)e),
       hp ? *(unsigned short*)(hp + 0x5C) : 0, hp ? *(unsigned short*)(hp + 0x5E) : 0,
       hp ? *(unsigned int*)(hp + 0x60) : 0);
 
@@ -3491,12 +3501,23 @@ static void KillGuardEntity(Entity* e) {
         int prev = *(unsigned short*)(hp + 0x5C);
         int rc = ((int (__thiscall*)(void*, int))0x19FB4C0)((void*)hp, -1);
         L("[KF] SetLife(-1) rc=%d  life %d -> %u\n", rc, prev, *(unsigned short*)(hp + 0x5C));
-        *(unsigned int*)(hp + 0x60) |= 0x01000000u;
+        *(unsigned int*)(hp + 0x60) |= 0x01000000u;   // the engine sets this on death too
     }
+    // Combat dead: the engine's is-alive (sub_133F550) checks bit 0x1000 at +4 of the service returned by
+    // sub_10EF8C0(entity) (class 0x5EB03CEC, found in ai+0x5C). SetLife alone does NOT set it — verified
+    // live (alive stayed 1). This is the flag that actually makes the guard dead to combat.
+    {
+        unsigned int svc = ((unsigned int (__cdecl*)(int))0x10EF8C0)((int)e);
+        if (svc && readable((void*)svc, 0x20)) {
+            unsigned int before = *(unsigned int*)(svc + 4);
+            *(unsigned int*)(svc + 4) = before | 0x1000u;
+            L("[KF] is-alive service=%08X +4 %08X -> %08X\n", svc, before, *(unsigned int*)(svc + 4));
+        } else L("[KF] is-alive service not found\n");
+    }
+    // AI-side stop (sub_753330 reads ai+0x8C). NOT the combat flag — kept only so the behaviour stops
+    // running and cannot re-pose the corpse. Clearly labelled to avoid the old confusion.
     *(unsigned char*)(ai + 0x8C) = 1;
-
-    L("[KF] after : AI+8C=%02X  health life=%u flags=%08X\n",
-      *(unsigned char*)(ai + 0x8C),
+    L("[KF] after : alive=%d health life=%u flags=%08X\n", (int)EngineIsAlive((unsigned int)e),
       hp ? *(unsigned short*)(hp + 0x5C) : 0, hp ? *(unsigned int*)(hp + 0x60) : 0);
 
     // Play the death clip recorded from a real kill (alias 1818493434, captured live when a soldier

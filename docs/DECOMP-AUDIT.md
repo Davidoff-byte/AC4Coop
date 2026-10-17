@@ -128,7 +128,35 @@ probe**, but the architecture already handles it: deaths are pushed as events, n
 
 ---
 
-## 6. Rule this audit enforces
+## 6. Addendum — verified live: `SetLife` alone does NOT make the guard combat-dead
+
+Test sequence on a live soldier:
+
+```
+[KF] before: alive=1  health life=36/36 flags=00000004
+[KF] SetLife(-1) rc=0  life 36 -> 65535
+[KF] after : alive=1  health life=65535 flags=01000004      <-- still alive to combat!
+```
+
+Then, setting the flag the decomp pointed at:
+
+```
+[KF] is-alive service=FCAC40F0 +4 00000000 -> 00001000
+[KF] after : alive=0  health life=65535 flags=01000004
+```
+
+**Corrected kill recipe (verified):**
+1. `SetLife(hp, -1)` — engine death event; Life/flags.
+2. `hp->[+0x60] |= 0x01000000`.
+3. `svc = sub_10EF8C0(entity)`; `svc[1] |= 0x1000` — **this** is the combat-dead term.
+4. `ai->[0x8C] = 1` — AI-side stop only (sub_753330); it is *not* the combat flag.
+5. death clip + `SetLayer(0x29)`.
+
+The earlier belief "SetLife(-1) is the whole death" was wrong; it produces the health state and the event,
+but combat is-alive is a separate service flag. This also explains why the guard previously needed the
+`+0x8C` write to stop behaving: the AI-side predicate was the only one being satisfied.
+
+## 7. Rule this audit enforces
 
 Nothing in the plan may cite an offset or a flag as fact unless it is (a) read out of the decompilation
 *and* (b) confirmed live, or explicitly marked **inference**. Three of our earlier "facts" were half-right
