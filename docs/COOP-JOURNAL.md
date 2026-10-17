@@ -3141,3 +3141,32 @@ second machine.
 **Next experiment needed:** anchor the ship (motionless) so motion churn disappears, then take damage and
 diff; print changed *dwords* typed as int and float (not bytes) so a decreasing HP integer/float is
 obvious. Do not guess an offset.
+
+## SESSION CLOSE (2026-10-17) — state left for next session
+
+### Landed and pushed (`fix/live-game-udp-bind`, fork Davidoff-byte/AC4Coop)
+- Engine-native kill recipe + guest→host kill relay + docs (commits `cab427c`, `8e96f04`).
+- Then, unverified but committed: `CaptureGuards` dead flag now reads **`ai+0x8C`** (the engine's verified
+  predicate) instead of `+0xB8`; and a mirror that THIS peer killed is remembered
+  (`MirrorKilledLocally`) so it is no longer transform/clip-driven while the host still reports it alive.
+- A capture-side diagnostic was added (`[Cap] ent=... dead=1`) plus `[Mirror] host reports DEAD`.
+
+### OPEN — the important one
+After a solo kill with `EntitySync=1 EntitySelfTest=1`, the kill happened (`AI+8C=1`) but **no
+`[Mirror] host reports DEAD` appeared**, so the death flag still did not reach `ApplyGuards`. Two
+candidates, both testable by the new `[Cap]` log:
+1. the killed entity drops out of the `CaptureGuards` enumeration (so no snapshot entry exists), or
+2. `GetEntityAI(e)` returns 0 after death, making `es.dead` compute 0.
+
+Until that is resolved, **host→guest death replication is unproven** — which means a host kill may never
+show on the guest. The guest→host direction (the reported one) is verified up to the send.
+
+### Ship hull HP
+Unsolved and documented above: not a health object, not in the ship AI service table, byte diff
+inconclusive while the ship is moving.
+
+### Tester package
+`bf-coop/dist/AC4Coop-coop-combat-2026-10-17.zip` — contains the build **as of the earlier commits**
+(`AC4Coop.asi` 205,312 bytes), HOST/GUEST ini, `dinput8.dll` (ASI loader), and `README-TESTER.md`.
+**Rebuild this package from `bin\AC4Coop.asi` before sending**, so the tester gets the same binary as the
+host (the `.asi` in the game folder is now newer than the one inside that zip).

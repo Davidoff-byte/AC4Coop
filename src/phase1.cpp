@@ -1980,9 +1980,22 @@ static void CaptureGuards(EntityPacket& pkt) {
             es.pos[0]=x; es.pos[1]=y; es.pos[2]=z;
             HookMath::Quaternion q; HookMath::FromMatrix(&e->m_GlobalMatrix, &q);
             es.quat[0]=q.x; es.quat[1]=q.y; es.quat[2]=q.z; es.quat[3]=q.w;
-            // Death state: sub_133F550 "is-alive" test — (*(u8)(GetEntityAI(e)+0xB8) & 0xC)==4 => dead.
+            // Death state. Verified: the engine's own is-dead predicate is sub_753330 ->
+            // *(BYTE*)(ai+0x8C), and a real death flips exactly that byte 0 -> 1 (field diff: AI+08C).
+            // The old +0xB8 test is wrong — a genuine death never touches +0xB8, so es.dead stayed 0
+            // and host kills were never replicated to the peer.
             AbstractEntityAI* ai = AIEntityHelper::GetEntityAI(e);
-            es.dead = (ai && readable(ai, 0xC0) && (*(unsigned char*)((char*)ai + 0xB8) & 0xC) == 4) ? 1 : 0;
+            es.dead = (ai && readable(ai, 0xC0) && *(unsigned char*)((char*)ai + 0x8C)) ? 1 : 0;
+            if (es.dead) {
+                static void* s_capDead[64];
+                static int   s_capDeadN = 0;
+                bool seen = false;
+                for (int q = 0; q < s_capDeadN; ++q) if (s_capDead[q] == e) { seen = true; break; }
+                if (!seen && s_capDeadN < 64) {
+                    s_capDead[s_capDeadN++] = e;
+                    L("[Cap] ent=%08X dead=1 ai=%08X (captured into the snapshot)\n", e, ai);
+                }
+            }
             // Alertness: HumanGroundStage (Fight=4=aggro, Navigation=1=calm).
             es.stage = 0;
             es.actionAlias = 0;
@@ -2009,6 +2022,10 @@ static void CaptureGuards(EntityPacket& pkt) {
 // Kills travel as EntityPacket entries with kind == 3; the host resolves them by position (the same
 // 4 m tolerance ApplyGuards already uses) and runs the verified kill recipe on the matching soldier.
 static const uint8_t KIND_KILL = 3;
+
+// Defined below with the mirror bookkeeping; needed here for the local-kill marking.
+static void MarkMirrorKilledLocally(void* e);
+static bool MirrorKilledLocally(void* e);
 
 static unsigned int FindHealthInAI(unsigned int ai);     // defined further below
 static void ApplyPeerKill(float x, float y, float z);    // defined further below
@@ -2045,6 +2062,7 @@ static void TrackMirrorDeathForRelay(Entity* e, const EntityState& es) {
     if (life == 0xFFFFu && prev != 0xFFFFu) {
         L("[Relay] mirror died locally ent=%08X hostPos=(%.1f,%.1f,%.1f) -> reporting to host\n",
           e, es.pos[0], es.pos[1], es.pos[2]);
+        MarkMirrorKilledLocally(e);       // stop driving this corpse even while the host says alive
         EntityPacket out;
         memset(&out, 0, sizeof(out));
         out.magic = NET_ENTITY_MAGIC;
@@ -2098,6 +2116,21 @@ static bool MirrorAliasChanged(void* e, unsigned int alias) {
         ++s_mirrorActN;
     }
     return true;
+}
+
+// Mirrors THIS peer killed. The host is still reporting them alive (its snapshot predates the kill or
+// the kill hasn't arrived), so es.dead alone is not enough: without this we would keep driving the
+// corpse's transform/clip from the host snapshot and it would stand back up or slide around.
+static void* s_mirrorDeadLocal[96];
+static int   s_mirrorDeadLocalN = 0;
+
+static bool MirrorKilledLocally(void* e) {
+    for (int i = 0; i < s_mirrorDeadLocalN; ++i) if (s_mirrorDeadLocal[i] == e) return true;
+    return false;
+}
+static void MarkMirrorKilledLocally(void* e) {
+    if (MirrorKilledLocally(e)) return;
+    if (s_mirrorDeadLocalN < 96) s_mirrorDeadLocal[s_mirrorDeadLocalN++] = e;
 }
 
 static void ApplyGuards(const EntityPacket& pkt) {
@@ -2159,7 +2192,18 @@ static void ApplyGuards(const EntityPacket& pkt) {
                 CharacterController* cc = (CharacterController*)bh->GetCharacterComponent();
                 if (readable(cc, 0x600)) cc->m_DriveEntity = false;
             }
-            if (!es.dead) {
+            bool locallyDead = MirrorKilledLocally(best);
+            if (es.dead) {
+                static void* s_deadSeen[64];
+                static int   s_deadSeenN = 0;
+                bool seen = false;
+                for (int i = 0; i < s_deadSeenN; ++i) if (s_deadSeen[i] == best) { seen = true; break; }
+                if (!seen && s_deadSeenN < 64) {
+                    s_deadSeen[s_deadSeenN++] = best;
+                    L("[Mirror] ent=%08X host reports DEAD (es.dead=1, from ai+0x8C)\n", best);
+                }
+            }
+            if (!es.dead && !locallyDead) {
                 HookMath::Quaternion q; q.x=es.quat[0]; q.y=es.quat[1]; q.z=es.quat[2]; q.w=es.quat[3];
                 HookMath::Transform m;
                 HookMath::ToMatrix(&q, &m);
@@ -2174,9 +2218,9 @@ static void ApplyGuards(const EntityPacket& pkt) {
                     }
                 }
             }
-            // (4) Death: the host's guard fell — mark this mirror dead (bit2 set). The visual drop is the
-            //     ragdoll follow-up; this keeps the mirror non-targetable + out of the local fight.
-            if (es.dead) {
+            // (4) Death: the host's guard fell (or THIS peer killed the mirror) — mark it dead so it drops
+            //     out of the local fight. es.dead now comes from the verified ai+0x8C predicate.
+            if (es.dead || locallyDead) {
                 AbstractEntityAI* bai = AIEntityHelper::GetEntityAI(best);
                 if (bai && readable(bai, 0xC0)) {
                     unsigned char* f = (unsigned char*)((char*)bai + 0xB8);
