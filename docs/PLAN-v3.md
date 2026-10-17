@@ -62,4 +62,16 @@ v2 relay is the ceiling for this engine and we keep hardening it.
 
 - v2 relay: implemented, verified solo (objId both ways, damage via `SetLife`), two-machine untested.
 - Kill: verified live, engine-confirmed dead (is-alive `1 -> 0`).
-- Gate: **running now** (G1/G2). G3 depends on the virtual pad.
+- **Gate result (2026-10-17): G1/G2 PASS, G3 FAIL.**
+  - G1: `RegisterPlayer(pad=1)` persists; `pad[1] == puppet`; puppet has a live AI + Human.
+  - G2: world stable (103 chars / 3575 entities), pad 0 fully playable.
+  - Message of the gate: the engine *does* enumerate and poll pads 0..3 (`[VPad] engine polled pad 1..3`),
+    and it even auto-assigned the puppet to pad 2 — so the pad plumbing exists.
+  - **G3 FAIL:** with a synthetic pad 1 holding the left stick forward, the **local player** moved, not
+    the puppet. Single-player merges pad input into the one local player; `PlayerPadManager` is a
+    mapping used elsewhere, not the SP input router.
+- Consequence: the "engine-native second player for free" route is **closed**. The v2 model (mirror +
+  events) is the ceiling for this engine, exactly as the gate was designed to decide.
+- Practical path forward: keep v2, and if guest input is wanted, feed it to **our own** puppet drive
+  (HumanGroundData / action replication — already implemented) instead of trying to make the engine treat
+  it as player 2. Combat for the peer then stays with the event lane (P1), not native engine combat.

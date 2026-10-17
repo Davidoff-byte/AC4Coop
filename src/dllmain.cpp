@@ -96,6 +96,7 @@ static DWORD WINAPI PollThread(LPVOID)
     pGetGlobalPos = (GetGlobalPos_t)(base + RVA_GetGlobalPosition);
 
     logline("[AC4Coop] Phase 0 online. module base = %p\n", (void*)base);
+    Phase1::InstallVirtualPadHook();   // Phase A: must run before the engine enumerates pads
     logline("[AC4Coop] GetWorld=%p  GetPlayer=%p  GetGlobalPosition=%p\n",
             (void*)pGetWorld, (void*)pGetPlayer, (void*)pGetGlobalPos);
 
@@ -104,6 +105,7 @@ static DWORD WINAPI PollThread(LPVOID)
 
     while (g_run)
     {
+        Phase1::InstallVirtualPadHook();   // retry until xinput1_3.dll is loaded
         Sleep(50); // ~20 Hz
         ++ticks;
 

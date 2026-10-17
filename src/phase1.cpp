@@ -269,6 +269,81 @@ HumanSwimScope* swimScope(Human* h, void** outCtx = nullptr, void** outFsm = nul
 
 } // namespace
 
+// ---- Phase A: virtual pad (XInputGetState IAT hook) ---------------------------------------------
+// The engine polls one XInputGetState per 560-byte device record, so a second player needs a second
+// record. The cheapest way to get one is to make the engine *discover* a pad at index 1 during its own
+// enumeration: report it connected from the very start. This hook is installed at ASI load time, before
+// the game initialises devices.
+typedef DWORD (WINAPI *XInputGetStateFn)(DWORD dwUserIndex, void* pState);
+static XInputGetStateFn s_realXInputGetState = nullptr;
+static volatile long s_vpadEnabled = 0;
+static volatile long s_vpadInstalled = 0;
+static int s_vpadServeLog = 0;
+static int s_vpadAskLog = 0;
+static int s_vpadTest = 0;          // [Coop] VPadTest=1 -> hold the stick forward on pad 1
+
+static DWORD WINAPI VPadGetState(DWORD idx, void* st) {
+    if (idx == 1 && s_vpadEnabled) {
+        if (st) {
+            memset(st, 0, 20);                                   // dwPacketNumber + XINPUT_GAMEPAD
+            unsigned char* b = (unsigned char*)st;
+            *(DWORD*)(b) = GetTickCount();                        // packet number
+            if (s_vpadTest) {
+                *(short*)(b + 8)  = 30000;                        // sThumbLY = forward
+                *(short*)(b + 12) = 0;                            // sThumbRY
+            }
+        }
+        if (s_vpadServeLog < 6) { ++s_vpadServeLog; L("[VPad] served synthetic pad 1 (test=%d)\n", s_vpadTest); }
+        return 0;                                  // ERROR_SUCCESS
+    }
+    if (s_vpadAskLog < 12) { ++s_vpadAskLog; L("[VPad] engine polled pad %u\n", (unsigned)idx); }
+    return s_realXInputGetState ? s_realXInputGetState(idx, st) : 1167;   // ERROR_DEVICE_NOT_CONNECTED
+}
+
+static void PatchXInputIAT(void* target, void* replacement) {
+    HMODULE mod = GetModuleHandleA(nullptr);
+    if (!mod) return;
+    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)mod;
+    IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)((char*)mod + dos->e_lfanew);
+    IMAGE_DATA_DIRECTORY& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!dir.VirtualAddress) return;
+    IMAGE_IMPORT_DESCRIPTOR* imp = (IMAGE_IMPORT_DESCRIPTOR*)((char*)mod + dir.VirtualAddress);
+    for (; imp->Name; ++imp) {
+        IMAGE_THUNK_DATA* thunk = (IMAGE_THUNK_DATA*)((char*)mod + imp->FirstThunk);
+        for (; thunk->u1.Function; ++thunk) {
+            if ((void*)thunk->u1.Function != target) continue;
+            DWORD old = 0;
+            if (VirtualProtect(&thunk->u1.Function, sizeof(ULONG_PTR), PAGE_READWRITE, &old)) {
+                thunk->u1.Function = (ULONG_PTR)replacement;
+                VirtualProtect(&thunk->u1.Function, sizeof(ULONG_PTR), old, &old);
+                L("[VPad] IAT patched (XInputGetState)\n");
+            }
+        }
+    }
+}
+
+void Phase1::InstallVirtualPadHook() {
+    if (s_vpadInstalled) return;
+    HMODULE xi = GetModuleHandleA("xinput1_3.dll");
+    if (!xi) xi = GetModuleHandleA("xinput1_4.dll");
+    if (!xi) xi = GetModuleHandleA("xinput9_1_0.dll");
+    if (!xi) return;                               // not loaded yet; caller retries
+    void* p = (void*)GetProcAddress(xi, "XInputGetState");
+    if (!p) return;
+    s_realXInputGetState = (XInputGetStateFn)p;
+    {
+        // Read the ini by absolute path: at ASI-load time the CWD is not the game folder yet.
+        char ini[MAX_PATH];
+        Phase1::ModuleRelativePath(ini, sizeof(ini), "AC4Coop.ini");
+        s_vpadTest = GetPrivateProfileIntA("Coop", "VPadTest", 0, ini);
+        L("[VPad] ini=%s VPadTest=%d\n", ini, s_vpadTest);
+    }
+    PatchXInputIAT(p, (void*)VPadGetState);
+    InterlockedExchange(&s_vpadEnabled, 1);
+    InterlockedExchange(&s_vpadInstalled, 1);
+    L("[VPad] installed; reporting a connected pad at index 1\n");
+}
+
 // ---- PLAN-v3 gate: does single-player accept a second local player on pad 1? -------------------
 static int  g_padGateFrames = 0;
 static void* g_padGatePuppet = nullptr;
@@ -3973,6 +4048,24 @@ static void ProbePadGate() {
           (unsigned)AIEntityHelper::GetEntityAI(pe), (unsigned)AIEntityHelper::GetHuman(pe));
     } else {
         L("[Gate] puppet no longer valid\n");
+    }
+    // Did the engine discover a second device? (560-byte records, XInput slot at +532)
+    {
+        unsigned int dm = *(unsigned int*)0x4DD5EDC;
+        if (dm && readable((void*)dm, 0x780)) {
+            unsigned int arr = *(unsigned int*)(dm + 1896);
+            unsigned int n   = *(unsigned int*)(dm + 1908);
+            L("[Gate] devMgr=%08X arr=%08X count(+1902)=%u count(+1908)=%u\n",
+              dm, arr, *(unsigned short*)(dm + 1902), n);
+            if (arr && readable((void*)arr, 4) && n > 0 && n <= 8) {
+                for (unsigned int i = 0; i < n; ++i) {
+                    unsigned int e = arr + 560 * i;
+                    if (!readable((void*)e, 560)) break;
+                    L("[Gate] dev[%u] type(+4)=%u xinputIdx(+532)=%u\n",
+                      i, *(unsigned int*)(e + 4), *(unsigned int*)(e + 532));
+                }
+            }
+        }
     }
     L("[Gate] G2: if the game is still running and pad 0 still controls the player -> PASS\n");
 }
