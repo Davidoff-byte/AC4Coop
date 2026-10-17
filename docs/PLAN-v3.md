@@ -67,9 +67,17 @@ v2 relay is the ceiling for this engine and we keep hardening it.
   - G2: world stable (103 chars / 3575 entities), pad 0 fully playable.
   - Message of the gate: the engine *does* enumerate and poll pads 0..3 (`[VPad] engine polled pad 1..3`),
     and it even auto-assigned the puppet to pad 2 — so the pad plumbing exists.
-  - **G3 FAIL:** with a synthetic pad 1 holding the left stick forward, the **local player** moved, not
-    the puppet. Single-player merges pad input into the one local player; `PlayerPadManager` is a
-    mapping used elsewhere, not the SP input router.
+- **G3 FAIL (confirmed twice, the second time without confounds).** First run was invalid — the stick
+  was held from launch, before the puppet existed. Retry: pad neutral at launch, puppet spawned first,
+  then the stick toggled at runtime and positions sampled programmatically:
+  ```
+  [VPad] test stick -> 1
+  [VPad] player start (100.56,-73.82,2.40)   puppet start (102.56,-73.82,2.24)
+  [VPad] PLAYER moved2=0.81   (dx=0.89 dz=-0.08)
+  [VPad] PUPPET moved2=0.00   (dx=0.00 dz=0.00)
+  ```
+  So SP merges pad input onto the single local player; the `pad -> entity` map is real but the SP input
+  path does not consult it. **Route closed.**
 - Consequence: the "engine-native second player for free" route is **closed**. The v2 model (mirror +
   events) is the ceiling for this engine, exactly as the gate was designed to decide.
 - Practical path forward: keep v2, and if guest input is wanted, feed it to **our own** puppet drive

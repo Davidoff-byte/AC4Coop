@@ -349,6 +349,51 @@ static int  g_padGateFrames = 0;
 static void* g_padGatePuppet = nullptr;
 static void ProbePadGate();
 
+// Runtime toggle for the pad-1 test stick, with a position comparison so the result doesn't depend on
+// someone watching: sample player + puppet, wait ~2 s, sample again, log both deltas.
+static int s_posProbeFrames = 0;
+static float s_p0Start[3], s_ppStart[3];
+
+void Phase1::ToggleVirtualPad() {
+    s_vpadTest ^= 1;
+    L("[VPad] test stick -> %d\n", s_vpadTest);
+    World* world = World::GetCurrentWorld();
+    Entity* player = world ? world->GetPlayer() : nullptr;
+    if (player && readable(player, 4)) {
+        s_p0Start[0] = player->m_GlobalMatrix.M41;
+        s_p0Start[1] = player->m_GlobalMatrix.M42;
+        s_p0Start[2] = player->m_GlobalMatrix.M43;
+        L("[VPad] player start (%.2f,%.2f,%.2f)\n", s_p0Start[0], s_p0Start[1], s_p0Start[2]);
+    }
+    if (g_padGatePuppet && readable(g_padGatePuppet, 4)) {
+        Entity* pe = (Entity*)g_padGatePuppet;
+        s_ppStart[0] = pe->m_GlobalMatrix.M41;
+        s_ppStart[1] = pe->m_GlobalMatrix.M42;
+        s_ppStart[2] = pe->m_GlobalMatrix.M43;
+        L("[VPad] puppet start (%.2f,%.2f,%.2f)\n", s_ppStart[0], s_ppStart[1], s_ppStart[2]);
+    } else {
+        L("[VPad] no puppet to compare\n");
+    }
+    s_posProbeFrames = 120;
+}
+
+static void FinishPadProbe() {
+    World* world = World::GetCurrentWorld();
+    Entity* player = world ? world->GetPlayer() : nullptr;
+    if (player && readable(player, 4)) {
+        float dx = player->m_GlobalMatrix.M41 - s_p0Start[0];
+        float dz = player->m_GlobalMatrix.M43 - s_p0Start[2];
+        L("[VPad] PLAYER moved2=%.2f (dx=%.2f dz=%.2f)\n", dx*dx + dz*dz, dx, dz);
+    }
+    if (g_padGatePuppet && readable(g_padGatePuppet, 4)) {
+        Entity* pe = (Entity*)g_padGatePuppet;
+        float dx = pe->m_GlobalMatrix.M41 - s_ppStart[0];
+        float dz = pe->m_GlobalMatrix.M43 - s_ppStart[2];
+        L("[VPad] PUPPET moved2=%.2f (dx=%.2f dz=%.2f)\n", dx*dx + dz*dz, dx, dz);
+    }
+    L("[VPad] verdict: whichever moved owns the pad-1 input\n");
+}
+
 void* Phase1::TrySpawnPuppet() {
     Entity* newEntity = nullptr;
     __try {
@@ -4582,6 +4627,7 @@ static void __cdecl OnFrame(Human* updatedHuman) {
     if (g_healthReq) { g_healthReq = 0; RelaySelfTest(); }  // F2: solo harness for the guest-side relay detection
     if (g_mapReq) { g_mapReq = 0; SimulatePeerKill(); }     // F1: self-test the position-based peer-kill path
     if (g_padGateFrames > 0 && --g_padGateFrames == 0) ProbePadGate();   // PLAN-v3 gate G1/G2
+    if (s_posProbeFrames > 0 && --s_posProbeFrames == 0) FinishPadProbe(); // pad-1 ownership comparison
     // NOTE: the die-clip watchers (TickDieClipWatch / PollTrackedGuards) are intentionally DISABLED.
     // They did their job (captured the death clip alias 1818493434 and the dead-flag semantics), but
     // running a full entity scan + engine calls every few frames caused intermittent crashes during

@@ -26,6 +26,7 @@ namespace Phase1 {
     // Executed on the main thread by the frame hook:
     void* TrySpawnPuppet();    // build -> add to world -> position -> RegisterPlayer(pad 1)
     void InstallVirtualPadHook();  // Phase A: report a connected pad at index 1 (retry-safe)
+    void ToggleVirtualPad();       // runtime toggle for the pad-1 test stick + position comparison
     void* TryCrowdProbe();     // acquire a CROWD builder -> build a non-player body -> add+place -> log verdict
     void  TrySceneProbe();     // log ONE guarded [Scene] diagnostic block (F9) — observation only
     void  TryShipProbe();      // log ONE guarded [Ship] diagnostic block (F10) — observation only

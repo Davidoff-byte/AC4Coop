@@ -180,6 +180,12 @@ static DWORD WINAPI PollThread(LPVOID)
         if (f3 && !f3prev) { logline("[AC4Coop] F3 -> input-state probe\n"); Phase1::RequestInputProbe(); }
         f3prev = f3;
 
+        // V (edge-triggered): toggle the pad-1 test stick and compare player vs puppet movement.
+        static bool vprev = false;
+        bool v = (GetAsyncKeyState('V') & 0x8000) != 0;
+        if (v && !vprev) { logline("[AC4Coop] V -> toggle virtual pad stick\n"); Phase1::ToggleVirtualPad(); }
+        vprev = v;
+
         // F4 (edge-triggered): entity-enumeration probe — dump the world's entity lists (ship list,
         // character list, object list, entity manager) to verify the offsets live. Observation only.
         static bool f14prev = false;
