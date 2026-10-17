@@ -269,6 +269,11 @@ HumanSwimScope* swimScope(Human* h, void** outCtx = nullptr, void** outFsm = nul
 
 } // namespace
 
+// ---- PLAN-v3 gate: does single-player accept a second local player on pad 1? -------------------
+static int  g_padGateFrames = 0;
+static void* g_padGatePuppet = nullptr;
+static void ProbePadGate();
+
 void* Phase1::TrySpawnPuppet() {
     Entity* newEntity = nullptr;
     __try {
@@ -372,6 +377,11 @@ void* Phase1::TrySpawnPuppet() {
             if (readable(pm, 0x20)) {
                 pm->RegisterPlayer(newEntity, 1);
                 L("[Phase1] RegisterPlayer(pad=1) done\n");
+                // PLAN-v3 gate: check in ~45 frames whether the registration persisted and the world is
+                // still healthy (G1/G2). G3 (does the engine read pad-1 input) needs the virtual pad.
+                g_padGatePuppet = newEntity;
+                g_padGateFrames = 45;
+                L("[Phase1] pad gate armed (G1/G2 in ~45 frames)\n");
             }
         }
         g_puppet = newEntity;
@@ -3942,6 +3952,31 @@ static void ShipEntityDiff() {
     s_ssState = 0;
 }
 
+// PLAN-v3 gate probe: is pad 1 bound to the puppet, and is the world still sane afterwards?
+static void ProbePadGate() {
+    World* world = World::GetCurrentWorld();
+    if (!world) { L("[Gate] no world\n"); return; }
+    PlayerPadManager* pm = PlayerPadManager::FromWorld(world);
+    L("[Gate] padManager=%p\n", pm);
+    if (!readable(pm, 0x40)) { L("[Gate] pad manager unreadable\n"); return; }
+    for (int i = 0; i < 4; ++i) {
+        void* e = ((void**)pm)[i];
+        L("[Gate] pad[%d] = %p%s\n", i, e, (e && e == g_padGatePuppet) ? "  (puppet)" : "");
+    }
+    L("[Gate] G1 pad[1]==puppet: %s\n", (((void**)pm)[1] == g_padGatePuppet) ? "PASS" : "FAIL");
+    L("[Gate] world characterList=%d entities=%d\n",
+      world->m_CharacterList.GetSize(), world->m_EntityManager.m_Entities.GetSize());
+    if (g_padGatePuppet && readable(g_padGatePuppet, 4)) {
+        Entity* pe = (Entity*)g_padGatePuppet;
+        L("[Gate] puppet still valid: pos=(%.1f,%.1f,%.1f) ai=%08X human=%08X\n",
+          pe->m_GlobalMatrix.M41, pe->m_GlobalMatrix.M42, pe->m_GlobalMatrix.M43,
+          (unsigned)AIEntityHelper::GetEntityAI(pe), (unsigned)AIEntityHelper::GetHuman(pe));
+    } else {
+        L("[Gate] puppet no longer valid\n");
+    }
+    L("[Gate] G2: if the game is still running and pad 0 still controls the player -> PASS\n");
+}
+
 static void ProbeHealthHeap() {    static HealthEnt cur[128];
     int n = ScanNPCHealth(cur, 128);
     if (g_hDumps == 0) {
@@ -4453,6 +4488,7 @@ static void __cdecl OnFrame(Human* updatedHuman) {
     if (g_inputReq) { g_inputReq = 0; ShipEntityDiff(); }  // F3: ship entity field diff (hull HP hunt)
     if (g_healthReq) { g_healthReq = 0; RelaySelfTest(); }  // F2: solo harness for the guest-side relay detection
     if (g_mapReq) { g_mapReq = 0; SimulatePeerKill(); }     // F1: self-test the position-based peer-kill path
+    if (g_padGateFrames > 0 && --g_padGateFrames == 0) ProbePadGate();   // PLAN-v3 gate G1/G2
     // NOTE: the die-clip watchers (TickDieClipWatch / PollTrackedGuards) are intentionally DISABLED.
     // They did their job (captured the death clip alias 1818493434 and the dead-flag semantics), but
     // running a full entity scan + engine calls every few frames caused intermittent crashes during
