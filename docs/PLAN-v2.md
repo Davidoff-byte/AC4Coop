@@ -18,14 +18,15 @@ input.
 | Life / Max / flags | `+0x5C` / `+0x5E` / `+0x60` | verified live |
 | dead encoding | `Life=-1 (0xFFFF)`, `flags |= 0x01000000` | verified live |
 | death trigger | `CSrvNPCHealth::SetLife(hp, v)` (`0x19FB4C0`) — **any value; only `v < 0` fires the death event** | verified (live + decomp) |
-| is-dead predicate | `sub_753330`: `*(BYTE**)(ai+0x98) && **… || *(BYTE*)(ai+0x8C)`; `ai+0x98 == health+0x63` | verified |
-| entity → health | `ai = GetEntityAI(e)`; service in `ai->[+0x70]` (count `+0x76`) with vtable `0x02712F60` | verified live |
+| is-dead predicate (combat, authoritative) | `sub_133F550(entity)`: `(ai+0xB8 & 0xC)==4` **or** bit `0x1000` at `+4` of the service with class id `0x5EB03CEC` (found in `ai+0x5C`, count `ai+0x62`) | decomp + live |
+| is-dead predicate (AI-side, different) | `sub_753330`: `*(BYTE**)(ai+0x98) && **… || *(BYTE*)(ai+0x8C)`; `ai+0x98 == health+0x63` | verified |
+| entity → health | `ai = GetEntityAI(e)`; service in `ai->[+0x70]` (count `+0x76`) with vtable `0x02712F60` (a different list from `ai+0x5C`) | verified live |
 | `GetEntityAI` | `0x6F5F70`: `*(e+0xE8) ? *(*(e+0xE8)+0x1C) : 0` — **goes blind if `+0xE8` is cleared** | decomp |
 | stable identity | `HandleContainer::m_ObjectID` (u64); `ManagedObject::GetObjectID` = `0x9F0B50` | decomp |
 | death service | vtable `0x02722528`, reached only virtually (one file references the vtable: its dtor) | decomp |
 | ragdoll pipeline | `Anim::*ForRagdoll`, `PhysicForRagdollUpdate`, `ActionPostUpdateForRagdoll` in `5863D0.c` | decomp |
 | input devices | 560-byte entries at `devMgr+1896`, counts `+1902/+1908`, XInput slot `+532`; `XInputGetState` called in `0xA065D0`, `0xA28A50`, `0xABF21A` | decomp |
-| kill recipe (current) | SetLife(-1) + dead flag + `ai+0x8C=1` + death clip `1818493434` + `SetLayer(&cc->m_FilterInfo, 0x29)` | verified live (real death, falls, no collision) |
+| kill recipe (current) | `SetLife(-1)` + dead flag + death clip `1818493434` + `SetLayer(&cc->m_FilterInfo, 0x29)` | verified live (real death, falls, no collision). NOTE: `ai+0x8C=1` also set today, but the audit shows it is redundant (AI-side predicate only); to be dropped after re-test |
 | ship hull HP | **unknown** — not a health object, not in the ship AI service table | open |
 
 ## Architecture
