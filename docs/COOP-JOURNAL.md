@@ -3206,3 +3206,72 @@ inconclusive while the ship is moving.
 (`AC4Coop.asi` 205,312 bytes), HOST/GUEST ini, `dinput8.dll` (ASI loader), and `README-TESTER.md`.
 **Rebuild this package from `bin\AC4Coop.asi` before sending**, so the tester gets the same binary as the
 host (the `.asi` in the game folder is now newer than the one inside that zip).
+
+## 2026-10-17 (late) — decomp audit, PLAN-v3, gate result, Route B, tester build
+
+### The decompilation corpus
+Full AC4 source is available at `C:\Users\Administrator\ac4-decomp`: **128,340 `.c` files** (one per
+function, named by address). Indexed with `gamedb`: 116,386 functions, 12,572 strings, 118,304 symbols,
+**3,474,056 call edges**. `gamedb graph/search/sql` now works; `findstr /s` is the quick alternative.
+
+### Audit corrections (see `DECOMP-AUDIT.md`)
+- There are **two** dead predicates:
+  - **Combat is-alive** `sub_133F550(entity)`: `ai+0xB8 & 0xC == 4` **or** bit `0x1000` at `+4` of the
+    service with class id `0x5EB03CEC` (found in `ai+0x5C`, count `ai+0x62`). This is what the damage
+    handler uses.
+  - **AI-side** `sub_753330`: `ai+0x98` (a cached pointer to `health+0x63`) or `ai+0x8C`.
+- Verified live: `SetLife(-1)` + health flags leaves **alive=1**. Setting the `0x1000` service bit flips it
+  to **alive=0**. That is the missing piece; `ai+0x8C` is only the AI-side stop.
+- `ai+0x98` is **not** a death record — it equals `health+0x63`.
+- The AI has two service arrays: `+0x5C`/`+0x62` (is-alive service) and `+0x70`/`+0x76` (health, death).
+- Ship hull HP: nothing in the decomp by name; all "Hull" hits are Havok convex hulls. Still unknown.
+
+### P0/P1 (v2 relay) — implemented, verified solo
+- `EntityState` carries `objId` (u64 from `HandleContainer::m_ObjectID`) and `hp`; `NET_PROTO_VER = 7`.
+- Host keeps `objId -> {entity, health}`; peer keeps `objId -> mirror`. Events resolve by id, position only
+  as fallback.
+- `entity -> health` cache so detection survives `GetEntityAI` going blind.
+- **Dead NPCs drop out of the snapshot enumeration**, so deaths are PUSHED as events both ways.
+- Damage applied through `CSrvNPCHealth::SetLife` (any value; `0xFFFF` = death).
+- Self-test loopback on both lanes (re-entrancy guarded) makes the relay testable on one machine.
+- Verified: inbound death by objId, outbound death by objId, damage `36 -> 35` via SetLife.
+
+### PLAN-v3 gate (thin client) — G1/G2 PASS, G3 FAIL
+- G1: `RegisterPlayer(pad=1)` persists, `pad[1] == puppet`, live AI+Human.
+- G2: world stable, pad 0 unaffected. Engine even auto-assigned the puppet to pad 2.
+- G3 (retried without confounds: neutral at launch, spawn first, stick toggled at runtime):
+  `PLAYER moved2=0.81`, `PUPPET moved2=0.00`.
+- Why: `RegisterPlayer` is only `padMgr[pad] = entity`. The real binding is `sub_18317F0`, which creates a
+  per-player controller, stores the pad index on it (`*(this+63)`), and informs the player
+  (`sub_1B06CE0`). A spawned entity never gets that controller, so the input path has nothing to read the
+  pad for. **Engine-native second player is closed.**
+
+### Route B (our own drive) — WORKS
+- `XInputGetState` IAT hook installed at ASI load; the engine polls pads 0..3 and we answer for index 1
+  (index at pad-object `+0x760`; state cached at `+0xD0..` by `sub_A28A50`).
+- Driving the puppet's own `HumanGroundData` (`m_IsSet`, `m_DestSpeedRatio`, `m_DestHeading`) with the
+  **virtual pad neutral** made it **travel, walk-animate and collide with the world** (user-observed).
+- Position table over 10 s confirmed real movement (~2.4 m) with `s_vpadTest=0`.
+- The earlier one-shot probe read `0.00` — measurement failure, not functional; the table replaces it.
+- Consequence: input relay is a transport problem now, not an engine-RE problem:
+  peer pad -> network -> our drive -> puppet. The local player is not touched because the peer's input
+  never goes through `XInputGetState`.
+
+### Tester build
+`bf-coop\dist\AC4Coop-v2-objId-2026-10-17.zip` (4.05 MB): `AC4Coop.asi` hash `C80B4E78...` (identical to
+the host install), HOST/GUEST ini, `dinput8.dll`, tester guide. Both machines must run the same asi
+(protocol 7).
+
+### Open / next
+1. **Two-machine validation** of the relay (kill by objId, damage, host->guest death). Checklist handed over.
+2. Input relay: map stick axes -> `m_DestSpeedRatio`/`m_DestHeading` (camera yaw), send in `PlayerState`
+   (bump proto again), host applies to the peer puppet.
+3. Guest applies host `hp` from the snapshot (closes the v2 loop for host-side damage).
+4. Ship hull HP: read the ship class damage code (do not diff a moving ship).
+5. Real ragdoll corpse (cosmetic; clip + `SetLayer(0x29)` already looks right).
+
+### Commits this session
+`cab427c` kill+relay, `8e96f04` journal, `1b05567` dead flag/capture diag, `a4dd37a` P0/P1, `c99a306`
+decomp audit, `73e9159` real combat-dead flag, `f1fc836` PLAN-v3+gate probe, `7dd4698` virtual pad (G3
+fail), `eeb3bf3` gate retry, `dff1bd7` Route B works, `6deaf61` continuous table + isolation. Branch
+`fix/live-game-udp-bind` on fork `Davidoff-byte/AC4Coop`.
