@@ -352,11 +352,18 @@ static void ProbePadGate();
 // Runtime toggle for the pad-1 test stick, with a position comparison so the result doesn't depend on
 // someone watching: sample player + puppet, wait ~2 s, sample again, log both deltas.
 static int s_posProbeFrames = 0;
+static int s_driveTest = 0;          // Route B test: drive the puppet from OUR vector, no virtual pad
+static int s_contSamples = 0;
+static void* s_contEnt = nullptr;
 static float s_p0Start[3], s_ppStart[3];
 
 void Phase1::ToggleVirtualPad() {
-    s_vpadTest ^= 1;
-    L("[VPad] test stick -> %d\n", s_vpadTest);
+    s_driveTest ^= 1;
+    L("[Drive] puppet drive test -> %d  (virtual pad stays neutral: s_vpadTest=%d)\n", s_driveTest, s_vpadTest);
+    L("[Drive] g_puppet=%p g_padGatePuppet=%p\n", g_puppet, g_padGatePuppet);
+    s_contEnt = g_padGatePuppet;
+    s_contSamples = 10;                 // 10 samples x 60 frames = ~10 s
+    s_posProbeFrames = 120;
     World* world = World::GetCurrentWorld();
     Entity* player = world ? world->GetPlayer() : nullptr;
     if (player && readable(player, 4)) {
@@ -381,7 +388,7 @@ void Phase1::ToggleVirtualPad() {
 // the network puppet uses (m_IsSet + m_DestSpeedRatio + m_DestHeading). If this walks, the real co-op
 // input path is "peer pad -> our drive -> puppet", independent of the engine granting a second player.
 static void DrivePuppetFromPad() {
-    if (!s_vpadTest || !g_padGatePuppet) return;
+    if (!s_driveTest || !g_padGatePuppet) return;
     Entity* pe = (Entity*)g_padGatePuppet;
     if (!readable(pe, 4)) return;
     Human* h = AIEntityHelper::GetHuman(pe);
@@ -4648,6 +4655,23 @@ static void __cdecl OnFrame(Human* updatedHuman) {
     if (g_mapReq) { g_mapReq = 0; SimulatePeerKill(); }     // F1: self-test the position-based peer-kill path
     if (g_padGateFrames > 0 && --g_padGateFrames == 0) ProbePadGate();   // PLAN-v3 gate G1/G2
     if (s_posProbeFrames > 0 && --s_posProbeFrames == 0) FinishPadProbe(); // pad-1 ownership comparison
+    if (s_contSamples > 0) {
+        static int s_ctr = 0;
+        if (++s_ctr >= 60) {
+            s_ctr = 0;
+            --s_contSamples;
+            World* w = World::GetCurrentWorld();
+            Entity* pl = w ? w->GetPlayer() : nullptr;
+            float px = pl ? pl->m_GlobalMatrix.M41 : 0, pz = pl ? pl->m_GlobalMatrix.M43 : 0;
+            float qx = 0, qz = 0;
+            if (s_contEnt && readable(s_contEnt, 4)) {
+                Entity* pe = (Entity*)s_contEnt;
+                qx = pe->m_GlobalMatrix.M41; qz = pe->m_GlobalMatrix.M43;
+            }
+            L("[Drive] t=%d  player=(%.2f,%.2f)  puppet=(%.2f,%.2f)\n",
+              10 - s_contSamples, px, pz, qx, qz);
+        }
+    }
     DrivePuppetFromPad();                                                // Route B: pad-1 -> puppet ground data
     // NOTE: the die-clip watchers (TickDieClipWatch / PollTrackedGuards) are intentionally DISABLED.
     // They did their job (captured the death clip alias 1818493434 and the dead-flag semantics), but
