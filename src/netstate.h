@@ -113,7 +113,7 @@ struct PlayerState {
 static const uint32_t NET_MAGIC = 0x43344341; // 'AC4C'
 // Wire/struct-layout version. PlayerState is #pragma pack(1): adding a field shifts every following
 // offset, so both peers MUST run the same build. Bump this whenever the layout changes.
-static const uint32_t NET_PROTO_VER = 6;
+static const uint32_t NET_PROTO_VER = 7;
 
 // ---- entity sync (host-authoritative "synced worlds") -------------------------------
 // One replicated entity's transform. `key` is the index in the host's enumeration; `kind`
@@ -133,7 +133,10 @@ struct EntityState {
     float    pos[3];       // world position (x,y,z)
     float    quat[4];      // world rotation (x,y,z,w)
     uint32_t actionAlias;  // current action clip (file alias); 0 = none (guards only)
-    int      hullHP;       // ship hull HP (ships only; 0 for guards) — host-authoritative damage
+    int      hullHP;       // ship hull HP (ships only; 0 for guards) - host-authoritative damage
+    uint64_t objId;        // host-assigned stable identity (HandleContainer::m_ObjectID); 0 = unknown
+    uint16_t hp;           // host-authoritative Life (guards); 0xFFFF = dead
+    uint16_t _pad2;
 };
 
 struct EntityPacket {

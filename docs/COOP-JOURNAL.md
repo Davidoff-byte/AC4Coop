@@ -3142,7 +3142,43 @@ second machine.
 diff; print changed *dwords* typed as int and float (not bytes) so a decreasing HP integer/float is
 obvious. Do not guess an offset.
 
-## SESSION CLOSE (2026-10-17) — state left for next session
+## P0 + P1 EXECUTED (2026-10-17) — identity and the health lane, verified solo
+
+Design change forced by evidence: **dead NPCs drop out of the snapshot enumeration**, so a death can
+never be inferred from the snapshot (that is why `es.dead` never propagated). Deaths and damage are now
+**pushed as events** in both directions; snapshots carry only living guards (transform/anim/hp).
+
+Implemented:
+- `EntityState` gained `objId` (u64, host-assigned from `HandleContainer::m_ObjectID`) and `hp` (u16);
+  `NET_PROTO_VER` bumped 6 -> 7.
+- Host keeps `objId -> {entity, health}`; the peer keeps `objId -> local mirror`. Events resolve by
+  `objId`; position is only a fallback.
+- **Health cache** (`entity -> CSrvNPCHealth*`) recorded while alive, so detection survives `GetEntityAI`
+  going blind (`entity+0xE8` cleared) — the suspected cause of the broken propagation.
+- Event lane is symmetric: guest reports any Life change; host applies `SetLife(hp, value)` (or kills on
+  `0xFFFF`). Host pushes its own health events back so the guest can apply them.
+- Self-test loopback delivers each packet into the local apply path, which is how both lanes become
+  testable on one machine (with a shared re-entrancy guard).
+
+Verified live (self-test, loopback):
+```
+[Kill] SELF-TEST peer event objId=4026540959 ent=36DD5880
+[Kill] peer DEATH objId=4026540959 -> ent=36DD5880          <- inbound, resolved by id
+[Kill] push health event objId=4026540959 life=65535 -> peer
+[Kill] SELF-TEST loopback: delivering the event to the apply path
+[Kill] peer DEATH objId=4026540959 -> ent=36DD5880          <- outbound, resolved by id
+
+[Relay] mirror ent=42FDD1D0 objId=4026539817 life 36 -> 35 -> host
+[Kill] peer damage objId=4026539817 hp=35 (SetLife rc=35)   <- damage via the engine setter
+```
+
+Still open:
+- Two-machine confirmation (datagram across the wire).
+- The guest does not yet apply the host's `hp` from the snapshot to its mirror (carried but unused);
+  needed to close the loop when the *host* damages a guard.
+- Corpse fidelity (P2) and input relay (P3) untouched.
+
+## SESSION CLOSE (earlier, 2026-10-17) — state as of the previous stop
 
 ### Landed and pushed (`fix/live-game-udp-bind`, fork Davidoff-byte/AC4Coop)
 - Engine-native kill recipe + guest→host kill relay + docs (commits `cab427c`, `8e96f04`).

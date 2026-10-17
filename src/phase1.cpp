@@ -1940,7 +1940,87 @@ static void ApplyShips(const EntityPacket& pkt) {
 // ---- guard/character sync (G1) -------------------------------------------------
 // Capture the nearby characters (Skeleton + BhvGenericNPC/BhvAssassin) as kind=2, appended after the
 // ships. The peer matches each by NEAREST POSITION (deterministic spawns) and drives the render.
+// ---- P0: stable identity + health cache ---------------------------------------------------------
+// GetEntityAI (0x6F5F70) is `*(e+0xE8) ? *(*(e+0xE8)+0x1C) : 0`. Once +0xE8 is cleared (a dead NPC) the
+// AI — and therefore the health — becomes unreachable, which is why es.dead never propagated. Cache
+// entity -> health while it is alive and keep using the cached service afterwards.
+static unsigned int FindHealthInAI(unsigned int ai);          // defined later
+
+struct EntHealth { unsigned int ent; unsigned int hp; };
+static EntHealth s_entHealth[256];
+static int s_entHealthN = 0;
+
+static unsigned int CachedHealthForEntity(unsigned int ent) {
+    for (int i = 0; i < s_entHealthN; ++i) if (s_entHealth[i].ent == ent) return s_entHealth[i].hp;
+    return 0;
+}
+static void RememberEntityHealth(unsigned int ent, unsigned int hp) {
+    for (int i = 0; i < s_entHealthN; ++i)
+        if (s_entHealth[i].ent == ent) { s_entHealth[i].hp = hp; return; }
+    if (s_entHealthN < 256) {
+        s_entHealth[s_entHealthN].ent = ent;
+        s_entHealth[s_entHealthN].hp  = hp;
+        ++s_entHealthN;
+    }
+}
+
+// Host-side object table for the current capture: objId -> entity + health service. The peer echoes the
+// objId back, so the host never has to guess which guard a hit belongs to.
+struct ObjEntry { uint64_t objId; unsigned int ent; unsigned int hp; };
+static ObjEntry s_objMap[256];
+static int s_objMapN = 0;
+
+static void ObjMapReset() { s_objMapN = 0; }
+static void ObjMapAdd(uint64_t objId, unsigned int ent, unsigned int hp) {
+    if (!objId || s_objMapN >= 256) return;
+    for (int i = 0; i < s_objMapN; ++i)
+        if (s_objMap[i].objId == objId) { s_objMap[i].ent = ent; s_objMap[i].hp = hp; return; }
+    s_objMap[s_objMapN].objId = objId;
+    s_objMap[s_objMapN].ent   = ent;
+    s_objMap[s_objMapN].hp    = hp;
+    ++s_objMapN;
+}
+static bool ObjMapFind(uint64_t objId, unsigned int* ent, unsigned int* hp) {
+    for (int i = 0; i < s_objMapN; ++i)
+        if (s_objMap[i].objId == objId) {
+            if (ent) *ent = s_objMap[i].ent;
+            if (hp)  *hp  = s_objMap[i].hp;
+            return true;
+        }
+    return false;
+}
+
+// Guest-side map: host-assigned objId -> local mirror entity, filled from the snapshots.
+static ObjEntry s_guestObj[256];
+static int s_guestObjN = 0;
+static void GuestObjAdd(uint64_t objId, unsigned int ent) {
+    if (!objId || s_guestObjN >= 256) return;
+    for (int i = 0; i < s_guestObjN; ++i)
+        if (s_guestObj[i].objId == objId) { s_guestObj[i].ent = ent; return; }
+    s_guestObj[s_guestObjN].objId = objId;
+    s_guestObj[s_guestObjN].ent   = ent;
+    s_guestObj[s_guestObjN].hp    = 0;
+    ++s_guestObjN;
+}
+static unsigned int GuestObjFind(uint64_t objId) {
+    for (int i = 0; i < s_guestObjN; ++i) if (s_guestObj[i].objId == objId) return s_guestObj[i].ent;
+    return 0;
+}
+
+// Entities whose health came FROM the host. Never report those back (prevents an event ping-pong).
+static unsigned int s_peerApplied[64];
+static int s_peerAppliedN = 0;
+static bool PeerApplied(unsigned int e) {
+    for (int i = 0; i < s_peerAppliedN; ++i) if (s_peerApplied[i] == e) return true;
+    return false;
+}
+static void MarkPeerApplied(unsigned int e) {
+    if (PeerApplied(e)) return;
+    if (s_peerAppliedN < 64) s_peerApplied[s_peerAppliedN++] = e;
+}
+
 static void CaptureGuards(EntityPacket& pkt) {
+    ObjMapReset();                       // rebuild the objId table for this capture
     World* world = World::GetCurrentWorld();
     if (!world) return;
     Entity* player = world->GetPlayer();
@@ -1986,6 +2066,18 @@ static void CaptureGuards(EntityPacket& pkt) {
             // and host kills were never replicated to the peer.
             AbstractEntityAI* ai = AIEntityHelper::GetEntityAI(e);
             es.dead = (ai && readable(ai, 0xC0) && *(unsigned char*)((char*)ai + 0x8C)) ? 1 : 0;
+            // P0: identity + health that survive the AI being torn down after death.
+            unsigned int hpSvc = FindHealthInAI((unsigned int)ai);
+            if (hpSvc) RememberEntityHealth((unsigned int)e, hpSvc);
+            else       hpSvc = CachedHealthForEntity((unsigned int)e);
+            es.objId = hc->GetObjectID();
+            if (hpSvc && readable((void*)hpSvc, 0x70)) {
+                es.hp = *(unsigned short*)(hpSvc + 0x5C);
+                if (*(unsigned int*)(hpSvc + 0x60) & 0x01000000u) es.dead = 1;   // authoritative dead flag
+            } else {
+                es.hp = 0;
+            }
+            ObjMapAdd(es.objId, (unsigned int)e, hpSvc);
             if (es.dead) {
                 static void* s_capDead[64];
                 static int   s_capDeadN = 0;
@@ -2028,12 +2120,18 @@ static void MarkMirrorKilledLocally(void* e);
 static bool MirrorKilledLocally(void* e);
 
 static unsigned int FindHealthInAI(unsigned int ai);     // defined further below
-static void ApplyPeerKill(float x, float y, float z);    // defined further below
+// P0/P1: peer -> host health event. objId is the host-assigned identity; position is a fallback only.
+static void ApplyPeerHealth(uint64_t objId, unsigned short life, float x, float y, float z);  // below
+static bool SelfTestModeActive();                        // defined below
+
+// Re-entrancy guard shared by both event lanes (self-test loopback must not ping-pong).
+static bool s_inEventLoop = false;
 
 static void ProcessKillEvents(const EntityPacket& pkt) {
     for (uint32_t i = 0; i < pkt.count && i < (uint32_t)MAX_SYNC_ENTITIES; ++i) {
         if (pkt.ents[i].kind != KIND_KILL) continue;
-        ApplyPeerKill(pkt.ents[i].pos[0], pkt.ents[i].pos[1], pkt.ents[i].pos[2]);
+        ApplyPeerHealth(pkt.ents[i].objId, pkt.ents[i].hp,
+                        pkt.ents[i].pos[0], pkt.ents[i].pos[1], pkt.ents[i].pos[2]);
     }
 }
 
@@ -2043,11 +2141,16 @@ static MirrorLifeWatch s_mirrLife[64];
 static int s_mirrLifeN = 0;
 
 static void TrackMirrorDeathForRelay(Entity* e, const EntityState& es) {
-    if (!e || es.dead) return;          // if the host already reports dead, never echo it back
+    if (!e || es.dead || PeerApplied((unsigned int)e)) return;   // never echo host-originated health
+    // Use the cached health: after a kill GetEntityAI can go blind (entity+0xE8 cleared), and then a
+    // fresh FindHealthInAI would return 0 and the event would be lost.
     unsigned int ai = (unsigned int)AIEntityHelper::GetEntityAI(e);
     unsigned int hp = FindHealthInAI(ai);
+    if (hp) RememberEntityHealth((unsigned int)e, hp);
+    else    hp = CachedHealthForEntity((unsigned int)e);
     if (!hp || !readable((void*)hp, 0x70)) return;
     unsigned short life = *(unsigned short*)(hp + 0x5C);
+
     int slot = -1;
     for (int i = 0; i < s_mirrLifeN; ++i) if (s_mirrLife[i].ent == (unsigned int)e) { slot = i; break; }
     if (slot < 0) {
@@ -2055,25 +2158,37 @@ static void TrackMirrorDeathForRelay(Entity* e, const EntityState& es) {
         slot = s_mirrLifeN++;
         s_mirrLife[slot].ent = (unsigned int)e;
         s_mirrLife[slot].life = life;
-        return;
+        return;                          // baseline only; no event for the initial state
     }
+
     unsigned short prev = s_mirrLife[slot].life;
+    if (life == prev) return;
     s_mirrLife[slot].life = life;
-    if (life == 0xFFFFu && prev != 0xFFFFu) {
-        L("[Relay] mirror died locally ent=%08X hostPos=(%.1f,%.1f,%.1f) -> reporting to host\n",
-          e, es.pos[0], es.pos[1], es.pos[2]);
-        MarkMirrorKilledLocally(e);       // stop driving this corpse even while the host says alive
-        EntityPacket out;
-        memset(&out, 0, sizeof(out));
-        out.magic = NET_ENTITY_MAGIC;
-        out.protoVer = NET_PROTO_VER;
-        out.seq = GetTickCount();
-        out.count = 1;
-        out.ents[0].kind = KIND_KILL;
-        out.ents[0].pos[0] = es.pos[0];
-        out.ents[0].pos[1] = es.pos[1];
-        out.ents[0].pos[2] = es.pos[2];
-        Net::SendEntities(out);
+    if (life == 0xFFFFu) MarkMirrorKilledLocally(e);   // stop driving the corpse at once
+
+    // P0/P1: report ANY life change (damage as well as death) keyed by the host's objId.
+    EntityPacket out;
+    memset(&out, 0, sizeof(out));
+    out.magic = NET_ENTITY_MAGIC;
+    out.protoVer = NET_PROTO_VER;
+    out.seq = GetTickCount();
+    out.count = 1;
+    out.ents[0].kind = KIND_KILL;             // "health update" lane
+    out.ents[0].objId = es.objId;
+    out.ents[0].hp = life;
+    out.ents[0].pos[0] = es.pos[0];
+    out.ents[0].pos[1] = es.pos[1];
+    out.ents[0].pos[2] = es.pos[2];
+    L("[Relay] mirror ent=%08X objId=%llu life %u -> %u -> host\n",
+      e, (unsigned long long)es.objId, (unsigned)prev, (unsigned)life);
+    Net::SendEntities(out);
+
+    // Self-test: no peer exists, so deliver it to the local apply path (what the host would do).
+    if (SelfTestModeActive() && !s_inEventLoop) {
+        s_inEventLoop = true;
+        L("[Relay] SELF-TEST loopback: delivering to the host path\n");
+        ProcessKillEvents(out);
+        s_inEventLoop = false;
     }
 }
 
@@ -2176,6 +2291,7 @@ static void ApplyGuards(const EntityPacket& pkt) {
             if (!best) continue;
             // Guest relay: if OUR attack is what killed this mirror, report it to the host (which owns
             // the real guard). Skipped when the death came from the host snapshot, so it can't echo.
+            GuestObjAdd(es.objId, (unsigned int)best);   // objId -> local mirror, for inbound events
             TrackMirrorDeathForRelay(best, es);
             // Visibility: log each guard the first time it becomes a playback dummy, so a live test can
             // state unambiguously whether the guard being hit was mirrored or a normal AI.
@@ -3322,6 +3438,37 @@ static Entity* FindNearestSoldierTo(float x, float y, float z, float radius) {
     return best;
 }
 
+// Host -> peer health event. Snapshots only carry LIVING guards (dead NPCs drop out of the entity
+// enumeration), so a death or a damage tick has to be pushed explicitly on the event lane.
+static uint64_t ObjIdForEntity(unsigned int ent) {
+    for (int i = 0; i < s_objMapN; ++i) if (s_objMap[i].ent == ent) return s_objMap[i].objId;
+    return 0;
+}
+static void SendHealthEvent(uint64_t objId, unsigned short life, float x, float y, float z) {
+    if (!g_entHost || !objId) return;              // host lane only
+    EntityPacket out;
+    memset(&out, 0, sizeof(out));
+    out.magic = NET_ENTITY_MAGIC;
+    out.protoVer = NET_PROTO_VER;
+    out.seq = GetTickCount();
+    out.count = 1;
+    out.ents[0].kind = KIND_KILL;
+    out.ents[0].objId = objId;
+    out.ents[0].hp = life;
+    out.ents[0].pos[0] = x; out.ents[0].pos[1] = y; out.ents[0].pos[2] = z;
+    L("[Kill] push health event objId=%llu life=%u -> peer\n", (unsigned long long)objId, (unsigned)life);
+    Net::SendEntities(out);
+
+    // Self-test: there is no peer, so deliver the packet to the local apply path — exactly what the guest
+    // would do. This is what makes the host->guest lane testable on one machine.
+    if (SelfTestModeActive() && !s_inEventLoop) {
+        s_inEventLoop = true;
+        L("[Kill] SELF-TEST loopback: delivering the event to the apply path\n");
+        ProcessKillEvents(out);
+        s_inEventLoop = false;
+    }
+}
+
 // The verified kill recipe, applied to one specific guard entity.
 static void KillGuardEntity(Entity* e) {
     if (!e) return;
@@ -3380,15 +3527,48 @@ static void KillGuardEntity(Entity* e) {
             L("[KF] collision layer -> Disabled(0x29) (controller left untouched)\n");
         } else L("[KF] no CharacterController\n");
     }
+
+    // Tell the peer. Dead guards disappear from the snapshot enumeration, so this push is the only way
+    // a host kill can ever reach the guest.
+    SendHealthEvent(ObjIdForEntity((unsigned int)e), 0xFFFFu,
+                    e->m_GlobalMatrix.M41, e->m_GlobalMatrix.M42, e->m_GlobalMatrix.M43);
 }
 
-// Host path: the peer reported a kill at this position — resolve to the guard the peer saw, using the
-// same 4 m tolerance ApplyGuards already matches snapshots with.
-static void ApplyPeerKill(float x, float y, float z) {
-    Entity* e = FindNearestSoldierTo(x, y, z, 4.0f);
-    if (!e) { L("[Kill] peer kill at (%.1f,%.1f,%.1f): no soldier within 4m\n", x, y, z); return; }
-    L("[Kill] peer kill at (%.1f,%.1f,%.1f) -> ent=%08X\n", x, y, z, e);
-    KillGuardEntity(e);
+// Host path: the peer reported a health change for a guard. Resolve by the host-assigned objId first;
+// fall back to the reported position only if the id is unknown (e.g. after a re-capture).
+static void ApplyPeerHealth(uint64_t objId, unsigned short life, float x, float y, float z) {
+    unsigned int ent = 0, hp = 0;
+    bool byId = ObjMapFind(objId, &ent, &hp);
+    if (!byId) {
+        // Guest side: objId -> local mirror, learned from the snapshots.
+        unsigned int ge = GuestObjFind(objId);
+        if (ge) { ent = ge; byId = true; hp = CachedHealthForEntity(ge); }
+    }
+    if (!byId) {
+        Entity* e = FindNearestSoldierTo(x, y, z, 4.0f);
+        if (!e) { L("[Kill] event objId=%llu unresolved (no soldier within 4m)\n", (unsigned long long)objId); return; }
+        ent = (unsigned int)e;
+        hp  = CachedHealthForEntity(ent);
+        L("[Kill] objId=%llu unknown -> position fallback ent=%08X\n", (unsigned long long)objId, ent);
+    }
+    if (!hp && ent) {
+        hp = FindHealthInAI((unsigned int)AIEntityHelper::GetEntityAI((Entity*)ent));
+        if (hp) RememberEntityHealth(ent, hp);
+    }
+
+    if (life == 0xFFFFu) {
+        L("[Kill] peer DEATH objId=%llu -> ent=%08X health=%08X\n", (unsigned long long)objId, ent, hp);
+        if (ent) {
+            MarkPeerApplied(ent);                 // don't echo it back
+            MarkMirrorKilledLocally((void*)ent);  // stop driving the corpse
+            KillGuardEntity((Entity*)ent);
+        }
+        return;
+    }
+    if (!hp) { L("[Kill] peer damage objId=%llu: no health\n", (unsigned long long)objId); return; }
+    int rc = ((int (__thiscall*)(void*, int))0x19FB4C0)((void*)hp, (int)life);
+    if (ent) MarkPeerApplied(ent);
+    L("[Kill] peer damage objId=%llu hp=%u (SetLife rc=%d)\n", (unsigned long long)objId, (unsigned)life, rc);
 }
 
 // F2: solo harness for the GUEST side of the relay. The real path can't be exercised in self-test
@@ -3443,8 +3623,12 @@ static void SimulatePeerKill() {
     Entity* e = FindNearestSoldierTo(px, py, pz, 40.0f);
     if (!e) { L("[Kill] no soldier within 40m\n"); return; }
     float x = e->m_GlobalMatrix.M41, y = e->m_GlobalMatrix.M42, z = e->m_GlobalMatrix.M43;
-    L("[Kill] SELF-TEST simulating peer kill at (%.1f,%.1f,%.1f)\n", x, y, z);
-    ApplyPeerKill(x, y, z);
+    uint64_t id = 0;
+    for (int i = 0; i < s_objMapN; ++i)
+        if (s_objMap[i].ent == (unsigned int)e) { id = s_objMap[i].objId; break; }
+    L("[Kill] SELF-TEST peer event objId=%llu ent=%08X pos=(%.1f,%.1f,%.1f)\n",
+      (unsigned long long)id, e, x, y, z);
+    ApplyPeerHealth(id, 0xFFFFu, x, y, z);
 }
 
 // ---- Die-clip watcher (always on, throttled) ---------------------------------------------------
