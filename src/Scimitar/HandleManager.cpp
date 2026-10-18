@@ -17,7 +17,7 @@ HandleContainer* __thiscall HandleManager::FindContainerNoLock(uint64_t ID, int 
 
 HandleContainer* __thiscall HandleManager::FindContainer(uint64_t ID, void* memoryAddress)
 {
-	return Hook::CallClassMethod<HandleContainer*, HandleManager*, uint64_t, void*>(0xA0BBF0, this, ID, memoryAddress);
+	return Hook::CallClassMethod<HandleContainer*, HandleManager*, uint64_t, void*>(0xA0BB40, this, ID, memoryAddress);
 }
 
 void __thiscall HandleManager::DestroyHandleContainer(HandleContainer* container)

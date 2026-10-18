@@ -103,6 +103,28 @@ facts): `ManagedObject.h`, `Hierarchy.h`, `Memory.h`. Build clean. **Not deploye
 Remaining Scimitar headers: 31 (including the large `Entity`/`World`/`Human`/`AIActor`). Continue in
 dependency order, one commit per header, re-testing the using feature after each.
 
+### Row 6 — `HandleManager.h` (2026-10-18)
+
+Rewritten with our own text; declarations unchanged. Re-derived from the binary:
+
+- the table is one static object at `0x04DD5FA0`; callers load that address straight into `ecx`
+  (`0x00407993`), so `GetInstance()` returns the object itself, not a pointer to it, and the class has
+  no vtable;
+- entries are 20 bytes: object `+0`, counters `+4` and `+8`, id `+12`. `CreateReference` (`0xA0BE50`)
+  bumps `+8`, `CreateHandle` (`0xA0BDE0`) bumps `+4`;
+- `FindContainerNoLock` (`0xA0BBF0`) takes no lock and creates on a miss; `FindContainer` is the
+  locking lookup `0xA0BB40` (`retn 10h` = id + one pointer, lock at `+0x7C`). The `.cpp` pointed
+  `FindContainer` at the no-lock core; corrected.
+
+Verification. `.text` diff against the pre-rewrite build of this branch: **0 bytes**. The new
+`bin\AC4Coop.asi` is byte-identical to the build running on the PC (`build-verified-2026-10-18`,
+2026-10-18 08:55) in `.text`, `.data`, `.fptable`, `.rsrc` and `.reloc`; the only difference is 9 bytes
+of build timestamp inside `.rdata`. No new machine code exists, so the row's "build + world loads"
+check is inherited from the live-verified build instead of re-run. Not deployed.
+
+Both `FindContainer` thunks are absent from the shipped `.asi` — the linker drops them as unreferenced,
+so this row cannot alter runtime behaviour.
+
 ## Exhaustive remaining worklist (generated 2026-10-18)
 
 Ordered smallest-first. Replace one, build clean, live-test, commit. Do not batch the big four.
