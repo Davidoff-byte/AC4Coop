@@ -7,6 +7,9 @@
 
 class Component;
 
+// Part of an entity that exists without an identity of its own: hierarchy link, a few editor flags and the
+// world matrix everything else is derived from. Position and rotation are read straight out of row 4 of that
+// matrix, which is the path the live mod uses for every position/teleport.
 class BaseEntity : public ManagedObject
 {
 public:
@@ -20,7 +23,7 @@ public:
 
 	Hierarchy* m_Hierarchy;
 	CustomFlags m_CustomFlags;
-	HookMath::Transform m_GlobalMatrix;
+	HookMath::Transform m_GlobalMatrix;	// translation in M41..M43
 
 	BaseEntity* GetFatherEntity();
 
@@ -46,20 +49,6 @@ public:
 		m_GlobalMatrix.M43 = pos.z;
 	}
 
-	inline static void HookInit()
-	{
-		uint64_t* addr = (uint64_t*)0x0064710F;
-
-		DWORD dwOldProtect, dwBkup;
-
-		VirtualProtect(addr, 16, PAGE_EXECUTE_READWRITE, &dwOldProtect);
-
-		addr[0] = (uint64_t)0x5E000000000C46C7;
-		addr[1] = (uint64_t)0xCCCCCCCC0008C25D;
-
-		VirtualProtect(addr, 16, dwOldProtect, &dwBkup);
-	}
-
 	int SetGlobalRotation(HookMath::Quaternion* rot);
 
 	char SetSight(HookMath::Vector4* sight, HookMath::Vector4* banking);
@@ -71,6 +60,11 @@ public:
 	int m_TypeFlags;
 };
 
+// A world entity: identity comes from the handle container, everything here is state.
+//
+// The two things our code depends on are the global matrix (see BaseEntity) and the component caches at the
+// end - components are looked up through GetComponentByType rather than by walking m_Components, because a
+// duplicate/ragdoll entity can have stale entries in the array.
 class Entity : public BaseEntity
 {
 public:
