@@ -324,6 +324,13 @@ static void PatchXInputIAT(void* target, void* replacement) {
 
 void Phase1::InstallVirtualPadHook() {
     if (s_vpadInstalled) return;
+    // Test scaffolding only: advertising a phantom pad at index 1 from process start is not something a
+    // normal build should do. Opt in with [Coop] VPadEnable=1.
+    {
+        char ini[MAX_PATH];
+        Phase1::ModuleRelativePath(ini, sizeof(ini), "AC4Coop.ini");
+        if (GetPrivateProfileIntA("Coop", "VPadEnable", 0, ini) == 0) return;
+    }
     HMODULE xi = GetModuleHandleA("xinput1_3.dll");
     if (!xi) xi = GetModuleHandleA("xinput1_4.dll");
     if (!xi) xi = GetModuleHandleA("xinput9_1_0.dll");
