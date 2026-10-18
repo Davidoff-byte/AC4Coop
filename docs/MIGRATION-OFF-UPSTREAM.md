@@ -60,3 +60,11 @@ User-confirmed: guard died, stayed down, no invisible wall. Position read from t
 (`35.4,-73.7,3.4`), so the HookMath conversions are behaviourally equivalent.
 
 Status: Hook done + verified; HookMath.h done + verified; HookMath.cpp still pending (next).
+
+## Include-graph audit (2026-10-18)
+
+Every Scimitar header was checked against every `.h`/`.cpp` include in the project:
+- 35 headers, **34 referenced**, **1 dead** (`BipedComponent.h`, 21 lines) — deleted.
+- Consequence: pruning is not a shortcut. The `Scimitar` block (~5,100 lines) is all load-bearing and has
+  to be **replaced**, not removed. Replacement stays incremental, in dependency order:
+  `ObjectShape` -> `CollisionFilterInfo` -> `Components/*` -> `Entity` -> `World` -> `Human`/`AIActor`.
