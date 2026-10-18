@@ -68,3 +68,15 @@ Every Scimitar header was checked against every `.h`/`.cpp` include in the proje
 - Consequence: pruning is not a shortcut. The `Scimitar` block (~5,100 lines) is all load-bearing and has
   to be **replaced**, not removed. Replacement stays incremental, in dependency order:
   `ObjectShape` -> `CollisionFilterInfo` -> `Components/*` -> `Entity` -> `World` -> `Human`/`AIActor`.
+
+### HookMath.cpp — replaced and verified (2026-10-18)
+
+`HookMath.cpp` rewritten from scratch (own implementations of all declared functions; row-major, row
+vectors, translation in row 4). Live oracle: `EntitySync=1 EntitySelfTest=1`, which runs
+`FromMatrix`/`ToMatrix` on every mirrored guard each tick.
+
+Result: guards **frozen, correct facing, no spinning** -> conversions correct. The "walking animation in
+place" is the pre-existing self-test mirror behaviour (action replication without transform drive), not a
+regression.
+
+Tooling layer (Hook + HookMath) is now entirely ours.
