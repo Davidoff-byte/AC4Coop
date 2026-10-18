@@ -1,39 +1,109 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <!-- Generated from the file list in AC4Coop.vcxproj; the view only, no build effect. -->
   <ItemGroup>
     <Filter Include="Source Files">
-      <UniqueIdentifier>{4FC737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
+      <UniqueIdentifier>{86049363-81c3-4fc6-ba77-776f98b8cef3}</UniqueIdentifier>
       <Extensions>cpp;c;cc;cxx</Extensions>
     </Filter>
-    <Filter Include="Header Files">
-      <UniqueIdentifier>{93995380-89BD-4B04-88EB-625FBE52EBFB}</UniqueIdentifier>
-      <Extensions>h;hpp;hxx</Extensions>
-    </Filter>
-    <Filter Include="Config">
-      <UniqueIdentifier>{67DA6AB6-F800-4C08-8B7A-83BB121AAD01}</UniqueIdentifier>
-    </Filter>
-    <Filter Include="Header Files\Scimitar">
-      <UniqueIdentifier>{712693ae-12ba-4657-a2ec-dd3d39e5144d}</UniqueIdentifier>
-    </Filter>
-    <Filter Include="Header Files\Scimitar\AI">
-      <UniqueIdentifier>{6eff1e6b-414a-43f8-bdef-358deb5b0a51}</UniqueIdentifier>
-    </Filter>
-    <Filter Include="Header Files\Scimitar\Components">
-      <UniqueIdentifier>{847fe86f-638f-43b1-b702-b032b286b5ea}</UniqueIdentifier>
-    </Filter>
     <Filter Include="Source Files\Scimitar">
-      <UniqueIdentifier>{043aaab0-29c9-4529-93ea-09302b6d514c}</UniqueIdentifier>
-    </Filter>
-    <Filter Include="Source Files\Scimitar\Components">
-      <UniqueIdentifier>{450dd363-c0f2-4f41-8cfb-2a929da39c01}</UniqueIdentifier>
+      <UniqueIdentifier>{a461b0d6-2d79-446a-8f6c-87a89b05bf88}</UniqueIdentifier>
     </Filter>
     <Filter Include="Source Files\Scimitar\AI">
-      <UniqueIdentifier>{b49b4920-e102-4df1-bc27-4e2862193535}</UniqueIdentifier>
+      <UniqueIdentifier>{63c9d553-773d-4031-bc4c-74826248c0c0}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\Scimitar\Components">
+      <UniqueIdentifier>{7df1b685-b73c-4c0c-bae9-9194cb4adde6}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files">
+      <UniqueIdentifier>{4356b13d-20bd-4077-99a3-c885785d8ce7}</UniqueIdentifier>
+      <Extensions>h;hpp;hxx</Extensions>
+    </Filter>
+    <Filter Include="Header Files\Scimitar">
+      <UniqueIdentifier>{38396eb1-d948-4db4-bc83-96a5c83c1c34}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\Scimitar\AI">
+      <UniqueIdentifier>{056c76c7-a748-49f7-9f58-6b49a20dfc4c}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\Scimitar\Components">
+      <UniqueIdentifier>{c98268d3-962a-4f77-bdd3-f4380afeff9a}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Config">
+      <UniqueIdentifier>{418a9f28-a5e5-4037-ba0c-6c356468dff1}</UniqueIdentifier>
     </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\dllmain.cpp">
       <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Hook.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\HookMath.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Scimitar\AI\AIActor.cpp">
+      <Filter>Source Files\Scimitar\AI</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Scimitar\AI\AIEntityHelper.cpp">
+      <Filter>Source Files\Scimitar\AI</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Scimitar\AI\Human.cpp">
+      <Filter>Source Files\Scimitar\AI</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Scimitar\BoneHandle.cpp">
+      <Filter>Source Files\Scimitar</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Scimitar\CollisionFilterInfo.cpp">
+      <Filter>Source Files\Scimitar</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Scimitar\Components\ActionComponent.cpp">
+      <Filter>Source Files\Scimitar\Components</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Scimitar\Components\AIComponent.cpp">
+      <Filter>Source Files\Scimitar\Components</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Scimitar\Components\Component.cpp">
+      <Filter>Source Files\Scimitar\Components</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Scimitar\DuplicationManager.cpp">
+      <Filter>Source Files\Scimitar</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Scimitar\Entity.cpp">
+      <Filter>Source Files\Scimitar</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Scimitar\EntityBuilder.cpp">
+      <Filter>Source Files\Scimitar</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Scimitar\HandleManager.cpp">
+      <Filter>Source Files\Scimitar</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Scimitar\Hierarchy.cpp">
+      <Filter>Source Files\Scimitar</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Scimitar\LoadingManager.cpp">
+      <Filter>Source Files\Scimitar</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Scimitar\LoadingThread.cpp">
+      <Filter>Source Files\Scimitar</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Scimitar\ManagedObject.cpp">
+      <Filter>Source Files\Scimitar</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Scimitar\Memory.cpp">
+      <Filter>Source Files\Scimitar</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Scimitar\PlayerPadManager.cpp">
+      <Filter>Source Files\Scimitar</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Scimitar\RowSelector.cpp">
+      <Filter>Source Files\Scimitar</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Scimitar\Statechart.cpp">
+      <Filter>Source Files\Scimitar</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Scimitar\World.cpp">
+      <Filter>Source Files\Scimitar</Filter>
     </ClCompile>
     <ClCompile Include="src\windowed.cpp">
       <Filter>Source Files</Filter>
@@ -44,77 +114,12 @@
     <ClCompile Include="src\net.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Hook.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Scimitar\Memory.cpp">
-      <Filter>Source Files\Scimitar</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Scimitar\ManagedObject.cpp">
-      <Filter>Source Files\Scimitar</Filter>
-    </ClCompile>
-    <ClCompile Include="src\HookMath.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Scimitar\Hierarchy.cpp">
-      <Filter>Source Files\Scimitar</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Scimitar\Entity.cpp">
-      <Filter>Source Files\Scimitar</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Scimitar\Components\Component.cpp">
-      <Filter>Source Files\Scimitar\Components</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Scimitar\Components\ActionComponent.cpp">
-      <Filter>Source Files\Scimitar\Components</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Scimitar\AI\AIActor.cpp">
-      <Filter>Source Files\Scimitar\AI</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Scimitar\World.cpp">
-      <Filter>Source Files\Scimitar</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Scimitar\HandleManager.cpp">
-      <Filter>Source Files\Scimitar</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Scimitar\CollisionFilterInfo.cpp">
-      <Filter>Source Files\Scimitar</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Scimitar\BoneHandle.cpp">
-      <Filter>Source Files\Scimitar</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Scimitar\AI\Human.cpp">
-      <Filter>Source Files\Scimitar\AI</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Scimitar\Statechart.cpp">
-      <Filter>Source Files\Scimitar</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Scimitar\Components\AIComponent.cpp">
-      <Filter>Source Files\Scimitar\Components</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Scimitar\AI\AIEntityHelper.cpp">
-      <Filter>Source Files\Scimitar\AI</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Scimitar\EntityBuilder.cpp">
-      <Filter>Source Files\Scimitar</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Scimitar\RowSelector.cpp">
-      <Filter>Source Files\Scimitar</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Scimitar\DuplicationManager.cpp">
-      <Filter>Source Files\Scimitar</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Scimitar\PlayerPadManager.cpp">
-      <Filter>Source Files\Scimitar</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Scimitar\LoadingManager.cpp">
-      <Filter>Source Files\Scimitar</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Scimitar\LoadingThread.cpp">
-      <Filter>Source Files\Scimitar</Filter>
-    </ClCompile>
-  </ItemGroup>
-  <ItemGroup>
+    <ClInclude Include="src\Hook.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\HookMath.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="src\phase1.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -124,29 +129,14 @@
     <ClInclude Include="src\netstate.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="src\windowed.h">
-      <Filter>Header Files</Filter>
+    <ClInclude Include="src\Scimitar\AI\AbstractEntityAI.h">
+      <Filter>Header Files\Scimitar\AI</Filter>
     </ClInclude>
-    <ClInclude Include="src\scimitarCommandLineOptions.h">
-      <Filter>Header Files</Filter>
+    <ClInclude Include="src\Scimitar\AI\AIActor.h">
+      <Filter>Header Files\Scimitar\AI</Filter>
     </ClInclude>
-    <ClInclude Include="src\Scimitar\ManagedObject.h">
-      <Filter>Header Files\Scimitar</Filter>
-    </ClInclude>
-    <ClInclude Include="src\Scimitar\Object.h">
-      <Filter>Header Files\Scimitar</Filter>
-    </ClInclude>
-    <ClInclude Include="src\Scimitar\ClassDescriptor.h">
-      <Filter>Header Files\Scimitar</Filter>
-    </ClInclude>
-    <ClInclude Include="src\Scimitar\Enums.h">
-      <Filter>Header Files\Scimitar</Filter>
-    </ClInclude>
-    <ClInclude Include="src\Hook.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\Scimitar\Memory.h">
-      <Filter>Header Files</Filter>
+    <ClInclude Include="src\Scimitar\AI\AIEntityHelper.h">
+      <Filter>Header Files\Scimitar\AI</Filter>
     </ClInclude>
     <ClInclude Include="src\Scimitar\AI\Human.h">
       <Filter>Header Files\Scimitar\AI</Filter>
@@ -154,67 +144,55 @@
     <ClInclude Include="src\Scimitar\AI\HumanSwimFSM.h">
       <Filter>Header Files\Scimitar\AI</Filter>
     </ClInclude>
-    <ClInclude Include="src\Scimitar\Components\ActionComponent.h">
-      <Filter>Header Files\Scimitar\Components</Filter>
-    </ClInclude>
-    <ClInclude Include="src\Scimitar\Components\Component.h">
-      <Filter>Header Files\Scimitar\Components</Filter>
-    </ClInclude>
-    <ClInclude Include="src\Scimitar\Entity.h">
-      <Filter>Header Files\Scimitar</Filter>
-    </ClInclude>
-    <ClInclude Include="src\HookMath.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\Scimitar\Hierarchy.h">
-      <Filter>Header Files\Scimitar</Filter>
-    </ClInclude>
     <ClInclude Include="src\Scimitar\BaseTypes.h">
-      <Filter>Header Files\Scimitar</Filter>
-    </ClInclude>
-    <ClInclude Include="src\Scimitar\GraphicTypes.h">
-      <Filter>Header Files\Scimitar</Filter>
-    </ClInclude>
-    <ClInclude Include="src\Scimitar\AI\AIActor.h">
-      <Filter>Header Files\Scimitar\AI</Filter>
-    </ClInclude>
-    <ClInclude Include="src\Scimitar\CollisionFilterInfo.h">
-      <Filter>Header Files\Scimitar</Filter>
-    </ClInclude>
-    <ClInclude Include="src\Scimitar\World.h">
-      <Filter>Header Files\Scimitar</Filter>
-    </ClInclude>
-    <ClInclude Include="src\Scimitar\HandleManager.h">
       <Filter>Header Files\Scimitar</Filter>
     </ClInclude>
     <ClInclude Include="src\Scimitar\BoneHandle.h">
       <Filter>Header Files\Scimitar</Filter>
     </ClInclude>
-    <ClInclude Include="src\Scimitar\InventoryContainer.h">
+    <ClInclude Include="src\Scimitar\ClassDescriptor.h">
       <Filter>Header Files\Scimitar</Filter>
     </ClInclude>
-    <ClInclude Include="src\Scimitar\AI\AIEntityHelper.h">
-      <Filter>Header Files\Scimitar\AI</Filter>
-    </ClInclude>
-    <ClInclude Include="src\Scimitar\AI\AbstractEntityAI.h">
-      <Filter>Header Files\Scimitar\AI</Filter>
-    </ClInclude>
-    <ClInclude Include="src\Scimitar\Statechart.h">
+    <ClInclude Include="src\Scimitar\CollisionFilterInfo.h">
       <Filter>Header Files\Scimitar</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Scimitar\Components\ActionComponent.h">
+      <Filter>Header Files\Scimitar\Components</Filter>
     </ClInclude>
     <ClInclude Include="src\Scimitar\Components\AIComponent.h">
       <Filter>Header Files\Scimitar\Components</Filter>
     </ClInclude>
-    <ClInclude Include="src\Scimitar\EntityBuilder.h">
-      <Filter>Header Files\Scimitar</Filter>
+    <ClInclude Include="src\Scimitar\Components\CharacterController.h">
+      <Filter>Header Files\Scimitar\Components</Filter>
     </ClInclude>
-    <ClInclude Include="src\Scimitar\RowSelector.h">
-      <Filter>Header Files\Scimitar</Filter>
+    <ClInclude Include="src\Scimitar\Components\Component.h">
+      <Filter>Header Files\Scimitar\Components</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Scimitar\Components\PhysicComponent.h">
+      <Filter>Header Files\Scimitar\Components</Filter>
     </ClInclude>
     <ClInclude Include="src\Scimitar\DuplicationManager.h">
       <Filter>Header Files\Scimitar</Filter>
     </ClInclude>
-    <ClInclude Include="src\Scimitar\PlayerPadManager.h">
+    <ClInclude Include="src\Scimitar\Entity.h">
+      <Filter>Header Files\Scimitar</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Scimitar\EntityBuilder.h">
+      <Filter>Header Files\Scimitar</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Scimitar\Enums.h">
+      <Filter>Header Files\Scimitar</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Scimitar\GraphicTypes.h">
+      <Filter>Header Files\Scimitar</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Scimitar\HandleManager.h">
+      <Filter>Header Files\Scimitar</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Scimitar\Hierarchy.h">
+      <Filter>Header Files\Scimitar</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Scimitar\InventoryContainer.h">
       <Filter>Header Files\Scimitar</Filter>
     </ClInclude>
     <ClInclude Include="src\Scimitar\LoadingManager.h">
@@ -223,18 +201,43 @@
     <ClInclude Include="src\Scimitar\LoadingThread.h">
       <Filter>Header Files\Scimitar</Filter>
     </ClInclude>
-    <ClInclude Include="src\Scimitar\WhiteRoomManager.h">
+    <ClInclude Include="src\Scimitar\ManagedObject.h">
+      <Filter>Header Files\Scimitar</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Scimitar\Memory.h">
+      <Filter>Header Files\Scimitar</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Scimitar\Object.h">
+      <Filter>Header Files\Scimitar</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Scimitar\ObjectShape.h">
+      <Filter>Header Files\Scimitar</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Scimitar\PlayerPadManager.h">
       <Filter>Header Files\Scimitar</Filter>
     </ClInclude>
     <ClInclude Include="src\Scimitar\PlayerProgression.h">
       <Filter>Header Files\Scimitar</Filter>
     </ClInclude>
-  </ItemGroup>
-  <ItemGroup>
+    <ClInclude Include="src\Scimitar\RowSelector.h">
+      <Filter>Header Files\Scimitar</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Scimitar\Statechart.h">
+      <Filter>Header Files\Scimitar</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Scimitar\WhiteRoomManager.h">
+      <Filter>Header Files\Scimitar</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Scimitar\World.h">
+      <Filter>Header Files\Scimitar</Filter>
+    </ClInclude>
+    <ClInclude Include="src\windowed.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\scimitarCommandLineOptions.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <None Include="AC4Coop.ini">
-      <Filter>Config</Filter>
-    </None>
-    <None Include="HANDOFF.md">
       <Filter>Config</Filter>
     </None>
   </ItemGroup>

@@ -11,10 +11,10 @@ requires (offsets, sizes, virtual slots), which are facts about the binary.
 
 | area | upstream lines | status |
 |---|---|---|
-| project files (.sln/.vcxproj/.filters/.gitignore) | ~430 | **to replace** (trivial, regenerate from our source list) |
+| project files (.sln/.vcxproj/.filters/.gitignore) | ~430 | **DONE** — `.vcxproj`/`.filters` regenerated from our file list (stale `BipedComponent.h` and missing `HANDOFF.md` dropped; `ship_sync.cpp` stays reference-only, as its own header says). `.sln` is untouched 24-line VS boilerplate with no prose |
 | `src/Hook.{h,cpp}` | ~97 | **DONE** — rewritten from scratch, build verified |
 | `src/HookMath.{h,cpp}` | ~645 | **header DONE** (rewritten; build verified). `.cpp` pending — needs a live positional check |
-| `src/Scimitar/**` (class declarations + small .cpp) | ~5,100 | **to replace incrementally** — only the headers a change actually touches |
+| `src/Scimitar/**` (class declarations + small .cpp) | ~5,100 | **DONE** — 34 of 35 headers replaced from the binary, `BipedComponent.h` deleted as dead |
 | `src/phase1.cpp` | 1,225 of 4,941 | ~75% ours; remaining early scaffolding rewritten opportunistically |
 | `src/net.*`, `netstate.h`, `ship_sync.cpp`, docs | ours | keep |
 

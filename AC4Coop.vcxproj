@@ -1,7 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
-  <!-- AC4Coop ASI (x86 DLL). Mirrors build.bat: /MT /EHsc /O2, links user32 + ws2_32,
-       output bin\AC4Coop.asi. Open AC4Coop.sln in VS2022 to edit and compile. -->
+  <!-- AC4Coop: an x86 ASI DLL. Release is /MT /EHsc /O2, links user32 + ws2_32, and writes
+       bin\AC4Coop.asi. Build with:
+         MSBuild AC4Coop.sln /p:Configuration=Release /p:Platform=x86 /p:PlatformToolset=v143
+
+       src\ship_sync.cpp is a reference implementation and is deliberately not listed here. -->
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Debug|Win32">
       <Configuration>Debug</Configuration>
@@ -34,7 +37,7 @@
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <PropertyGroup Label="UserMacros" />
-  <!-- Output straight to bin\AC4Coop.asi, exactly like build.bat. -->
+  <!-- Output lands directly in bin\ as AC4Coop.asi. -->
   <PropertyGroup>
     <OutDir>$(ProjectDir)bin\</OutDir>
     <IntDir>$(ProjectDir)obj\$(Configuration)\</IntDir>
@@ -121,7 +124,6 @@
     <ClInclude Include="src\Scimitar\CollisionFilterInfo.h" />
     <ClInclude Include="src\Scimitar\Components\ActionComponent.h" />
     <ClInclude Include="src\Scimitar\Components\AIComponent.h" />
-    <ClInclude Include="src\Scimitar\Components\BipedComponent.h" />
     <ClInclude Include="src\Scimitar\Components\CharacterController.h" />
     <ClInclude Include="src\Scimitar\Components\Component.h" />
     <ClInclude Include="src\Scimitar\Components\PhysicComponent.h" />
@@ -150,7 +152,6 @@
   </ItemGroup>
   <ItemGroup>
     <None Include="AC4Coop.ini" />
-    <None Include="HANDOFF.md" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>
