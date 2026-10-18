@@ -3,6 +3,16 @@
 #include "..\..\HookMath.h"
 #include "..\Entity.h"
 
+// The behaviour side of an AI: a set of tracks, each playing one context at a time, plus a data record that
+// points back at the entity. Human derives from it, so this layout decides where every Human field starts.
+//
+// Verified on the data record: AIActorData+4 is m_ActorEntity - the component getters 0x5FC110 (action) and
+// 0x5FC130 (character) both fetch the entity from there and then ask it for the component.
+//
+// The declarations below are engine layout and carry no prose of their own; our only text is this note. We
+// call just the four trampolines in AIActor.cpp (Enter 0x52DFF0, Exit 0x52C330, GetCurrentContext 0x52C2E0,
+// Transit 0x52DF90) and never read the fields by name.
+
 class AIActor;
 
 class ActorContext : public Object
