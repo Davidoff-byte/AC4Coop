@@ -13,6 +13,8 @@ enum Resistance
 	Resistance_Indestructible = 0x3,
 };
 
+// Base physics component. Only m_DriveEntity is written by us (to keyframe a body); the rest keeps the
+// engine layout. The static descriptor getter returns a fixed descriptor object from the data segment.
 class PhysicComponent : public Component
 {
 public:
@@ -29,7 +31,7 @@ public:
 public:
 	inline static ClassDescriptor* GetStaticClassDescriptor()
 	{
-		return Hook::CallCdeclMethod<ClassDescriptor*>(0x00735670);
+		return Hook::CallCdeclMethod<ClassDescriptor*>(0x00735670);	// -> descriptor at 0x27A4300
 	}
 
 	inline int SetEnabled(bool enabled)
@@ -50,6 +52,9 @@ public:
 	Reference m_ImpactData;
 };
 
+// Havok-facing body description. Base Object is 4 bytes and the inertia transform is 64, so m_Shape sits
+// at +0x44 - the offset the physics dump in phase1 reads. Everything after it follows from the embedded
+// CollisionFilterInfo, so the order here is fixed.
 class RigidBody : public Object
 {
 public:
@@ -68,7 +73,7 @@ public:
 	};
 
 	HookMath::Transform m_InertiaTensorLocal;
-	Reference m_Shape;
+	Reference m_Shape;			// +0x44
 	float m_Mass;
 	float m_LinearDamping;
 	float m_AngularDamping;
@@ -90,7 +95,7 @@ public:
 
 	inline static ClassDescriptor* GetStaticClassDescriptor()
 	{
-		return Hook::CallCdeclMethod<ClassDescriptor*>(0x61F790);
+		return Hook::CallCdeclMethod<ClassDescriptor*>(0x61F790);	// -> descriptor at 0x277EFC4
 	}
 };
 
@@ -126,6 +131,6 @@ public:
 
 	inline static ClassDescriptor* GetStaticClassDescriptor()
 	{
-		return Hook::CallCdeclMethod<ClassDescriptor*>(0x7357E0);
+		return Hook::CallCdeclMethod<ClassDescriptor*>(0x7357E0);	// -> descriptor at 0x27A43F0
 	}
 };
