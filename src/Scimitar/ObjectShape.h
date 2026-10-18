@@ -4,6 +4,7 @@
 #include "..\HookMath.h"
 #include "CollisionFilterInfo.h"
 
+// Surface materials. The two overrider values sit far above the real range on purpose.
 enum ContactMaterial
 {
 	Dirt = 0x0,
@@ -73,12 +74,16 @@ public:
 	IColor m_Color;
 };
 
+// Base of the collision shape resources. Only the user category is state of its own.
 class ObjectShape : public ManagedObject
 {
 public:
 	UserResourceCategory m_UserCategory;
 };
 
+// Havok shape wrappers. The 8-byte gap after the vtable is part of Havok's object header, and m_Shape
+// therefore sits at +12 in every one of them. None of this is touched by this project; the types exist so
+// the shape classes below describe the right memory.
 class HKPCapsule
 {
 public:
