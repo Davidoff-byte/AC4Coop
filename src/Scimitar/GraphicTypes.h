@@ -3,6 +3,9 @@
 #include "BaseTypes.h"
 #include "..\HookMath.h"
 
+// Rendering-side types. Entity embeds BoundingVolume and GraphicNodeUpdateTag by value, so their sizes
+// decide every field after them; the rest of the file is enums whose values come from the engine data.
+
 class PoolAddress
 {
 public:
@@ -40,6 +43,7 @@ public:
 	WORD m_IndexInSector;
 };
 
+// 32 bytes: two Vector3 plus the type and the optional parent matrix.
 class BoundingVolume
 {
 public:
