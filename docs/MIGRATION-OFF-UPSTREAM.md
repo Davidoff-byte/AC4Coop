@@ -93,3 +93,12 @@ The working build must never be put at risk by migration work.
 - If a header replacement breaks something, revert only that header on the branch (the tag is untouched).
 - Each header replacement is its own commit: build-clean is not enough, the using feature must be re-tested
   (corpse collision for `CollisionFilterInfo`, ship for ship types, puppet/mirrors for `Entity`/`Human`).
+
+### Header replacement — first batch (2026-10-18, branch `migration/off-upstream`)
+
+Replaced with our own text, declarations preserved (call sites depend on the names; layouts are engine
+facts): `ManagedObject.h`, `Hierarchy.h`, `Memory.h`. Build clean. **Not deployed** — the verified build
+(tag `build-verified-2026-10-18`) remains the one on the PC.
+
+Remaining Scimitar headers: 31 (including the large `Entity`/`World`/`Human`/`AIActor`). Continue in
+dependency order, one commit per header, re-testing the using feature after each.

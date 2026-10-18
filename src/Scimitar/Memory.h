@@ -1,5 +1,6 @@
-#pragma once
+﻿#pragma once
 
+// Engine allocator entry points; the bodies resolve absolute addresses in Memory.cpp.
 namespace Memory
 {
 	void* __cdecl GetAllocator(size_t size, size_t alignment, void* allocator);
