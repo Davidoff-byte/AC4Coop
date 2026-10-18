@@ -80,3 +80,16 @@ place" is the pre-existing self-test mirror behaviour (action replication withou
 regression.
 
 Tooling layer (Hook + HookMath) is now entirely ours.
+
+## Build protection protocol (2026-10-18)
+
+The working build must never be put at risk by migration work.
+
+- **Known-good build**: tag `build-verified-2026-10-18` on `fix/live-game-udp-bind`. That is the binary on
+  the PC and the tester package base (Hook + HookMath ours, live-verified).
+- **All remaining migration work happens on `migration/off-upstream`.** Nothing is merged to
+  `fix/live-game-udp-bind` until it has passed a build **and** the live check for the feature it touches.
+- **Never deploy from the migration branch.** Deploying is a separate, explicit step after a live check.
+- If a header replacement breaks something, revert only that header on the branch (the tag is untouched).
+- Each header replacement is its own commit: build-clean is not enough, the using feature must be re-tested
+  (corpse collision for `CollisionFilterInfo`, ship for ship types, puppet/mirrors for `Entity`/`Human`).
