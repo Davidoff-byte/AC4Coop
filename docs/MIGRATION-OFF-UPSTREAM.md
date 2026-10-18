@@ -43,3 +43,20 @@ requires (offsets, sizes, virtual slots), which are facts about the binary.
 
 `git log` upstream commits remain only as history; every file in `src/` is regenerated from our
 decompilation; `CREDITS.md` reflects that the initial skeleton has been fully replaced.
+
+## Live verification (2026-10-18)
+
+`Hook.{h,cpp}` and `HookMath.h` were exercised end-to-end by the real kill path on the rewritten files:
+
+````
+[Kill] SELF-TEST peer event objId=4026541036 -> ent=358A9440
+[KF] SetLife(-1) rc=0  life 36 -> 65535
+[KF] is-alive service=FCB0B828 +4 00000000 -> 00001000
+[KF] after : alive=0
+[KF] death clip + collision layer -> Disabled(0x29)
+````
+
+User-confirmed: guard died, stayed down, no invisible wall. Position read from the matrix was correct
+(`35.4,-73.7,3.4`), so the HookMath conversions are behaviourally equivalent.
+
+Status: Hook done + verified; HookMath.h done + verified; HookMath.cpp still pending (next).
