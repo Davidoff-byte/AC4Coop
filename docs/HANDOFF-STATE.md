@@ -2,13 +2,20 @@
 
 ## Where we are
 - Repo: `C:\Users\Administrator\Documents\Default Project\bf-coop\ref\AC4Coop`, remote `fork` only.
-- Verified build: tag `build-verified-2026-10-18` on `fix/live-game-udp-bind`. This is the .asi on the PC
-  and the base for the tester package. **Do not disturb it.**
-- Migration work: branch `migration/off-upstream` — migration **complete** (every file under `src/` and the
-  project files replaced; `git diff 68355c7 -- src/` leaves no untouched file). Build clean, never deployed.
-  Next: merge to `fix/live-game-udp-bind`, then the deploy + tester rebuild (separate, explicit steps).
-- Deploy protocol: only after build **and** the live check for the feature. Never deploy from the
-  migration branch.
+- Verified build: tag `build-verified-2026-10-18` on `fix/live-game-udp-bind`. That tag is the
+  previous known-good .asi; **do not move or delete it**.
+- Migration: complete and merged into `fix/live-game-udp-bind` (fast-forward, both branches at the same
+  commit). Every file under `src/` differs from the upstream initial commit.
+- **Deployed 2026-10-18 ~09:46**: the migration build is the `.asi` in the game folder now. Previous
+  .asi + ini backed up to `bf-coop\backups\20261018-094641\`.
+- Live check of the deployed build (2026-10-18): game boots, world/player/18 entities enumerated, F9 scene
+  probe answers, and F6 built + integrated a puppet (`BuildEntityWithSelector rc=0 entity=2D1C1220`,
+  `AddEntity issued`, 0 exceptions). The spawn was done with `[Net] Enabled=0`; with net on, the frame
+  path returns before the spawn request, so F6 is a single-machine check only.
+- Tester package: `bf-coop\dist\AC4Coop-tester-2026-10-18.zip`
+  (sha256 `AD541BCB6AB141FEF39F2A1BA57E50889C07A97A3A0FDAC93FAE6630916A6F5B`), .asi inside is the
+  deployed build (sha256 `B5A8ABBC76BC1ED1B3355DB51BE114C1C0734EF87AEBDB2C2202E8DECC5D7093`).
+- Deploy protocol: only after build **and** the live check for the feature.
 
 ## Facts that matter
 - Wire protocol: `NET_PROTO_VER = 7`. Both machines must run the same .asi.
