@@ -1,14 +1,14 @@
-#pragma once
+﻿#pragma once
 
 #include "BaseTypes.h"
 
 class Entity;
 
-// Builds a fully-formed Entity from a resolved builder + a (duplicated) RowSelector. The player's
-// cached builder is reused so the puppet comes out looking like the local player (Edward).
+// Produces a fully built Entity from a resolved builder plus a duplicated RowSelector. Reusing the
+// player's cached builder is what makes the puppet look like the local character.
 class EntityBuilder
 {
 public:
-	// out receives the built entity; selector is a duplicated RowSelector (consumed by the build).
+	// `out` receives the built entity; `selector` is a duplicated RowSelector and is consumed by the build.
 	int BuildEntityWithSelector(Entity** out, void* selector);
 };

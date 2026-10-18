@@ -1,10 +1,10 @@
-#pragma once
+﻿#pragma once
 
 #include "BaseTypes.h"
 
-// A RowSelector picks which archetype/row an EntityBuilder builds. BuildEntityWithSelector consumes
-// (frees) the selector it is handed, so callers Duplicate() a fresh copy first — and Duplicate needs
-// an active DuplicationManager scope (see DuplicationManager::Begin/End) or it null-derefs.
+// Chooses the archetype row an EntityBuilder instantiates. The builder consumes the selector it is
+// handed, so callers must pass a fresh Duplicate() — and Duplicate requires an active duplication scope
+// (DuplicationManager::Begin/End), otherwise it dereferences null.
 class RowSelector
 {
 public:

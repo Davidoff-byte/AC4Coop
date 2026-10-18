@@ -1,9 +1,10 @@
-#pragma once
+﻿#pragma once
 
 #include "AbstractEntityAI.h"
 #include "Human.h"
 #include "..\Entity.h"
 
+// Thin accessors over the engine's entity -> AI and entity -> Human lookups.
 namespace AIEntityHelper
 {
 	AbstractEntityAI* __fastcall GetEntityAI(Entity* entity);
