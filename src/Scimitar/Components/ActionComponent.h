@@ -2,6 +2,8 @@
 
 #include "Component.h"
 
+// Animation/action driver of a human. Everything below acts on the per-(channel, layer) controller,
+// reached through 0x666BB0 (returns 0 when there is no controller for that pair).
 class ActionComponent : Component
 {
 public:
@@ -17,63 +19,53 @@ public:
 	int __fastcall SetTargetAction(int actionAlias, int a3_seems_always_0, int ActionTransition, int a5_seems_always_0xFFFF, int ActionTransitionLayer);
 	void SetActionKit(int* handle);
 
-	// Returns the currently-playing scimitar::Action* on (channelID, layer); its file-defined alias is at
-	// Action+0x08. Used to capture which clip the peer is playing so the puppet can be told to play it.
+	// Currently playing action on (channel, layer); the file-defined alias sits at action+0x08. We use it to
+	// learn which clip the peer is playing so the puppet can be told to play the same one.
 	void* GetCurrentAction(unsigned char* actionIsMirrored, int channelID, int layer);
 
-	// Per-channel animation blend factor (e.g. the walk/jog/run speed blend within one locomotion action).
-	// index = blend slot, value clamped [0,1]. PC GetBlendFactor = 0x667590 (returns float via st0; resolves
-	// the channel controller for (channel,layer) then reads slot `index`, 0.0 if no controller).
+	// Per-slot blend factor (the walk/jog/run blend inside one locomotion action). index selects the slot,
+	// value is clamped to [0,1]. GetBlendFactor is 0x667590: it resolves the controller and reads the slot
+	// from it, returning 0.0 when there is none.
 	void SetBlendFactor(unsigned char index, float value, int channelID, int layer);
 	float GetBlendFactor(unsigned char index, int channelID, int layer);
 
-	// Number of blend-factor slots on the (channel,layer) controller = ActionController::m_BlendFactors size
-	// (u16 @ controller+0x32, data @ +0x2C). Sized per action: the ground locomotion move cycle uses a 46-slot
-	// blend tree (HumanGroundScope::UpdateGroundBlendTree -> SimpleAnimBlender<46> -> SetTargetBlendFactors),
-	// so 4 slots is nowhere near enough. Writes past this count are silently dropped by the engine.
-	// Controller lookup = PC 0x666BB0 (GetFirstChannelControllerUpdateSafe); 0 if no controller.
+	// Slot count of the controller's blend tree: u16 at controller+0x32 with the data at +0x2C. It is sized
+	// per action (the ground move cycle uses 46 slots), and writes past it are dropped silently.
 	int GetBlendFactorCount(int channelID, int layer);
 
-	// Per-slot blend-factor persistence (ACTPersistType). The DEFAULT is transient — a blend factor set via
-	// SetBlendFactor is reset by the next action update before the clip is sampled. ACTPERSIST_ALWAYS (=4)
-	// makes the slot survive action/transition resets, so our externally-driven blend actually sticks on the
-	// puppet (whose own statechart, which would normally re-set it every frame, is disabled). The engine's own
-	// locomotion does the same: SetBlendFactorPersistence(ALWAYS) once, then SetBlendFactors each frame.
-	// PC 0x652D60, thiscall(this, u8 slotIndex, ACTPersistType, u32 channelID, ACTLayer).
+	// ACTPersistType of a slot. Transient is the default and means the next action update resets the slot
+	// before the clip is sampled; ACTPERSIST_ALWAYS (=4) survives action/transition resets. That is what we
+	// need on a puppet whose own statechart is disabled, and it is what the engine's locomotion does too:
+	// set persistence once, then write the factor every frame. Engine 0x652D60.
 	void SetBlendFactorPersistence(unsigned char slotIndex, int persistType, int channelID, int layer);
 
-	// Playback TIME SCALE (clip speed multiplier) on a channel controller. Locomotion speed-warps its loop
-	// clip through this so foot-speed matches ground speed — so a teleported puppet that has the RIGHT action
-	// and the RIGHT blend factors STILL plays slow if its time scale isn't synced (confirmed via read-back:
-	// action+blend matched the peer yet the gait was slow). Get returns 1.0 when no controller (never 0, which
-	// would freeze the anim). SetTimeScale writes controller+0 and propagates to every clip evaluator (+0x40);
-	// onlyIfChanged skips the write if within 5e-4. PC GetTimeScale 0x667540, SetTimeScale 0x6528B0,
-	// SetTimeScalePersistence 0x652A40 (persistType ACTPERSIST_ALWAYS=4 to keep it across resets).
+	// Playback time scale of the channel's clip. Speed-warps the loop so the feet match the ground speed;
+	// a puppet with the right action and blend factors still looks slow if this is wrong. Get returns 1.0
+	// (not 0, which would freeze the clip) when there is no controller. Set writes controller+0 and
+	// propagates to every clip evaluator (+0x40); onlyIfChanged skips writes within 5e-4.
+	// Get 0x667540, Set 0x6528B0, persistence 0x652A40 (ACTPERSIST_ALWAYS to survive resets).
 	float GetTimeScale(int channelID, int layer);
 	void  SetTimeScale(float value, int channelID, int layer, bool onlyIfChanged);
 	void  SetTimeScalePersistence(int persistType, int channelID, int layer);
 
-	// Current ActionEvaluator on the (channel,layer) controller (ActionController+0x28, m_CurrentActionEvaluatorCache)
-	// or null. Layout (PS3-symbol names, PC-verified via GetCurrentAction/sub_495700):
+	// Current ActionEvaluator of (channel, layer) at controller+0x28, or null. Layout of the evaluator:
 	//   +0x0D4 u8  m_EvaluatorType (4 = ActionEvaluator)
-	//   +0x0E0     m_BlendInEvaluator (ActionBlendEvaluator): +0x0E0 m_Time, +0x0E4 m_Length (runtime, copied from
-	//              m_ActionBlend.m_Length in ActionBlendEvaluator::Start), +0x1C8 m_ActionBlend.m_Length
+	//   +0x0E0     m_BlendInEvaluator: +0x0E0 m_Time, +0x0E4 m_Length (runtime copies of
+	//              m_ActionBlend.m_Length, made in Start), +0x1C8 m_ActionBlend.m_Length
 	//   +0x258 u8  m_ContextData.m_IsTransitionAction
 	//   +0x2A8     m_Action
 	void* GetCurrentEvaluator(int channelID, int layer);
 
-	// Normalized playback position [0,1] of the current action on (channel,layer). GetCurrentActionRatio PC
-	// 0x667170 (0.0 if no controller). SetCurrentActionRatio PC 0x652640 seeks every evaluator on the channel's
-	// controllers; the game calls it right after SetTargetAction to start the new clip at a matched phase
-	// (e.g. Exec_Move_To_JumpImpulsion: SetCurrentActionRatio(r, 0, processDisplacement=0, processEvents=1, ly)).
+	// Normalized position [0,1] of the current clip. Set seeks every evaluator on the channel's controllers,
+	// and the game calls it right after SetTargetAction to start the matching clip at the peer's phase.
+	// Get 0x667170, Set 0x652640.
 	float GetCurrentActionRatio(int channelID, int layer);
 	void  SetCurrentActionRatio(float ratio, int channelID, bool processDisplacement, bool processEvents, int layer);
 
-	// Sets/activates the character action-set (per-character clip overrides on top of the generic kit).
-	// Takes a Reference<CharacterActionSet>* (points to the handle slot, e.g. &otherActionComponent+0x18 on
-	// PC): it ref-counts the handle, swaps it into this component's CAS slot (this+0x18), and adds its dynamic
-	// action blocks. We hand the puppet the local player's CAS (same character, already active) so its actions
-	// resolve to the right character's clips instead of the generic base.
+	// Swaps in a character action set: takes a Reference<CharacterActionSet>* (a pointer to the handle slot,
+	// e.g. the peer component's +0x18), ref-counts it, stores it in this component's CAS slot (this+0x18)
+	// and adds its dynamic action blocks. Handing the puppet the local player's set gives its actions the
+	// right character clips instead of the generic base.
 	void ActivateCharacterActionSet(void* characterActionSetRef);
 
 	inline int SetEnabled(bool enabled)
