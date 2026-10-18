@@ -9,6 +9,15 @@
 class Human;
 class HumanData;
 
+// Human = AIActor + the human data bundle. The bundle holds one context object per locomotion mode (ground,
+// swim, ladder, climb, ...), and those contexts are where the fields we drive live: the swim chain starts at
+// m_HumanContextBundle.m_Swim, and the puppet's action/character components are reached through
+// m_AIActorDataPtr with the engine getters (0x5FC110 action, 0x5FC130 character, both reading the entity
+// from AIActorData+4).
+//
+// Everything below is engine layout with no prose of its own - our text is this note. Field order and the
+// by-value members (BoneHandle, InventoryContainer, ContactPoint, the context structs) must not change.
+
 class DebugContext : public ActorContext
 {
 public:
