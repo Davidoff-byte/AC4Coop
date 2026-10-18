@@ -44,6 +44,10 @@ requires (offsets, sizes, virtual slots), which are facts about the binary.
 `git log` upstream commits remain only as history; every file in `src/` is regenerated from our
 decompilation; `CREDITS.md` reflects that the initial skeleton has been fully replaced.
 
+**Reached 2026-10-18.** `git diff 68355c7 -- src/` (68355c7 = upstream initial commit) leaves no untouched
+file, the project files are regenerated, and `CREDITS.md` records the replacement. The remaining step is the
+branch merge and the deploy/tester rebuild, which are separate and explicit.
+
 ## Live verification (2026-10-18)
 
 `Hook.{h,cpp}` and `HookMath.h` were exercised end-to-end by the real kill path on the rewritten files:

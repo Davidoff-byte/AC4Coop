@@ -4,9 +4,9 @@
 - Repo: `C:\Users\Administrator\Documents\Default Project\bf-coop\ref\AC4Coop`, remote `fork` only.
 - Verified build: tag `build-verified-2026-10-18` on `fix/live-game-udp-bind`. This is the .asi on the PC
   and the base for the tester package. **Do not disturb it.**
-- Migration work: branch `migration/off-upstream` (34/35 Scimitar headers replaced; the 35th,
-  `BipedComponent.h`, was deleted as dead. All 28 worklist rows are done, build clean, never deployed).
-  Next: the project files (`.sln`/`.vcxproj`/`.filters`), then the merge + deploy step.
+- Migration work: branch `migration/off-upstream` — migration **complete** (every file under `src/` and the
+  project files replaced; `git diff 68355c7 -- src/` leaves no untouched file). Build clean, never deployed.
+  Next: merge to `fix/live-game-udp-bind`, then the deploy + tester rebuild (separate, explicit steps).
 - Deploy protocol: only after build **and** the live check for the feature. Never deploy from the
   migration branch.
 
