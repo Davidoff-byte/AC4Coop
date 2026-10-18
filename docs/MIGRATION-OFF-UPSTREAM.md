@@ -125,6 +125,22 @@ check is inherited from the live-verified build instead of re-run. Not deployed.
 Both `FindContainer` thunks are absent from the shipped `.asi` — the linker drops them as unreferenced,
 so this row cannot alter runtime behaviour.
 
+### Row 7 — `WhiteRoomManager.h` (2026-10-18)
+
+Rewritten with our own text; declarations unchanged. Re-derived from the binary:
+
+- it is a heap object behind a global pointer slot, not a static: the engine's getter `0x609670` is a
+  single `return dword_2AC1E7C`, other code null-tests the slot (`0x550D80`), and the destructor
+  `0x61A020` clears it — so `*(WhiteRoomManager**)0x02AC1E7C` is the right form;
+- `+24` is a `HandleContainer` owned by the manager: the destructor releases `*(this+6)` (byte `+24`)
+  through the container decrement sequence, and `0x44E830` dereferences it as `[0]` object / `[8]` count;
+- the class does have a vtable (`0x1E58B98`, deleting destructor `0x61C710`); our header never
+  constructs or virtual-calls it, so the layout is deliberately left opaque.
+
+Verification. `.text` diff against this branch before the row: **0 bytes**; all sections identical to the
+build on the PC except 5 timestamp bytes in `.rdata`. No new machine code, so the live check is
+inherited from the verified build. Not deployed.
+
 ## Exhaustive remaining worklist (generated 2026-10-18)
 
 Ordered smallest-first. Replace one, build clean, live-test, commit. Do not batch the big four.
