@@ -171,6 +171,25 @@ identical, which the byte oracle below checks.
 | 10 | `InventoryContainer.h` | declared only; `Human` embeds `m_Inventory[38]` by value, so the slot layout is load-bearing | 0 bytes |
 | 11 | `Components\Component.h` | `SetEnabled` (0x7130C0) sets/clears `0x4000000` in the flags dword at `this+4` — what `GetEnabled` tests | 0 bytes |
 | 12 | `BoneHandle.h` | ctor 0x49DA40 writes the invalid container at `+0` and `0xFF` at `+4`; 5-byte handle+index embedded by value | 0 bytes |
+| 13 | `Object.h` | 4-byte vtable-only base; only `Delete` is used | 0 bytes |
+| 14 | `Statechart.h` | base of AbstractEntityAI; `HandleTrigger` thunk 0xA014A0, unused | 0 bytes |
+| 15 | `AI\HumanSwimFSM.h` | `HumanSwim+0x30 -> FSM+0x0C -> scope+0x1100/0x1110`; `+0xA50/+0xA54/+0xDD8` CE-found | 0 bytes |
+| 16 | `Components\ActionComponent.h` | thunk addresses re-checked; 0x666BB0 controller lookup, 0x667590 blend slot | 0 bytes |
+| 17 | `Components\CharacterController.h` | embedded `CollisionFilterInfo`/`ContactPoint` fix every later offset | 0 bytes |
+| 18 | `Components\PhysicComponent.h` | descriptors 0x735670/0x61F790/0x7357E0; `RigidBody::m_Shape` at `+0x44` | 0 bytes |
+| 19 | `ClassDescriptor.h` | opaque metadata; bitfields and `align(8)` kept | 0 bytes |
+| 20 | `CollisionFilterInfo.h` | `SetLayer` 0x636480: layer = `*this & 0x3F`, owner at `+4`/`+8`; thunk now forwards its argument (was hard-coded 21) | 0 bytes |
+| 21 | `Entity.h` | removed the dead `HookInit` byte patch (no callers; it also dropped `pop esi`) | 0 bytes |
+| 22 | `ObjectShape.h` | collision shapes/materials only; Havok wrappers keep `m_Shape` at `+12` | 0 bytes |
+| 23 | `World.h` | `GetCurrentWorld` 0x54D4D0 (manager `+0x50`, null without a world), `GetPlayer` 0x70E810 | 0 bytes |
+| 24 | `GraphicTypes.h` | `BoundingVolume` 32 bytes, embedded by value in Entity | 0 bytes |
+| 25 | `Enums.h` | engine enumerations, values kept | 0 bytes |
+| 26 | `BaseTypes.h` | `HandleContainer` 20 bytes; invalid container base 0x04DD5F8C, `0x027F3F90` points at it | 0 bytes |
+| 27 | `AI\AIActor.h` | pure layout; `AIActorData+4` = entity (proven by 0x5FC110/0x5FC130) | 0 bytes |
+| 28 | `AI\Human.h` | pure layout; swim chain via `m_HumanContextBundle.m_Swim` | 0 bytes |
+
+All 28 worklist rows are done. 34 of the 35 Scimitar headers are replaced; the 35th
+(`BipedComponent.h`) was deleted as dead. Nothing was deployed.
 
 ## Exhaustive remaining worklist (generated 2026-10-18)
 
