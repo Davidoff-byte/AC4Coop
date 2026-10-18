@@ -1,5 +1,9 @@
 #include "Human.h"
 
+// The two hood calls and the context lookup act on the human interface sub-object (IHuman), the component
+// getters act on the actor data record. Addresses are the engine's; the entity at AIActorData+4 is what the
+// component getters walk to.
+
 bool __fastcall Human::PutHoodDown(bool a1, bool a2, int a3)
 {
 	return Hook::CallClassMethod<bool, void**, bool, bool, int>(0x0169F260, &this->IHuman, a1, a2, a3);

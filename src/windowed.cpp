@@ -1,4 +1,4 @@
-// Windowed-mode enabler (MSVC / x86). Ported from AC4Hook's HookSettings + scimitarCommandLineOptions.
+// Windowed mode for AC4: force the display flag off and rewrite the window style at creation.
 #include "windowed.h"
 #include "scimitarCommandLineOptions.h"
 #include <windows.h>
@@ -6,23 +6,22 @@
 
 namespace Windowed {
 
-// scimitar::CreateWindow @ moduleBase + 0x65A0:
-//     esi = (byte_2AC07D3 ? 0x7F360000 : 0)          <- preloaded from the fullscreen flag
-//     add esi, 0x00CA0000    (6 bytes @ 0x65A0)       <- 0xCA0000 windowed | 0x80000000 fullscreen popup
-//     push esi ; dwStyle -> CreateWindowExA
-// AC4Hook's 'add' only yields windowed when the flag was already 0. We instead OVERWRITE esi so the
-// windowed style is forced regardless of the fullscreen flag (immune to option-propagation/timing).
-// AC4's "fullscreen" is a WS_POPUP window (not DXGI-exclusive), so the window style fully controls it.
+// scimitar::CreateWindow, module base + 0x65A0:
+//     esi = (byte_2AC07D3 ? 0x7F360000 : 0)   <- preloaded from the fullscreen flag
+//     add esi, 0x00CA0000                     <- 0xCA0000 windowed, 0x80000000 fullscreen popup
+//     push esi -> CreateWindowExA
+// We do not add to it, we replace esi outright, so the window ends up windowed whatever the flag says at
+// that moment. AC4's "fullscreen" is a WS_POPUP window, not a mode switch, so the style is all that matters.
 static const uintptr_t RVA_CreateWindowStyle = 0x65A0;
-static const uintptr_t RVA_FullscreenFlag    = 0x26C07D3; // byte_2AC07D3 (fileVA 0x2AC07D3)
+static const uintptr_t RVA_FullscreenFlag    = 0x26C07D3; // byte at file VA 0x2AC07D3
 static const size_t    STEAL_LEN             = 6;
 
-static uint32_t g_jmpBack    = 0;  // absolute addr to resume after the stolen instruction
-static uint32_t g_borderless = 0;  // DWORD so the inline-asm cmp is unambiguous
+static uint32_t g_jmpBack    = 0;  // resume address after the stolen instruction
+static uint32_t g_borderless = 0;
 
-// The engine parses its own command line AFTER our DLL attaches and overwrites the options struct,
-// so a one-shot write loses the race. Re-assert m_FullScreen=false (and the flag CreateWindow reads)
-// continuously for a few seconds, spanning the engine's parse and its display init.
+// The engine parses its command line after we attach and would overwrite the options struct, so a single
+// write races it. Re-assert both the option and the flag for a few seconds, which spans the parse and the
+// display init.
 static DWORD WINAPI ForceWindowedLoop(LPVOID param)
 {
     DWORD durationMs = (DWORD)(uintptr_t)param;
@@ -41,16 +40,16 @@ static DWORD WINAPI ForceWindowedLoop(LPVOID param)
     return 0;
 }
 
-// Force the window style to windowed (bordered, or borderless popup), ignoring the incoming esi.
+// Replaces esi at the CreateWindow site: bordered or borderless, then resumes the stolen code.
 static void __declspec(naked) StyleDetour()
 {
     __asm {
         cmp g_borderless, 0
         jne set_borderless
-        mov esi, 0x00CA0000          // WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX (bordered window)
+        mov esi, 0x00CA0000          // WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX
         jmp done
     set_borderless:
-        mov esi, 0x80000000          // WS_POPUP (borderless window)
+        mov esi, 0x80000000          // WS_POPUP
     done:
         jmp g_jmpBack
     }
@@ -76,12 +75,12 @@ void Apply(bool fullscreen, bool borderless)
         return; // leave the game in its normal fullscreen mode
     }
 
-    // 1) install the CreateWindow style detour (controls the window border)
+    // 1) style detour
     g_borderless = borderless ? 1u : 0u;
     uintptr_t styleAddr = base + RVA_CreateWindowStyle;
 
-    // Diagnostic: the steal site must still read '81 C6 00 00 CA 00' (add esi,0xCA0000).
-    // If it doesn't, either CreateWindow already ran (we loaded too late) or the code differs.
+    // The site must still hold '81 C6 00 00 CA 00' (add esi,0xCA0000). If it does not, either CreateWindow
+    // already ran (we loaded too late) or the build differs - in both cases do not patch.
     const uint8_t expect[STEAL_LEN] = { 0x81, 0xC6, 0x00, 0x00, 0xCA, 0x00 };
     const uint8_t* here = reinterpret_cast<const uint8_t*>(styleAddr);
     bool match = true;
@@ -96,8 +95,8 @@ void Apply(bool fullscreen, bool borderless)
         PatchJump(reinterpret_cast<uint8_t*>(styleAddr), reinterpret_cast<void*>(&StyleDetour), STEAL_LEN);
     }
 
-    // 2) continuously re-assert windowed for a few seconds to beat the engine's command-line parse.
-    //    Duration configurable: [Display] ForceWindowedMs (default 5000).
+    // 2) keep re-asserting windowed while the engine parses its command line.
+    //    Duration: [Display] ForceWindowedMs (default 5000).
     DWORD durationMs = GetPrivateProfileIntA("Display", "ForceWindowedMs", 5000, ".\\AC4Coop.ini");
     CreateThread(nullptr, 0, ForceWindowedLoop, (LPVOID)(uintptr_t)durationMs, 0, nullptr);
 }

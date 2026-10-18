@@ -1,6 +1,9 @@
 #include "World.h"
 #include "HandleManager.h"
 
+// World entry points. AddEntity/RemoveEntity and GetPlayer are plain thiscalls; the static ones are cdecl.
+// GetHandle resolves the world's own handle container through the handle table.
+
 void World::LoadWorldAsync(uint64_t worldID, bool pauseAfterLoad, int callback, int numberOfFramesToDelay, uint64_t portalID, bool merge)
 {
 	return Hook::CallCdeclMethod<void, uint64_t, bool, int, int, uint64_t, bool>(0x0055C570, worldID, pauseAfterLoad, callback, numberOfFramesToDelay, portalID, merge);

@@ -1,5 +1,8 @@
 #include "AIEntityHelper.h"
 
+// Free functions that map an entity to its AI side. The engine exposes all four as cdecl entry points;
+// nothing here is a member call.
+
 namespace AIEntityHelper
 {
 	AbstractEntityAI* __fastcall GetEntityAI(Entity* entity)

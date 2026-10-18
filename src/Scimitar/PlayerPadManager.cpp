@@ -1,11 +1,13 @@
 #include "PlayerPadManager.h"
 
+// Per-pad slot table. RegisterPlayer overwrites the slot for that pad index.
 void PlayerPadManager::RegisterPlayer(Entity* entity, int pad)
 {
-	// PlayerPadManager::RegisterPlayer(this, entity, pad) = padMgr[pad]=entity — thiscall (fileVA 0x734500).
 	Hook::CallClassMethod<void, PlayerPadManager*, Entity*, int>(0x734500, this, entity, pad);
 }
 
+// The manager is not a world member directly: the world holds a holder pointer at +0x7F8 and the manager
+// sits at holder+4.
 PlayerPadManager* PlayerPadManager::FromWorld(World* world)
 {
 	if (!world)

@@ -1,5 +1,9 @@
 #include "Entity.h"
 
+// Entity entry points. The ones that matter to the mod are SetGlobalMatrixInternal (teleport/pose drive,
+// with the physics flag choosing between a plain write and a capsule push) and GetComponentByType (every
+// component lookup goes through it rather than the raw array).
+
 int Entity::Duplicate()
 {
 	return Hook::CallClassMethod<int, Entity*, int*, int>(0x0052A980, this, 0, 1);
@@ -40,6 +44,7 @@ void Entity::OnAddToWorld(void* world)
 	Hook::CallFastCallMethod<void, Entity*, void*>(0x5131F0, this, world);
 }
 
+// Nothing to tell the renderer when there is no graphic node yet.
 void Entity::ReflectionFlagsChanged()
 {
 	if (m_GraphicNode)
@@ -48,6 +53,8 @@ void Entity::ReflectionFlagsChanged()
 	}
 }
 
+// Writing the matrix directly is enough for a teleport; updatePhysics makes the engine push the capsule
+// through the world so collision and height follow.
 void Entity::SetGlobalMatrixInternal(HookMath::Transform* matrix, bool updatePhysics)
 {
 	if (!matrix)

@@ -1,12 +1,13 @@
 #pragma once
-// Ported from AC4Hook (author's mapping). Full scimitar::CommandLineOptions layout.
-// The struct is reproduced verbatim so field offsets match the game's global instance.
-// Global instance lives at fileVA 0x02ABECC0  ==  moduleBase + 0x26BECC0 (ASLR-safe).
+// Layout of the engine's global command-line options object. The fields are engine data, so the order and
+// the explicit sizes are reproduced exactly; the instance lives at file VA 0x02ABECC0, which is
+// moduleBase + 0x26BECC0 (ASLR-safe, resolved in GetInstance).
 
 #include <windows.h>
 #include <cstdint>
 
-// --- minimal math shims (match AC4Hook HookMath sizes/alignment exactly) ---------
+// Minimal vector/quaternion shims with the engine's size and alignment (this header is self-contained and
+// is only included by the windowed-mode code, so it does not collide with HookMath.h).
 namespace HookMath {
     struct __declspec(align(16)) Vector4    { float x = 0, y = 0, z = 0, w = 0; };
     struct __declspec(align(16)) Quaternion { float x = 0, y = 0, z = 0, w = 1; };
@@ -212,7 +213,7 @@ public:
     bool m_DisableRobotVoices;
     bool m_PlayTest;
 
-    // ASLR-safe: resolve from the live module base instead of the fixed 0x02ABECC0.
+    // Resolved from the live module base, so it survives ASLR.
     static scimitarCommandLineOptions* GetInstance()
     {
         return (scimitarCommandLineOptions*)((uintptr_t)GetModuleHandleW(nullptr) + 0x26BECC0);

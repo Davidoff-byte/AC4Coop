@@ -1,5 +1,9 @@
 #include "BoneHandle.h"
 
+// Thunks for the skeleton queries. A BoneHandle is a handle container plus a byte index (see the header);
+// every call passes `this` and the engine resolves the skeleton component itself. Nothing here is used by
+// the mod today - they exist so the class is complete and callable when a pose path needs them.
+
 HookMath::Vector4 BoneHandle::GetPosition()
 {
 	HookMath::Vector4 output;

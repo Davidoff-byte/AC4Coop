@@ -1,7 +1,7 @@
 #include "LoadingManager.h"
 
+// Engine-wide loading state, no instance. The engine returns an int; we expose it as a bool.
 bool LoadingManager::IsLoading()
 {
-	// LoadingManager::IsLoading() — cdecl, no args (fileVA 0xA26F70). Returns int; normalize to bool.
 	return Hook::CallCdeclMethod<int>(0xA26F70) != 0;
 }

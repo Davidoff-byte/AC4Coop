@@ -1,5 +1,8 @@
 #include "ActionComponent.h"
 
+// Every entry point below is a direct engine call. The controller for a (channel, layer) pair is resolved
+// inside the engine (0x666BB0); the wrappers in the header that need the controller raw call it directly.
+
 int __fastcall ActionComponent::SetTargetAction(int actionAlias, int a3_seems_always_0, int ActionTransition, int a5_seems_always_0xFFFF, int ActionTransitionLayer)
 {
 	return Hook::CallClassMethod<int, ActionComponent*, int, int, int, int, int>(0x006625D0, this, actionAlias, a3_seems_always_0, ActionTransition, a5_seems_always_0xFFFF, ActionTransitionLayer);

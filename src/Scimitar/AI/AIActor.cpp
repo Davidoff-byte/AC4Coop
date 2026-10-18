@@ -1,5 +1,8 @@
 #include "AIActor.h"
 
+// Context/track control. Each is a direct thiscall into the engine; the actor is only ever held as an
+// opaque pointer by our code.
+
 void* AIActor::EnterContext(int contextID)
 {
 	return Hook::CallClassMethod<void*, AIActor*, int>(0x0052DFF0, this, contextID);
@@ -15,9 +18,8 @@ int AIActor::GetCurrentContextID(int trackID)
 	return Hook::CallClassMethod<int, AIActor*, int>(0x0052C2E0, this, trackID);
 }
 
+// Leaves whatever the active track is playing and enters the new context in its place.
 int AIActor::TransitToContext(int contextID)
 {
-	// AIActor::TransitToContext(this, id) — thiscall (fileVA 0x52DF90): exit current + enter id on the
-	// active track (this[0x100], expected to be the main AI track during locomotion).
 	return Hook::CallClassMethod<int, AIActor*, int>(0x0052DF90, this, contextID);
 }

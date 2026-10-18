@@ -1,6 +1,11 @@
 #include "Memory.h"
 #include "..\Hook.h"
 
+// Thin wrappers over the engine allocator. Allocate prefers the engine's default allocator and only falls
+// back to malloc when there is none (or it declines); Free asks which allocator owns the block and returns
+// it there. The two globals are the engine's allocator record (0x04DD5EE0) and its data reference
+// (0x02AC40F0 / 0x02AC40F4).
+
 void* __cdecl Memory::GetAllocator(size_t size, size_t alignment, void* allocator)
 {
 	return Hook::CallCdeclMethod<void*, size_t, size_t, void*>(0x00A085B0, size, alignment, allocator);
