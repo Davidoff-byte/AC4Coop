@@ -4,6 +4,7 @@
 
 class Statechart;
 
+// One entry of a statechart's active-state list.
 class StatechartState : public Object
 {
 public:
@@ -12,6 +13,9 @@ public:
 	Statechart* m_Statechart;
 };
 
+// Engine state machine. AbstractEntityAI derives from it and the AI's reaction/perception handlers are
+// statecharts too, so everything below is kept for the layout: our code never reads a member by name and
+// never calls HandleTrigger, which thunks to 0xA014A0 (16-bit trigger id, one context pointer).
 class Statechart : public Object
 {
 public:
