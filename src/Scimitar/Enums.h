@@ -1,5 +1,8 @@
 #pragma once
 
+// Engine enumerations used by the declarations in this folder. The values are engine data - code compares
+// them numerically (e.g. the ship sync checks weapon and ammo types), so they must keep their numbers.
+
 enum LODLevel
 {
 	LODLEVEL_NOTVISIBLE = 0x0,
