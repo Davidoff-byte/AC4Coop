@@ -6,6 +6,9 @@
 #include "Components\Component.h"
 #include "..\HookMath.h"
 
+// Result of a physics query. Only m_PhysicComponent is read by us (to get the entity that was hit);
+// everything else exists so the engine can fill the struct, and its size is load-bearing because Human and
+// CharacterController embed a ContactPoint by value.
 class ContactPoint
 {
 public:
@@ -39,6 +42,9 @@ public:
 	unsigned int m_MyShapeKeyIndexAndId;
 };
 
+// Havok filter word plus its owner. The first dword packs the layer into bits 0..5: SetLayer (0x636480)
+// tests `*this & 0x3F`, swaps in the new layer in those bits and then pokes the owner object reached from
+// +4 (OwnerType) and +8 (OwnerPointer). That is what makes the whole struct 12 bytes.
 class CollisionFilterInfo
 {
 public:
@@ -136,6 +142,7 @@ public:
 		COLLISIONMATERIAL = 0x3,
 	};
 
+	// 32 bits exactly: 6 layer + 4 part + 6 group + 10 instance + 6 single-bit flags.
 	class FilterInfo
 	{
 	public:
@@ -164,6 +171,8 @@ public:
 	static uint64_t GetCollisionsEnabledAsMask(CollisionFilterInfo::Layer layer);
 };
 
+// Physics query wrappers. RayCastHitTest fills a caller-provided ContactPoint; RayCastHitEntity uses one
+// static point and answers with the hit component's owner entity.
 class RayCast
 {
 public:

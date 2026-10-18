@@ -2,7 +2,7 @@
 
 bool CollisionFilterInfo::SetLayer(int layer)
 {
-	return Hook::CallClassMethod<bool, CollisionFilterInfo*, int>(0x00636480, this, 21);
+	return Hook::CallClassMethod<bool, CollisionFilterInfo*, int>(0x00636480, this, layer);
 }
 
 uint64_t CollisionQueryCollisionFilter::GetCollisionsEnabledAsMask(CollisionFilterInfo::Layer layer)
