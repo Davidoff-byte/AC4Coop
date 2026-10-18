@@ -1,6 +1,6 @@
-ï»¿# Migration off the upstream skeleton
+# Migration off the upstream skeleton
 
-Goal: the repository contains **nothing** written by the upstream author â€” only our own code, with the
+Goal: the repository contains **nothing** written by the upstream author — only our own code, with the
 engine facts regenerated from our decompilation (`C:\Users\Administrator\ac4-decomp`).
 
 Rule for every file: re-derive the layout/behaviour from the decompilation (and confirm live where the
@@ -12,25 +12,25 @@ requires (offsets, sizes, virtual slots), which are facts about the binary.
 | area | upstream lines | status |
 |---|---|---|
 | project files (.sln/.vcxproj/.filters/.gitignore) | ~430 | **to replace** (trivial, regenerate from our source list) |
-| `src/Hook.{h,cpp}` | ~97 | **DONE** â€” rewritten from scratch, build verified |
-| `src/HookMath.{h,cpp}` | ~645 | **header DONE** (rewritten; build verified). `.cpp` pending â€” needs a live positional check |
-| `src/Scimitar/**` (class declarations + small .cpp) | ~5,100 | **to replace incrementally** â€” only the headers a change actually touches |
+| `src/Hook.{h,cpp}` | ~97 | **DONE** — rewritten from scratch, build verified |
+| `src/HookMath.{h,cpp}` | ~645 | **header DONE** (rewritten; build verified). `.cpp` pending — needs a live positional check |
+| `src/Scimitar/**` (class declarations + small .cpp) | ~5,100 | **to replace incrementally** — only the headers a change actually touches |
 | `src/phase1.cpp` | 1,225 of 4,941 | ~75% ours; remaining early scaffolding rewritten opportunistically |
 | `src/net.*`, `netstate.h`, `ship_sync.cpp`, docs | ours | keep |
 
 ## Order of work
 
-1. **Project files** â€” regenerate `.sln/.vcxproj` from our own file list. Removes ~430 upstream lines and
+1. **Project files** — regenerate `.sln/.vcxproj` from our own file list. Removes ~430 upstream lines and
    makes the build independent of their project layout.
-2. **Hook** â€” reimplement the three call helpers we actually use (`CallClassMethod`, `CallCdeclMethod`,
+2. **Hook** — reimplement the three call helpers we actually use (`CallClassMethod`, `CallCdeclMethod`,
    `CallClassMethod<void,...>` variants) as direct function-pointer casts; no framework needed.
-3. **HookMath** â€” reimplement only the operations used (matrix from/to quaternion, vector ops, transform
+3. **HookMath** — reimplement only the operations used (matrix from/to quaternion, vector ops, transform
    composition). Verify by comparing outputs against the live engine on a known entity.
-4. **Scimitar headers** â€” replace one at a time, starting with the smallest and hottest:
+4. **Scimitar headers** — replace one at a time, starting with the smallest and hottest:
    `ObjectShape`, `CollisionFilterInfo`, `Components/*`, then `Entity`/`World`, then `Human`/`AIActor`.
    For each: dump the vtable + field offsets from the decomp (or live), keep our own names, and compile.
    Do not attempt all at once; a header is only replaced when a change touches it.
-5. **phase1.cpp** â€” as areas are touched, rewrite the early scaffolding rather than editing it.
+5. **phase1.cpp** — as areas are touched, rewrite the early scaffolding rather than editing it.
 
 ## Verification for every replacement
 
@@ -64,12 +64,12 @@ Status: Hook done + verified; HookMath.h done + verified; HookMath.cpp still pen
 ## Include-graph audit (2026-10-18)
 
 Every Scimitar header was checked against every `.h`/`.cpp` include in the project:
-- 35 headers, **34 referenced**, **1 dead** (`BipedComponent.h`, 21 lines) â€” deleted.
+- 35 headers, **34 referenced**, **1 dead** (`BipedComponent.h`, 21 lines) — deleted.
 - Consequence: pruning is not a shortcut. The `Scimitar` block (~5,100 lines) is all load-bearing and has
   to be **replaced**, not removed. Replacement stays incremental, in dependency order:
   `ObjectShape` -> `CollisionFilterInfo` -> `Components/*` -> `Entity` -> `World` -> `Human`/`AIActor`.
 
-### HookMath.cpp â€” replaced and verified (2026-10-18)
+### HookMath.cpp — replaced and verified (2026-10-18)
 
 `HookMath.cpp` rewritten from scratch (own implementations of all declared functions; row-major, row
 vectors, translation in row 4). Live oracle: `EntitySync=1 EntitySelfTest=1`, which runs
@@ -94,16 +94,16 @@ The working build must never be put at risk by migration work.
 - Each header replacement is its own commit: build-clean is not enough, the using feature must be re-tested
   (corpse collision for `CollisionFilterInfo`, ship for ship types, puppet/mirrors for `Entity`/`Human`).
 
-### Header replacement â€” first batch (2026-10-18, branch `migration/off-upstream`)
+### Header replacement — first batch (2026-10-18, branch `migration/off-upstream`)
 
 Replaced with our own text, declarations preserved (call sites depend on the names; layouts are engine
-facts): `ManagedObject.h`, `Hierarchy.h`, `Memory.h`. Build clean. **Not deployed** â€” the verified build
+facts): `ManagedObject.h`, `Hierarchy.h`, `Memory.h`. Build clean. **Not deployed** — the verified build
 (tag `build-verified-2026-10-18`) remains the one on the PC.
 
 Remaining Scimitar headers: 31 (including the large `Entity`/`World`/`Human`/`AIActor`). Continue in
 dependency order, one commit per header, re-testing the using feature after each.
 
-### Row 6 â€” `HandleManager.h` (2026-10-18)
+### Row 6 — `HandleManager.h` (2026-10-18)
 
 Rewritten with our own text; declarations unchanged. Re-derived from the binary:
 
@@ -122,16 +122,16 @@ Verification. `.text` diff against the pre-rewrite build of this branch: **0 byt
 of build timestamp inside `.rdata`. No new machine code exists, so the row's "build + world loads"
 check is inherited from the live-verified build instead of re-run. Not deployed.
 
-Both `FindContainer` thunks are absent from the shipped `.asi` â€” the linker drops them as unreferenced,
+Both `FindContainer` thunks are absent from the shipped `.asi` — the linker drops them as unreferenced,
 so this row cannot alter runtime behaviour.
 
-### Row 7 â€” `WhiteRoomManager.h` (2026-10-18)
+### Row 7 — `WhiteRoomManager.h` (2026-10-18)
 
 Rewritten with our own text; declarations unchanged. Re-derived from the binary:
 
 - it is a heap object behind a global pointer slot, not a static: the engine's getter `0x609670` is a
   single `return dword_2AC1E7C`, other code null-tests the slot (`0x550D80`), and the destructor
-  `0x61A020` clears it â€” so `*(WhiteRoomManager**)0x02AC1E7C` is the right form;
+  `0x61A020` clears it — so `*(WhiteRoomManager**)0x02AC1E7C` is the right form;
 - `+24` is a `HandleContainer` owned by the manager: the destructor releases `*(this+6)` (byte `+24`)
   through the container decrement sequence, and `0x44E830` dereferences it as `[0]` object / `[8]` count;
 - the class does have a vtable (`0x1E58B98`, deleting destructor `0x61C710`); our header never
@@ -141,12 +141,12 @@ Verification. `.text` diff against this branch before the row: **0 bytes**; all 
 build on the PC except 5 timestamp bytes in `.rdata`. No new machine code, so the live check is
 inherited from the verified build. Not deployed.
 
-### Row 8 â€” `PlayerProgression.h` (2026-10-18)
+### Row 8 — `PlayerProgression.h` (2026-10-18)
 
 Rewritten with our own text; both getters kept. Re-derived from the binary:
 
 - `0x04DEEF90` / `0x04DEEF94` have exactly four data xrefs each, all inside `0x12F9C90`
-  (`PlayerProgressionManager::LoadEntityBuilderAndSelectorsForPlayer`) â€” nothing else reads or writes
+  (`PlayerProgressionManager::LoadEntityBuilderAndSelectorsForPlayer`) — nothing else reads or writes
   them, which matches the codebase's single writer;
 - `0x04DEEF90` receives a freshly allocated object (`0x7A3BD0`) and the previous one is freed through
   the engine allocator: a `RowSelector*`;
@@ -154,12 +154,12 @@ Rewritten with our own text; both getters kept. Re-derived from the binary:
   and releases the old container, and an `atexit` handler (`0x1E39190`) releases the last one;
 - both slots are **zero in the image**, so either getter returns null before the first spawn. The
   invalid-container seeding of `0x04DEEF94` happens inside `0x12F9C90` on its first run (guarded by
-  `0x4DEEF98` bit 0), not statically â€” the previous header implied a permanently non-null handle.
+  `0x4DEEF98` bit 0), not statically — the previous header implied a permanently non-null handle.
 
 Verification. `.text` diff against this branch before the row: **0 bytes**; all sections identical to the
 build on the PC except 5 timestamp bytes in `.rdata`. Not deployed.
 
-### Rows 9+ (2026-10-18, same branch) â€” layout-preserving rewrites
+### Rows 9+ (2026-10-18, same branch) — layout-preserving rewrites
 
 For these headers the declarations are pure engine facts and the repo usually uses the type as an
 opaque pointer, so the rewrite is prose plus verified notes; every type, field and order is kept

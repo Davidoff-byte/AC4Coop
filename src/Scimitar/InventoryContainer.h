@@ -3,6 +3,8 @@
 #include "BaseTypes.h"
 #include "BoneHandle.h"
 
+// One inventory slot: the bone the item hangs from, a reference that keeps the item resource alive,
+// and the handle itself.
 class InventorySlot
 {
 public:
@@ -11,6 +13,9 @@ public:
 	Handle m_Item;
 };
 
+// A fixed-size bag. Nothing in this project reads it by member name - Human embeds it by value as
+// m_Inventory[38], so the only thing that matters here is that the sizes and order stay exactly as
+// the engine lays them out.
 class InventoryContainer
 {
 public:
