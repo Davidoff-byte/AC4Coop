@@ -30,6 +30,7 @@ public:
 	void* m_Grid;
 };
 
+// Opaque evaluators; only their footprint matters (16 bytes each, embedded in World).
 class WaterLevelFunctor
 {
 	char padding[16];
@@ -193,6 +194,11 @@ public:
 	int m_LastLoadingDistance;
 };
 
+// A loaded world. Everything below is state the engine owns; we only call into it.
+//
+// GetCurrentWorld (0x54D4D0) reads a global world manager and returns its +0x50 pointer, or null when no
+// world is up - that null is the normal state during loading, so every caller must check it.
+// GetPlayer (0x70E810) resolves the player entity through the world's entity manager, not by scanning.
 class World : public ManagedObject
 {
 public:
