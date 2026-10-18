@@ -102,3 +102,38 @@ facts): `ManagedObject.h`, `Hierarchy.h`, `Memory.h`. Build clean. **Not deploye
 
 Remaining Scimitar headers: 31 (including the large `Entity`/`World`/`Human`/`AIActor`). Continue in
 dependency order, one commit per header, re-testing the using feature after each.
+
+## Exhaustive remaining worklist (generated 2026-10-18)
+
+Ordered smallest-first. Replace one, build clean, live-test, commit. Do not batch the big four.
+
+| # | lines | header | live check after replacing |
+|---|-------|--------|----------------------------|
+| 1 | 9 | `LoadingManager.h` | startup + save load |
+| 2 | 13 | `LoadingThread.h` | startup + save load |
+| 3 | 13 | `DuplicationManager.h` | build + world loads |
+| 4 | 15 | `PlayerPadManager.h` | build + world loads |
+| 5 | 17 | `Components\AIComponent.h` | build + world loads |
+| 6 | 18 | `HandleManager.h` | build + world loads |
+| 7 | 18 | `WhiteRoomManager.h` | build + world loads |
+| 8 | 18 | `PlayerProgression.h` | build + world loads |
+| 9 | 23 | `AI\AbstractEntityAI.h` | build + world loads |
+| 10 | 24 | `InventoryContainer.h` | build + world loads |
+| 11 | 28 | `Components\Component.h` | build + world loads |
+| 12 | 28 | `BoneHandle.h` | mirror pose + action replication |
+| 13 | 29 | `Object.h` | build + world loads |
+| 14 | 32 | `Statechart.h` | build + world loads |
+| 15 | 54 | `AI\HumanSwimFSM.h` | mirror pose + action replication |
+| 16 | 70 | `Components\ActionComponent.h` | mirror pose + action replication |
+| 17 | 97 | `Components\CharacterController.h` | corpse collision + ship contact |
+| 18 | 116 | `Components\PhysicComponent.h` | corpse collision + ship contact |
+| 19 | 160 | `ClassDescriptor.h` | build + world loads |
+| 20 | 160 | `CollisionFilterInfo.h` | corpse collision + ship contact |
+| 21 | 161 | `Entity.h` | spawn puppet + kill a guard |
+| 22 | 174 | `ObjectShape.h` | corpse collision + ship contact |
+| 23 | 245 | `World.h` | world loads, mirrors drive |
+| 24 | 247 | `GraphicTypes.h` | build + world loads |
+| 25 | 261 | `Enums.h` | build + world loads |
+| 26 | 369 | `BaseTypes.h` | build + world loads |
+| 27 | 548 | `AI\AIActor.h` | mirror pose + action replication |
+| 28 | 766 | `AI\Human.h` | mirror pose + action replication |
