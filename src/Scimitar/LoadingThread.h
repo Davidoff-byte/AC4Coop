@@ -1,10 +1,10 @@
-#pragma once
+﻿#pragma once
 
 #include "BaseTypes.h"
 
-// Async resource-load helpers (mirrors LoadingThread::LoadFile). Used only by the builder-reload
-// fallback: when the player's cached EntityBuilder object has been released, we re-request it by ID and
-// wait for it to repopulate. Resident in normal gameplay, so this path is rarely exercised.
+// Async resource-load helpers. Only used by the builder-reload fallback: if the player's cached
+// EntityBuilder has been released we re-request it by id and wait for it to repopulate. Resident in
+// normal play, so this path is rarely taken.
 class LoadingThread
 {
 public:

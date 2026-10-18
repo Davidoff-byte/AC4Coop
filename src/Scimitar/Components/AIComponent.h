@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include "..\BaseTypes.h"
 #include "Component.h"

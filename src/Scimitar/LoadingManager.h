@@ -1,9 +1,9 @@
-#pragma once
+﻿#pragma once
 
 #include "BaseTypes.h"
 
-// Static loading-state query. IsLoading() reads *(g_LoadingThread+432)!=0 — true while the engine is
-// streaming/tearing down a world. Used to gate puppet construction so we never build mid-load.
+// Static loading-state query: true while the engine is streaming or tearing down a world (it reads the
+// loading thread's busy flag). Used to avoid building entities mid-load.
 class LoadingManager
 {
 public:

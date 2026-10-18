@@ -1,19 +1,17 @@
-#pragma once
+﻿#pragma once
 
 #include "BaseTypes.h"
 
 class Entity;
 class World;
 
-// Maps up to 8 local input pads to their player entities (slots [0..7] = Entity*). RegisterPlayer binds
-// an entity to a pad; a networked puppet is a remote proxy and must NOT take a pad (that would hijack
-// the real local player). GetUnusedPadID is inline-hooked elsewhere to force the puppet onto an empty
-// slot; that hook keeps its raw address (it patches code, not calls it).
+// Maps up to 8 local pads to their player entities (slots are Entity*). A networked puppet is a remote
+// proxy and must NOT be bound to a pad, or it hijacks the local player's input.
 class PlayerPadManager
 {
 public:
-	void RegisterPlayer(Entity* entity, int pad);
+	void RegisterPlayer(Entity* entity, int pad);   // engine 0x734500 = padMgr[pad] = entity
 
-	// The pad manager hangs off the world: World+0x7F8 -> holder; PlayerPadManager* = *(holder+4).
+	// Reached through the world: World+0x7F8 -> holder; PlayerPadManager* = *(holder+4).
 	static PlayerPadManager* FromWorld(World* world);
 };
