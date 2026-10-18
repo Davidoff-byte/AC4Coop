@@ -5,6 +5,10 @@
 #include "..\Hook.h"
 #include "Memory.h"
 
+// Engine class metadata: the property/enum/call tables plus the function pointers used to construct,
+// serialize, duplicate and release an object. This project only ever holds it as an opaque pointer (the
+// GetStaticClassDescriptor returns), so the layout exists to be correct, not to be walked.
+
 class ClassDescriptor;
 
 typedef void (*inplaceConstructorMemberPtr)(void*);
@@ -17,6 +21,7 @@ typedef void (*intializeObjectMemberPtr)(void*, InitType, void*);
 typedef void (*destructObjectMemberPtr)(void*);
 typedef void (*releaseResourcesObjectMemberPtr)(void*);
 
+// Packed type id + array/generic/bitfield description of one value.
 class TypeData
 {
 public:
@@ -163,6 +168,7 @@ public:
 	BYTE m_ClassAlignment : 7;
 	BYTE m_NeedToSkipReleaseResources : 1;
 
+	// Allocate the class's own size, then run its in-place constructor over the fresh memory.
 	inline void* CreateObject()
 	{
 		void* obj = Memory::Allocate(m_ClassSize);
