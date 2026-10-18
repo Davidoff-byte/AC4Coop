@@ -6,12 +6,22 @@
 #include "Memory.h"
 #include "..\HookMath.h"
 
+// Shared engine vocabulary: handle containers, the small/big array headers, caches and a few small
+// structs. Everything here is embedded by value in the classes that follow, so sizes and field order are
+// part of the ABI.
+
 class ObjectAllocator : public ManagedObject
 {
 public:
 	void* m_ObjectBlockAllocatorData;
 };
 
+// One entry of the engine's object table. Packed to 20 bytes - the table allocates entries with a stride
+// of 20 (0xA0BBF0), so the id has to follow the two counters unaligned.
+//
+// The engine's CreateHandle (0xA0BDE0) bumps +4 and CreateReference (0xA0BE50) bumps +8; releasing a
+// container decrements +4 and destroys it once both counters are clear. The shared invalid container is a
+// static at 0x04DD5F8C (object null, id 0); the global slot 0x027F3F90 holds a pointer to it.
 #pragma pack(push, 1)
 class HandleContainer
 {
@@ -32,6 +42,9 @@ public:
 	uint64_t m_ObjectID;
 };
 #pragma pack(pop)
+
+// Both wrappers are just a container pointer. Deleting through one destroys the object and nulls the slot;
+// IsValid reports whether the container is the shared invalid one.
 class Handle
 {
 public:
@@ -106,6 +119,8 @@ public:
 	}
 };
 
+// 8-byte header of a small array. The size lives in the low 16 bits, the reserved capacity in bits 16..29,
+// and bits 30/31 say whether the array owns its memory / its objects.
 class SmallArrayData
 {
 public:
@@ -144,6 +159,7 @@ public:
 	}
 };
 
+// 12-byte header of a big array: data pointer, size, then a flags dword with the two high bits set.
 class BigArrayData
 {
 public:
@@ -299,6 +315,7 @@ public:
 	int m_Delta;
 };
 
+// 28 bytes: an implementation pointer followed by the inline lock storage the engine copies into it.
 class AdaptiveLock
 {
 public:
