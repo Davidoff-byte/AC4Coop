@@ -4,6 +4,12 @@
 #include "..\..\HookMath.h"
 #include "PhysicComponent.h"
 
+// Character physics state. Almost all of it exists to keep the engine's layout: our code only touches the
+// velocity/force/impulse vectors, the kamikaze position and flags used to park a keyframed body, and the
+// collision filter (proven live by the death path's layer change).
+//
+// The base chain is PhysicComponent (m_DriveEntity etc.) -> this. Because CollisionFilterInfo and
+// ContactPoint are embedded by value, their sizes decide every offset below, so neither may change here.
 class CharacterController : public PhysicComponent
 {
 public:
