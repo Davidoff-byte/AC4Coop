@@ -12,7 +12,7 @@ requires (offsets, sizes, virtual slots), which are facts about the binary.
 | area | upstream lines | status |
 |---|---|---|
 | project files (.sln/.vcxproj/.filters/.gitignore) | ~430 | **to replace** (trivial, regenerate from our source list) |
-| `src/Hook.{h,cpp}` | ~97 | **to replace** (thin call wrappers: thiscall/cdecl/class-method) |
+| `src/Hook.{h,cpp}` | ~97 | **DONE** — rewritten from scratch, build verified |
 | `src/HookMath.{h,cpp}` | ~645 | **to replace** (matrix/quaternion/vector math; write from the engine's conventions) |
 | `src/Scimitar/**` (class declarations + small .cpp) | ~5,100 | **to replace incrementally** — only the headers a change actually touches |
 | `src/phase1.cpp` | 1,225 of 4,941 | ~75% ours; remaining early scaffolding rewritten opportunistically |
