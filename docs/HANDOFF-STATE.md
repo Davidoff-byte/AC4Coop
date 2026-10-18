@@ -4,8 +4,8 @@
 - Repo: `C:\Users\Administrator\Documents\Default Project\bf-coop\ref\AC4Coop`, remote `fork` only.
 - Verified build: tag `build-verified-2026-10-18` on `fix/live-game-udp-bind`. This is the .asi on the PC
   and the base for the tester package. **Do not disturb it.**
-- Migration work: branch `migration/off-upstream` (14/35 headers rewritten, build clean, never deployed).
-  Next: worklist row 9 (`AI\AbstractEntityAI.h`).
+- Migration work: branch `migration/off-upstream` (15/35 headers rewritten, build clean, never deployed).
+  Next: worklist row 10 (`InventoryContainer.h`).
 - Deploy protocol: only after build **and** the live check for the feature. Never deploy from the
   migration branch.
 

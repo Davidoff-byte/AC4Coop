@@ -159,6 +159,16 @@ Rewritten with our own text; both getters kept. Re-derived from the binary:
 Verification. `.text` diff against this branch before the row: **0 bytes**; all sections identical to the
 build on the PC except 5 timestamp bytes in `.rdata`. Not deployed.
 
+### Rows 9+ (2026-10-18, same branch) — layout-preserving rewrites
+
+For these headers the declarations are pure engine facts and the repo usually uses the type as an
+opaque pointer, so the rewrite is prose plus verified notes; every type, field and order is kept
+identical, which the byte oracle below checks.
+
+| # | header | notes | `.text` diff |
+|---|--------|-------|--------------|
+| 9 | `AI\AbstractEntityAI.h` | opaque pointer in our code; service arrays `+0x70` (count `+0x76`) and `+0x5C`, alive byte `+0x8C`, is-alive bit `+0xB8` cited from the handoff | 0 bytes |
+
 ## Exhaustive remaining worklist (generated 2026-10-18)
 
 Ordered smallest-first. Replace one, build clean, live-test, commit. Do not batch the big four.
