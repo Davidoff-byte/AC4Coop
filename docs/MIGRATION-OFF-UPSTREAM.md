@@ -141,6 +141,24 @@ Verification. `.text` diff against this branch before the row: **0 bytes**; all 
 build on the PC except 5 timestamp bytes in `.rdata`. No new machine code, so the live check is
 inherited from the verified build. Not deployed.
 
+### Row 8 — `PlayerProgression.h` (2026-10-18)
+
+Rewritten with our own text; both getters kept. Re-derived from the binary:
+
+- `0x04DEEF90` / `0x04DEEF94` have exactly four data xrefs each, all inside `0x12F9C90`
+  (`PlayerProgressionManager::LoadEntityBuilderAndSelectorsForPlayer`) — nothing else reads or writes
+  them, which matches the codebase's single writer;
+- `0x04DEEF90` receives a freshly allocated object (`0x7A3BD0`) and the previous one is freed through
+  the engine allocator: a `RowSelector*`;
+- `0x04DEEF94` is a `HandleContainer*`: the loader bumps `[+4]`, swaps it with `_InterlockedExchange`
+  and releases the old container, and an `atexit` handler (`0x1E39190`) releases the last one;
+- both slots are **zero in the image**, so either getter returns null before the first spawn. The
+  invalid-container seeding of `0x04DEEF94` happens inside `0x12F9C90` on its first run (guarded by
+  `0x4DEEF98` bit 0), not statically — the previous header implied a permanently non-null handle.
+
+Verification. `.text` diff against this branch before the row: **0 bytes**; all sections identical to the
+build on the PC except 5 timestamp bytes in `.rdata`. Not deployed.
+
 ## Exhaustive remaining worklist (generated 2026-10-18)
 
 Ordered smallest-first. Replace one, build clean, live-test, commit. Do not batch the big four.
