@@ -63,10 +63,14 @@ Reading order for a newcomer: `docs/ops/JOURNAL-2026-10-30.md` →
 | **PS3 debug build `scimitar_final.elf`** (0.52 GB, DWARF) | only for the reverse-engineering work; not needed to build or run | you must provide it — see `docs/ops/PS3-SYMBOLS.md` |
 | VS 2022 Build Tools, x86 toolset **v143** | the build line above | Microsoft |
 
-A fresh clone builds and produces an ASI: `455D166D7C0D`, 305,152 B.
+A fresh clone builds and produces an ASI: **305,152 B**.
 
-That is **ahead of what is deployed** (`33F8FDB08190`, 303,616 B) by the multi-instance diagnostic
-in `dllmain.cpp` — so "builds" and "is the tested binary" are two different things here.
+The *size* is stable; the **hash depends on the checkout path** — two clones in different folders give
+different digests, because absolute source paths still end up in the image despite `/Brepro` and no
+PDB. So "same hash" here means "same build from the same directory", not universally reproducible.
+
+That is also **ahead of what is deployed** (`33F8FDB08190`, 303,616 B) by the multi-instance
+diagnostic in `dllmain.cpp` — "builds" and "is the tested binary" are two different things here.
 
 ## Path configuration — `tools/paths.py`
 
