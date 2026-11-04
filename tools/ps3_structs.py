@@ -6,14 +6,19 @@ Writes one file per target so results survive partial scans:
     python ps3_structs.py            # all targets
     python ps3_structs.py Entity     # one
 """
+
+# --- path resolution (see tools/paths.py; override with AC4_* env vars) ---
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+import paths
 import os
 import re
 import sys
 
 from elftools.elf.elffile import ELFFile
 
-ELF = r"D:\Games\acbf_ps3_gold\scimitar_final.elf"
-OUT = r"C:\Users\Administrator\Documents\Default Project\projects\assassins-creed\bf-coop\ops\evidence\ps3_structs"
+ELF = paths.PS3_ELF
+OUT = _os.path.join(paths.ensure_evidence(), "ps3_structs")
 
 TARGETS = [
     "Entity", "Component", "Human", "CharacterController", "Actor", "Faction",

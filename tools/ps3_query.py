@@ -8,11 +8,16 @@ Answers three questions directly instead of inferring them from bit masks:
     python ps3_query.py enums
     python ps3_query.py struct <substring>
 """
+
+# --- path resolution (see tools/paths.py; override with AC4_* env vars) ---
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+import paths
 import sys
 
 from elftools.elf.elffile import ELFFile
 
-ELF = r"D:\Games\acbf_ps3_gold\scimitar_final.elf"
+ELF = paths.PS3_ELF
 KEY = ("role", "kind", "faction", "enemy", "hostile", "archetype", "variation")
 
 

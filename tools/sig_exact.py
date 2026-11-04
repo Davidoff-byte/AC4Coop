@@ -1,11 +1,16 @@
-﻿"""Exact relocation with correct PE mapping: known-build bytes at a VA -> target build."""
+"""Exact relocation with correct PE mapping: known-build bytes at a VA -> target build."""
+
+# --- path resolution (see tools/paths.py; override with AC4_* env vars) ---
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+import paths
 import json, os, re, sys, glob
 from capstone import Cs, CS_ARCH_X86, CS_MODE_32
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pe import PE
 
-KNOWN = r"D:\SteamLibrary\steamapps\common\Assassin's Creed IV Black Flag\AC4BFSP.exe"
-SRC = r"C:\Users\Administrator\Documents\Default Project\projects\assassins-creed\bf-coop\ref\AC4Coop\src"
+KNOWN = paths.KNOWN_EXE
+SRC = paths.SRC
 WINDOWS = [40, 32, 24, 20, 16, 12]
 
 def addrs():
@@ -24,6 +29,10 @@ def main(argv):
     target=None
     for i,a in enumerate(argv):
         if a=='--target' and i+1<len(argv): target=argv[i+1]
+    if not target:
+        print("usage: sig_exact.py --target <path to the other AC4BFSP.exe>")
+        print("       (reference build from paths.KNOWN_EXE; set AC4_TARGET_EXE or pass --target)")
+        return 2
     kp, tp = PE(KNOWN), PE(target)
     rows=[]
     for va in sorted(addrs()):

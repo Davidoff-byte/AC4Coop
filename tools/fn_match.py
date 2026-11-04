@@ -10,6 +10,11 @@ For a known-build address:
 
     python fn_match.py --target <exe> --sites "0x54d4d0,0x70e810" [--min-score 0.75]
 """
+
+# --- path resolution (see tools/paths.py; override with AC4_* env vars) ---
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+import paths
 import os
 import sys
 
@@ -18,7 +23,7 @@ from capstone import Cs, CS_ARCH_X86, CS_MODE_32
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pe import PE  # noqa: E402
 
-KNOWN = r"D:\SteamLibrary\steamapps\common\Assassin's Creed IV Black Flag\AC4BFSP.exe"
+KNOWN = paths.KNOWN_EXE
 PROLOGUES = (b"\x55\x8b\xec", b"\x8b\xff\x55\x8b\xec", b"\x53\x8b\xdc", b"\x53", b"\x56",
              b"\x57", b"\x83\xec", b"\x81\xec", b"\x6a\xff\x68", b"\x8b\xc1", b"\x8b\x44\x24")
 MAX_INSNS = 240

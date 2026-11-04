@@ -16,6 +16,11 @@ never reaches the log file.
 """
 from __future__ import annotations
 
+# --- path resolution (see tools/paths.py; override with AC4_* env vars) ---
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+import paths
+
 import argparse
 import glob
 import json
@@ -28,7 +33,7 @@ import time
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 OPS = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-GAME = r"D:\SteamLibrary\steamapps\common\Assassin's Creed IV Black Flag"
+GAME = paths.GAME_DIR
 PY = sys.executable
 PEER = os.path.join(OPS, "tools", "peer9.py")
 EVID = os.path.join(OPS, "evidence", "E0-B")

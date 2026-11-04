@@ -1,3 +1,8 @@
+
+# --- path resolution (see tools/paths.py; override with AC4_* env vars) ---
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+import paths
 import glob
 import os
 import re
@@ -5,7 +10,7 @@ import subprocess
 import sys
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-GAME = r"D:\SteamLibrary\steamapps\common\Assassin's Creed IV Black Flag"
+GAME = paths.GAME_DIR
 PY = sys.executable
 POS = (43.5, -73.4, 3.6)          # from the peer's own decode
 ROW = re.compile(r"\[Id\] idx=(\d+) objId=(\d+) ent=([0-9A-Fa-f]+).*?pos=\(([-\d.]+),([-\d.]+),([-\d.]+)\)")

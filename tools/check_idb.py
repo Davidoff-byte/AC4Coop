@@ -1,7 +1,12 @@
 """Check the AC4 BF IDB function list after a restore. Read-only."""
+
+# --- path resolution (see tools/paths.py; override with AC4_* env vars) ---
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+import paths
 import sys
 
-DB = r"D:\SteamLibrary\steamapps\common\Assassin's Creed IV Black Flag\AC4BFSP.exe"
+DB = paths.KNOWN_EXE
 PROBES = [0x54EC00, 0x73B4B0, 0x5FAC00, 0x67B2A0, 0x5200C0, 0x504F60, 0x133F630]
 
 import idapro

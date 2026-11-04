@@ -13,12 +13,17 @@ exact command to run.
 """
 from __future__ import annotations
 
+# --- path resolution (see tools/paths.py; override with AC4_* env vars) ---
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+import paths
+
 import glob
 import os
 import re
 import sys
 
-GAME = r"D:\SteamLibrary\steamapps\common\Assassin's Creed IV Black Flag"
+GAME = paths.GAME_DIR
 ROW = re.compile(
     r"\[Id\] idx=(\d+) objId=(\d+) ent=([0-9A-Fa-f]+) evt=([0-9A-Fa-f]+)"
     r".*?pos=\(([-\d.]+),([-\d.]+),([-\d.]+)\)")

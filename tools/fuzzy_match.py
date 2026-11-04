@@ -1,4 +1,4 @@
-﻿"""Fuzzy function matching with correct PE section mapping.
+"""Fuzzy function matching with correct PE section mapping.
 
 Normalises the first N instructions of a known-build function to (mnemonic + operand kinds),
 then scores that stream against every plausible function start in the target build.
@@ -6,6 +6,11 @@ Reports the best candidates with a score so a human can confirm by decompiling.
 
     python fuzzy_match.py --target <exe> --sites "0x70e810,0x528200"
 """
+
+# --- path resolution (see tools/paths.py; override with AC4_* env vars) ---
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+import paths
 import os
 import sys
 
@@ -14,7 +19,7 @@ from capstone import Cs, CS_ARCH_X86, CS_MODE_32
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pe import PE  # noqa: E402
 
-KNOWN = r"D:\SteamLibrary\steamapps\common\Assassin's Creed IV Black Flag\AC4BFSP.exe"
+KNOWN = paths.KNOWN_EXE
 N_INSNS = 16
 PROLOGUES = (b"\x55\x8b\xec", b"\x8b\xff\x55\x8b\xec", b"\x53", b"\x56", b"\x57",
              b"\x83\xec", b"\x81\xec", b"\x6a\xff\x68", b"\x8b\xc1", b"\x8b\x44\x24")

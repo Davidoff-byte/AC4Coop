@@ -1,3 +1,8 @@
+
+# --- path resolution (see tools/paths.py; override with AC4_* env vars) ---
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+import paths
 #!/usr/bin/env python3
 """Offline oracle for the AC4Coop signature resolver.
 
@@ -31,7 +36,7 @@ import struct
 import sys
 
 # --- ground truth -------------------------------------------------------------------------------
-DEFAULT_EXE = r"D:\SteamLibrary\steamapps\common\Assassin's Creed IV Black Flag\AC4BFSP.exe"
+DEFAULT_EXE = paths.KNOWN_EXE
 EXPECTED_SHA256 = "bc11ad7924e1eca7363ee86aa3332c05386d0a05896c0b7370131daee9ab5150"
 EXPECTED_SIZE = 45056040
 EXPECTED_TIMESTAMP = 0x64A813D4

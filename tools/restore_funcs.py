@@ -10,12 +10,17 @@ It must be the ONLY process touching the DB - check idb_list first.
     python restore_funcs.py            # dry run, prints what it would do
     python restore_funcs.py --apply
 """
+
+# --- path resolution (see tools/paths.py; override with AC4_* env vars) ---
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+import paths
 import json
 import os
 import sys
 
-SYM = r"C:\Users\Administrator\Documents\Default Project\projects\assassins-creed\bf-coop\RE-AC4\symbols"
-DB = r"D:\SteamLibrary\steamapps\common\Assassin's Creed IV Black Flag\AC4BFSP.exe"
+SYM = paths.SYMBOLS
+DB = paths.KNOWN_EXE
 
 
 def collect():

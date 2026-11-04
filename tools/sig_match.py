@@ -8,6 +8,11 @@ operands are wildcards, everything else (opcodes, register operands, small immed
 
 Outputs ops/evidence/sig_map_v2.json and (optionally) a C++ header with the wildcard patterns.
 """
+
+# --- path resolution (see tools/paths.py; override with AC4_* env vars) ---
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+import paths
 import json
 import os
 import re
@@ -16,8 +21,8 @@ import glob
 
 from capstone import Cs, CS_ARCH_X86, CS_MODE_32
 
-KNOWN = r"D:\SteamLibrary\steamapps\common\Assassin's Creed IV Black Flag\AC4BFSP.exe"
-SRC = r"C:\Users\Administrator\Documents\Default Project\projects\assassins-creed\bf-coop\ref\AC4Coop\src"
+KNOWN = paths.KNOWN_EXE
+SRC = paths.SRC
 IMAGE_BASE = 0x400000
 MAX_INSN = 14
 
@@ -138,7 +143,7 @@ def main(argv):
         t = f"{r['target']:#x}" if r["target"] else "NOT FOUND"
         print(f"  {r['known']:#9x} -> {t:>10}  hits={r['n']} insns={r['insns']}")
 
-    out = r"C:\Users\Administrator\Documents\Default Project\projects\assassins-creed\bf-coop\ops\evidence\sig_map_v2.json"
+    out = _os.path.join(paths.ensure_evidence(), "sig_map_v2.json")
     json.dump({"known": KNOWN, "target": target, "rows": rows}, open(out, "w"), indent=1)
     print("map ->", out)
     return 0

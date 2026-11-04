@@ -8,14 +8,19 @@ The result is a known->target address map plus a per-site confidence.
 
 Known build: D:\\SteamLibrary\\...\\Assassin's Creed IV Black Flag\\AC4BFSP.exe  (45,056,040 B)
 """
+
+# --- path resolution (see tools/paths.py; override with AC4_* env vars) ---
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+import paths
 import re
 import os
 import sys
 import json
 import glob
 
-KNOWN = r"D:\SteamLibrary\steamapps\common\Assassin's Creed IV Black Flag\AC4BFSP.exe"
-SRC = r"C:\Users\Administrator\Documents\Default Project\projects\assassins-creed\bf-coop\ref\AC4Coop\src"
+KNOWN = paths.KNOWN_EXE
+SRC = paths.SRC
 IMAGE_BASE = 0x400000
 WINDOWS = [48, 40, 32, 24, 20, 16, 12]
 MASK = 0x400000          # 45,056,040 = known exe size
@@ -117,7 +122,7 @@ def main(argv):
         t = f"{r['target']:#x}" if r["target"] else "NOT FOUND"
         print(f"{r['known']:#10x} {t:>10} {r['sig_len']:4}  {r['n']}")
 
-    out = r"C:\Users\Administrator\Documents\Default Project\projects\assassins-creed\bf-coop\ops\evidence\sig_map.json"
+    out = _os.path.join(paths.ensure_evidence(), "sig_map.json")
     with open(out, "w", encoding="utf-8") as f:
         json.dump({"known_exe": KNOWN, "target_exe": target, "rows": rows}, f, indent=1)
     print("map ->", out)

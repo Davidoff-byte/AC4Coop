@@ -68,6 +68,28 @@ A fresh clone builds and produces an ASI: `455D166D7C0D`, 305,152 B.
 That is **ahead of what is deployed** (`33F8FDB08190`, 303,616 B) by the multi-instance diagnostic
 in `dllmain.cpp` — so "builds" and "is the tested binary" are two different things here.
 
+## Path configuration — `tools/paths.py`
+
+No tool contains an absolute path any more. Everything resolves through `tools/paths.py`:
+
+| variable | meaning | required |
+|---|---|---|
+| `AC4_GAME_DIR` | game install, the folder holding `AC4BFSP.exe` | yes |
+| `AC4_KNOWN_EXE` | the build the offsets were derived from | yes |
+| `AC4_TARGET_EXE` | a different build being relocated onto | no |
+| `AC4_PS3_ELF` | PS3 debug executable with DWARF (`scimitar_final.elf`) | only for RE tools |
+| `AC4_SYMBOLS` | folder with `functions.jsonl` / `functions_v2.jsonl` | only for RE tools |
+| `AC4_WORK` | scratch root (IDA databases, dumps) | default `./work` |
+| `AC4_EVIDENCE` | where tools write output | default `./docs/evidence` |
+
+Check what it resolved:
+
+```powershell
+py tools\paths.py
+```
+
+Each tool prints usage and exits 2 rather than crashing when a required path is missing.
+
 ## What is unfinished, stated plainly
 
 - guard perception of the other player — `docs/ops/AI-T5-G10.md`

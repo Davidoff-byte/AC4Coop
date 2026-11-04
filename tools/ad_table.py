@@ -20,6 +20,11 @@ seen once is emitted but marked `// seen 1x`.
 """
 from __future__ import annotations
 
+# --- path resolution (see tools/paths.py; override with AC4_* env vars) ---
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+import paths
+
 import argparse
 import collections
 import glob
@@ -29,7 +34,7 @@ import sys
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-GAME = r"D:\SteamLibrary\steamapps\common\Assassin's Creed IV Black Flag"
+GAME = paths.GAME_DIR
 AD = re.compile(r"\[AD\]\s+(?:vanished\s+)?player=(\d+)\s+victim=(\d+)\s+objId=(\d+)\s+dist=([\d.]+)")
 MARKERS = {
     "stealth_low": "low-profile kill from behind (walk)",
