@@ -52,3 +52,27 @@ Reading order for a newcomer: `docs/ops/JOURNAL-2026-10-30.md` →
 3. One writer per file; one build from a clean tree.
 4. Reports are files, not messages — a polling watcher silently dropped three finished reports.
 5. Single-player, offline only. No anti-cheat, no DRM work, no piracy.
+
+## Prerequisites — what is NOT in this repo
+
+| needed | why | where from |
+|---|---|---|
+| **AC4 Black Flag PC 1.05** — `AC4BFSP.exe` 45,056,040 B, sha256 `bc11ad79…ab5150` | every offset targets this exact binary | you must own the game |
+| **`dinput8.dll`** — an ASI loader | loads `AC4Coop.asi` into the process | not shipped here; any ASI loader works |
+| **`known_builds.txt`** | the build gate refuses to patch a binary it does not recognise | included in this repo |
+| **PS3 debug build `scimitar_final.elf`** (0.52 GB, DWARF) | only for the reverse-engineering work; not needed to build or run | you must provide it — see `docs/ops/PS3-SYMBOLS.md` |
+| VS 2022 Build Tools, x86 toolset **v143** | the build line above | Microsoft |
+
+A fresh clone builds and produces an ASI: `455D166D7C0D`, 305,152 B.
+
+That is **ahead of what is deployed** (`33F8FDB08190`, 303,616 B) by the multi-instance diagnostic
+in `dllmain.cpp` — so "builds" and "is the tested binary" are two different things here.
+
+## What is unfinished, stated plainly
+
+- guard perception of the other player — `docs/ops/AI-T5-G10.md`
+- spawning an enemy the guest does not have — `docs/ops/PS3-SYMBOLS.md` §6
+- ship sync beyond identity
+- the second-build port — `docs/ops/JOURNAL-2026-11-04.md` §11: 22 of 101 sites resolved
+- no two-machine run since the last five commits, so everything after `5BC501A06101` is
+  compile-and-reason only
