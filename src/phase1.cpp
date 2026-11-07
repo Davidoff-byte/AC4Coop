@@ -2702,7 +2702,13 @@ static inline bool IsFighterRole(int role) {
         return false;
     }
 }
-static inline bool IsFighterBody(const KindRole& kr) { return kr.ok && kr.kind == 3 && IsFighterRole(kr.role); }
+// Measured, not assumed: a live census of 600 bodies in a pirate-populated scene showed EVERY one
+// at kind==2 (2 Peasant, 4 Courtesan, 17 Pirate, 1 Templar) and ZERO at kind==3. The old
+// `kind == 3` test therefore rejected 100% of bodies and nothing was ever synced. `kind` is the
+// entity class (2 = character), not a hostility flag; the subtype lives in `role`.
+static inline bool IsFighterBody(const KindRole& kr) {
+    return kr.ok && (kr.kind == 2 || kr.kind == 3) && IsFighterRole(kr.role);
+}
 static inline bool IsCivilianBody(const KindRole& kr) { return kr.ok && kr.kind == 2 && kr.role == 2; }
 
 // ---- sync scope (TASK: proximity to the PEER) ------------------------------------------------

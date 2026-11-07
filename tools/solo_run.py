@@ -1,4 +1,4 @@
-"""Run the solo phases against a live game, automatically, once the game is in-world.
+﻿"""Run the solo phases against a live game, automatically, once the game is in-world.
 
     python solo_run.py --game "D:\\SteamLibrary\\...\\Assassin's Creed IV Black Flag"
     python solo_run.py --phase P0          # one phase only
@@ -56,8 +56,7 @@ def judge(path, phases):
 
     if "P0" in phases:
         checks = {
-            "rx": bool(re.search(r"\[Net\] stats .*rx=(\d+)", txt) and
-                      int(re.search(r"rx=(\d+)", txt).group(1)) > 0),
+            "rx": bool(re.findall(r"rx=(\d+)", txt) and int(re.findall(r"rx=(\d+)", txt)[-1]) > 0),
             "spawn": "[Net] spawn succeeded" in txt,
             "pup": "[Pup] mode=position" in txt or "[Pup] mode=physics" in txt,
             "smooth": "[Smooth]" in txt,
@@ -130,3 +129,4 @@ def main(argv):
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))
+
