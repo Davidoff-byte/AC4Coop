@@ -56,7 +56,9 @@ def main(argv):
     for r in rows:
         t=f"{r['target']:#x}" if r['target'] else 'MISSING'
         print(f"  {r['known']:#9x} -> {t:>10}  n={r['n']} w={r['w']}")
-    json.dump({'known':KNOWN,'target':target,'rows':rows}, open(r'..\..\ops\evidence\sig_map_v3.json','w'), indent=1)
+    out = _os.path.join(paths.ensure_evidence(), 'sig_map_v3.json')
+    json.dump({'known':KNOWN,'target':target,'rows':rows}, open(out, 'w'), indent=1)
+    print('map ->', out)
     return 0
 
 if __name__=='__main__': sys.exit(main(sys.argv))

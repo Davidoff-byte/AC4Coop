@@ -1,0 +1,612 @@
+{
+ "known": "D:\\SteamLibrary\\steamapps\\common\\Assassin's Creed IV Black Flag\\AC4BFSP.exe",
+ "target": "D:\\Games\\Assassins's Creed 4 - Black Flag\\AC4BFSP.exe",
+ "rows": [
+  {
+   "known": 4259840,
+   "target": 13610937,
+   "n": 1,
+   "w": 16
+  },
+  {
+   "known": 5046273,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 5255984,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 5407232,
+   "target": 18540400,
+   "n": 1,
+   "w": 16
+  },
+  {
+   "known": 5559504,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 5593634,
+   "target": 4463395,
+   "n": 7,
+   "w": 16
+  },
+  {
+   "known": 6269952,
+   "target": 4523840,
+   "n": 1,
+   "w": 12
+  },
+  {
+   "known": 6281008,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 6513792,
+   "target": 7055616,
+   "n": 1,
+   "w": 16
+  },
+  {
+   "known": 6787616,
+   "target": 8075440,
+   "n": 1,
+   "w": 40
+  },
+  {
+   "known": 6787623,
+   "target": 8075447,
+   "n": 1,
+   "w": 40
+  },
+  {
+   "known": 6788605,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 6788611,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 6788613,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 6788619,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 6788625,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 6788944,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 6789078,
+   "target": 8077062,
+   "n": 1,
+   "w": 40
+  },
+  {
+   "known": 6789084,
+   "target": 8077068,
+   "n": 1,
+   "w": 32
+  },
+  {
+   "known": 6789092,
+   "target": 8077076,
+   "n": 2,
+   "w": 24
+  },
+  {
+   "known": 6789109,
+   "target": 8077093,
+   "n": 2,
+   "w": 12
+  },
+  {
+   "known": 6796010,
+   "target": 8083082,
+   "n": 1,
+   "w": 40
+  },
+  {
+   "known": 6821855,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 6821882,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 6821887,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 6821889,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 6821891,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 6821893,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 6821902,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 6821911,
+   "target": 8099137,
+   "n": 3,
+   "w": 16
+  },
+  {
+   "known": 6822118,
+   "target": 8147759,
+   "n": 1,
+   "w": 12
+  },
+  {
+   "known": 6822272,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 6822631,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 6822650,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 6822691,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 6822710,
+   "target": 8129494,
+   "n": 1,
+   "w": 16
+  },
+  {
+   "known": 6822729,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 6822748,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 6822753,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 6822773,
+   "target": 8129557,
+   "n": 1,
+   "w": 12
+  },
+  {
+   "known": 7064928,
+   "target": 4283696,
+   "n": 7,
+   "w": 12
+  },
+  {
+   "known": 7298928,
+   "target": 5514864,
+   "n": 1,
+   "w": 40
+  },
+  {
+   "known": 7399440,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 7552944,
+   "target": 8074688,
+   "n": 1,
+   "w": 12
+  },
+  {
+   "known": 7552946,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 7552953,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 7552984,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 7554144,
+   "target": 8082004,
+   "n": 3,
+   "w": 12
+  },
+  {
+   "known": 7554191,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 7621872,
+   "target": 5077040,
+   "n": 7,
+   "w": 16
+  },
+  {
+   "known": 7977168,
+   "target": 7412320,
+   "n": 1,
+   "w": 40
+  },
+  {
+   "known": 8158624,
+   "target": 4681984,
+   "n": 2,
+   "w": 24
+  },
+  {
+   "known": 9471818,
+   "target": 9545706,
+   "n": 1,
+   "w": 40
+  },
+  {
+   "known": 10423120,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 10613088,
+   "target": 10743888,
+   "n": 1,
+   "w": 24
+  },
+  {
+   "known": 12907168,
+   "target": 8262080,
+   "n": 2,
+   "w": 32
+  },
+  {
+   "known": 13117456,
+   "target": 13205616,
+   "n": 1,
+   "w": 40
+  },
+  {
+   "known": 13238272,
+   "target": 13312896,
+   "n": 1,
+   "w": 40
+  },
+  {
+   "known": 16462368,
+   "target": 16431488,
+   "n": 7,
+   "w": 24
+  },
+  {
+   "known": 16777216,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 17311760,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 17758400,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 19901133,
+   "target": 18596365,
+   "n": 1,
+   "w": 40
+  },
+  {
+   "known": 20182352,
+   "target": 17273584,
+   "n": 6,
+   "w": 16
+  },
+  {
+   "known": 22514512,
+   "target": 24726016,
+   "n": 1,
+   "w": 16
+  },
+  {
+   "known": 24184512,
+   "target": 27490624,
+   "n": 1,
+   "w": 40
+  },
+  {
+   "known": 24371600,
+   "target": 10234864,
+   "n": 3,
+   "w": 12
+  },
+  {
+   "known": 27243712,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 27501068,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 31694848,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 31695372,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 31727192,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 31745912,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 31760680,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 31772304,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 31815568,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 31815648,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 31815728,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 31856952,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 31890824,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 31911440,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 37631604,
+   "target": 32076440,
+   "n": 7,
+   "w": 40
+  },
+  {
+   "known": 38475404,
+   "target": 37591883,
+   "n": 7,
+   "w": 40
+  },
+  {
+   "known": 40445760,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 40495568,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 40544120,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 40627392,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 40634323,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 40713432,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 40776920,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 40820816,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 40872088,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 40961704,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 40972128,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 41054344,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 42669708,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 42691400,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 44819748,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 44821696,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 44828627,
+   "target": null,
+   "n": 0,
+   "w": 0
+  },
+  {
+   "known": 44834408,
+   "target": null,
+   "n": 0,
+   "w": 0
+  }
+ ]
+}
