@@ -88,3 +88,20 @@ second one).
 **Fail condition:** if the SP build's `GamerCollection` is empty outside a multiplayer session, or
 `RegisterAvatarEntity` asserts on a non-gamer entity, the path closes and `P6-RESULT.md`'s cut
 stands.
+
+## PC mapping attempt 1 - negative, and why
+
+Two cheap anchors were tried against `AC4BFSP.exe` and both are too coarse to name the global:
+
+| approach | result |
+|---|---|
+| accessor shape `A1 imm32 C3` / `8B 05 imm32 C3` (return a global pointer) | **5,900 candidates** - `tools/find_global_getters.py`. Same failure mode as `fn_match.py`: a three-instruction getter has no shape. |
+| string anchor `"GamerCollection"` / `"GamerWorldInstance"` -> find imm32 code refs | string found (`0x1e6cfb8`, `0x1e45c48`) but **zero direct code references** - the names are reached through a pointer table, not pushed inline |
+
+So neither "match the function" nor "xref the name" lands it. The next step must be the **two-hop
+xref**: find the data slot(s) holding the string address, then find the code that references *that
+slot*. Class descriptors are usually built by a registration function that takes the name pointer
+from such a table, and that function is a much better anchor than any getter.
+
+Recorded because it is the same lesson twice in one week: shape matching short functions does not
+work, and name xrefs in this binary go through tables.
