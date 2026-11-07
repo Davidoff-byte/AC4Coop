@@ -2860,6 +2860,15 @@ static int      s_compDistinct  = 0;        // ids stored in the table (<= COMP_
 static unsigned s_compOverflow  = 0;        // sightings that did not fit (table was full)
 static unsigned s_compWeaponCand = 0;       // candidates carrying 0x027106A8 WeaponComponent
 static unsigned s_compIconCand   = 0;       // candidates carrying 0x0269E9D0 MapIconBehaviorGuard
+// ---- which archetypes actually FIGHT -----------------------------------------------------------
+// The fighter role set is a prior taken from the PS3 subtype enum; only four roles have ever been
+// observed live. This histogram answers the question directly instead of by inference: for every
+// body currently in a COMBAT ground stage (4 Fight, 0xC RangeCombat, 0x11 FleeFight), which
+// `role` is it, and is it carrying a weapon component? A role that fights but is not in
+// IsFighterRole shows up here and is the evidence needed to widen the set.
+static unsigned s_fightRole[64] = {0};      // role -> count, combat bodies only
+static unsigned s_fightN        = 0;        // combat bodies this window
+static unsigned s_fightArmed    = 0;        // ... of which had WeaponComponent/MapIconBehaviorGuard
 // ---- AI object vtable histogram ---------------------------------------------------------------
 // The component list did not separate soldiers from civilians, so the AI object itself is tallied
 // too. The pointer is the one the candidate gate already obtains from
@@ -3297,6 +3306,21 @@ static void CaptureGuards(EntityPacket& pkt) {
             if (IsFighterBody(kr))       ++s_krSoldier;   // "soldier" = kind 3 with a fighter role (T21)
             else if (IsCivilianBody(kr)) ++s_krCivilian;
             else                         ++s_krOther;
+            // Combat-stage census: which role is actually fighting right now. This is the empirical
+            // answer to "is the fighter set complete", asked of the population instead of assumed.
+            {
+                int st = -1;
+                Human* hh2 = AIEntityHelper::GetHuman(e);
+                if (hh2 && readable(hh2, 4)) {
+                    HumanDataBundle* b2 = hh2->m_Data.m_HumanDataBundle;
+                    if (b2 && readable(b2, 4)) st = (int)b2->m_GroundData.m_HumanGroundStage;
+                }
+                if (st == 4 || st == 0xC || st == 0x11) {
+                    ++s_fightN;
+                    if (weapon || guardIcon) ++s_fightArmed;
+                    ++s_fightRole[kr.role & 63];
+                }
+            }
             // T17: per-body [KR] row, pre-filter, so a mis-decoded offset is visible against the
             // component walk on the SAME body (skel / BhvGenericNPC 0x026E34D8 / comps). objId comes
             // from the handle already in hand; nothing here is a new engine call.
@@ -7871,6 +7895,20 @@ static void OnFrameInner(Human* updatedHuman) {
             // should equal soldier (radius permitting).
             L("[Sync] kindrole n=%u soldier=%u civilian=%u other=%u\n",
               s_krN, s_krSoldier, s_krCivilian, s_krOther);
+            // Who is actually fighting: role histogram over combat-stage bodies. Any role here that
+            // IsFighterRole() rejects is a fighter the set is missing - the point of the line.
+            {
+                char fr[220]; int o = 0; fr[0] = 0;
+                for (int r = 0; r < 64; ++r) {
+                    if (!s_fightRole[r]) continue;
+                    o += _snprintf_s(fr + o, sizeof(fr) - o, _TRUNCATE, " %d:x%u", r, s_fightRole[r]);
+                    if (o >= (int)sizeof(fr) - 24) break;
+                }
+                L("[Fight] combatBodies=%u armed=%u roles=%s%s\n",
+                  s_fightN, s_fightArmed, o ? fr : " none",
+                  s_fightN && !s_fightArmed ? " (no weapons on combat bodies)" : "");
+                memset(s_fightRole, 0, sizeof(s_fightRole)); s_fightN = 0; s_fightArmed = 0;
+            }
             // T21: what the fighter filter rejected, as kind/role:count pairs. This is the line that
             // tells us whether a missing role (e.g. a fighter the set does not list) is being dropped.
             if (s_krRejTotal) {
