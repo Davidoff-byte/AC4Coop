@@ -1,4 +1,4 @@
-// Phase 1 — spawn a second Human from the player's cached EntityBuilder + RowSelector, bind to pad 1.
+﻿// Phase 1 â€” spawn a second Human from the player's cached EntityBuilder + RowSelector, bind to pad 1.
 #define _CRT_SECURE_NO_WARNINGS
 #include "phase1.h"
 #include "paths.h"
@@ -35,7 +35,7 @@ extern "C" int AC4Coop_FormatBuildLine(char* out, int cap);
 namespace {
 
 // sub_4054D0(char active): focus activate/deactivate. Inline-hook target (see InstallNoPauseHook), so it
-// keeps its raw RVA — the hook patches this code rather than calling it through a class wrapper.
+// keeps its raw RVA â€” the hook patches this code rather than calling it through a class wrapper.
 const uintptr_t RVA_Deactivate      = 0x54D0;
 
 // Human activity-context replication (parkour/climb/swim/etc). A Human owns per-activity context
@@ -48,7 +48,7 @@ const int       CTX_GROUND          = 2;        // default context id (no explic
 const int       CTX_SWIM            = 10;       // Swim context: positions the character via its physics capsule
 const int       ACTLAYER_PRIMARY    = 0;        // main body-animation layer (action replication)
 const int       ACTPERSIST_ALWAYS   = 4;        // ACTPersistType: keep a blend-factor slot across action/transition
-                                                // resets (default is transient) — makes our driven blend stick
+                                                // resets (default is transient) â€” makes our driven blend stick
 
 // Per-frame MAIN-THREAD hook site (from AC4Hook): the Human update, which runs once per frame
 // for the player. base+0x12FAACD steals 6 bytes:  8B 8E 08 01 00 00  =  mov ecx,[esi+0x108]
@@ -82,7 +82,7 @@ int      g_disablePuppetAI = 1;          // [Coop] DisablePuppetAI: disable the 
 bool     g_casActivated = false;         // whether the current puppet's CharacterActionSet has been activated (once)
 // [Coop] HybridLoco: per-context action ownership. The crash is two threads playing an action at once, so we
 // guarantee EXACTLY ONE action-writer at all times: on the GROUND context the puppet's OWN FSM owns actions
-// (behavior ENABLED, we only feed HumanGroundData, we never SetTargetAction) — this reproduces the MVP's
+// (behavior ENABLED, we only feed HumanGroundData, we never SetTargetAction) â€” this reproduces the MVP's
 // correct locomotion gait; on every OTHER context WE own actions (behavior DISABLED + action replication) for
 // parkour/climb/etc. HybridLoco=0 falls back to the old global-flag behavior for A/B.
 int      g_hybridLoco = 1;
@@ -108,7 +108,7 @@ static const int kCollisionLayerDisabled = 0x28;   // Layer::Disabled (0x29 was 
 
 // [Coop] ShipPassenger: deck offset, in the LOCAL ship's local space (metres), where the peer's puppet is
 // placed when BOTH peers are aboard their own ships. Axes are a first guess for this build (X right,
-// Y up, Z fore/aft) — tune this ONE constant; the rotation is applied from the ship's global matrix below.
+// Y up, Z fore/aft) â€” tune this ONE constant; the rotation is applied from the ship's global matrix below.
 static const float kShipPassengerDeckOffset[3] = { 0.0f, 2.0f, -3.0f };
 
 // [Coop] DisableSpawns: suppress ambient entity spawning so both clients present the same empty world
@@ -430,7 +430,7 @@ void Phase1::ToggleVirtualPad() {
     s_posProbeFrames = 120;
 }
 
-// Route B: force the puppet to move from the pad-1 test state using its OWN ground data — the same seam
+// Route B: force the puppet to move from the pad-1 test state using its OWN ground data â€” the same seam
 // the network puppet uses (m_IsSet + m_DestSpeedRatio + m_DestHeading). If this walks, the real co-op
 // input path is "peer pad -> our drive -> puppet", independent of the engine granting a second player.
 static void DrivePuppetFromPad() {
@@ -538,7 +538,7 @@ void* Phase1::TrySpawnPuppet() {
         return nullptr;
     }
 
-    // Steps below mutate world state — gate behind ini so we can test build-only first.
+    // Steps below mutate world state â€” gate behind ini so we can test build-only first.
     bool doIntegrate = Net::Enabled() ||
                        GetPrivateProfileIntA("Coop", "IntegratePuppet", 0, Paths::Ini()) != 0;
     if (!doIntegrate) {
@@ -586,7 +586,7 @@ void* Phase1::TrySpawnPuppet() {
 }
 
 // ---- crowd (non-player) body probe [F8] ----------------------------------------------
-// GO/NO-GO probe for the ambient-NPC-sync plan (bf-coop/AMBIENT-NPC-SYNC-PLAN.md §4): can the same
+// GO/NO-GO probe for the ambient-NPC-sync plan (bf-coop/AMBIENT-NPC-SYNC-PLAN.md Â§4): can the same
 // build machinery produce a NON-PLAYER (crowd) body, and does that body render?
 //
 // Static REC (byte-verified against AC4BFSP.exe, tools/_dump_eb_vtable.py + _probe_crowd_builder.py):
@@ -598,8 +598,8 @@ void* Phase1::TrySpawnPuppet() {
 //     derived variant = 0x1E577E0 (also slot 39). Slot 39 takes a crowd template HASH, reads the
 //     manager global VA 0x2AC1E68, and in its slow path builds the body as: map entry -> template
 //     object -> [[vtbl]+0xC](0,0) clone -> FUN_00526590 (activate flags/spatial) -> FUN_00A2E820
-//     (job flush). It uses NO RowSelector — the crowd path selects by template hash, not by a selector.
-//   * Candidate builder sources: world+0xA48 (fallback +0xA44) per SPAWN-RETHINK.md §11, and
+//     (job flush). It uses NO RowSelector â€” the crowd path selects by template hash, not by a selector.
+//   * Candidate builder sources: world+0xA48 (fallback +0xA44) per SPAWN-RETHINK.md Â§11, and
 //     world+0x924 (the world's spawner/template manager read by the world-side caller).
 //
 // So the probe acquires a builder object, validates its vtable is the builder family, then calls SLOT 39
@@ -611,7 +611,7 @@ void* Phase1::TrySpawnPuppet() {
 // line. Adopts nothing, drives nothing, never touches the puppet path (g_puppet / TrySpawnPuppet).
 // Fully SEH-guarded; every dereference is readable()-checked.
 void* Phase1::TryCrowdProbe() {
-    // area crowd template hashes — engine-captured live (MODLOG 2026-10-07: 0x49BB47AC x96; RE-NOTES §tooling)
+    // area crowd template hashes â€” engine-captured live (MODLOG 2026-10-07: 0x49BB47AC x96; RE-NOTES Â§tooling)
     const uint32_t CROWD_HASHES[3] = { 0x49BB47ACu, 0x47CD5ECCu, 0x479DB35Cu };
     const int      N_HASHES = 3;
     const int      SLOT_CROWD_SPAWN = 39;   // +0x9C  FUN_005FD730  (crowd / free-roam spawn by template hash)
@@ -941,7 +941,7 @@ static int floorDivIdx(float v, float cell) {
 static uint32_t computeSceneKey(World* world, Entity* player) {
     __try {
         if (!readable(world, 8)) return 0;
-        uint32_t cell = world->m_FloorHeightData.m_CellSize;   // World.h:116 — terrain cell size (metres)
+        uint32_t cell = world->m_FloorHeightData.m_CellSize;   // World.h:116 â€” terrain cell size (metres)
         if (cell == 0) return 0;                               // unreadable/absent -> "unknown"
         if (!readable(player, 8)) return 0;
         float x = player->m_GlobalMatrix.M41;
@@ -1040,7 +1040,7 @@ bool Phase1::CaptureLocalState(PlayerState& s) {
         s.stalkingClipAllowFastStalkingCount = h->m_StalkingClipAllowFastStalkingCount;
         s.disturbedZoneCount = h->m_DisturbedZoneCount;
 
-        // Current primary action (anim clip) the player is playing — the file-defined alias at Action+0x08.
+        // Current primary action (anim clip) the player is playing â€” the file-defined alias at Action+0x08.
         // Replicated so the puppet plays the same clip regardless of context (universal animation sync).
         s.actionAlias = 0;
         s.actionChannel = 0xFFFF;
@@ -1086,7 +1086,7 @@ bool Phase1::CaptureLocalState(PlayerState& s) {
                     // clips are picked by the alias, so only the LOOP needs this blend to vary with speed.
                     // Capture the WHOLE array: the ground move cycle evaluates a 46-slot blend tree
                     // (UpdateGroundBlendTree -> SetTargetBlendFactors(46 floats, 0, PRIMARY)) and the gait
-                    // weights live past slot 3 — syncing only 0..3 left the puppet on the default (walk).
+                    // weights live past slot 3 â€” syncing only 0..3 left the puppet on the default (walk).
                     int n = ac->GetBlendFactorCount(0, ACTLAYER_PRIMARY);
                     if (n > BLEND_MAX) n = BLEND_MAX;
                     if (n < 0) n = 0;
@@ -1172,7 +1172,7 @@ bool Phase1::CaptureLocalState(PlayerState& s) {
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
-// [Coop] PuppetPhysics (default 0). 0 = "position" mode: the puppet is a pure render mirror — its matrix is
+// [Coop] PuppetPhysics (default 0). 0 = "position" mode: the puppet is a pure render mirror â€” its matrix is
 // written with updatePhysics=false (no physics/capsule solve) and its collision filter is disabled, so it
 // can neither push the player nor be blocked by geometry. 1 = legacy behaviour: every applied snapshot is a
 // SetGlobalMatrixInternal(...,true) physics warp, exactly as before this flag existed.
@@ -1190,7 +1190,7 @@ static void LogPuppetMode() {
       phys ? "physics" : "position", phys, phys ? "untouched" : "disabled");
 }
 
-// Apply a remote peer's state to the puppet (absolute position — shared world coords, no offset).
+// Apply a remote peer's state to the puppet (absolute position â€” shared world coords, no offset).
 // Never nulls g_puppet on a transient fault (that would trigger endless respawns).
 void Phase1::ApplyRemoteState(const PlayerState& s) {
     // [Relevance] Remember where the peer actually is; the host's entity capture filters by this.
@@ -1270,7 +1270,7 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
         if (g_switchCd > 0) --g_switchCd;
 
         // We are ALWAYS the position authority (SetGlobalMatrixInternal above): stop the character controller
-        // from driving the entity so its physics can never fight the forced matrix — in both modes. In ground
+        // from driving the entity so its physics can never fight the forced matrix â€” in both modes. In ground
         // mode the (enabled) FSM still animates the correct gait: UpdateMoveCycleNew derives the walk/jog/run
         // from the HumanGroundData intention we feed below, not from the puppet actually moving through space.
         {
@@ -1331,7 +1331,7 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
                 int cur = h->GetCurrentContextID(MAIN_AI_TRACK);
                 // A context is drivable if it's ground, or its bit is set in the allow-mask. The masked
                 // (target-needing) contexts would crash a later engine update, so instead of entering them
-                // we force the puppet back to ground — never leave it stranded in a stale parkour pose.
+                // we force the puppet back to ground â€” never leave it stranded in a stale parkour pose.
                 bool allowed = (want == CTX_GROUND) ||
                                (want >= 0 && want < 32 && (g_ctxMask & (1u << want)));
                 if (allowed) {
@@ -1348,12 +1348,12 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
             }
         }
         // Swim locomotion drive: once the puppet is actually in the Swim context (transitioned above), the
-        // FSM + scope exist, so push the peer's swim input onto them — this is what makes the puppet leave
+        // FSM + scope exist, so push the peer's swim input onto them â€” this is what makes the puppet leave
         // the idle swim pose, play the moving-swim anim and travel. Position is already corrected via the
         // SetGlobalMatrixInternal capsule push at the top. Gated exactly like the swim position path.
         if (g_driveContext && (g_ctxMask & (1u << CTX_SWIM)) && s.contextId == CTX_SWIM) {
             // Authoritative position: the swim FSM positions the character through its CharacterController,
-            // which the entity-matrix push doesn't move — so force the controller to the peer's position via
+            // which the entity-matrix push doesn't move â€” so force the controller to the peer's position via
             // the kamikaze target + flag (field-write form of CharacterController::SetGlobalPositionKamikaze).
             // Swim-gated only: on ground the FSM is really moving the character and this fights it -> jitter.
             // [Coop] PuppetPhysics=0: the kamikaze warp IS a controller/physics solve (it is how the swim FSM
@@ -1385,7 +1385,7 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
                 sc->m_DestDirection.z   = s.ctx.swim.destDir[2];
                 sc->m_DestDirection.w   = s.ctx.swim.destDir[3];
                 sc->m_DestSpeedRatio    = s.ctx.swim.destSpeedRatio;
-                // Also drive the eased CURRENT state — the FSM won't advance these itself on a teleported
+                // Also drive the eased CURRENT state â€” the FSM won't advance these itself on a teleported
                 // puppet (no real velocity), so without them the facing goes stale and the stroke anim
                 // never blends in. m_CurSpeedProportion is the stroke blend; m_Sprint the fast-swim flag;
                 // m_AISwim[] are the per-gait swim anim-request floats that select which stroke plays.
@@ -1433,7 +1433,7 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
                     // CharacterActionSetManager doesn't take the kit-lookup path that bails and drops the CAS
                     // override (-> base/Connor clip).
                     ac->SetTargetAction((int)s.actionAlias, 0, 0, (int)s.actionChannel, (int)s.actionLayer);
-                    // Start the new clip at the peer's phase instead of frame 0 — the game does the same right
+                    // Start the new clip at the peer's phase instead of frame 0 â€” the game does the same right
                     // after its own SetTargetAction calls. Without it every swap pops. processDisplacement=0
                     // (we own position), processEvents=0 (don't fire the skipped span's anim events).
                     if (g_seekOnSwitch && s.actionRatio > 0.0f && s.actionRatio < 1.0f)
@@ -1478,7 +1478,7 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
                 if ((fl & 7) == 6) fl = (uint16_t)((fl & ~7) | 1);
                 bool write = true;
                 if ((fl & 7) == 0) {
-                    // Peer cut with NO blend — typically a transition clip handing off to its target, seamless on
+                    // Peer cut with NO blend â€” typically a transition clip handing off to its target, seamless on
                     // the peer because the clip ends on the target's start pose. Our switch lands whenever the
                     // packet does, so that match isn't guaranteed: never downgrade a blend the puppet found itself,
                     // and otherwise use a short AROLLBROLL (MinBlendIn) to hide the timing seam.
@@ -1511,13 +1511,13 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
             }
         }
 
-        // Blend factors (the walk/jog/run speed sub-blend within the current LOOP action) — set EVERY frame
+        // Blend factors (the walk/jog/run speed sub-blend within the current LOOP action) â€” set EVERY frame
         // since they vary continuously with the peer's speed. Indexed on the primary CONTROLLER channel 0 +
         // ACTLAYER_PRIMARY (same as the capture / the engine's own SetBlendFactor calls), NOT s.actionChannel
         // (the body-part channel used for SetTargetAction routing).
-        // ROOT CAUSE of "always slowest walk": a plain SetBlendFactor is TRANSIENT — the puppet's action update
+        // ROOT CAUSE of "always slowest walk": a plain SetBlendFactor is TRANSIENT â€” the puppet's action update
         // resets it to the slot default before sampling the clip, so our value never took. Confirmed via log:
-        // the LOCAL capture reads real, varying blend factors (e.g. [0,0.04,0.95,0]) — the capture was fine;
+        // the LOCAL capture reads real, varying blend factors (e.g. [0,0.04,0.95,0]) â€” the capture was fine;
         // the write just didn't stick. Fix (mirrors the engine's own locomotion): mark each slot
         // ACTPERSIST_ALWAYS(=4) so it survives the per-frame reset, THEN write the peer's factor. Done every
         // frame because the controller/evaluator is recreated on each SetTargetAction (fresh default persistence).
@@ -1533,7 +1533,7 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
                     ac->SetBlendFactorPersistence((unsigned char)i, ACTPERSIST_ALWAYS, 0, ACTLAYER_PRIMARY);
                     ac->SetBlendFactor((unsigned char)i, s.blendFactors[i], 0, ACTLAYER_PRIMARY);
                 }
-                // Playback time scale (clip speed) — the missing gait lever: read-back proved the action AND
+                // Playback time scale (clip speed) â€” the missing gait lever: read-back proved the action AND
                 // blend factors already match the peer, so the only remaining difference is how fast the clip
                 // plays. Persist it (like the blend) so the puppet's action update doesn't snap it back to 1.0.
                 // Guard against a bogus/zero wire value that would freeze the anim.
@@ -1541,7 +1541,7 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
                     ac->SetTimeScalePersistence(ACTPERSIST_ALWAYS, 0, ACTLAYER_PRIMARY);
                     ac->SetTimeScale(s.timeScale, 0, ACTLAYER_PRIMARY, false);
                 }
-                // DIAGNOSTIC: read back the puppet's OWN state right after we wrote it — (1) is it playing the
+                // DIAGNOSTIC: read back the puppet's OWN state right after we wrote it â€” (1) is it playing the
                 // action we sent (alias match), (2) did the blend stick (readback == sent), (3) did the time
                 // scale stick. One line tells us where the chain breaks.
                 static int rc = 0;
@@ -1652,10 +1652,10 @@ void Phase1::TryShipCtorProbe() {
 }
 
 // Route A (ship physics): construct a fresh keyframed hkpRigidBody that shares the source ship's
-// collision shape. The body is heap-allocated (0x220) and intentionally LEAKED on despawn — the ghost
+// collision shape. The body is heap-allocated (0x220) and intentionally LEAKED on despawn â€” the ghost
 // is hidden (never removed), so a Havok-memory-pool mismatch on free is avoided.
 
-// Havok memory-pool allocator (via the engine's TLS + hkMemorySystem) — the physics update runs the
+// Havok memory-pool allocator (via the engine's TLS + hkMemorySystem) â€” the physics update runs the
 // memory system on bodies, so a plain malloc'd body can hang. Falls back to aligned malloc.
 static void* HavokAlloc(unsigned int size) {
     __try {
@@ -1763,7 +1763,7 @@ static void* DuplicateShip(void* shipEnt) {
         // 3) Ghost physics (Route A): give the clone a FRESH keyframed hkpRigidBody (shares the source
         //    shape) so updatePhysics=true writes its motion state and the masts/sails skeleton follows.
         //    The RigidBodyComponent clone shallow-copied m_HKRigidBody; replace it with the new body.
-        //    Keep the AIComponent (ship-ctrl) DISABLED — its damage path null-derefs on the broken world.
+        //    Keep the AIComponent (ship-ctrl) DISABLED â€” its damage path null-derefs on the broken world.
         Component* rbComp = ((Entity*)dup)->GetComponentByType(RigidBodyComponent::GetStaticClassDescriptor());
         if (rbComp && readable(rbComp, 4)) {
             RigidBodyComponent* rbc = (RigidBodyComponent*)rbComp;
@@ -1774,7 +1774,7 @@ static void* DuplicateShip(void* shipEnt) {
             if (newBody) {
                 *(void**)((char*)newBody + 0x0C) = rbc;        // back-pointer (m_userData)
                 L("[ShipPhys] ghost body constructed %p (src %p) vt=%08X\n", newBody, srcBody, *(uint32_t*)newBody);
-                // keep ENABLED (m_DriveEntity=false already) — testing whether the Havok-pool alloc fixed the freeze
+                // keep ENABLED (m_DriveEntity=false already) â€” testing whether the Havok-pool alloc fixed the freeze
             } else {
                 rbc->SetEnabled(false);                        // fallback: no physics
                 L("[ShipPhys] ghost body construction FAILED\n");
@@ -1817,7 +1817,7 @@ static void* SpawnGhostShip() {
 }
 
 void Phase1::TryShipDupProbe() {
-    if (g_ghostShip) { L("[ShipDup] ghost already spawned (%p) — press F11 to remove\n", g_ghostShip); return; }
+    if (g_ghostShip) { L("[ShipDup] ghost already spawned (%p) â€” press F11 to remove\n", g_ghostShip); return; }
     // Route A investigation: dump the SOURCE ship's Havok rigid body (vtable + first 0x100 bytes) to
     // locate hkpRigidBody::clone + hkpWorld. Runs on F12 (before the spawn). Observation only.
     __try {
@@ -1937,7 +1937,7 @@ void Phase1::TryShipDupProbe() {
                 } else {
                     L("[FF] no known behavior on puppet\n");
                 }
-                // Compare with the LOCAL player (Edward) — the guards DO attack him.
+                // Compare with the LOCAL player (Edward) â€” the guards DO attack him.
                 if (pl) {
                     uint16_t pc2 = *(uint16_t*)((uint8_t*)pl + 0x66);   // authoritative count @ +0x66 (never +0x64)
                     if (pc2 < 1 || pc2 > 96) pc2 = 0;   // clamp: 1..96 safety net
@@ -1986,7 +1986,7 @@ void Phase1::TryShipDupProbe() {
                               p[off+8],p[off+9],p[off+10],p[off+11],p[off+12],p[off+13],p[off+14],p[off+15]);
                         }
                     }
-                    // Also dump the RigidBody struct (shape reference + mass + body ptr) — the engine's
+                    // Also dump the RigidBody struct (shape reference + mass + body ptr) â€” the engine's
                     // own copy of the shape, so we can share it in the cinfo.
                     {
                         unsigned char* rb = (unsigned char*)&rbc->m_RigidBody;
@@ -2091,7 +2091,7 @@ void Phase1::DespawnGhostShip() {
 // Host enumerates the NavalManager ship list [mgr+0x3E8] (handle containers, stride 0xD0, count u16
 // @ +0x3EE) and broadcasts each ship's transform. The peer deep-copies its OWN matching ship into a
 // ghost (DuplicateShip: clone + disable physics/AI + AddEntity) and drives the ghost's RENDER via the
-// SetGlobalMatrixInternal hook — the proven ship-ghost seam (verified on the Jackdaw; NPC ships are the
+// SetGlobalMatrixInternal hook â€” the proven ship-ghost seam (verified on the Jackdaw; NPC ships are the
 // same vt 0x01E4A128 EntityGroup class). Character sync is a separate, still-unRE'd effort.
 static int   g_entSync = -1;   // ini [Coop] EntitySync (read once)
 static int   g_entHost = -1;   // ini [Coop] EntityHost (read once): 1 = authoritative sender
@@ -2099,7 +2099,7 @@ static uint32_t g_entSeq = 0;  // entity-packet sequence
 
 
 // Render-override targets: ghost entity + the transform to render it at. Filled each tick, consumed by
-// the SetGlobalMatrixInternal hook — drives the RENDER (the last write, so no fight with physics).
+// the SetGlobalMatrixInternal hook â€” drives the RENDER (the last write, so no fight with physics).
 struct SyncTarget {
     uint32_t ent;
     float    pos[3];
@@ -2108,7 +2108,7 @@ struct SyncTarget {
 static SyncTarget g_syncTargets[MAX_SYNC_ENTITIES];
 static int        g_syncCount = 0;
 
-// [Coop] ShipSync (default 1): master kill switch for the whole NPC-ship lane — capture AND apply.
+// [Coop] ShipSync (default 1): master kill switch for the whole NPC-ship lane â€” capture AND apply.
 // Read once, so a live run cannot flip it mid-session. When 0 the host sends no ship entries and the
 // peer's ApplyShips empties g_syncCount, which also clears any stale render override.
 static int s_shipSync = -1;
@@ -2132,7 +2132,7 @@ static void* GetNavalManager() {
     } __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
 }
 
-// The HANDLE CONTAINER of the i-th ship from [mgr+0x3E8] (stride 0xD0) — the same container shape the
+// The HANDLE CONTAINER of the i-th ship from [mgr+0x3E8] (stride 0xD0) â€” the same container shape the
 // guard path uses (hc->m_Object at +0x00, hc->GetObjectID() for stable identity, phase1.cpp:3200-3217).
 static void* GetShipHandle(void* mgr, int i) {
     void* list = *(void**)((char*)mgr + 0x3E8);
@@ -2234,7 +2234,7 @@ static Entity* FindLocalShipByObjId(void* mgr, int n, uint64_t objId) {
 // matching ship's RENDER matrix to the host's transform via the SetGlobalMatrixInternal hook. The ship's
 // own physics/AI keeps running (its logic position stays local), but the visual follows the host.
 //
-// Identity: the host's naval-manager index (es.key) means NOTHING on this machine — the two managers
+// Identity: the host's naval-manager index (es.key) means NOTHING on this machine â€” the two managers
 // enumerate different ships in different orders. Matching is therefore (a) es.objId, (b) nearest local
 // ship of the same vtable within SHIP_MATCH_TOL_M, (c) skip + count. The LOCAL ship (the Jackdaw), the
 // ghost and the player entity are never targets: driving the local hull with an NPC ship's transform is
@@ -2314,7 +2314,7 @@ static void ApplyShips(const EntityPacket& pkt) {
 // ships. The peer matches each by NEAREST POSITION (deterministic spawns) and drives the render.
 // ---- P0: stable identity + health cache ---------------------------------------------------------
 // GetEntityAI (0x6F5F70) is `*(e+0xE8) ? *(*(e+0xE8)+0x1C) : 0`. Once +0xE8 is cleared (a dead NPC) the
-// AI — and therefore the health — becomes unreachable, which is why es.dead never propagated. Cache
+// AI â€” and therefore the health â€” becomes unreachable, which is why es.dead never propagated. Cache
 // entity -> health while it is alive and keep using the cached service afterwards.
 static unsigned int FindHealthInAI(unsigned int ai);          // defined later
 
@@ -2860,6 +2860,7 @@ static int      s_compDistinct  = 0;        // ids stored in the table (<= COMP_
 static unsigned s_compOverflow  = 0;        // sightings that did not fit (table was full)
 static unsigned s_compWeaponCand = 0;       // candidates carrying 0x027106A8 WeaponComponent
 static unsigned s_compIconCand   = 0;       // candidates carrying 0x0269E9D0 MapIconBehaviorGuard
+static unsigned s_capWin        = 0;       // captures this 5 s window (SnapshotHz*5)
 // ---- which archetypes actually FIGHT -----------------------------------------------------------
 // The fighter role set is a prior taken from the PS3 subtype enum; only four roles have ever been
 // observed live. This histogram answers the question directly instead of by inference: for every
@@ -3194,6 +3195,7 @@ static void EmitGuardEntity(EntityPacket& pkt, uint32_t& count, int idx, Entity*
 }
 
 static void CaptureGuards(EntityPacket& pkt) {
+    ++s_capWin;
     if (s_adLog < 0) s_adLog = GetPrivateProfileIntA("Coop", "ActionDeathLog", 0, Paths::Ini());
     ObjMapReset();                       // rebuild the objId table for this capture
     World* world = World::GetCurrentWorld();
@@ -3685,7 +3687,7 @@ static void TrackMirrorDeathForRelay(Entity* e, const EntityState& es) {
 }
 
 // True when EntitySelfTest is on. In self-test the capture source and the mirror are the same world, so
-// writing the transform back is redundant — and snapping a stationary guard ~10x/s is exactly what reads
+// writing the transform back is redundant â€” and snapping a stationary guard ~10x/s is exactly what reads
 // as visible jitter. Self-test therefore keeps the AI disable but skips the transform write.
 static bool SelfTestModeActive() {
     static int s = -1;
@@ -4212,7 +4214,7 @@ static void ApplyGuards(const EntityPacket& pkt) {
                 }
             }
             // (4) Death: reproduce the REAL death locally instead of hand-writing AI flags. Once per
-            //     entity. The old `ai+0xB8 |= 4` write is removed — it is only one of the two terms of
+            //     entity. The old `ai+0xB8 |= 4` write is removed â€” it is only one of the two terms of
             //     the engine's is-alive test and left the mirror in a half-dead state.
             if (es.dead && !MirrorKilledLocally(best) && !DeathAppliedRecently((unsigned int)best)) {
                 MarkMirrorKilledLocally(best);
@@ -4575,7 +4577,7 @@ static void ProbeEntityEnum() {
             L("[Enum] playerShipHandle=%p (sentinel 0x04DD5F8C = none)\n", hc);
         }
 
-        // 4) World header lists (offsets from the reconstructed World.h — verify empirically).
+        // 4) World header lists (offsets from the reconstructed World.h â€” verify empirically).
         if (readable(world, 8)) {
             int nc = world->m_CharacterList.GetSize();
             L("[Enum] m_CharacterList size=%d\n", nc);
@@ -4611,7 +4613,7 @@ static void ProbeEntityEnum() {
                 ++shownE;
             }
             // Guard enumeration: characters (Skeleton) flagged by WeaponComponent (0x027106A8) or
-            // MapIconBehaviorGuard (0x0269E9D0) — the soldiers, vs the unarmed crowd. Logs position so the
+            // MapIconBehaviorGuard (0x0269E9D0) â€” the soldiers, vs the unarmed crowd. Logs position so the
             // two machines can be diffed (spawn determinism).
             {
                 Entity* pl = world->GetPlayer();
@@ -4893,10 +4895,10 @@ bool Phase1::RequestWatchDeadBit() {
 
 // ---- Guard -> CSrvNPCHealth mapping probe (F1) ------------------------------------------------
 // sub_1371140(owner) resolves CSrvNPCHealth out of owner->[+0x0C]'s service array at [+0x70]
-// (count at +0x76), keyed by class id 0x57EEEEC7 — which is CRC32("CSrvNPCHealth"), verified offline.
+// (count at +0x76), keyed by class id 0x57EEEEC7 â€” which is CRC32("CSrvNPCHealth"), verified offline.
 // The unknown is *which* object is the owner, so test every candidate derivable from a live guard
 // (Entity, its AI, its Human) and report the one whose service array actually holds a
-// CSrvNPCHealth. Pure memory reads — no engine calls, no writes.
+// CSrvNPCHealth. Pure memory reads â€” no engine calls, no writes.
 static void DumpSvcArray(const char* tag, int idx, void* cand) {
     unsigned int c = (unsigned int)cand;
     if (!c || !readable((void*)c, 0x10)) return;
@@ -4964,7 +4966,7 @@ static void ProbeGuardHealthMap() {
 // ---- Health snapshot / diff probe (F2) ---------------------------------------------------------
 // Every live CSrvNPCHealth object (vtable 0x02712F60) with Life@+0x5C, Max@+0x5E, flags@+0x60.
 // F2 press #1 records a baseline; every later press diffs against it. This answers the co-op wall
-// question objectively: after hitting a guard, does its NPC-health Life actually fall — including
+// question objectively: after hitting a guard, does its NPC-health Life actually fall â€” including
 // when that guard is a driven mirror (BhvGenericNPC disabled, m_DriveEntity=false)? Read-only.
 struct HealthEnt { unsigned int addr; unsigned short life; unsigned short hpMax; unsigned int flags; };
 static HealthEnt g_hPrev[128];
@@ -5054,7 +5056,7 @@ static void ProbeReverseWalk() {
     for (int i = 1; i < hn; ++i) { unsigned int v = want[i]; int j = i - 1; while (j >= 0 && want[j] > v) { want[j+1] = want[j]; --j; } want[j+1] = v; }
 
     g_rwN = 0;
-    L("[Rev] health objects=%d — searching for the service container...\n", hn);
+    L("[Rev] health objects=%d â€” searching for the service container...\n", hn);
     int found = 0;
     __try {
         SYSTEM_INFO si; GetSystemInfo(&si);
@@ -5131,7 +5133,7 @@ static void ProbeReverseWalk() {
 // ---- Kill nearest soldier through its own service table (F1, WRITES) ---------------------------
 // Verified path: a guard's AbstractEntityAI (vt 0x026D3CD8) holds a service array at +0x70
 // (count at +0x76), and one entry is its CSrvNPCHealth (vt 0x02712F60). The engine's own dead
-// encoding — observed live on a guard that died — is Life(+0x5C)=0xFFFF and Flags(+0x60)|=0x01000000.
+// encoding â€” observed live on a guard that died â€” is Life(+0x5C)=0xFFFF and Flags(+0x60)|=0x01000000.
 // This writes exactly that, so the engine treats it as a real death rather than a faked flag.
 static void KillNearestGuard() {
     World* world = World::GetCurrentWorld();
@@ -5431,7 +5433,7 @@ static LONG WINAPI GpTrap(PEXCEPTION_POINTERS ep) {
             L("[GP] health+%03X accessed by eip=%08X\n", addr - g_gpHealth, eip);
         }
         ++g_gpCount;
-        // the Life word itself (+0x5C..+0x5D) — this is the death write; report and auto-disarm
+        // the Life word itself (+0x5C..+0x5D) â€” this is the death write; report and auto-disarm
         if (addr >= g_gpHealth + 0x5C && addr < g_gpHealth + 0x5E) {
             L("[GP] *** LIFE WRITE by eip=%08X (addr health+%03X)\n", eip, addr - g_gpHealth);
             DisarmGuardPage();
@@ -5504,7 +5506,7 @@ static void ArmGuardPage() {
     g_gpArmed = 1;
     g_gpArmTick = GetTickCount();
     float tx = best->m_GlobalMatrix.M41, ty = best->m_GlobalMatrix.M42, tz = best->m_GlobalMatrix.M43;
-    L("[GP] armed on health=%08X (life=%u/%u) page=%08X TARGET ent=%08X pos=(%.1f,%.1f,%.1f) — kill THAT guard\n",
+    L("[GP] armed on health=%08X (life=%u/%u) page=%08X TARGET ent=%08X pos=(%.1f,%.1f,%.1f) â€” kill THAT guard\n",
       hp, *(unsigned short*)(hp + 0x5C), *(unsigned short*)(hp + 0x5E), g_gpPage, best, tx, ty, tz);
 }
 
@@ -5914,7 +5916,7 @@ static void SendHealthEvent(uint64_t objId, unsigned short life, float x, float 
         L("[KT] death push objId=%llu seq=%u\n", (unsigned long long)objId, (unsigned)out.seq);
     Net::SendEntities(out);
 
-    // Self-test: there is no peer, so deliver the packet to the local apply path — exactly what the guest
+    // Self-test: there is no peer, so deliver the packet to the local apply path â€” exactly what the guest
     // would do. This is what makes the host->guest lane testable on one machine.
     if (SelfTestModeActive() && !s_inEventLoop) {
         s_inEventLoop = true;
@@ -5998,14 +6000,14 @@ static void KillGuardEntityInner(Entity* e, bool notifyPeer) {
     if (hp) {
         // Engine-native death: CSrvNPCHealth::SetLife(hp, -1) (sub_19FB4C0, vtable slot 16). A negative
         // value IS the engine's own death write (Life lands on 0xFFFF) AND it posts the health event
-        // that drives the death state machine — which is what should trigger the ragdoll/animation.
+        // that drives the death state machine â€” which is what should trigger the ragdoll/animation.
         int prev = *(unsigned short*)(hp + 0x5C);
         int rc = ((int (__thiscall*)(void*, int))0x19FB4C0)((void*)hp, -1);
         L("[KF] SetLife(-1) rc=%d  life %d -> %u\n", rc, prev, *(unsigned short*)(hp + 0x5C));
         *(unsigned int*)(hp + 0x60) |= 0x01000000u;   // the engine sets this on death too
     }
     // Combat dead: the engine's is-alive (sub_133F550) checks bit 0x1000 at +4 of the service returned by
-    // sub_10EF8C0(entity) (class 0x5EB03CEC, found in ai+0x5C). SetLife alone does NOT set it — verified
+    // sub_10EF8C0(entity) (class 0x5EB03CEC, found in ai+0x5C). SetLife alone does NOT set it â€” verified
     // live (alive stayed 1). This is the flag that actually makes the guard dead to combat.
     {
         unsigned int svc = ((unsigned int (__cdecl*)(int))0x10EF8C0)((int)e);
@@ -6015,7 +6017,7 @@ static void KillGuardEntityInner(Entity* e, bool notifyPeer) {
             L("[KF] is-alive service=%08X +4 %08X -> %08X\n", svc, before, *(unsigned int*)(svc + 4));
         } else L("[KF] is-alive service not found\n");
     }
-    // AI-side stop (sub_753330 reads ai+0x8C). NOT the combat flag — kept only so the behaviour stops
+    // AI-side stop (sub_753330 reads ai+0x8C). NOT the combat flag â€” kept only so the behaviour stops
     // running and cannot re-pose the corpse. Clearly labelled to avoid the old confusion.
     *(unsigned char*)(ai + 0x8C) = 1;
     L("[KF] after : alive=%d health life=%u flags=%08X\n", (int)EngineIsAlive((unsigned int)e),
@@ -6348,7 +6350,7 @@ static void RelaySelfTest() {
         unsigned int hp = FindHealthInAI((unsigned int)AIEntityHelper::GetEntityAI(e));
         s_relayTestEnt = (unsigned int)e;
         s_relayTestState = 1;
-        L("[RelayTest] armed on ent=%08X life=%u — press F2 again to kill + report\n",
+        L("[RelayTest] armed on ent=%08X life=%u â€” press F2 again to kill + report\n",
           e, hp ? *(unsigned short*)(hp + 0x5C) : 0);
         return;
     }
@@ -6357,7 +6359,7 @@ static void RelaySelfTest() {
     s_relayTestState = 0;
     if (!e || !readable(e, 4)) { L("[RelayTest] target gone\n"); return; }
     EntityState es; memset(&es, 0, sizeof(es));
-    es.kind = 2; es.dead = 0;                     // host is NOT aware — the real scenario
+    es.kind = 2; es.dead = 0;                     // host is NOT aware â€” the real scenario
     es.pos[0] = e->m_GlobalMatrix.M41; es.pos[1] = e->m_GlobalMatrix.M42; es.pos[2] = e->m_GlobalMatrix.M43;
     KillGuardEntity(e);
     L("[RelayTest] guard killed; now exercising guest death detection (expect a [Relay] line)\n");
@@ -6387,7 +6389,7 @@ static void SimulatePeerKill() {
 // Functional death is solved (AI+0x8C=1 + health encoding), but the corpse animation comes from the
 // death state machine. To reproduce it we need the death clip's action alias. This samples the nearest
 // soldier's current action alias and, when its dead flag flips 0->1, dumps the alias window around the
-// transition — so a natural kill tells us the real die clip. Read-only.
+// transition â€” so a natural kill tells us the real die clip. Read-only.
 struct DieWatch {
     unsigned int ent; int dead; unsigned int lastAlias;
     unsigned int ai; unsigned int health;
@@ -6487,7 +6489,7 @@ static void TickDieClipWatch() {
     if ((++s_dwBeat % 240) == 0) L("[DieClip] tracking %d soldier(s)\n", s_dwN);
 }
 
-// Every-frame poll of the tracked guards: reads AI+0x98 (the engine's other death indicator — the
+// Every-frame poll of the tracked guards: reads AI+0x98 (the engine's other death indicator â€” the
 // dereferenced byte, i.e. the death record's flag), AI+0x8C, and the health Life. Any change is logged
 // so a death transition can't fall between the 6 Hz discovery samples.
 static void PollTrackedGuards() {
@@ -6627,7 +6629,7 @@ static void ShipEntityDiff() {
         }
         if (readable((void*)s_ss.ent, 0x400)) memcpy(s_ss.entBuf, (void*)s_ss.ent, 0x400);
         for (int i = 0; i < s_ss.ncomps; ++i) memcpy(s_ss.compBuf[i], (void*)s_ss.comps[i], 0x200);
-        L("[ShipDiff] BASELINE ship=%08X comps=%d — damage the ship, then press F3 again\n",
+        L("[ShipDiff] BASELINE ship=%08X comps=%d â€” damage the ship, then press F3 again\n",
           s_ss.ent, s_ss.ncomps);
         // Also try the guard-style route: does the ship's AI carry a health service in ai->[+0x70]?
         {
@@ -6879,7 +6881,7 @@ static void norm3(float* v) {
 }
 static float lerpf(float a, float b, float t) { return a + (b - a) * t; }
 
-// Blend two states. Start from the newer (copies seq/worldId/contextId/flags/bytes/valid — these are
+// Blend two states. Start from the newer (copies seq/worldId/contextId/flags/bytes/valid â€” these are
 // discrete and must NOT be interpolated), then lerp the continuous fields: position, orientation
 // (per-row matrix nlerp in the game's native basis), speeds and heading.
 static void lerpState(const PlayerState& a, const PlayerState& b, float t, PlayerState& o) {
@@ -6891,7 +6893,7 @@ static void lerpState(const PlayerState& a, const PlayerState& b, float t, Playe
     float py = lerpf(a.matrix.M42, b.matrix.M42, t);
     float pz = lerpf(a.matrix.M43, b.matrix.M43, t);
 
-    // Orientation: interpolate the rotation basis (rows 0-2) DIRECTLY in the game's native matrix space —
+    // Orientation: interpolate the rotation basis (rows 0-2) DIRECTLY in the game's native matrix space â€”
     // per-component lerp each row then renormalize (nlerp). Do NOT round-trip through the engine quat<->
     // matrix ops (FromMatrix/ToMatrix): they use a different basis convention and left the puppet rotated
     // 90 deg (lying on the floor, then culled). Across one interp interval the rotation delta is tiny, so
@@ -6926,7 +6928,7 @@ static void lerpState(const PlayerState& a, const PlayerState& b, float t, Playe
     if (a.actionAlias == b.actionAlias && a.actionChannel == b.actionChannel && a.blendCount == b.blendCount) {
         for (int i = 0; i < b.blendCount; ++i) o.blendFactors[i] = lerpf(a.blendFactors[i], b.blendFactors[i], t);
         o.timeScale = lerpf(a.timeScale, b.timeScale, t);   // clip speed is continuous too
-        // Phase: lerp unless the clip looped between snapshots (b < a), then keep b's (o = b) — never
+        // Phase: lerp unless the clip looped between snapshots (b < a), then keep b's (o = b) â€” never
         // interpolate backwards across the wrap.
         if (b.actionRatio >= a.actionRatio) o.actionRatio = lerpf(a.actionRatio, b.actionRatio, t);
     }
@@ -6937,7 +6939,7 @@ static void lerpState(const PlayerState& a, const PlayerState& b, float t, Playe
 // jumps backwards by more than 1000 is treated as a peer restart and wipes the history.
 static void PushSnapshot(const PlayerState& s, uint64_t nowUs) {
     if (g_haveSnapSeq) {
-        if (s.seq == g_lastSnapSeq) return;            // duplicate of the newest — GetRemote holds it
+        if (s.seq == g_lastSnapSeq) return;            // duplicate of the newest â€” GetRemote holds it
         if (s.seq <  g_lastSnapSeq) {
             if ((g_lastSnapSeq - s.seq) > 1000) {      // peer restart -> the old history is useless
                 g_snapCount = 0; g_snapHead = 0;
@@ -7026,7 +7028,7 @@ void Phase1::TrySceneProbe() {
         uint32_t cellSize   = 0;
         int      lastLoadCell = -1;
         // GridPartition::m_CellsLoadStatusDataBlock is NOT reachable from World in these headers (it sits
-        // behind World::m_Grid, a Reference we cannot resolve here) — left as -1 rather than guessing.
+        // behind World::m_Grid, a Reference we cannot resolve here) â€” left as -1 rather than guessing.
         int      cellsBlock   = -1;
         int      worldAreas   = -1;
         if (readable(world, 8)) {
@@ -7120,7 +7122,7 @@ void Phase1::TryShipDriveProbe() {
         }
 
         // F5 = HOLD: capture the ship's world position, then OVERRIDE every world-transform write
-        // (in the SetGlobalMatrixInternal hook) with that position — proof we can drive the ship.
+        // (in the SetGlobalMatrixInternal hook) with that position â€” proof we can drive the ship.
         if (g_holdShip) {
             g_holdShip = 0;
             g_holdShipEnt = nullptr;
@@ -7196,7 +7198,7 @@ void Phase1::TryShipProbe() {
         }
 
         // Ship gameplay sub-object: FUN_00fb3220(ship, 0). Try __thiscall first (flag on stack),
-        // then __fastcall (flag in DL) — convention was ambiguous; log whichever succeeds.
+        // then __fastcall (flag in DL) â€” convention was ambiguous; log whichever succeeds.
         {
             typedef int (__thiscall *ShipSubFn_t)(void* ship, char flag);
             typedef int (__fastcall *ShipSubFn_f)(void* ship, char flag);
@@ -7789,12 +7791,12 @@ static void OnFrameInner(Human* updatedHuman) {
     // it gets no socket). They never reach a player frame, so binding here means only the live
     // game ever opens the socket, and there is no corpse socket to steal its datagrams.
     static bool s_netStarted = false;
-    static int  s_netStrictPeer = 1;   // ini [Coop] NetStrictPeer (Feature #3) — read once
-    static int  s_sceneAware    = 1;   // ini [Coop] SceneAware    (Feature #1) — read once
-    static int  s_shipPassenger = 0;   // ini [Coop] ShipPassenger — read once (default OFF)
-    static int  s_shipGhost     = 0;   // ini [Coop] ShipGhost — ghost-ship clone (default OFF; fragile on world travel)
-    static int  s_ghostSelfTest = 0;   // ini [Coop] ShipGhostSelfTest — drive the ghost to the LOCAL ship (solo verify)
-    static int  s_transformProbe = 0;  // ini [Coop] TransformProbe — read-only transform-source probe (default OFF)
+    static int  s_netStrictPeer = 1;   // ini [Coop] NetStrictPeer (Feature #3) â€” read once
+    static int  s_sceneAware    = 1;   // ini [Coop] SceneAware    (Feature #1) â€” read once
+    static int  s_shipPassenger = 0;   // ini [Coop] ShipPassenger â€” read once (default OFF)
+    static int  s_shipGhost     = 0;   // ini [Coop] ShipGhost â€” ghost-ship clone (default OFF; fragile on world travel)
+    static int  s_ghostSelfTest = 0;   // ini [Coop] ShipGhostSelfTest â€” drive the ghost to the LOCAL ship (solo verify)
+    static int  s_transformProbe = 0;  // ini [Coop] TransformProbe â€” read-only transform-source probe (default OFF)
     if (!s_netStarted) {
         s_netStarted    = true;
         s_netStrictPeer = GetPrivateProfileIntA("Coop", "NetStrictPeer", 1, Paths::Ini());
@@ -7893,8 +7895,10 @@ static void OnFrameInner(Human* updatedHuman) {
             // soldier+civilian+other == n. With a populated street one run proves entity+0x9C
             // classifies the population: soldier>0 while civilian>0, and the snapshot's candidates
             // should equal soldier (radius permitting).
-            L("[Sync] kindrole n=%u soldier=%u civilian=%u other=%u\n",
-              s_krN, s_krSoldier, s_krCivilian, s_krOther);
+            L("[Sync] kindrole n=%u soldier=%u civilian=%u other=%u  (%u captures -> per capture n=%.1f soldier=%.1f)\n",
+              s_krN, s_krSoldier, s_krCivilian, s_krOther, s_capWin,
+              s_capWin ? (double)s_krN / s_capWin : 0.0,
+              s_capWin ? (double)s_krSoldier / s_capWin : 0.0);
             // Who is actually fighting: role histogram over combat-stage bodies. Any role here that
             // IsFighterRole() rejects is a fighter the set is missing - the point of the line.
             {
@@ -7963,7 +7967,7 @@ static void OnFrameInner(Human* updatedHuman) {
             CompHistReset();
             AiHistReset();
             s_scopeCand = 0; s_scopeEnemies = 0; s_scopeInRadius = 0; s_scopeSent = 0;
-            s_krN = 0; s_krSoldier = 0; s_krCivilian = 0; s_krOther = 0;
+            s_krN = 0; s_krSoldier = 0; s_krCivilian = 0; s_krOther = 0; s_capWin = 0;
             s_krWinLines = 0;   // T17: the per-window [KR] budget refills with the other counters
             s_krRejN = 0; s_krRejTotal = 0; s_krRejOverflow = 0;   // T21: rejection histogram
             // TASK 3 oracle counters, same window.
@@ -8073,7 +8077,7 @@ static void OnFrameInner(Human* updatedHuman) {
             static bool s_protoWarned = false;
             if (!s_protoWarned) {
                 s_protoWarned = true;
-                L("[Net] PEER PROTO MISMATCH (peer=%u local=%u) — refusing to spawn/drive. Update BOTH machines to the same build.\n",
+                L("[Net] PEER PROTO MISMATCH (peer=%u local=%u) â€” refusing to spawn/drive. Update BOTH machines to the same build.\n",
                   (unsigned)raw.protoVer, (unsigned)NET_PROTO_VER);
             }
         }
@@ -8097,7 +8101,7 @@ static void OnFrameInner(Human* updatedHuman) {
             }
         }
         // Peer is "present" only with a recent fresh same-world packet AND (Feature #3) a live receive
-        // timer — covers world change, disconnect, silence and unexpected-source drops, where GetRemote
+        // timer â€” covers world change, disconnect, silence and unexpected-source drops, where GetRemote
         // keeps returning a stale last packet forever. With NetStrictPeer=0 the timer arm is inert, so
         // the condition reduces exactly to today's.
         bool timerOk = (s_netStrictPeer == 0) || (Net::MillisSinceRecv() < 2000);
@@ -8125,7 +8129,7 @@ static void OnFrameInner(Human* updatedHuman) {
                 s_entHealthN = 0;
                 s_hostLifeN = 0;
                 s_pushedDeathN = 0;
-                // A1: the alias ring is per-world too — objIds are recycled, so a stale objId -> alias
+                // A1: the alias ring is per-world too â€” objIds are recycled, so a stale objId -> alias
                 // entry would attach the previous world's clip to a death in the new one.
                 s_adRingN = 0; s_adRingNext = 0; s_adLines = 0;
                 // [KH] same scope: the kill-unresolved line budget is per world, not per capture.
@@ -8147,7 +8151,7 @@ static void OnFrameInner(Human* updatedHuman) {
         // is unchanged. A world change FREES it (memory unmapped, or reused with a different vtbl) so we
         // drop the dangling ref; a pause/menu leaves it INTACT so we preserve it. This distinguishes
         // "gone" from "paused" without relying on whiteroom/world-id detection (the pause menu defeats
-        // that — its active world reads as a different real world, which previously mis-dropped on pause).
+        // that â€” its active world reads as a different real world, which previously mis-dropped on pause).
         bool puppetAlive = false;
         if (g_puppet) {
             __try { puppetAlive = readable(g_puppet, 8) && (*(void**)g_puppet == g_puppetVtbl); }
@@ -8345,7 +8349,7 @@ static void __cdecl LogSetGlobalMatrix(uint32_t thisEnt) {
     if (!thisEnt || !readable((void*)thisEnt, 4)) return;
 
     // Immediate probe: log the FIRST time a character (vt 0x01E4CE90) reaches SetGlobalMatrixInternal.
-    // This is the GO/NO-GO for the guard render override — if this never logs, characters use the
+    // This is the GO/NO-GO for the guard render override â€” if this never logs, characters use the
     // skeleton path and the guard drive needs the direct-call approach instead.
     { static bool s_charSeen = false;
       if (!s_charSeen && *(uint32_t*)thisEnt == 0x01E4CE90u) {
@@ -8355,7 +8359,7 @@ static void __cdecl LogSetGlobalMatrix(uint32_t thisEnt) {
     }
 
     // One-time probe: record the DISTINCT vtables that reach SetGlobalMatrixInternal. This verifies
-    // whether CHARACTERS (vt 0x01E4CE90) actually use this render path — if they don't appear here,
+    // whether CHARACTERS (vt 0x01E4CE90) actually use this render path â€” if they don't appear here,
     // the render override can't drive them (they'd use the skeleton path instead).
     { static uint32_t s_vt[40]; static int s_n = 0; static bool s_done = false;
       if (!s_done && s_n < 40) {
@@ -8488,7 +8492,7 @@ static void InstallGetUnusedPadHook() {
 }
 
 // Keep the game running when it loses focus (so a backgrounded 2nd instance doesn't pause).
-// sub_4054D0(active): active==0 is the focus-loss/deactivate path — swallow it.
+// sub_4054D0(active): active==0 is the focus-loss/deactivate path â€” swallow it.
 typedef int (__cdecl *Deactivate_t)(char);
 static Deactivate_t g_origDeactivate = nullptr;
 static int __cdecl MyDeactivate(char active) {
@@ -8524,10 +8528,10 @@ static bool playerInWorld() {
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
-// (1) Universal spawn gate: decline SpawningRequest::Spawn (RVA 0x39B8D0) — the entry EVERY spawning
-// strategy funnels through (crowd, blob NPCs, guards, sphere, naval) — but ONLY while the player is
+// (1) Universal spawn gate: decline SpawningRequest::Spawn (RVA 0x39B8D0) â€” the entry EVERY spawning
+// strategy funnels through (crowd, blob NPCs, guards, sphere, naval) â€” but ONLY while the player is
 // present (see playerInWorld). __thiscall(this), no stack args, returns char in al. Intercepted as
-// __fastcall(this, edx) — the dummy edx absorbs the register thiscall leaves unused; `return 0` maps
+// __fastcall(this, edx) â€” the dummy edx absorbs the register thiscall leaves unused; `return 0` maps
 // to al=0, the function's own "declined" path, which callers handle. Blocking unconditionally hung
 // boot because the player/essential entities spawn through here too, hence the playerInWorld gate.
 const uintptr_t RVA_SpawnRequestSpawn = 0x39B8D0;
@@ -8541,14 +8545,14 @@ static char __fastcall MySpawnRequest(void* thisPtr, void* edx) {
 
 static void InstallSpawnRequestHook() {
     uintptr_t fn = base() + RVA_SpawnRequestSpawn;
-    // Steal 5 bytes: push esi; mov esi,ecx; mov eax,[esi] (56 8B F1 8B 06) — clean, no relative refs.
+    // Steal 5 bytes: push esi; mov esi,ecx; mov eax,[esi] (56 8B F1 8B 06) â€” clean, no relative refs.
     g_origSpawnReq = (SpawnReq_t)buildTrampoline(fn, 5);
     patchJmp(fn, (void*)&MySpawnRequest, 5);
     OutputDebugStringA("[Phase1] spawn suppression hook installed (SpawningRequest::Spawn)\n");
 }
 
 // (2) Extra: no-op CrowdHerder::UpdateSpawningNeeds (RVA 0x1578B50), the type-4 crowd spawn issuer.
-// __thiscall(this, fractionArray, needDelta) — 2 stack args, callee-cleaned (ret 8). Intercepted as
+// __thiscall(this, fractionArray, needDelta) â€” 2 stack args, callee-cleaned (ret 8). Intercepted as
 // __fastcall so ecx=this maps; the dummy edx absorbs the unused reg, so the two stack args land as
 // a2/a3, and an early return compiles to `ret 8`. Stops the herd crowd before it builds requests.
 const uintptr_t RVA_CrowdSpawnNeeds = 0x1578B50;
@@ -8562,7 +8566,7 @@ static void __fastcall MyCrowdSpawnNeeds(void* thisPtr, void* edx, int fractionA
 
 static void InstallCrowdSpawnHook() {
     uintptr_t fn = base() + RVA_CrowdSpawnNeeds;
-    // Steal 6 bytes: push ebp; mov ebp,esp; sub esp,4Ch (55 8B EC 83 EC 4C) — clean, no relative refs.
+    // Steal 6 bytes: push ebp; mov ebp,esp; sub esp,4Ch (55 8B EC 83 EC 4C) â€” clean, no relative refs.
     g_origCrowdSpawnNeeds = (CrowdSpawnNeeds_t)buildTrampoline(fn, 6);
     patchJmp(fn, (void*)&MyCrowdSpawnNeeds, 6);
     OutputDebugStringA("[Phase1] crowd-spawn suppression hook installed (UpdateSpawningNeeds)\n");
@@ -8576,7 +8580,7 @@ void Phase1::RequestCrowdProbe() { g_crowdReq = 1; }
 // can be walked/verified in Cheat Engine. Each deref is readable()-guarded and the whole thing is
 // SEH-wrapped, so it prints as far as the chain is valid and never faults the game. Swim fields only read
 // sane once the player is actually IN the water (contextId 10); on the ground the swim context/FSM/scope
-// may be null/unallocated — that's expected.
+// may be null/unallocated â€” that's expected.
 void Phase1::DumpPlayerInfo() {
     __try {
         World*  world  = World::GetCurrentWorld();
@@ -8650,7 +8654,7 @@ void Phase1::InstallFrameHook() {
     g_idResolver = GetPrivateProfileIntA("Coop", "IdResolver", 1, Paths::Ini()) != 0;
     L("[IdRes] entity identity: %s\n", g_idResolver ? "registry first, scan fallback" : "scan only");
     // --------------------------------------------------------------------------------------------
-    // [Coop] LegacyPadIdHook (default 1) — gates the GetUnusedPadID detour ONLY.
+    // [Coop] LegacyPadIdHook (default 1) â€” gates the GetUnusedPadID detour ONLY.
     //
     // STATUS: this hook is LIVE and REQUIRED by the puppet spawn path. BhvAssassin::AddToWorldInternal
     // calls GetUnusedPadID while g_blockReg is set by TrySpawnPuppet (phase1.cpp:537), and the detour
@@ -8658,7 +8662,7 @@ void Phase1::InstallFrameHook() {
     // g_blockReg is cleared on despawn (phase1.cpp:1513, 5519) and on liveness drop. The callback is a
     // pure pass-through whenever g_blockReg is null, i.e. for the real player and outside a spawn.
     //
-    // There is no "SpawnBody" config key in the source at all — that name never existed as an ini key.
+    // There is no "SpawnBody" config key in the source at all â€” that name never existed as an ini key.
     // Do not describe this hook as dead or as gated: it is on the live spawn path.
     //
     // LegacyPadIdHook=0 is a DIAGNOSTIC A/B switch only (crash triage): it removes the detour
@@ -8700,3 +8704,7 @@ void Phase1::InstallFrameHook() {
         OutputDebugStringA("[Phase1] SGM hook installed (ship transform-write tracer)\n");
     }
 }
+
+
+
+
