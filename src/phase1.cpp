@@ -3194,6 +3194,59 @@ static void EmitGuardEntity(EntityPacket& pkt, uint32_t& count, int idx, Entity*
     if (deathId) PushHostDeath(deathId, (unsigned int)e, deathPos);
 }
 
+// ---- [Gamer] structure probe (diagnostic, read-only, one shot) --------------------------------
+// The engine models a player as a Gamer whose avatar is an entity (PS3 disassembly in
+// docs/ops/GAMER-AVATAR-API.md: Gamer = { u64 id @ +0x00, avatar array @ +0x10, count u16 @ +0x14 };
+// GamerCollection = { array @ +0x04, count u16 @ +0x08 }). Instead of hunting PC addresses first,
+// ask the live process directly: is there a slot inside the World whose value looks like a
+// GamerCollection, and does one of its gamers list the LOCAL PLAYER ENTITY as an avatar?
+// Every dereference is readable()-guarded and the walk is bounded; worst case is "no hits".
+static void ProbeGamerStructure() {
+    static bool s_done = false;
+    if (s_done) return;
+    s_done = true;
+    World* w = World::GetCurrentWorld();
+    if (!w) { L("[Gamer] probe: no world\n"); return; }
+    Entity* player = w->GetPlayer();
+    if (!player) { L("[Gamer] probe: no player\n"); return; }
+    L("[Gamer] probe: world=%p player=%p -- scanning world slots\n", w, player);
+
+    int hits = 0, candN = 0;   // NB: `near` is a legacy MSVC keyword, not a valid identifier
+    const unsigned char* base = (const unsigned char*)w;
+    for (int off = 0; off < 0x2000 && hits < 4; off += 4) {
+        if (!readable(base + off, 4)) break;
+        void* p = *(void**)(base + off);
+        if (!p || !readable(p, 0x20)) continue;
+        unsigned short n = *(unsigned short*)((char*)p + 8);
+        if (n < 1 || n > 8) continue;
+        void* arr = *(void**)((char*)p + 4);
+        if (!arr || !readable(arr, n * 4)) continue;
+        for (int i = 0; i < n; ++i) {
+            void* g = *(void**)((char*)arr + i * 4);
+            if (!g || !readable(g, 0x20)) continue;
+            unsigned long long id = *(unsigned long long*)g;
+            unsigned short avN = *(unsigned short*)((char*)g + 0x14);
+            void* avArr = *(void**)((char*)g + 0x10);
+            if (avN > 8 || (avN && (!avArr || !readable(avArr, avN * 4)))) continue;
+            ++candN;
+            bool match = false;
+            for (int j = 0; j < avN; ++j) {
+                void* av = *(void**)((char*)avArr + j * 4);
+                if (av == player) match = true;
+            }
+            if (match) {
+                ++hits;
+                L("[Gamer] HIT world+0x%X coll=%p gamers=%u gamer[%d]=%p id=%016llX avatars=%u PLAYER_MATCH\n",
+                  off, p, (unsigned)n, i, g, id, (unsigned)avN);
+            } else if (candN <= 6) {
+                L("[Gamer] near world+0x%X coll=%p gamers=%u gamer[%d]=%p id=%016llX avatars=%u\n",
+                  off, p, (unsigned)n, i, g, id, (unsigned)avN);
+            }
+        }
+    }
+    L("[Gamer] probe done: candidates=%d hits=%d\n", candN, hits);
+}
+
 static void CaptureGuards(EntityPacket& pkt) {
     ++s_capWin;
     if (s_adLog < 0) s_adLog = GetPrivateProfileIntA("Coop", "ActionDeathLog", 0, Paths::Ini());
@@ -8044,6 +8097,8 @@ static void OnFrameInner(Human* updatedHuman) {
         }
     }
     if (Net::Enabled()) {
+        { static int gp = -1; if (gp < 0) gp = GetPrivateProfileIntA("Coop", "GamerProbe", 0, Paths::Ini());
+          if (gp) { static int gc = 0; if (++gc == 300) ProbeGamerStructure(); } }
         EntitySyncTick();   // host broadcasts entity transforms; peer mirrors them (synced worlds)
         // Capture only succeeds in a real playable world (not title/whiteroom). Require it to be
         // stable for a bit before spawning, so we never spawn during loads/menus.
