@@ -2279,6 +2279,10 @@ static void CaptureShips(EntityPacket& pkt) {
             for (int si = 0; si < (int)n && si < 64; ++si) {
                 Entity* se = GetShipEntity(mgr, si);
                 if (!se || *(uint32_t*)se != 0x01E4A128u) continue;
+                // The naval list includes the player's own ship (the Jackdaw). Sinking yourself with a
+                // test key is not a test, so the local ship is always skipped - distance alone cannot
+                // exclude it, since the local ship is at distance 0.
+                if (se == localShip) continue;
                 const float dx = se->m_GlobalMatrix.M41 - px, dz = se->m_GlobalMatrix.M43 - pz;
                 if (radiusM > 0 && (dx * dx + dz * dz) > (float)(radiusM * radiusM)) continue;
                 void* ho = ShipGcLObj(se);
