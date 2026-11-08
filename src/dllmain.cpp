@@ -365,6 +365,19 @@ static unsigned __stdcall PollThread(void*)
         if (f11 && !f11prev) { logline("[AC4Coop] F11 -> remove ghost ship\n"); Phase1::RequestGhostDespawn(); }
         f11prev = f11;
 
+        // ScrollLock / Pause (edge-triggered): live ship-damage harness. ScrollLock damages every ship
+        // within Coop:ShipTestRadiusM by Coop:ShipTestFracPct of its own max; Pause drives the hull to
+        // -1 so the engine's own zero-health event sinks it. Both go through the real setter (slot
+        // 0x12C), so the HUD fraction and the death event behave exactly as in combat.
+        static bool scrollPrev = false;
+        bool scroll = (GetAsyncKeyState(VK_SCROLL) & 0x8000) != 0;
+        if (scroll && !scrollPrev) { logline("[AC4Coop] ScrollLock -> damage nearby ships\n"); Phase1::RequestShipTest(1); }
+        scrollPrev = scroll;
+        static bool pausePrev = false;
+        bool pauseKey = (GetAsyncKeyState(VK_PAUSE) & 0x8000) != 0;
+        if (pauseKey && !pausePrev) { logline("[AC4Coop] Pause -> sink nearby ships\n"); Phase1::RequestShipTest(2); }
+        pausePrev = pauseKey;
+
         // F12 (edge-triggered): construct-ship experiment -- build a SHIP entity at the ctor VA and add it
         // to the world so the USER can see whether the engine streams its model (hull/masts) on its own.
         static bool f12prev = false;

@@ -104,8 +104,9 @@ struct PlayerState {
     bool     shipValid;    // player is aboard a ship -> the fields below are meaningful
     float    shipPos[3];   // ship world position (x,y,z) = m_GlobalMatrix.M41/42/43
     float    shipQuat[4];  // ship rotation quaternion (x,y,z,w), from the 3x3 at +0x10
-    int32_t  shipHP;       // ship hull HP. SOURCE UNRESOLVED: [[ship+0x5C]+0x84] is disproved (it regenerates,
-                           // not health); a ShipHealthData class exists. Do not treat this field as verified.
+    float    shipHP;       // ship hull HP = *(float*)(GcLShip + 0xD0) (max at GcLShip + 0xB4), read
+                           // through the object's vtable slot 0x1B4 and applied through slot 0x12C.
+                           // Verified - see ops/evidence/hull-hp-found.md.
 
     uint8_t  valid;                 // 1 = a live player was captured
 };
@@ -114,7 +115,7 @@ struct PlayerState {
 static const uint32_t NET_MAGIC = 0x43344341; // 'AC4C'
 // Wire/struct-layout version. PlayerState is #pragma pack(1): adding a field shifts every following
 // offset, so both peers MUST run the same build. Bump this whenever the layout changes.
-static const uint32_t NET_PROTO_VER = 9;   // 9: compact per-field entity wire (EntityField mask)
+static const uint32_t NET_PROTO_VER = 10;  // 10: float shipHP (GcLShip+0xD0); 9: compact per-field entity wire
 
 // ---- entity sync (host-authoritative "synced worlds") -------------------------------
 // One replicated entity's transform. `key` is the index in the host's enumeration; `kind`

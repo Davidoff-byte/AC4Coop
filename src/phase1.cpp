@@ -970,6 +970,67 @@ static uint32_t worldLastLoadCellId(World* world) {
 static void*   g_ghostShip = nullptr;        // the spawned ghost ship entity
 static float   g_ghostSyncPos[3] = {0,0,0};  // peer's ship world position (x,y,z)
 static float   g_ghostSyncQuat[4] = {0,0,0,1}; // peer's ship rotation quaternion (x,y,z,w)
+static float   g_ghostSyncHP = 0.0f;        // [ShipHPSync] peer's ship hull HP (GcLShip+0xD0)
+static float   g_ghostAppliedHP = -1.0f;    // hull HP last written to the ghost (-1 = not applied yet)
+// ---- [Coop] ShipHPSync (default OFF) ---------------------------------------------------------
+// Hull HP lives at GcLShip+0xD0 (max at GcLShip+0xB4). A ship entity reaches its GcLShip through the
+// engine call at 0x01038330 (decomp unit "01038330"); null when the ship has no such object.
+// READ through the object's vtable slot 0x1B4 (float getter). Do NOT call slot 0x1B8: it takes an extra
+// argument and the wrong arity unbalances the stack.
+// WRITE through slot 0x12C, the __stdcall thunk to sub_1225A10 (a damage-aware setter: clamps, fires the
+// zero event, republishes the HUD fraction). __stdcall is the thunk's own convention (this on the stack),
+// which is also how the engine's virtual call site passes it.
+// Evidence: ops/evidence/hull-hp-found.md.
+// Read once, cached (same idiom as PuppetPhysicsMode below).
+static int s_shipHPSync = -1;
+static inline int ShipHPSyncEnabled() {
+    if (s_shipHPSync < 0)
+        s_shipHPSync = GetPrivateProfileIntA("Coop", "ShipHPSync", 0, Paths::Ini()) != 0 ? 1 : 0;
+    return s_shipHPSync;
+}
+// GcLShip* for a ship entity, or null. Every step is guarded: the entity, the engine call's result and the
+// HP/dword we are about to read are all validated with readable().
+static void* ShipGcLObj(void* shipEnt) {
+    if (!shipEnt || !readable(shipEnt, 4)) return nullptr;
+    void* hobj = ((void* (__cdecl*)(void*, char))0x01038330)(shipEnt, 0);
+    return (hobj && readable(hobj, 0xD4)) ? hobj : nullptr;   // +0xD0 HP and the vtable pointer
+}
+// Current hull HP through slot 0x1B4. False (and *out untouched) when unreachable or not a sane value.
+static bool ReadShipHullHP(void* shipEnt, float* out) {
+    void* hobj = ShipGcLObj(shipEnt);
+    if (!hobj || !out) return false;
+    __try {
+        void** vt = *(void***)hobj;
+        if (!readable((void*)vt, 0x1B8)) return false;
+        float v = ((float (__thiscall*)(void*))vt[0x1B4 / 4])(hobj);
+        if (!(v >= 0.0f) || !(v <= 1.0e7f)) return false;   // NaN / absurd -> treat as unknown
+        *out = v;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+// Write a hull HP onto a ship through slot 0x12C. False when unreachable or rejected as insane.
+// The slot holds thunk 0x12279B0, whose body is `movss xmm0,[ebp+8]; push ecx; movss [esp],xmm0;
+// call sub_1225A10; retn 4` - i.e. `this` arrives in ECX and the float on the stack, so the call is
+// __thiscall. Calling it as __stdcall would put `this` on the stack and leave ECX garbage.
+static bool WriteShipHullHP(void* shipEnt, float hp) {
+    void* hobj = ShipGcLObj(shipEnt);
+    if (!hobj) return false;
+    // negative is legal: the engine's own damage path leaves hulls below zero (observed -40) before
+    // the zero-health event fires, and the sink test relies on being able to drive it there.
+    if (!(hp >= -1.0e6f) || !(hp <= 1.0e7f)) return false;
+    __try {
+        void** vt = *(void***)hobj;
+        if (!readable((void*)vt, 0x130)) return false;
+        ((void (__thiscall*)(void*, float))vt[0x12C / 4])(hobj, hp);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+// T39: live ship-test harness. The 20 Hz poll thread in dllmain.cpp sets the request (ScrollLock =
+// damage, Pause = sink); CaptureShips consumes it, because this is where the naval manager and the
+// local ship are resolved. Mode 1 damages every ship within ShipTestRadiusM by ShipTestFracPct of
+// its OWN max; mode 2 drives the hull to -1 so the engine fires its zero-health event and sinks.
+static volatile long g_shipTestReq = 0;
+void Phase1::RequestShipTest(int mode) { if (mode) g_shipTestReq = mode; }
 static volatile long g_ghostHasSync = 0;     // 1 = we have a peer ship position to drive to
 static bool    g_ghostAuto = false;          // 1 = spawned by the net path (despawn on disembark); 0 = manual F12
 static float   g_localShipZ = 0.0f;          // the LOCAL ship's current Z (water height, bobs with waves)
@@ -1151,7 +1212,7 @@ bool Phase1::CaptureLocalState(PlayerState& s) {
         s.shipValid = false;
         s.shipPos[0] = s.shipPos[1] = s.shipPos[2] = 0.0f;
         s.shipQuat[0] = s.shipQuat[1] = s.shipQuat[2] = 0.0f; s.shipQuat[3] = 1.0f;
-        s.shipHP = 0;
+        s.shipHP = 0.0f;
         void* ship = handleResolve(h->m_IsOnShipEntity);
         if (!ship) ship = handleResolve(h->m_Data.m_Vehicle);
         if (ship && readable(ship, sizeof(HookMath::Transform))) {
@@ -1161,8 +1222,12 @@ bool Phase1::CaptureLocalState(PlayerState& s) {
             HookMath::Quaternion q;
             HookMath::FromMatrix(sm, &q);
             s.shipQuat[0] = q.x; s.shipQuat[1] = q.y; s.shipQuat[2] = q.z; s.shipQuat[3] = q.w;
-            void* stat = readable((char*)ship + 0x5C, 4) ? *(void**)((char*)ship + 0x5C) : nullptr;
-            s.shipHP = (stat && readable((char*)stat + 0x84, 4)) ? *(int*)((char*)stat + 0x84) : 0;
+            // Hull HP from GcLShip+0xD0 (verified; [[ship+0x5C]+0x84] was disproved - it regenerates).
+            // Behind ShipHPSync: with the flag off nothing is read and the field stays 0.0f.
+            if (ShipHPSyncEnabled()) {
+                float hp = 0.0f;
+                if (ReadShipHullHP(ship, &hp)) s.shipHP = hp;
+            }
             s.shipValid = true;
         }
 
@@ -1210,6 +1275,14 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
         g_ghostSyncQuat[2] = s.shipQuat[2];
         g_ghostSyncQuat[3] = s.shipQuat[3];
         g_ghostHasSync = 1;
+        // [Coop] ShipHPSync (default OFF): carry the peer's hull HP to the ghost. Change-guarded, so the
+        // damage-aware setter (clamp + zero event + HUD republish) is not hammered once per packet.
+        if (ShipHPSyncEnabled()) {
+            g_ghostSyncHP = s.shipHP;
+            if (g_ghostShip && g_ghostSyncHP != g_ghostAppliedHP) {
+                if (WriteShipHullHP(g_ghostShip, g_ghostSyncHP)) g_ghostAppliedHP = g_ghostSyncHP;
+            }
+        }
     } else {
         g_ghostHasSync = 0;
     }
@@ -2076,6 +2149,7 @@ void Phase1::DespawnGhostShip() {
     if (!g_ghostShip) return;
     Entity* dead = (Entity*)g_ghostShip;
     g_ghostShip = nullptr;
+    g_ghostAppliedHP = -1.0f;   // ShipHPSync: re-apply the peer's HP to the next ghost
     g_ghostAuto = false;
     __try {
         HookMath::Transform hideTransform;   // identity rotation, position far away
@@ -2189,6 +2263,39 @@ static void CaptureShips(EntityPacket& pkt) {
     if (!mgr || !readable((char*)mgr + 0x3E8, 8)) return;
     unsigned short n = *(unsigned short*)((char*)mgr + 0x3EE);
     Entity* localShip = GetLocalShip();
+    // T39: consume a ship-test request (ScrollLock = damage, Pause = sink). The request is latched by
+    // the 20 Hz poll thread, so a slow frame here cannot lose the keypress.
+    {
+        static int s_shipTest = -1;
+        if (s_shipTest < 0) s_shipTest = GetPrivateProfileIntA("Coop", "ShipTest", 0, Paths::Ini());
+        if (s_shipTest && g_shipTestReq) {
+            const int mode = (int)g_shipTestReq;
+            g_shipTestReq = 0;
+            const int fracPct = GetPrivateProfileIntA("Coop", "ShipTestFracPct", 45, Paths::Ini());
+            const int radiusM = GetPrivateProfileIntA("Coop", "ShipTestRadiusM", 250, Paths::Ini());
+            const float px = localShip ? localShip->m_GlobalMatrix.M41 : 0.0f;
+            const float pz = localShip ? localShip->m_GlobalMatrix.M43 : 0.0f;
+            int hits = 0;
+            for (int si = 0; si < (int)n && si < 64; ++si) {
+                Entity* se = GetShipEntity(mgr, si);
+                if (!se || *(uint32_t*)se != 0x01E4A128u) continue;
+                const float dx = se->m_GlobalMatrix.M41 - px, dz = se->m_GlobalMatrix.M43 - pz;
+                if (radiusM > 0 && (dx * dx + dz * dz) > (float)(radiusM * radiusM)) continue;
+                void* ho = ShipGcLObj(se);
+                if (!ho || !readable((char*)ho + 0xB4, 4)) continue;
+                const float mx = *(float*)((char*)ho + 0xB4);
+                float hp = 0.0f;
+                if (!ReadShipHullHP(se, &hp)) continue;
+                const float want = (mode == 2) ? -1.0f : hp - mx * ((float)fracPct / 100.0f);
+                if (WriteShipHullHP(se, want)) {
+                    L("[ShipTest] mode=%d ship=%d obj=%08X max=%.1f hp=%.1f -> %.1f\n",
+                      mode, si, (unsigned)ho, mx, hp, want);
+                    ++hits;
+                }
+            }
+            L("[ShipTest] mode=%d ships_hit=%d radius=%dm frac=%d%%\n", mode, hits, radiusM, fracPct);
+        }
+    }
     // T30: [Coop] ShipDump=1 prints every ship's component class IDs (the same CRC the health-service
     // getters compare against), so the real hull-HP service can be found by matching
     // ops/evidence/health-service-crcs.md instead of guessing a field. sub_A1D0D0 is __thiscall.
@@ -8035,6 +8142,7 @@ static void OnFrameInner(Human* updatedHuman) {
         s_shipPassenger = GetPrivateProfileIntA("Coop", "ShipPassenger", 0, Paths::Ini());
         s_shipGhost     = GetPrivateProfileIntA("Coop", "ShipGhost",     0, Paths::Ini());
         s_ghostSelfTest = GetPrivateProfileIntA("Coop", "ShipGhostSelfTest", 0, Paths::Ini());
+        s_shipHPSync    = GetPrivateProfileIntA("Coop", "ShipHPSync",    0, Paths::Ini());
         s_transformProbe = GetPrivateProfileIntA("Coop", "TransformProbe", 0, Paths::Ini());
         g_identityBand   = GetPrivateProfileIntA("Coop", "IdentityBand",   0, Paths::Ini());
         g_combatTest     = GetPrivateProfileIntA("Coop", "CombatTest",     0, Paths::Ini());
@@ -8549,6 +8657,11 @@ static void OnFrameInner(Human* updatedHuman) {
             HookMath::Transform m;
             HookMath::ToMatrix(&q, &m);
             m.M41 = g_ghostSyncPos[0]; m.M42 = g_ghostSyncPos[1]; m.M43 = g_localShipZ;
+            // [Coop] ShipHPSync: apply a pending hull HP; a fresh ghost is normally spawned after the packet
+            // that carried the value, so this cannot live only on the receive path.
+            if (ShipHPSyncEnabled() && g_ghostShip && g_ghostSyncHP != g_ghostAppliedHP) {
+                if (WriteShipHullHP(g_ghostShip, g_ghostSyncHP)) g_ghostAppliedHP = g_ghostSyncHP;
+            }
             __try {
                 ((Entity*)g_ghostShip)->SetGlobalMatrixInternal(&m, true);
                 { static int n = 0; if ((n++ & 0x3F) == 0)

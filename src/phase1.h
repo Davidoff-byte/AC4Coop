@@ -15,6 +15,7 @@ namespace Phase1 {
     void RequestShipProbe();   // hotkey handler (F10, any thread): queue a ship/boarding probe next frame
     void RequestShipSpawn();   // hotkey handler (F11, any thread): queue a ship-dude spawn request next frame
     void RequestGhostDespawn(); // hotkey handler (F11, any thread): queue a ghost-ship removal next frame
+void RequestShipTest(int mode); // hotkey handler (ScrollLock = 1 damage, Pause = 2 sink): queue a hull write
     void RequestShipCtorProbe(); // hotkey handler (F12, any thread): queue a construct-ship-entity probe next frame
     void RequestShipDriveProbe(); // hotkey handler (F13, any thread): queue a local-ship transform-write probe next frame
     void RequestEntityEnum();     // hotkey handler (F14, any thread): queue an entity-enumeration probe next frame
