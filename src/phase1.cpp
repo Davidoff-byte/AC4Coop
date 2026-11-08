@@ -1025,6 +1025,22 @@ static bool WriteShipHullHP(void* shipEnt, float hp) {
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
+// Direct field write, for DUPLICATE ships only. The setter (slot 0x12C -> sub_1225A10) faults on a
+// cloned GcLShip: it dereferences this+1092 -> [+0x58] and re-enters sub_1220B60, and on a duplicate
+// those sub-objects are not initialised, so every call raises and the apply never takes. A raw write
+// sets the value the ghost carries without firing events or republishing the HUD fraction - which is
+// all a render-only duplicate needs. NEVER use this on a real ship: use the setter there, so clamps,
+// the invulnerability bit and the zero-health event still behave.
+static bool WriteShipHullHPRaw(void* shipEnt, float hp) {
+    void* hobj = ShipGcLObj(shipEnt);
+    if (!hobj) return false;
+    if (!(hp >= -1.0e6f) || !(hp <= 1.0e7f)) return false;
+    if (!readable((char*)hobj + 0xD0, 4)) return false;
+    __try {
+        *(float*)((char*)hobj + 0xD0) = hp;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
 // T39: live ship-test harness. The 20 Hz poll thread in dllmain.cpp sets the request (ScrollLock =
 // damage, Pause = sink); CaptureShips consumes it, because this is where the naval manager and the
 // local ship are resolved. Mode 1 damages every ship within ShipTestRadiusM by ShipTestFracPct of
@@ -1280,7 +1296,7 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
         if (ShipHPSyncEnabled()) {
             g_ghostSyncHP = s.shipHP;
             if (g_ghostShip && g_ghostSyncHP != g_ghostAppliedHP) {
-                if (WriteShipHullHP(g_ghostShip, g_ghostSyncHP)) g_ghostAppliedHP = g_ghostSyncHP;
+                if (WriteShipHullHPRaw(g_ghostShip, g_ghostSyncHP)) g_ghostAppliedHP = g_ghostSyncHP;
             }
         }
     } else {
@@ -8670,7 +8686,7 @@ static void OnFrameInner(Human* updatedHuman) {
                     L("[ShipHPSync] want=%.1f applied=%.1f ghost=%08X gcL=%08X\n",
                       g_ghostSyncHP, g_ghostAppliedHP, (unsigned)g_ghostShip,
                       (unsigned)ShipGcLObj(g_ghostShip)); }
-                if (WriteShipHullHP(g_ghostShip, g_ghostSyncHP)) g_ghostAppliedHP = g_ghostSyncHP;
+                if (WriteShipHullHPRaw(g_ghostShip, g_ghostSyncHP)) g_ghostAppliedHP = g_ghostSyncHP;
             }
             __try {
                 ((Entity*)g_ghostShip)->SetGlobalMatrixInternal(&m, true);
