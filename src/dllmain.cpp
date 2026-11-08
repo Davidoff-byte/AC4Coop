@@ -235,6 +235,16 @@ static bool sampleOnce(Vec4& pos, void*& outWorld, void*& outPlayer)
     }
 }
 
+// ---- hook gates (diagnostic) -------------------------------------------------------------------
+// The ini matrix in ops/tools/bisect_crash.ps1 proved the launch crash is NOT gated by the existing
+// flags: every variant crashed with the same signature. The hooks below are installed at DllMain and
+// were not covered. These flags are read before any patch, so one build can bisect them at runtime.
+static bool HookGate(const char* key)
+{
+    if (!GetPrivateProfileIntA("Coop", "InstallHooks", 1, Paths::Ini())) return false;
+    return GetPrivateProfileIntA("Coop", key, 1, Paths::Ini()) != 0;
+}
+
 static unsigned __stdcall PollThread(void*)
 {
     char leaf[64];
@@ -284,7 +294,7 @@ static unsigned __stdcall PollThread(void*)
     // log file and OutputDebugString are the evidence; a console must never gate the poll loop.
     // g_stdoutReady stays false, so logline() skips printf.
 
-    Phase1::InstallVirtualPadHook();   // Phase A: must run before the engine enumerates pads
+    if (HookGate("HookPad")) Phase1::InstallVirtualPadHook();   // Phase A, before pad enumeration
     logline("[AC4Coop] GetWorld=%p  GetPlayer=%p  GetGlobalPosition=%p\n",
             (void*)pGetWorld, (void*)pGetPlayer, (void*)pGetGlobalPos);
 
@@ -505,6 +515,7 @@ static void MiLog(const char* fmt, ...)
     if (f) { fputs(line, f); fclose(f); }
 }
 
+
 static void InstallMultiInstance()
 {
     uintptr_t base = (uintptr_t)GetModuleHandleW(nullptr);
@@ -566,16 +577,16 @@ BOOL APIENTRY DllMain(HMODULE hMod, DWORD reason, LPVOID)
             return TRUE;   // stay resident for logging; install nothing
         }
 
-        InstallMultiInstance();   // must run before WinMain's single-instance check
+        if (HookGate("HookMultiInstance")) InstallMultiInstance();   // must run before WinMain
 
         // Windowed mode — must run now, before the engine reaches scimitar::CreateWindow.
         // Config from .\AC4Coop.ini  [Display] Fullscreen=0  Borderless=0   (defaults: windowed, bordered)
         bool fullscreen = GetPrivateProfileIntA("Display", "Fullscreen", 0, Paths::Ini()) != 0;
         bool borderless = GetPrivateProfileIntA("Display", "Borderless", 0, Paths::Ini()) != 0;
-        Windowed::Apply(fullscreen, borderless);
+        if (HookGate("HookWindowed")) Windowed::Apply(fullscreen, borderless);
 
         // Phase 1: hook the per-frame Human update so spawns/drives run on the game's main thread.
-        Phase1::InstallFrameHook();
+        if (HookGate("HookFrame")) Phase1::InstallFrameHook();
 
         // Guard the action/animation state gate (0x00679220) so a node with no bound target never
         // reaches sub_681980 / sub_679750's unchecked [node+0x114] dereference. [Coop] GuardNullActionTarget
