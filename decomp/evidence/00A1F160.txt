@@ -1,0 +1,114 @@
+=== 00A1F160  ObjectRegistryLookupOwner ===
+src/phase1.cpp:4370-4371  ResolveEntityByIdRaw():
+    return Hook::CallClassMethod<void*, void*, uint32_t, uint32_t>(
+        0x00A1F160, (void*)0x04DD9824, (uint32_t)id, (uint32_t)(id >> 32));
+
+  static void* ResolveEntityByIdRaw(uint64_t id) {
+      if (!id) return nullptr;
+      __try {
+          if (*(void**)0x04DD601C == nullptr) return nullptr;   // registry lock/service not up
+          return Hook::CallClassMethod<void*, void*, uint32_t, uint32_t>(
+              0x00A1F160, (void*)0x04DD9824, (uint32_t)id, (uint32_t)(id >> 32));
+      } __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+  }
+
+ROLE (from the call site): resolve (id_lo,id_hi) in the engine object registry at
+0x04DD9824 and return the registered owner pointer.
+WHAT THE BYTES DO (verified, disassembled from AC4BFSP.exe at 0x00A1F160):
+  * push ebp / mov ebp,esp / push ecx,ebx,esi,edi; `mov esi,[ebp+8]`, `mov edi,[ebp+0xC]`,
+    `mov ebx,ecx` => __thiscall(this=ECX, uint32 id_lo, uint32 id_hi), and `ret 8` at the exits
+    confirms exactly two stack arguments (12 bytes of pushed args popped by the caller's 8 --
+    the callee pops 8, i.e. thiscall).
+  * `test esi,esi / jne` then `test edi,edi / je 0xA1F20A` => (0,0) short-circuits to the
+    "not found" exit.
+  * `mov ecx,0x04DD601C ; call 0x00D587F0` -- locks the registry critical section; the call site
+    pre-checks that same object at 0x04DD601C, so the source comment and the binary agree.
+  * `cmp byte ptr [0x027F4AC6],0 ; je 0xA1F200` -- the exact byte_27F4AC6 gate the comment names.
+  * `push edi / push esi / push 0 ; mov ecx,ebx ; call 0x00A1E8D0` -- table lookup;
+    on a hit `mov eax,[eax+8]` returns entry->owner (+8 in the 16-byte entry), unlocks via
+    0x00AC6580 and returns; on a miss it tries 0x04DD5FA0 (call 0x00A076F0) and then the
+    thiscall fallback 0x00A1DC00, each path unlocking 0x04DD601C again before returning.
+  * no generation check anywhere in the body -- matches the warning in the source comment that
+    the caller must re-verify the object's own id (the call site does).
+
+PROLOGUE BYTES: 55 8b ec 51 53 56 8b 75 08 8b d9 57 8b 7d 0c 89
+
+DISASSEMBLY (181 bytes, 0x00A1F160..00A1F214):
+00A1F160  55                   push ebp
+00A1F161  8b ec                mov ebp, esp
+00A1F163  51                   push ecx
+00A1F164  53                   push ebx
+00A1F165  56                   push esi
+00A1F166  8b 75 08             mov esi, dword ptr [ebp + 8]
+00A1F169  8b d9                mov ebx, ecx
+00A1F16B  57                   push edi
+00A1F16C  8b 7d 0c             mov edi, dword ptr [ebp + 0xc]
+00A1F16F  89 5d fc             mov dword ptr [ebp - 4], ebx
+00A1F172  85 f6                test esi, esi
+00A1F174  75 08                jne 0xa1f17e
+00A1F176  85 ff                test edi, edi
+00A1F178  0f 84 8c 00 00 00    je 0xa1f20a
+00A1F17E  b9 1c 60 dd 04       mov ecx, 0x4dd601c
+00A1F183  e8 68 96 33 00       call 0xd587f0
+00A1F188  80 3d c6 4a 7f 02 00 cmp byte ptr [0x27f4ac6], 0
+00A1F18F  74 6f                je 0xa1f200
+00A1F191  57                   push edi
+00A1F192  56                   push esi
+00A1F193  6a 00                push 0
+00A1F195  8b cb                mov ecx, ebx
+00A1F197  e8 34 f7 ff ff       call 0xa1e8d0
+00A1F19C  85 c0                test eax, eax
+00A1F19E  74 18                je 0xa1f1b8
+00A1F1A0  8b 70 08             mov esi, dword ptr [eax + 8]
+00A1F1A3  b9 1c 60 dd 04       mov ecx, 0x4dd601c
+00A1F1A8  e8 d3 73 0a 00       call 0xac6580
+00A1F1AD  5f                   pop edi
+00A1F1AE  8b c6                mov eax, esi
+00A1F1B0  5e                   pop esi
+00A1F1B1  5b                   pop ebx
+00A1F1B2  8b e5                mov esp, ebp
+00A1F1B4  5d                   pop ebp
+00A1F1B5  c2 08 00             ret 8
+00A1F1B8  57                   push edi
+00A1F1B9  56                   push esi
+00A1F1BA  b9 a0 5f dd 04       mov ecx, 0x4dd5fa0
+00A1F1BF  e8 2c 85 fe ff       call 0xa076f0
+00A1F1C4  8b d8                mov ebx, eax
+00A1F1C6  85 db                test ebx, ebx
+00A1F1C8  74 15                je 0xa1f1df
+00A1F1CA  b9 1c 60 dd 04       mov ecx, 0x4dd601c
+00A1F1CF  e8 ac 73 0a 00       call 0xac6580
+00A1F1D4  5f                   pop edi
+00A1F1D5  5e                   pop esi
+00A1F1D6  8b c3                mov eax, ebx
+00A1F1D8  5b                   pop ebx
+00A1F1D9  8b e5                mov esp, ebp
+00A1F1DB  5d                   pop ebp
+00A1F1DC  c2 08 00             ret 8
+00A1F1DF  8b 4d fc             mov ecx, dword ptr [ebp - 4]
+00A1F1E2  57                   push edi
+00A1F1E3  56                   push esi
+00A1F1E4  e8 17 ea ff ff       call 0xa1dc00
+00A1F1E9  b9 1c 60 dd 04       mov ecx, 0x4dd601c
+00A1F1EE  8b f0                mov esi, eax
+00A1F1F0  e8 8b 73 0a 00       call 0xac6580
+00A1F1F5  5f                   pop edi
+00A1F1F6  8b c6                mov eax, esi
+00A1F1F8  5e                   pop esi
+00A1F1F9  5b                   pop ebx
+00A1F1FA  8b e5                mov esp, ebp
+00A1F1FC  5d                   pop ebp
+00A1F1FD  c2 08 00             ret 8
+00A1F200  b9 1c 60 dd 04       mov ecx, 0x4dd601c
+00A1F205  e8 76 73 0a 00       call 0xac6580
+00A1F20A  5f                   pop edi
+00A1F20B  5e                   pop esi
+00A1F20C  33 c0                xor eax, eax
+00A1F20E  5b                   pop ebx
+00A1F20F  8b e5                mov esp, ebp
+00A1F211  5d                   pop ebp
+00A1F212  c2 08 00             ret 8
+
+TAIL PADDING: cc cc cc cc cc cc cc cc
+sha256(original bytes) = 6dc75c72d6abcab92fbddbd14acb236192fa3751f73bd4bb9fffa0e6171bcee7
+arm: probe (no pinned compiler cl 16.00.40219.01 available); evidence only.

@@ -378,6 +378,36 @@
    "size": 11,
    "status": "claimed"
   },
+  "00A1F160": {
+   "addr": "00A1F160",
+   "claimed_at": "2026-11-08T19:43:31Z",
+   "name": "ObjectRegistryLookupOwner",
+   "owner": "spine-gate-template-args",
+   "receipts": [
+    {
+     "arm": "probe",
+     "at": "2026-11-08T19:43:31Z",
+     "verdict": "UNVERIFIED-EVIDENCE"
+    }
+   ],
+   "size": 181,
+   "status": "claimed"
+  },
+  "00C4F2A0": {
+   "addr": "00C4F2A0",
+   "claimed_at": "2026-11-08T19:43:31Z",
+   "name": "HavokBodyCtorFromCinfo",
+   "owner": "spine-gate-template-args",
+   "receipts": [
+    {
+     "arm": "probe",
+     "at": "2026-11-08T19:43:31Z",
+     "verdict": "UNVERIFIED-EVIDENCE"
+    }
+   ],
+   "size": 759,
+   "status": "claimed"
+  },
   "01038330": {
    "addr": "01038330",
    "claimed_at": "2026-11-08T16:48:59Z",

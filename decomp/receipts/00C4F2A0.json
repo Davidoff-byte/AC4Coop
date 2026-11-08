@@ -1,0 +1,15 @@
+{
+ "unit": "00C4F2A0",
+ "addr": "0x00C4F2A0",
+ "size": 759,
+ "name": "HavokBodyCtorFromCinfo",
+ "submitted_at": "2026-11-08T19:44:41Z",
+ "original_sha": "5a2af7188877c5c45eab79417e8916de3df17eb5726f26797a38e006cd911975",
+ "candidate_src_sha": "07509e0b51d4f4c47111ba63d8c30fd758b6a9f858fecf0febc3fa492839d86e",
+ "candidate_src": "00C4F2A0.cpp",
+ "arm": "probe",
+ "verdict": "UNVERIFIED-EVIDENCE",
+ "detail": "no object supplied: the pinned compiler (cl 16.00.40219.01) is not installed, so byte equality cannot be checked. Recorded as evidence only - never a match.",
+ "evidence": "00C4F2A0.txt",
+ "evidence_sha": "93464da76e574d0ed7e40b3f29dbe789af8835d62c38169ee8500a4b26eb2453"
+}

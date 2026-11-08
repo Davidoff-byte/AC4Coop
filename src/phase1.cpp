@@ -4350,14 +4350,14 @@ static bool MirrorAliasShouldApply(void* e, unsigned int alias) {
 static unsigned int s_covMatched = 0, s_covNoBody = 0, s_covStolen = 0;   // coverage counters, reset with stats
 
 // ---- [IdRes] engine-resolver entity identity (additive; the scan below stays the fallback) --------
-// The engine keeps an object registry at VA 0x004DD9824: table pointer at +0x10, uint16 count at +0x16,
+// The engine keeps an object registry at VA 0x04DD9824: table pointer at +0x10, uint16 count at +0x16,
 // stride 16, entry {id_lo, id_hi, owner, extra}. 0x00A1F160 is
 // `void* __thiscall (registry, uint32_t id_lo, uint32_t id_hi)` (retn 8) and returns entry->owner, or 0
 // for (0,0), for unknown ids, and when byte_27F4AC6 == 0.
 //
 // It has NO generation check, so an id that was destroyed and re-issued can hand back a dangling
 // pointer. Every hit is therefore verified against the object's own id before it is used. The resolver
-// also dereferences the registry critical section at *0x004DD601C unconditionally, so that pointer is
+// also dereferences the registry critical section at *0x04DD601C unconditionally, so that pointer is
 // checked first (it is null before the registry comes up and after a teardown).
 static bool g_idResolver = true;
 static int  s_idResHit  = 0;
@@ -4366,9 +4366,9 @@ static int  s_idResMiss = 0;
 static void* ResolveEntityByIdRaw(uint64_t id) {
     if (!id) return nullptr;
     __try {
-        if (*(void**)0x004DD601C == nullptr) return nullptr;   // registry lock/service not up
+        if (*(void**)0x04DD601C == nullptr) return nullptr;   // registry lock/service not up
         return Hook::CallClassMethod<void*, void*, uint32_t, uint32_t>(
-            0x00A1F160, (void*)0x004DD9824, (uint32_t)id, (uint32_t)(id >> 32));
+            0x00A1F160, (void*)0x04DD9824, (uint32_t)id, (uint32_t)(id >> 32));
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return nullptr;
     }

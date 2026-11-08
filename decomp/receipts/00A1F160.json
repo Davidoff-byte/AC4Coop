@@ -1,0 +1,15 @@
+{
+ "unit": "00A1F160",
+ "addr": "0x00A1F160",
+ "size": 181,
+ "name": "ObjectRegistryLookupOwner",
+ "submitted_at": "2026-11-08T19:43:31Z",
+ "original_sha": "6dc75c72d6abcab92fbddbd14acb236192fa3751f73bd4bb9fffa0e6171bcee7",
+ "candidate_src_sha": "d95644e1db7e4ad3b561a324a9ef2d802b80cd7cba09ffc5caa7f728fb40d94a",
+ "candidate_src": "00A1F160.cpp",
+ "arm": "probe",
+ "verdict": "UNVERIFIED-EVIDENCE",
+ "detail": "no object supplied: the pinned compiler (cl 16.00.40219.01) is not installed, so byte equality cannot be checked. Recorded as evidence only - never a match.",
+ "evidence": "00A1F160.txt",
+ "evidence_sha": "1a4502f2f0e41430d538b2cf37cc35eddda9cc690d33ff9a24ae6571c739b240"
+}
