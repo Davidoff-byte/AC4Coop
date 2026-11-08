@@ -1,0 +1,12 @@
+AllyOrSame @ 0x1711500  (size 68)   -- probe receipt, no cl 16.00.40219.01 on this machine
+measured 2026-11-08 by ORCH against the pinned binary
+  AC4BFSP.exe sha256 bc11ad7924e1eca7363ee86aa3332c05386d0a05896c0b7370131daee9ab5150
+  candidate body: ac4-decomp\1711500.c (submitted verbatim)
+
+claim
+    AllyOrSame(a, b) = same faction pointer, or faction(b) is in faction(a)+0x0C
+    (the ALLY list).
+
+cross-check / limit of this receipt
+    paired with EnemyOf this fixes both relation-array offsets (+0x0C ally,
+    +0x14 enemy) from two independent bodies rather than from a note.

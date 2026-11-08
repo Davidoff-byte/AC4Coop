@@ -1,0 +1,15 @@
+EnemyOf @ 0x17114C0  (size 64)   -- probe receipt, no cl 16.00.40219.01 on this machine
+measured 2026-11-08 by ORCH against the pinned binary
+  AC4BFSP.exe sha256 bc11ad7924e1eca7363ee86aa3332c05386d0a05896c0b7370131daee9ab5150
+  candidate body: ac4-decomp\17114C0.c (submitted verbatim)
+
+claim
+    EnemyOf(a, b) = faction(a) && faction(b) && contains(faction(b), faction(a)+0x14).
+    That is: the target's faction is in the source's ENEMY list. Arguments are
+    entity pointers (each goes through the faction resolver sub_133A4C0).
+
+cross-check / limit of this receipt
+    the +0x14 offset is fixed by the body; the list membership test is
+    sub_19017C0. The decompiled signature is __cdecl (int,int), so a
+    bool(__cdecl*)(void*,void*) cast is safe by signature - the ABI job checks
+    the epilogue independently.

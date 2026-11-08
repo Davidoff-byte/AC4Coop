@@ -1,0 +1,15 @@
+{
+ "unit": "0171A040",
+ "addr": "0x0171A040",
+ "size": 76,
+ "name": "IsAllyOfOwner",
+ "submitted_at": "2026-11-08T12:57:24Z",
+ "original_sha": "16b938b6b4143548fd94bb5292c485ead1f7eeebf85b17ee27c72ec5672b3ef2",
+ "candidate_src_sha": "670a6e9824f42303675d65d05a4a9ba6283c78270e9a0d3ca0d4c1bcb1085b4a",
+ "candidate_src": "0171A040.cpp",
+ "arm": "probe",
+ "verdict": "UNVERIFIED-EVIDENCE",
+ "detail": "no object supplied: the pinned compiler (cl 16.00.40219.01) is not installed, so byte equality cannot be checked. Recorded as evidence only - never a match.",
+ "evidence": "0171A040.txt",
+ "evidence_sha": "1207e02db9a80e3f9fdf34bf0116cd415ff2449651e06e760f2c05747d2124ed"
+}

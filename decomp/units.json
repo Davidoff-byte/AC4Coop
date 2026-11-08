@@ -363,6 +363,21 @@
    "size": 142,
    "status": "claimed"
   },
+  "0133A4C0": {
+   "addr": "0133A4C0",
+   "claimed_at": "2026-11-08T12:57:24Z",
+   "name": "ResolveFaction",
+   "owner": "seat-orch",
+   "receipts": [
+    {
+     "arm": "probe",
+     "at": "2026-11-08T12:57:24Z",
+     "verdict": "UNVERIFIED-EVIDENCE"
+    }
+   ],
+   "size": 125,
+   "status": "claimed"
+  },
   "0133F630": {
    "addr": "0133F630",
    "claimed_at": null,
@@ -415,6 +430,66 @@
     }
    ],
    "size": 104,
+   "status": "claimed"
+  },
+  "017114C0": {
+   "addr": "017114C0",
+   "claimed_at": "2026-11-08T12:57:22Z",
+   "name": "EnemyOf",
+   "owner": "seat-orch",
+   "receipts": [
+    {
+     "arm": "probe",
+     "at": "2026-11-08T12:57:23Z",
+     "verdict": "UNVERIFIED-EVIDENCE"
+    }
+   ],
+   "size": 64,
+   "status": "claimed"
+  },
+  "01711500": {
+   "addr": "01711500",
+   "claimed_at": "2026-11-08T12:57:23Z",
+   "name": "AllyOrSame",
+   "owner": "seat-orch",
+   "receipts": [
+    {
+     "arm": "probe",
+     "at": "2026-11-08T12:57:23Z",
+     "verdict": "UNVERIFIED-EVIDENCE"
+    }
+   ],
+   "size": 68,
+   "status": "claimed"
+  },
+  "01719FF0": {
+   "addr": "01719FF0",
+   "claimed_at": "2026-11-08T12:57:23Z",
+   "name": "IsEnemyOfOwner",
+   "owner": "seat-orch",
+   "receipts": [
+    {
+     "arm": "probe",
+     "at": "2026-11-08T12:57:23Z",
+     "verdict": "UNVERIFIED-EVIDENCE"
+    }
+   ],
+   "size": 72,
+   "status": "claimed"
+  },
+  "0171A040": {
+   "addr": "0171A040",
+   "claimed_at": "2026-11-08T12:57:23Z",
+   "name": "IsAllyOfOwner",
+   "owner": "seat-orch",
+   "receipts": [
+    {
+     "arm": "probe",
+     "at": "2026-11-08T12:57:24Z",
+     "verdict": "UNVERIFIED-EVIDENCE"
+    }
+   ],
+   "size": 76,
    "status": "claimed"
   },
   "018B9EA0": {

@@ -1,0 +1,15 @@
+{
+ "unit": "0133A4C0",
+ "addr": "0x0133A4C0",
+ "size": 125,
+ "name": "ResolveFaction",
+ "submitted_at": "2026-11-08T12:57:24Z",
+ "original_sha": "591a3e2c340037c6818279ac78af561aecc2b5b07509aabcbd9b0e4092e44f07",
+ "candidate_src_sha": "96662486f22176ffbd85e6bf6c70f55d78c24f97cc5cda6ea66b675be1a4ffb2",
+ "candidate_src": "0133A4C0.cpp",
+ "arm": "probe",
+ "verdict": "UNVERIFIED-EVIDENCE",
+ "detail": "no object supplied: the pinned compiler (cl 16.00.40219.01) is not installed, so byte equality cannot be checked. Recorded as evidence only - never a match.",
+ "evidence": "0133A4C0.txt",
+ "evidence_sha": "5b1e71599a1ced0bbb15b9af688c7bbbd5d35b1cb42686304d2a32b6774c4e45"
+}
