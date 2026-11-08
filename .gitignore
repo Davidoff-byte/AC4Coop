@@ -11,3 +11,7 @@ HANDOFF.md
 # compiler output, reproducible from the candidate once the pinned toolchain
 # exists, and they are the only large/blobby part of the tree.
 decomp/objects/*
+
+# python bytecode (was accidentally tracked; regenerates on every run)
+__pycache__/
+*.pyc
