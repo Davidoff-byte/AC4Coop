@@ -89,9 +89,13 @@ namespace {
     // Rejects: datagrams from the peer that arrived but contributed NO state (version mismatch, a
     // failed decode, or an illegal entity kind). They still count in rxPackets/rxBytes - they really
     // were on the wire - but they do NOT refresh g_lastRecvMs (see the liveness note in RecvThread).
-    volatile LONG g_rxRejects = 0;        // every dropped datagram, whatever the reason
+    volatile LONG g_rxRejects = 0;        // dropped datagrams, EXCLUDING DEC_PENDING and DEC_STALE chunks
     volatile LONG g_rxProtoMismatch = 0;  // subset of the above: protoVer != NET_PROTO_VER on either lane
     volatile LONG g_rxSizeMismatch = 0;   // player lane only: magic matched but n != sizeof(PlayerState)
+    volatile LONG g_rxStaleChunks = 0;    // entity lane: DEC_STALE, a late chunk of a superseded snapshot.
+                                          // The drop is correct, but it is NOT a reject - a benign
+                                          // reorder is normal on a well-formed link - so it is excluded
+                                          // from g_rxRejects exactly like DEC_PENDING.
 
     // ---- Phase 2: compact entity wire ---------------------------------------------------------
     // A record carries a stable 64-bit identity. `key` is the entity-manager INDEX and is NOT stable
@@ -128,6 +132,12 @@ namespace {
     inline uint64_t ReadLocalWorldId() {
         return (uint64_t)InterlockedCompareExchange64(&g_localWorldId, 0, 0);
     }
+
+    // X5 bootstrap allowance (m4), shared by the decoder (recv thread) and SetLocalWorldId (main
+    // thread). 1 = a non-zero world match has been seen since the last world change. Reset by
+    // SetLocalWorldId on an actual world change so the new world's worldId == 0 bootstrap frame is
+    // tolerated again instead of being DEC_WORLD forever.
+    volatile LONG g_worldConfirmed = 0;
 
     // Receiver reassembly: one in-flight snapshot (seq is monotonic; a new seq discards the old one).
     struct RxAssembly {
@@ -385,11 +395,11 @@ namespace {
         // reports 0 cannot prove it is looking at the same world as us, so it is DEC_WORLD. m4.
         {
             const uint64_t localWorld = ReadLocalWorldId();
-            static bool s_worldConfirmed = false;
+            const bool worldConfirmed = (InterlockedCompareExchange(&g_worldConfirmed, 0, 0) != 0);
             if (localWorld != 0 && h.worldId != 0 && h.worldId != localWorld) return fail(DEC_WORLD);
-            if (localWorld != 0 && h.worldId == 0 && s_worldConfirmed) return fail(DEC_WORLD);
-            if (!s_worldConfirmed && localWorld != 0 && h.worldId == localWorld) {
-                s_worldConfirmed = true;   // one-shot: the bootstrap allowance ends here
+            if (localWorld != 0 && h.worldId == 0 && worldConfirmed) return fail(DEC_WORLD);
+            if (!worldConfirmed && localWorld != 0 && h.worldId == localWorld) {
+                InterlockedExchange(&g_worldConfirmed, 1);   // one-shot: the bootstrap allowance ends here
                 dbg("[Net] X5 world rule: bootstrap allowance ended - sender worldId=0 is now DEC_WORLD\n");
             }
         }
@@ -565,10 +575,11 @@ namespace {
         dbg("[Net] entity packet REJECTED: header worldId != local world (world change in progress?)\n");
     }
     void LogRejectSummary(LONG rejects) {
-        char m[192];
-        wsprintfA(m, "[Net] rx rejects=%ld protoMismatch=%ld sizeMismatch=%ld (datagrams dropped without applying state)\n",
+        char m[224];
+        wsprintfA(m, "[Net] rx rejects=%ld protoMismatch=%ld sizeMismatch=%ld stale=%ld (datagrams dropped without applying state)\n",
                   rejects, (LONG)InterlockedCompareExchange(&g_rxProtoMismatch, 0, 0),
-                  (LONG)InterlockedCompareExchange(&g_rxSizeMismatch, 0, 0));
+                  (LONG)InterlockedCompareExchange(&g_rxSizeMismatch, 0, 0),
+                  (LONG)InterlockedCompareExchange(&g_rxStaleChunks, 0, 0));
         dbg(m);
     }
 
@@ -628,6 +639,9 @@ namespace {
                         const bool entityOk = entityPkt &&
                             (DecodeEntityChunk((const uint8_t*)buf, (size_t)n, decoded, &why) == DEC_OK);
                         const bool entityPending = entityPkt && !entityOk && why == DEC_PENDING;
+                        // DEC_STALE: a late/reordered chunk of a superseded snapshot. Correct to drop,
+                        // but benign on a well-formed link -> its own counter, never a reject.
+                        const bool entityStale   = entityPkt && !entityOk && why == DEC_STALE;
                         const bool accepted = playerPkt ? playerOk : entityOk;
                         if (playerPkt && !playerOk) {
                             InterlockedIncrement(&g_rxProtoMismatch);
@@ -642,8 +656,10 @@ namespace {
                                 LogWorldMismatch();
                             }
                             // DEC_PENDING: a chunk buffered for reassembly - neither accepted nor rejected.
+                            // DEC_STALE: a superseded chunk - dropped, and counted as stale, not as a reject.
                         }
-                        if (!accepted && !entityPending) {
+                        if (entityStale) InterlockedIncrement(&g_rxStaleChunks);
+                        if (!accepted && !entityPending && !entityStale) {
                             const LONG rejects = InterlockedIncrement(&g_rxRejects);
                             if (rejects == 1 || (rejects % 256) == 0) LogRejectSummary(rejects);
                         }
@@ -683,7 +699,8 @@ namespace {
                         // A REJECTED datagram refreshes nothing either (X18): it used to bump
                         // g_lastRecvMs, so a peer whose every snapshot failed to decode looked alive.
                         // rxPackets/rxBytes still count it - it did arrive on the wire - and
-                        // g_rxRejects is the subset that produced no state.
+                        // g_rxRejects is the subset that produced no state, EXCLUDING the chunks that
+                        // were merely deferred (DEC_PENDING) or superseded (DEC_STALE).
                         const bool heartbeatOnly = accepted && entityPkt && decoded.count == 0;
                         if (accepted && !heartbeatOnly) g_lastRecvMs = GetTickCount64();
                         InterlockedIncrement(&g_rxPackets);
@@ -898,7 +915,15 @@ void SetStrictPeer(bool strict) { g_strictPeer = strict; }
 // X5: the local world id (World::GetObjectID()). The entity encoder stamps it into the wire header;
 // the decoder drops snapshots whose world differs from the local one. Interlocked 64-bit write so the
 // recv thread's read (ReadLocalWorldId) never tears on this x86 build.
-void SetLocalWorldId(uint64_t id) { InterlockedExchange64(&g_localWorldId, (LONGLONG)id); }
+void SetLocalWorldId(uint64_t id) {
+    // X5: a world CHANGE re-arms the bootstrap allowance. Without this the "confirmed" flag stayed
+    // latched for the life of the process, so the first legitimate worldId == 0 frame of a NEW world
+    // was DEC_WORLD forever. Only an actual change resets it - phase1 calls this every frame with the
+    // same id. Interlocked because the decoder reads it on the recv thread.
+    if ((uint64_t)InterlockedCompareExchange64(&g_localWorldId, 0, 0) != id)
+        InterlockedExchange(&g_worldConfirmed, 0);
+    InterlockedExchange64(&g_localWorldId, (LONGLONG)id);
+}
 
 uint64_t LastRecvMs() {
     if (!g_enabled) return 0;
@@ -927,6 +952,7 @@ void GetStats(Stats& out) {
     out.rejects       = (uint32_t)InterlockedCompareExchange(&g_rxRejects,       0, 0);
     out.protoMismatch = (uint32_t)InterlockedCompareExchange(&g_rxProtoMismatch, 0, 0);
     out.sizeMismatch  = (uint32_t)InterlockedCompareExchange(&g_rxSizeMismatch,  0, 0);
+    out.staleChunks   = (uint32_t)InterlockedCompareExchange(&g_rxStaleChunks,   0, 0);
 }
 
 void ResetStats() {
@@ -938,6 +964,7 @@ void ResetStats() {
     InterlockedExchange(&g_rxRejects,       0);
     InterlockedExchange(&g_rxProtoMismatch, 0);
     InterlockedExchange(&g_rxSizeMismatch,  0);
+    InterlockedExchange(&g_rxStaleChunks,   0);
 }
 
 } // namespace Net

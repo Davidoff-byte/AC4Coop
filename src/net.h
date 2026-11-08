@@ -36,8 +36,11 @@ namespace Net {
     // anonymous case: the leading magic was ours but the datagram length was not
     // sizeof(PlayerState), i.e. the peer runs a build with a different struct. That path is checked
     // BEFORE the version gate, so it can never be counted as a protoMismatch (see net.cpp).
-    // All of them are 0 on a well-formed link.
-    struct Stats { uint32_t txPackets, txBytes, txEnts, rxPackets, rxBytes, rejects, protoMismatch, sizeMismatch; };
+    // All of them are 0 on a well-formed link. staleChunks is the entity lane's DEC_STALE: a late /
+    // reordered chunk of an already-superseded snapshot. Dropping it is correct, and it is NOT a
+    // reject (a benign reorder is normal on a well-formed link), so it is counted separately and
+    // excluded from `rejects` exactly as DEC_PENDING is.
+    struct Stats { uint32_t txPackets, txBytes, txEnts, rxPackets, rxBytes, rejects, protoMismatch, sizeMismatch, staleChunks; };
     void GetStats(Stats& out);
     void ResetStats();
 }

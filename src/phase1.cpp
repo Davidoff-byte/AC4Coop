@@ -2254,7 +2254,8 @@ static void* SpawnGhostShip() {
             // Backoff after a failed duplicate/hull write. Advisory only: it shapes WHEN we retry,
             // and no counter here can ever gate SelectProxySource.
             static uint64_t s_proxyDupFailUntil = 0;
-            static unsigned s_proxyDupFails     = 0;
+            static unsigned s_proxyDupFails     = 0;   // saturated at 8: only the shift (clamped to 4)
+                                                       // and the [GhostProxy] log field consume it
             static uint64_t s_proxyLogLast      = 0;   // wall-clock throttle, 1 s
             const uint64_t nowMs = GetTickCount64();
             ProxySrcWorldCheck();
@@ -2291,7 +2292,7 @@ static void* SpawnGhostShip() {
                             hide.M41 = 0.0f; hide.M42 = -100000.0f; hide.M43 = 0.0f;
                             ((Entity*)dup)->SetGlobalMatrixInternal(&hide, false);
                         } __except (EXCEPTION_EXECUTE_HANDLER) {}
-                        ++s_proxyDupFails;
+                        if (s_proxyDupFails < 8) ++s_proxyDupFails;   // saturate: log field + shift are bounded
                         { unsigned sh = s_proxyDupFails < 4 ? s_proxyDupFails : 4;
                           s_proxyDupFailUntil = nowMs + (250ULL << (sh - 1)); }   // 250/500/1000/2000 ms
                         if (nowMs - s_proxyLogLast >= 1000) {
@@ -2299,7 +2300,7 @@ static void* SpawnGhostShip() {
                             L("[GhostProxy] fallback reason=hull-write-failed\n");
                         }
                     } else {
-                        ++s_proxyDupFails;
+                        if (s_proxyDupFails < 8) ++s_proxyDupFails;   // saturate: log field + shift are bounded
                         { unsigned sh = s_proxyDupFails < 4 ? s_proxyDupFails : 4;
                           s_proxyDupFailUntil = nowMs + (250ULL << (sh - 1)); }
                         if (nowMs - s_proxyLogLast >= 1000) {
@@ -3673,7 +3674,8 @@ static unsigned s_scopeSent     = 0;  // character states actually packed into a
 // gate is off (the default).  s_scopeCand is likewise pre-gate now -- see the note at the counter.
 static unsigned s_scopeHostile  = 0;  // of candidates, HostilityToPlayer == HOST_YES
 static unsigned s_scopeUnknown  = 0;  // of candidates, faction unresolvable (NOT "friendly")
-static unsigned s_scopeCaps     = 0;  // CaptureGuards calls in this window (sentPerCap denominator)
+static unsigned s_scopeCaps     = 0;  // CaptureGuards ATTEMPTS in this window (sentPerCap denominator;
+                                      // counted at entry, so a capture with no world is included)
 // T13 oracle, same 5 s window: every character candidate the walk reached BEFORE the soldier filter,
 // split by entity+0x9C. soldier+civilian+other == n, so the line proves the classifier in one run.
 static unsigned s_krN        = 0;
@@ -4196,6 +4198,10 @@ static void EmitGuardEntity(EntityPacket& pkt, uint32_t& count, int idx, Entity*
 
 static void CaptureGuards(EntityPacket& pkt) {
     if (s_adLog < 0) s_adLog = GetPrivateProfileIntA("Coop", "ActionDeathLog", 0, Paths::Ini());
+    // A28: one increment per CAPTURE ATTEMPT, counted at entry so a capture that bails out early
+    // (no world loaded yet) is still in the denominator - otherwise sentPerCap is biased high by
+    // dividing a window's sends by only the captures that happened to run with a world present.
+    ++s_scopeCaps;
     ObjMapReset();                       // rebuild the objId table for this capture
     World* world = World::GetCurrentWorld();
     if (!world) return;
@@ -4430,11 +4436,9 @@ static void CaptureGuards(EntityPacket& pkt) {
             EmitGuardEntity(pkt, count, i, e, bhvC, hc, px, py, pz, nowMs);
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    // A28: one increment per CAPTURE (not per emission), after the emit loop -- the denominator of
-    // sentPerCap.  Unconditional: SyncSlotSweep is the next statement in this function.
-    ++s_scopeCaps;
-    // TASK 2: release slots the capture has not seen for 10 s. Runs AFTER the capture, so everything
-    // this capture handled carries a fresh stamp; only entities that left the world can be released.
+    // A28: the per-capture increment now happens at function entry (see the note there), before the
+    // `if (!world) return;` early exit, so the denominator counts every attempt. SyncSlotSweep below
+    // still only runs when a world exists.
     SyncSlotSweep(nowMs);
 
     // Anything we tracked last capture but did not see now either walked out of range or died. D-016(5):
