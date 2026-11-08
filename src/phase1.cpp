@@ -2288,6 +2288,36 @@ static void CaptureShips(EntityPacket& pkt) {
                         if (cb) watchBlock(cc, cb, (uint32_t)crcw, i);
                     }
                 }
+                // T34: follow the naval health bar's own read path to the per-ship health object.
+                // Verified chain (ops/evidence/naval-healthbar.md, from sub_12B4720 / sub_193D8F0):
+                //   H   = *(entity + 0x8F4)
+                //   sp  = *(H + 0xC8)            // smart handle { ptr@+0, state@+8 }
+                //   obj = *(sp + 0x00)           // taken when *(int32*)(sp+8) < 0
+                // The bar then reads obj+0x55C and obj+0x560. Watch the whole neighbourhood of both
+                // owners instead of guessing which field is the hull value.
+                if (readable((char*)ent + 0x8F4, 4)) {
+                    void* H = *(void**)((char*)ent + 0x8F4);
+                    if (H && readable(H, 4)) {
+                        watchBlock(H, 0x400, 0x00008F40u, i);
+                        if (readable((char*)H + 0xC8, 4)) {
+                            void* sp = *(void**)((char*)H + 0xC8);
+                            if (sp && readable(sp, 12)) {
+                                void* obj = *(void**)((char*)sp);
+                                if (obj && readable(obj, 0x700)) {
+                                    watchBlock(obj, 0x700, 0x000000C0u, i);
+                                    if (dumpThisTick) {
+                                        char line[420]; int o = 0;
+                                        for (int f = 0x540 / 4; f < 0x5A0 / 4; ++f)
+                                            o += _snprintf_s(line + o, sizeof(line) - o, _TRUNCATE,
+                                                            " %X:%.4f", 4 * f, *(float*)((char*)obj + 4 * f));
+                                        L("[HBar] ship=%d ent=%08X H=%08X obj=%08X%s\n",
+                                          i, (unsigned)ent, (unsigned)H, (unsigned)obj, line);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
             if (dumpThisTick) {
                 const unsigned short cn = *(unsigned short*)((char*)ent + 0x66);
