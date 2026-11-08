@@ -5,3 +5,8 @@
 build.bat
 HANDOFF.md
 /src/build_info.h
+decomp/receipts/*
+decomp/candidates/*
+decomp/objects/*
+decomp/evidence/*
+

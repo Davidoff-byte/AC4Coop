@@ -1,0 +1,31 @@
+{
+ "units": {
+  "00504F60": {
+   "addr": "00504F60",
+   "claimed_at": null,
+   "name": "AddComponent",
+   "owner": null,
+   "receipts": [],
+   "size": 464,
+   "status": "unknown"
+  },
+  "005200C0": {
+   "addr": "005200C0",
+   "claimed_at": null,
+   "name": "GetComponentByType",
+   "owner": null,
+   "receipts": [],
+   "size": 51,
+   "status": "unknown"
+  },
+  "0133F630": {
+   "addr": "0133F630",
+   "claimed_at": null,
+   "name": "DamageGate",
+   "owner": null,
+   "receipts": [],
+   "size": 297,
+   "status": "unknown"
+  }
+ }
+}
