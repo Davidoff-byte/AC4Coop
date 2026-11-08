@@ -3369,8 +3369,32 @@ static int HostileOnly() {
     if (s < 0) s = GetPrivateProfileIntA("Coop", "HostileOnly", 0, Paths::Ini());
     return s;
 }
-static inline bool IsEnemyOfOwner(const void* e) {
-    return ((bool(__cdecl*)(void*))0x01719FF0)((void*)e);
+// A28 (RE 2026-11-08): the correct question is "is this body hostile to the LOCAL PLAYER", not
+// "is the entity's owner an enemy of the entity's own faction" (0x1719FF0, which is ~always false
+// for an ordinary NPC).  0x17114C0(A,B) == "faction(B) in enemies(faction(A))", i.e. B is an enemy
+// of A: the SUBJECT is arg0, the CANDIDATE is arg1.  __cdecl, two stack args, bare `ret`, BOOL out.
+// 0x133A4C0 is entity -> faction pointer, __cdecl, one stack arg, 0 == unresolvable.
+// Direction must not be swapped: never (e, player).
+// HOST_UNKNOWN == 0 so zero-initialised storage can never be read as HOST_NO (fail-safe).
+enum Hostility {
+    HOST_UNKNOWN = 0,   // unresolvable faction / null entity -- NOT "friendly"
+    HOST_NO      = 1,
+    HOST_YES     = 2
+};
+static Hostility HostilityToPlayer(const void* player, const void* e) {
+    if (!player || !e) return HOST_UNKNOWN;
+    __try {
+        // Fast path: 0x17114C0 returns 1 only when it resolved BOTH factions itself, so a 1 here
+        // is YES with no extra engine calls.  Subject first: (player, e).
+        if (((BOOL(__cdecl*)(void*, void*))0x017114C0)((void*)player, (void*)e)) return HOST_YES;
+        // Slow path: 0 is ambiguous ("not enemy" vs "could not resolve"); resolve to separate them.
+        // These are the only reason the two extra calls exist -- the predicate resolves both anyway.
+        if (!((int(__cdecl*)(void*))0x0133A4C0)((void*)player)) return HOST_UNKNOWN;
+        if (!((int(__cdecl*)(void*))0x0133A4C0)((void*)e))      return HOST_UNKNOWN;
+        return HOST_NO;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return HOST_UNKNOWN;
+    }
 }
 
 // ---- sync scope (TASK: proximity to the PEER) ------------------------------------------------
@@ -3396,6 +3420,11 @@ static unsigned s_scopeCand     = 0;  // characters that passed skeleton+bhv+hea
 static unsigned s_scopeEnemies  = 0;  // of those, the ones carrying the (dead) weapon/icon ids
 static unsigned s_scopeInRadius = 0;  // of those, the ones inside SyncRadiusM of the peer
 static unsigned s_scopeSent     = 0;  // character states actually packed into a snapshot
+// A28: counted per candidate BEFORE the HostileOnly gate, so the filter is observable even when the
+// gate is off (the default).  s_scopeCand is likewise pre-gate now -- see the note at the counter.
+static unsigned s_scopeHostile  = 0;  // of candidates, HostilityToPlayer == HOST_YES
+static unsigned s_scopeUnknown  = 0;  // of candidates, faction unresolvable (NOT "friendly")
+static unsigned s_scopeCaps     = 0;  // CaptureGuards calls in this window (sentPerCap denominator)
 // T13 oracle, same 5 s window: every character candidate the walk reached BEFORE the soldier filter,
 // split by entity+0x9C. soldier+civilian+other == n, so the line proves the classifier in one run.
 static unsigned s_krN        = 0;
@@ -4015,17 +4044,24 @@ static void CaptureGuards(EntityPacket& pkt) {
                   (bhvC && readable(bhvC, 4)) ? *(uint32_t*)bhvC : 0u, skel ? 1u : 0u, (unsigned)n);
             }
             if (SyncEnemiesOnly() && !IsFighterBody(kr)) { KrRejectAdd(kr); continue; }
-            // T26: keep only bodies the engine itself calls enemies of the owner. Costs one call into
-            // 0x1719FF0 per candidate, so it is a separate, default-off gate rather than the default.
-            if (HostileOnly() && !IsEnemyOfOwner(e)) { KrRejectAdd(kr); continue; }
+            // A28: ONE classification per candidate, before the gate, so the counters describe the
+            // population and not just the survivors.  Counted hostile -> unknown -> candidate.
+            // Default-off gate means nothing is rejected (identical to before) but it is measured.
+            const int hostile = (int)HostilityToPlayer(player, e);
+            if (hostile == HOST_YES)     ++s_scopeHostile;
+            if (hostile == HOST_UNKNOWN) ++s_scopeUnknown;
+            ++s_scopeCand;
+            // Selection filter only: drop NO and UNKNOWN alike when the gate is on.  No health write,
+            // no es.dead change, no packing change -- the wire is untouched with the gate at its default.
+            if (HostileOnly() && hostile != HOST_YES) { KrRejectAdd(kr); continue; }
             // ---- scope counters ----
             // Candidates = every body that survived skeleton + BhvGenericNPC + the health service and
             // the T13 soldier filter above (so with SyncEnemiesOnly=1 this counts soldiers only; the
-            // pre-filter population is what [Sync] kindrole reports). Enemies = the subset carrying
-            // WeaponComponent or MapIconBehaviorGuard. Counted before the relevance test on purpose: the
-            // numbers must describe the SCOPE, not the radius, so `sent` can be read against `enemies`.
+            // pre-filter population is what [Sync] kindrole reports), counted PRE-hostility-gate, so
+            // `candidates` is the population and not the survivor count.  Enemies = the subset carrying
+            // WeaponComponent or MapIconBehaviorGuard (legacy dead counter, meaning unchanged).  Counted
+            // before the relevance test on purpose: the numbers must describe the SCOPE, not the radius.
             const bool isEnemy = weapon || guardIcon;
-            ++s_scopeCand;
             if (isEnemy) ++s_scopeEnemies;
             // Diagnostic only: fold this candidate's component ids (already collected on the walk
             // above) into the window histogram, plus its AI object vtable from the pointer the gate
@@ -4105,6 +4141,9 @@ static void CaptureGuards(EntityPacket& pkt) {
             EmitGuardEntity(pkt, count, i, e, bhvC, hc, px, py, pz, nowMs);
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    // A28: one increment per CAPTURE (not per emission), after the emit loop -- the denominator of
+    // sentPerCap.  Unconditional: SyncSlotSweep is the next statement in this function.
+    ++s_scopeCaps;
     // TASK 2: release slots the capture has not seen for 10 s. Runs AFTER the capture, so everything
     // this capture handled carries a fresh stamp; only entities that left the world can be released.
     SyncSlotSweep(nowMs);
@@ -8679,9 +8718,15 @@ static void OnFrameInner(Human* updatedHuman) {
             // Scope (TASK 1): candidates that passed the validity gate, how many of them are inside
             // SyncRadiusM of the peer, and how many were actually emitted (nearest-first, capped by
             // SyncMaxEntities; `sent` also includes ships, packed before the characters).
-            L("[Sync] scope candidates=%u inRadius=%u enemies=%u sent=%u (SyncEnemiesOnly=%d, SyncRadiusM=%d, SyncMaxEntities=%d)\n",
-              s_scopeCand, s_scopeInRadius, s_scopeEnemies, s_scopeSent,
-              SyncEnemiesOnly(), SyncRadiusM(), SyncMaxEntities());
+            // A28: HostileOnly is printed here for the first time (it was invisible in every capture),
+            // and `captures`/`sentPerCap` are added because `sent` is a WINDOW SUM, not a per-snapshot
+            // figure -- only sentPerCap is bounded by SyncMaxEntities.  L() formats into char buf[1024]
+            // (see the definition above), so the 187-char line cannot truncate.
+            L("[Sync] scope candidates=%u inRadius=%u enemies=%u hostile=%u unknown=%u sent=%u captures=%u sentPerCap=%.2f (SyncEnemiesOnly=%d, SyncRadiusM=%d, SyncMaxEntities=%d, HostileOnly=%d)\n",
+              s_scopeCand, s_scopeInRadius, s_scopeEnemies, s_scopeHostile, s_scopeUnknown, s_scopeSent,
+              s_scopeCaps,
+              s_scopeCaps ? (double)s_scopeSent / (double)s_scopeCaps : 0.0,
+              SyncEnemiesOnly(), SyncRadiusM(), SyncMaxEntities(), HostileOnly());
             // T13/T21 oracle: the discriminator over every character candidate the walk reached in
             // this window, BEFORE the SyncEnemiesOnly filter (so the numbers do not collapse to zero
             // when the filter is on). soldier = kind 3 with a fighter role from the T21 set;
@@ -8769,6 +8814,7 @@ static void OnFrameInner(Human* updatedHuman) {
             CompHistReset();
             AiHistReset();
             s_scopeCand = 0; s_scopeEnemies = 0; s_scopeInRadius = 0; s_scopeSent = 0;
+            s_scopeHostile = 0; s_scopeUnknown = 0; s_scopeCaps = 0;   // A28: same window boundary
             s_krN = 0; s_krSoldier = 0; s_krCivilian = 0; s_krOther = 0;
             s_krWinLines = 0;   // T17: the per-window [KR] budget refills with the other counters
             s_krRejN = 0; s_krRejTotal = 0; s_krRejOverflow = 0;   // T21: rejection histogram
