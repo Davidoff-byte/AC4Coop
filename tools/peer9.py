@@ -569,9 +569,11 @@ def main(argv):
                     if args.ent is not None:
                         # A NON-kill record: the game keeps kill-only packets out of the
                         # snapshot slot on purpose, so this is the only way to exercise
-                        # the guest's entity receive/bind path.
+                        # the guest's entity receive/bind path. It MUST carry pos, or the
+                        # guest matches it against (0,0,0) and every candidate is "far".
                         rec = {"key": 0, "kind": 2, "idKind": 0, "wireId": args.ent,
-                               "hp": args.hp, "dead": 0}
+                               "hp": args.hp, "dead": 0,
+                               "pos": (x, y, z), "quat": (0.0, 0.0, 0.0, 1.0)}
                         sock.sendto(encode_entity_wire(seq, 1, [rec]), dest)
                         tx += 1
                 interval = INTERVAL
