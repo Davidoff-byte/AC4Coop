@@ -2810,6 +2810,7 @@ static unsigned s_bindRejHp     = 0;
 static unsigned s_bindRejArch   = 0;
 static unsigned s_bindRejTaken  = 0;
 static unsigned s_bindRejComps  = 0;
+static float    s_bindMinD      = 1e9f;   // nearest candidate distance seen this window (m²)
 static unsigned s_bindUnmatched = 0;
 static double   s_bindErrSum    = 0.0;
 static float    s_bindErrMax    = 0.0f;
@@ -4084,6 +4085,7 @@ static void ApplyGuards(const EntityPacket& pkt) {
                 float dy = e->m_GlobalMatrix.M42 - es.pos[1];
                 float dz = e->m_GlobalMatrix.M43 - es.pos[2];
                 float d = dx*dx + dy*dy + dz*dz;
+                if (d < s_bindMinD) s_bindMinD = d;
                 if (d < bestD) { bestD = d; best = e; bestBhv = bhvC; }
             }
             if (!best) { ++s_covNoBody; ++s_bindUnmatched; continue; }
@@ -7979,10 +7981,10 @@ static void OnFrameInner(Human* updatedHuman) {
                 static int s_diag = -1;
                 if (s_diag < 0) s_diag = GetPrivateProfileIntA("Coop", "BindDiag", 0, Paths::Ini());
                 if (s_diag)
-                    L("[BindDiag] recs=%u scan=%u rej(self=%u comps=%u skel=%u bhv=%u ai=%u hp=%u arch=%u taken=%u) noBody=%u\n",
+                    L("[BindDiag] recs=%u scan=%u rej(self=%u comps=%u skel=%u bhv=%u ai=%u hp=%u arch=%u taken=%u) noBody=%u minD=%.2f\n",
                       s_bindSent, s_bindScanN, s_bindRejSelf, s_bindRejComps, s_bindRejSkel,
                       s_bindRejBhv, s_bindRejAi, s_bindRejHp, s_bindRejArch, s_bindRejTaken,
-                      s_bindUnmatched);
+                      s_bindUnmatched, (s_bindMinD < 1e8f) ? sqrtf(s_bindMinD) : -1.0f);
             }
             // Component histogram, same window. ALL non-zero distinct component vtable ids by
             // descending count (32 slots), then the two ids the enemies-only filter trusts, each as
@@ -8027,6 +8029,7 @@ static void OnFrameInner(Human* updatedHuman) {
             s_bindScanN = 0; s_bindRejSelf = 0; s_bindRejComps = 0; s_bindRejSkel = 0;
             s_bindRejBhv = 0; s_bindRejAi = 0; s_bindRejHp = 0; s_bindRejArch = 0;
             s_bindRejTaken = 0;
+            s_bindMinD = 1e9f;
             s_bindErrSum = 0.0; s_bindErrMax = 0.0f;
             // One-shot receive watchdog: counters reset every poll, so 2 polls with tx and no rx
             // means ~10 s of transmitting into the void. Say so once - silence is the failure mode
