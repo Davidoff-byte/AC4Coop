@@ -1511,7 +1511,30 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
         g_ghostSyncMs = GetTickCount64();   // liveness stamp: EntitySyncTick clears the latch when stale
         g_ghostSyncWorldId = s.worldId;     // ...or when the clone's world stops matching the current one
         g_ghostPeerNoShip = false;
-        g_ghostPeerMaxHP = s.shipMaxHP;   // [GhostProxy] peer's class fingerprint (GcLShip+0xB4; 0 = unknown)
+        // PX-m3: the peer's copy of GcLShip+0xB4 arrives raw over the wire; only the LOCAL read is
+        // bounded (ReadShipHullMax). 0 already means "unknown" downstream (the proxy gate is
+        // > 0.0f), so an out-of-band value must become 0 -- no proxy -- and never a number the
+        // selector believes. Band top = the measured live maximum (350..52000: hull-hp-found.md,
+        // ghost-identity-by-proxy.md); the bit test is used instead of
+        // "raw != raw" because an operand-comparison NaN test can be folded under /fp:fast.
+        {
+            float raw = s.shipMaxHP;
+            const uint32_t bits = *(uint32_t*)&raw;                  // same cast pattern as the timer read
+            const bool isNan = ((bits & 0x7F800000u) == 0x7F800000u) && ((bits & 0x007FFFFFu) != 0);
+            float clean = raw;
+            const char* why = nullptr;
+            if (isNan)                   { clean = 0.0f; why = "nan"; }
+            else if (!(raw > 0.0f))      { clean = 0.0f; why = "non-positive"; }   // also -inf / negative
+            else if (!(raw <= 52000.0f)) { clean = 0.0f; why = "above-band"; }     // also +inf
+            if (why) {
+                static bool s_peerMaxHpClampLogged = false;   // once per process: an out-of-band wire
+                if (!s_peerMaxHpClampLogged) {                // value is a smell, not a 20 Hz event
+                    s_peerMaxHpClampLogged = true;
+                    L("[GhostProxy] shipMaxHP out of band raw=%g -> %g reason=%s\n", raw, clean, why);
+                }
+            }
+            g_ghostPeerMaxHP = clean;   // [GhostProxy] peer's class fingerprint (GcLShip+0xB4; 0 = unknown)
+        }
         g_ghostPeerClass = s.shipClass;   // [GhostProxy] peer's ship class (entity+0x9C; 0 = unknown)
         // [Coop] ShipHPSync (default OFF): carry the peer's hull HP to the ghost. Change-guarded, so the
         // damage-aware setter (clamp + zero event + HUD republish) is not hammered once per packet.
@@ -4566,7 +4589,7 @@ static unsigned int FindHealthInAI(unsigned int ai);     // defined further belo
 // P0/P1: peer -> host health event. objId is the host-assigned identity; position is a fallback only.
 static void ApplyPeerHealth(uint64_t objId, unsigned short life, float x, float y, float z);  // below
 static bool SelfTestModeActive();                        // defined below
-static void KillGuardEntity(Entity* e);                  // defined below
+static bool KillGuardEntity(Entity* e);                  // defined below
 static void MirrorVisualDeath(Entity* e);                // defined below
 
 // Re-entrancy guard shared by both event lanes (self-test loopback must not ping-pong).
@@ -7184,25 +7207,33 @@ static void MirrorVisualDeathInner(Entity* e) {
 // notifyPeer=false is the guest variant (KillGuardEntityQuiet below): the mirror carries a LOCAL objId,
 // so pushing it back would reach the host as an unknown id and resolve by POSITION onto whichever guard
 // stands there. Every pre-existing call site goes through KillGuardEntity(Entity*) and still notifies.
-static void KillGuardEntityInner(Entity* e, bool notifyPeer);     // wrapped below
-static void KillGuardEntity(Entity* e) {
-    if (!e || !readable(e, 4)) return;
-    __try { KillGuardEntityInner(e, true); }
+// C2-M1: the return value is "the ENGINE says this body is dead after this call", never "the function
+// reached its end". notifyPeer selects only the peer push; the verdict means the same on both paths.
+static bool KillGuardEntityInner(Entity* e, bool notifyPeer);     // wrapped below
+static bool KillGuardEntity(Entity* e) {
+    if (!e || !readable(e, 4)) return false;
+    bool dead = false;
+    __try { dead = KillGuardEntityInner(e, true); }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         L("[KF] EXCEPTION 0x%08X (ent=%08X) - kill aborted\n", GetExceptionCode(), e);
+        dead = false;
     }
+    return dead;
 }
 
-static void KillGuardEntityQuiet(Entity* e) {
-    if (!e || !readable(e, 4)) return;
-    __try { KillGuardEntityInner(e, false); }
+static bool KillGuardEntityQuiet(Entity* e) {
+    if (!e || !readable(e, 4)) return false;
+    bool dead = false;
+    __try { dead = KillGuardEntityInner(e, false); }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         L("[KF] EXCEPTION 0x%08X (ent=%08X) - kill aborted\n", GetExceptionCode(), e);
+        dead = false;
     }
+    return dead;
 }
 
-static void KillGuardEntityInner(Entity* e, bool notifyPeer) {
-    if (!e) return;
+static bool KillGuardEntityInner(Entity* e, bool notifyPeer) {
+    if (!e) return false;                                  // no body: engine says nothing
 
     unsigned int ai = (unsigned int)AIEntityHelper::GetEntityAI(e);
     unsigned int hp = FindHealthInAI(ai);
@@ -7211,8 +7242,8 @@ static void KillGuardEntityInner(Entity* e, bool notifyPeer) {
     // No health service means this is not a killable NPC (stale/duplicated entity, or a junk AI pointer).
     // Everything below walks the AI, so stop here - a tester crash came from exactly this: ai=10251025
     // passed the readable() test and EngineIsAlive() faulted on it.
-    if (!hp) { L("[KF] no health service (ai=%08X) -> skip\n", ai); return; }
-    if (!ai || !readable((void*)ai, 0xC0)) { L("[KF] ai unreadable\n"); return; }
+    if (!hp) { L("[KF] no health service (ai=%08X) -> skip\n", ai); return false; }   // nothing was killed
+    if (!ai || !readable((void*)ai, 0xC0)) { L("[KF] ai unreadable\n"); return false; }
 
     L("[KF] before: alive=%d  health life=%u/%u flags=%08X\n", (int)EngineIsAlive((unsigned int)e),
       hp ? *(unsigned short*)(hp + 0x5C) : 0, hp ? *(unsigned short*)(hp + 0x5E) : 0,
@@ -7278,6 +7309,18 @@ static void KillGuardEntityInner(Entity* e, bool notifyPeer) {
     if (notifyPeer)
         SendHealthEvent(ObjIdForEntity((unsigned int)e), 0xFFFFu,
                         e->m_GlobalMatrix.M41, e->m_GlobalMatrix.M42, e->m_GlobalMatrix.M43);
+
+    // C2-M1 verdict: read the engine back instead of assuming. Life (+0x5C) is the independent
+    // predicate -- this function writes the +0x60 death flag ITSELF above, so that flag can only
+    // corroborate its own write and must not be the sole evidence of a kill. SetLife(-1) is refused
+    // on an already-dead body (live log quoted above: "rc=-1 life 65535 -> 65535"), and in
+    // exactly that case the body IS dead, so Life == 0xFFFF is the right answer for both.
+    bool engineDead = false;
+    if (readable((void*)(hp + 0x60), 4))
+        engineDead = (*(unsigned short*)(hp + 0x5C) == 0xFFFFu);
+    L("[KF] verdict ent=%08X life=%u engineDead=%d\n", e,
+      readable((void*)(hp + 0x5C), 2) ? (unsigned)*(unsigned short*)(hp + 0x5C) : 0, (int)engineDead);
+    return engineDead;
 }
 
 // ini [Coop] GuestKillMirror (default 1): let the guest run the real engine kill on a mirrored guard.
@@ -7428,7 +7471,14 @@ static bool GuestKillMirrorEntity(uint64_t objId, unsigned int ent, bool viaGues
             L("[Mirror] dead ent=%08X skipped reason=no-behaviour-component\n", ent);
             return false;
         }
-        KillGuardEntityQuiet((Entity*)ent);   // own __try/__except
+        const bool engineDead = KillGuardEntityQuiet((Entity*)ent);   // own __try/__except; real verdict
+        if (!engineDead) {
+            // C2-M1: no SetLife, or the engine refused it. Do NOT arm the latch here -- CorpseLatchTick
+            // does SetEnabled(false) + m_DriveEntity = false, which would freeze a body that is still
+            // alive. Report unsettled so the claim retries (settled = killed || alreadyDead).
+            L("[Mirror] dead ent=%08X -> KillGuardEntity applied=0 reason=engine-not-dead (GuestKillMirror=%d)\n", ent, flag);
+            return false;
+        }
         // The enable above only buys the engine the samples it needs to start the death transition.
         // Hand the body to the latch so the tick's disable/drive-clear are re-applied a few ticks
         // later and the statechart cannot talk the corpse back to life.
@@ -8443,38 +8493,15 @@ void Phase1::TryShipProbe() {
             L("[Ship] pos=unavailable\n");
         }
 
-        // Ship gameplay sub-object: FUN_00fb3220(ship, 0). Try __thiscall first (flag on stack),
-        // then __fastcall (flag in DL) — convention was ambiguous; log whichever succeeds.
-        {
-            typedef int (__thiscall *ShipSubFn_t)(void* ship, char flag);
-            typedef int (__fastcall *ShipSubFn_f)(void* ship, char flag);
-            int   sub = 0;
-            DWORD exc = 0;
-            __try { sub = ((ShipSubFn_t)(base() + 0x00FB3220))(shipEnt, 0); }
-            __except (EXCEPTION_EXECUTE_HANDLER) { exc = GetExceptionCode(); }
-            if (exc || !readable((void*)(uintptr_t)sub, 8)) {
-                L("[Ship] sub thiscall: exc=0x%08X sub=%p (falling back to fastcall)\n", exc, (void*)(uintptr_t)sub);
-                exc = 0;
-                __try { sub = ((ShipSubFn_f)(base() + 0x00FB3220))(shipEnt, 0); }
-                __except (EXCEPTION_EXECUTE_HANDLER) { exc = GetExceptionCode(); }
-            }
-            void* subp = (void*)(uintptr_t)sub;
-            if (exc || !readable(subp, 8)) {
-                L("[Ship] sub=EXCEPTION/unreadable (exc=0x%08X)\n", exc);
-            } else {
-                uint32_t subVt = *(uint32_t*)subp;
-                L("[Ship] sub=%p subVt=%08X\n", subp, subVt);
-                for (int row = 0; row < 8; ++row) {   // sub+0x00..0x80, 4 u32 per line
-                    uint32_t v[4];
-                    for (int i = 0; i < 4; ++i) {
-                        uintptr_t off = (uintptr_t)(row * 0x10 + i * 4);
-                        v[i] = readable((char*)subp + off, 4) ? *(uint32_t*)((char*)subp + off) : 0;
-                    }
-                    L("[Ship] sub+0x%02X: %08X %08X %08X %08X\n",
-                      (unsigned)(row * 0x10), v[0], v[1], v[2], v[3]);
-                }
-            }
-        }
+        // DBA-1: the FUN_00FB3220 probe was removed here (ops/evidence/double-base-add.md §5).
+        // It called base() + 0x00FB3220 -- the VA pasted where an RVA belongs (0x400000 + 0xFB3220
+        // = 0x013B3220, mid-function), a double base-add. Corrected, the call is still unsafe:
+        // the callee is int __cdecl a1,a2 (args at [ebp+8]/[ebp+0xC], bare ret at 0x00FB3234), and
+        // with a2 == 0 it runs sub_525590(a1, ...) + a container walk, so a1 must be a collection
+        // manager -- whether a ship Entity* is legal was never proven. The warm-up "flag on stack"
+        // __thiscall attempt also puts a1 = 0, which is why the log always fell through.
+        // Nothing is lost: RequestShipProbe (phase1.cpp:6088) has no caller at HEAD, so g_shipReq
+        // (:6066) can never be set and this function is unreachable.
 
         // Walk the ship entity's first 0x200 bytes for pointers to objects with a .rdata vtable
         // (its components). The ship HP (ShipHealthData / GcLNavalHealth) is behind one of these.
