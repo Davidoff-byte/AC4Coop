@@ -2224,7 +2224,7 @@ static void CaptureShips(EntityPacket& pkt) {
                         L("[ShipDump]   c[%d] ptr=%08X vt=%08X crc=%d\n", k, (unsigned)c, vt, crc);
                         // WatercraftAttributes = 91423769: print the first 32 dwords as floats, which is
                         // where max/current hull values would live. Read-only; nothing is written.
-                        if (s_dumpFloats && crc == 91423769 && readable(c, 0x80)) {
+                        if (s_dumpFloats && (crc == 91423769 || crc == 2036133539) && readable(c, 0x80)) {
                             char line[512]; int o = 0;
                             for (int f = 0; f < 32; ++f) {
                                 DWORD bits = *(DWORD*)((char*)c + 4 * f);
