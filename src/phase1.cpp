@@ -1817,6 +1817,137 @@ static void* ConstructGhostBody(void* sourceBody, const HookMath::Transform& tm)
     return body;
 }
 
+// -------------------------------------------------------------------------------------------
+// Ghost player-marker suppression (Coop:GhostMarkerSuppress, default 1).
+//
+// The duplicate inherits the ship's marker component, and its activate path re-sends
+// PLAYER_MARKER_ADD for the clone, so the minimap holds two "player ship" icons that thrash.
+//
+// Quoted from AC4BFSP.exe.i64 (IDA 9.3, idalib), all three facts verified this session:
+//
+//   sub_1223790 — the ONLY PLAYER_MARKER_ADD emitter (its one and only data reference in the
+//   image is the vtable slot at 0x26A2770, so the *class vtable slot* is the identity):
+//        v12[0] = this + 72;                          // +0x48 = subject key
+//        result = sub_7FE9A0(&off_26A37A8 /* L"PLAYER_MARKER_ADD" */, 2, v12);
+//        if ( a3 ) { *(this + 68) |= 1u; ... *((_DWORD *)this + 12) = v8(this); }   // +0x44, +0x30
+//   NOTE: sub_1223790 never reads +0x26. Only the base MARKER_ADD emitter (sub_117D1D0) and the
+//   faction emitter (sub_1223620) branch on that byte, so no +0x26 value "decides" the player
+//   marker — the vtable slot does. We therefore identify the component by its slots, not by kind.
+//
+//   sub_114CC30 — the deactivate virtual (slot 3 = byte 0x0C of BOTH vtables of that family:
+//   0x26A270C and 0x26A277C both hold it):
+//        sub_7FA170(this + 60);                       // frees *(this+0x3C), nulls it
+//        v6 = this + 72;                              // SAME subject key as the add
+//        result = sub_7FE9A0(L"MARKER_REMOVE", 2, &v6);
+//        if ( a3 ) *(_BYTE *)(this + 68) &= ~1u;      // clear +0x44 bit 0
+//
+// The subject key is the address of the component's own +0x48 field, so a remove issued on the
+// ghost's clone can only ever name the clone — the player's own marker is a different object.
+// sub_114CC30 frees (+0x3C) before it emits; nothing on any add path writes +0x3C, so on a fresh
+// clone it is normally NULL (free is a no-op). If it is NOT null we refuse to run the engine
+// teardown on a possibly shared sub-object and only clear the local registration fields.
+static const uint32_t VA_PLAYER_MARKER_ADD = 0x1223790u;   // vtable slot 0 (or 0x70) of the class
+static const uint32_t VA_MARKER_DEACTIVATE = 0x114CC30u;   // vtable slot 3 (0x0C) of the class
+
+static int s_ghostMarkerSuppress = -1;
+static inline int GhostMarkerSuppressEnabled() {
+    if (s_ghostMarkerSuppress < 0)
+        s_ghostMarkerSuppress = GetPrivateProfileIntA("Coop", "GhostMarkerSuppress", 1, Paths::Ini()) != 0 ? 1 : 0;
+    return s_ghostMarkerSuppress;
+}
+
+// 1 if `obj` carries the player-marker class vtable (PLAYER_MARKER_ADD emitter present AND the
+// MARKER_REMOVE deactivate at slot 3). Fills kind (+0x26) and handle (+0x30) for the log line.
+static int GhostMarkerProbe(void* obj, int* kindOut, uint32_t* handleOut)
+{
+    if (!obj || !readable(obj, 0x78)) return 0;
+    uint32_t vt = *(uint32_t*)obj;
+    if (!vt) return 0;
+    if (!readable((void*)(uintptr_t)(vt + 0x0C), 4)) return 0;
+    if (*(uint32_t*)(uintptr_t)(vt + 0x0C) != VA_MARKER_DEACTIVATE) return 0;
+    // The family has two sibling vtables; the emitter sits at slot 0 of one and at +0x70 of the
+    // other, so accept either — but only one of the two may hold it.
+    uint32_t add0 = 0, add70 = 0;
+    if (readable((void*)(uintptr_t)(vt + 0x00), 4)) add0 = *(uint32_t*)(uintptr_t)(vt + 0x00);
+    if (readable((void*)(uintptr_t)(vt + 0x70), 4)) add70 = *(uint32_t*)(uintptr_t)(vt + 0x70);
+    if (add0 != VA_PLAYER_MARKER_ADD && add70 != VA_PLAYER_MARKER_ADD) return 0;
+    *kindOut = (int)*(uint8_t*)((char*)obj + 0x26);
+    *handleOut = *(uint32_t*)((char*)obj + 0x30);
+    return 1;
+}
+
+// Run the class's own deactivate virtual (a3 = 1). Returns 1 if it ran, 0 if it was refused.
+static int GhostMarkerDeactivate(void* comp, int* kindOut, uint32_t* handleOut)
+{
+    if (!GhostMarkerProbe(comp, kindOut, handleOut)) return 0;
+    uint32_t vt = *(uint32_t*)comp;
+    uint32_t shared = *(uint32_t*)((char*)comp + 0x3C);
+    typedef int (__thiscall *MarkerDeactivateFn)(void*, void*, void*);
+    MarkerDeactivateFn fn = *(MarkerDeactivateFn*)(uintptr_t)(vt + 0x0C);
+    if (!fn) return 0;
+    if (shared) {
+        // Do not free a sub-object the clone may be sharing with the source component.
+        L("[GhostMarker] teardown skipped: +0x3C=%08X (shared) — clearing registration only\n", shared);
+        *(uint8_t*)((char*)comp + 0x44) &= (uint8_t)~1u;
+        *(uint32_t*)((char*)comp + 0x30) = 0;
+        return 0;
+    }
+    __try {
+        fn(comp, nullptr, (void*)1);            // -> MARKER_REMOVE + clear +0x44 bit 0
+        return 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        L("[GhostMarker] deactivate EXCEPTION 0x%08X\n", GetExceptionCode());
+        return 0;
+    }
+}
+
+// Scan one pointer array of the ghost; `depth` allows one level down into a child entity's own
+// component array. Returns the number of markers deactivated.
+static int GhostMarkerScanArray(void* base, int count, int depth, int* kindOut, uint32_t* handleOut)
+{
+    if (!base || count <= 0 || count > 512) return 0;
+    if (!readable(base, count * 4)) return 0;
+    int n = 0;
+    for (int i = 0; i < count; ++i) {
+        void* p = *(void**)((char*)base + i * 4);
+        if (!p || !readable(p, 4)) continue;
+        int k = 0; uint32_t h = 0;
+        if (GhostMarkerProbe(p, &k, &h)) {
+            *kindOut = k; *handleOut = h;
+            if (GhostMarkerDeactivate(p, &k, &h)) ++n;
+            continue;
+        }
+        if (depth > 0 && readable((char*)p + 0x68, 2)) {
+            void* cbase = *(void**)((char*)p + 0x60);         // component array
+            int   ccount = *(uint16_t*)((char*)p + 0x66);     // u16 count
+            n += GhostMarkerScanArray(cbase, ccount, depth - 1, kindOut, handleOut);
+        }
+    }
+    return n;
+}
+
+// Suppress the player marker on the ghost ONLY. Walks the clone's component array (+0x60 / u16
+// +0x66) and the child array copied by FUN_00503600 (+0x140 / u16 +0x146), plus one level of
+// child components. Never touches the source ship or the local player. Logs once per spawn.
+static void GhostSuppressPlayerMarker(void* ghost)
+{
+    if (!ghost || !GhostMarkerSuppressEnabled()) return;
+    if (!readable(ghost, 0x150)) return;
+    int suppressed = 0, kind = -1;
+    uint32_t handle = 0;
+    __try {
+        void* cbase = *(void**)((char*)ghost + 0x60);          // m_Components data
+        int   ccount = *(uint16_t*)((char*)ghost + 0x66);
+        suppressed += GhostMarkerScanArray(cbase, ccount, 1, &kind, &handle);
+        void* kbase = *(void**)((char*)ghost + 0x140);         // child (sub-entity) array
+        int   kcount = *(uint16_t*)((char*)ghost + 0x146);
+        suppressed += GhostMarkerScanArray(kbase, kcount, 1, &kind, &handle);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        L("[GhostMarker] walk EXCEPTION 0x%08X\n", GetExceptionCode());
+    }
+    L("[GhostMarker] suppressed=%d kind=%d handle=%08X\n", suppressed, kind, handle);
+}
+
 // Spawn a ghost ship = a FULL clone of the LOCAL ship (EntityGroup vtable[3] deep-copy + the 3 direct
 // component fields + physics disabled). Returns the ghost EntityGroup, or nullptr on failure.
 // Runs on the main thread (the frame hook). This is the ship-spawn primitive proven via F12.
@@ -1892,6 +2023,7 @@ static void* DuplicateShip(void* shipEnt) {
             HookMath::Vector4 gpos;
             gpos.x = sm->M41; gpos.y = sm->M42; gpos.z = sm->M43; gpos.w = 0.0f;
             ((Entity*)dup)->SetPosition(gpos);
+            GhostSuppressPlayerMarker(dup);   // Coop:GhostMarkerSuppress — kill the 2nd player icon
             return dup;
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             return nullptr;
