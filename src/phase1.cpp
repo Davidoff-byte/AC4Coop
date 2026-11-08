@@ -2330,7 +2330,7 @@ static void CaptureShips(EntityPacket& pkt) {
                     float  hp = -1.0f, hpmax = -1.0f;
                     uint32_t hvt = 0;
                     __try {
-                        hobj = ((void* (__cdecl*)(void*, char))0x001038330)(ent, 0);
+                        hobj = ((void* (__cdecl*)(void*, char))0x01038330)(ent, 0);
                         if (hobj && readable(hobj, 4)) {
                             void** vt = *(void***)hobj;
                             hvt = (uint32_t)vt;
