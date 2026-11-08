@@ -1,0 +1,15 @@
+{
+ "unit": "00681980",
+ "addr": "0x00681980",
+ "size": 693,
+ "name": "ActionNodeUpdateB",
+ "submitted_at": "2026-11-08T12:43:50Z",
+ "original_sha": "66fe75012bd840a5113392105826286f92c40a4965d600bf367cc118838b4de5",
+ "candidate_src_sha": "38e746be90b4224bebb844b95cf5c513ad82dfd61a76ac8287a31d5456259a49",
+ "candidate_src": "00681980.cpp",
+ "arm": "probe",
+ "verdict": "UNVERIFIED-EVIDENCE",
+ "detail": "no object supplied: the pinned compiler (cl 16.00.40219.01) is not installed, so byte equality cannot be checked. Recorded as evidence only - never a match.",
+ "evidence": "00681980.txt",
+ "evidence_sha": "4054b98049a22955c4b46094ae11954eb96a9108b9c0a4e4c697e8ff54b42525"
+}

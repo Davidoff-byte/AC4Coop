@@ -1,0 +1,20 @@
+ActionNodeUpdateB @ 0x681980  (size 693)   -- probe receipt, no cl 16.00.40219.01 on this machine
+measured 2026-11-08 by ORCH against the pinned binary
+  AC4BFSP.exe sha256 bc11ad7924e1eca7363ee86aa3332c05386d0a05896c0b7370131daee9ab5150
+  candidate body: ac4-decomp\681980.c (submitted verbatim)
+
+claim
+    The larger per-node action update. Same ([this+0xFC] & 7) switch, but here the
+    two slot objects are loaded from +0x114 (this+276) and +0x118 (this+280):
+      * +0x114 is passed to sub_734460(v11) when non-null;
+      * +0x118 is passed to sub_733FB0(v12), and the result's [+680]+44 bit 0x1000 is
+        read;
+      * the two records are then resolved/created via sub_69D440(mask, id, flag) and
+        dispatched per branch through vtbl+0x28 / vtbl+0x8C, ending in sub_4AD640.
+    On exit the accepted mask is OR-ed into [this+0x0C].
+
+cross-check / limit of this receipt
+    Host function of deref sites #3-#6 (VAs 0x681AE7, 0x681B61, 0x681B23, 0x681B49).
+    It also shows why the null-return fix sits at 0x6817FA: this body calls
+    sub_733FB0 unconditionally on +0x118, and the +0x1000 bit read would fault on a
+    null result. The body does not prove which callers can supply a null +0x118.

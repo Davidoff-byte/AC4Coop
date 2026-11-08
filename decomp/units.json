@@ -183,6 +183,36 @@
    "size": 84,
    "status": "claimed"
   },
+  "00679750": {
+   "addr": "00679750",
+   "claimed_at": "2026-11-08T12:43:50Z",
+   "name": "ActionNodeUpdateA",
+   "owner": "seat-orch",
+   "receipts": [
+    {
+     "arm": "probe",
+     "at": "2026-11-08T12:43:50Z",
+     "verdict": "UNVERIFIED-EVIDENCE"
+    }
+   ],
+   "size": 303,
+   "status": "claimed"
+  },
+  "00681980": {
+   "addr": "00681980",
+   "claimed_at": "2026-11-08T12:43:50Z",
+   "name": "ActionNodeUpdateB",
+   "owner": "seat-orch",
+   "receipts": [
+    {
+     "arm": "probe",
+     "at": "2026-11-08T12:43:50Z",
+     "verdict": "UNVERIFIED-EVIDENCE"
+    }
+   ],
+   "size": 693,
+   "status": "claimed"
+  },
   "006F5F70": {
    "addr": "006F5F70",
    "claimed_at": "2026-11-08T12:12:53Z",
@@ -355,6 +385,21 @@
     }
    ],
    "size": 80,
+   "status": "claimed"
+  },
+  "01406C70": {
+   "addr": "01406C70",
+   "claimed_at": "2026-11-08T12:43:51Z",
+   "name": "ActionRoleNames",
+   "owner": "seat-orch",
+   "receipts": [
+    {
+     "arm": "probe",
+     "at": "2026-11-08T12:43:51Z",
+     "verdict": "UNVERIFIED-EVIDENCE"
+    }
+   ],
+   "size": 457,
    "status": "claimed"
   },
   "017106C0": {

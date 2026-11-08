@@ -1,0 +1,21 @@
+ActionRoleNames @ 0x1406C70  (size 457)   -- probe receipt, no cl 16.00.40219.01 on this machine
+measured 2026-11-08 by ORCH against the pinned binary
+  AC4BFSP.exe sha256 bc11ad7924e1eca7363ee86aa3332c05386d0a05896c0b7370131daee9ab5150
+  candidate body: ac4-decomp\1406C70.c (submitted verbatim)
+
+claim
+    Role index -> display string, 0..28, one switch case per string:
+      0 Any, 1 Guard, 2 Civilian, 3 Thief, 4 Courtesan, 5 Mercenary, 6 Target,
+      7 CityEventBourgeois, 8 CityEventPickpocketeer, 9 CityEventOfficial,
+      10 Orator, 11 Horse, 12 Nurse, 13 "Templar achievement",
+      14 "Male present hardsole", 15 Assassin, 16 Harasser, 17 Pirate, 18 Lite,
+      19 Animal, 20 Haytham, 21 Homestead, 22 Drunk, 23 Naval, 24 CartHorse,
+      25 Criminal, 26 Dealer, 27 "Newspaper Boy", 28 Vigilantes.
+    Values >= 29 print nothing (default: return).
+
+cross-check / limit of this receipt
+    Matches the PS3 enum EntityDescriptorNPCSubType exactly for 0..28 and adds the
+    engine's own spelling for the two the project renamed (21 "Homestead",
+    23 "Naval"). It also shows 29/30 (VaneMarooned / ElTiburon in the PS3 enum) have
+    no PC string, i.e. the PC table stops at 28 - do not assume 29/30 are reachable
+    on this build.

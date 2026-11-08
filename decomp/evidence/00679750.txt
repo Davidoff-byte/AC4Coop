@@ -1,0 +1,19 @@
+ActionNodeUpdateA @ 0x679750  (size 303)   -- probe receipt, no cl 16.00.40219.01 on this machine
+measured 2026-11-08 by ORCH against the pinned binary
+  AC4BFSP.exe sha256 bc11ad7924e1eca7363ee86aa3332c05386d0a05896c0b7370131daee9ab5150
+  candidate body: ac4-decomp\679750.c (submitted verbatim)
+
+claim
+    Per-node action update. Masks the incoming id with [this+0x12]; when the result
+    is 0xFFFF it computes the "all slots are already active" mask from a shift keyed
+    on a per-object byte, else it computes pending = mask & ~active. It then
+    switches on ([this+0xFC] & 7) - the same kind field as EntityKindRole - and for
+    cases 1/6, 2, 3, 4/5 calls vtbl+0x28 and/or vtbl+0x98 on the slot objects at
+    +0x114 / +0x118, finally OR-ing the accepted mask into [this+0x0E].
+
+cross-check / limit of this receipt
+    This is the host function of deref sites #1 and #2 (offsets +0x86 and +0x94,
+    VAs 0x6797D6 / 0x6797E4), which is why the guards for those sites live here.
+    The body proves the +0xFC&7 dispatch is shared with the soldier/civilian
+    predicates; it does not prove what the engine stores in +0x114 at runtime,
+    which is the open question behind the crash class.
