@@ -104,9 +104,10 @@ struct PlayerState {
     bool     shipValid;    // player is aboard a ship -> the fields below are meaningful
     float    shipPos[3];   // ship world position (x,y,z) = m_GlobalMatrix.M41/42/43
     float    shipQuat[4];  // ship rotation quaternion (x,y,z,w), from the 3x3 at +0x10
-    float    shipHP;       // ship hull HP = *(float*)(GcLShip + 0xD0) (max at GcLShip + 0xB4), read
-                           // through the object's vtable slot 0x1B4 and applied through slot 0x12C.
-                           // Verified - see ops/evidence/hull-hp-found.md.
+    float    shipHP;       // AUTHORITATIVE ship hull HP for the player lane: *(float*)(GcLShip+0xD0)
+                           // (max at GcLShip + 0xB4), read through the object's vtable slot 0x1B4 and
+                           // applied through slot 0x12C. Verified - see ops/evidence/hull-hp-found.md.
+                           // EntityState::hullHP is the legacy int copy of the same quantity.
 
     uint8_t  valid;                 // 1 = a live player was captured
 };
@@ -118,24 +119,38 @@ static const uint32_t NET_MAGIC = 0x43344341; // 'AC4C'
 static const uint32_t NET_PROTO_VER = 10;  // 10: float shipHP (GcLShip+0xD0); 9: compact per-field entity wire
 
 // ---- entity sync (host-authoritative "synced worlds") -------------------------------
-// One replicated entity's transform. `key` is the index in the host's enumeration; `kind`
-// selects which list that index is into (0 = World::m_CharacterList, 1 = ships filtered
-// from m_EntityManager.m_Entities by vtable 0x01E4A128). pos = m_GlobalMatrix.M41/M42/M43;
-// quat = the 3x3 rotation (HookMath::FromMatrix).
+// One replicated entity's transform. `key` is the index in the host's enumeration; `kind` (EntityKind
+// below) names the list that index is into: 1 = ship (filtered from m_EntityManager.m_Entities by
+// vtable 0x01E4A128), 2 = guard (soldier), 3 = one-shot kill event (not a list index).
+// pos = m_GlobalMatrix.M41/M42/M43; quat = the 3x3 rotation (HookMath::FromMatrix).
 static const uint32_t NET_ENTITY_MAGIC = 0x45344341; // 'AC4E'
 static const int      MAX_SYNC_ENTITIES = 128;
 
+// The entity kind carried by EntityState::kind and by the compact wire record. This is the ONLY
+// definition: 0 is reserved and no lane may publish it (net.cpp rejects it with DEC_KIND, as it does
+// any value above EK_KILL), so the receive side can never hand an unknown kind to the apply path.
+enum EntityKind : uint8_t {
+    EK_UNDEFINED = 0,   // reserved / undefined - rejected on receive, never sent
+    EK_SHIP      = 1,   // ship        -> phase1.cpp ApplyShips
+    EK_GUARD     = 2,   // guard NPC   -> phase1.cpp ApplyGuards
+    EK_KILL      = 3,   // one-shot death event -> ProcessKillEvents / Net::GetKillEntities
+};
+
 #pragma pack(push, 1)
 struct EntityState {
-    uint32_t key;          // index in the source list
-    uint8_t  kind;         // 2 = guard (soldier), 1 = ship
+    uint32_t key;          // index in the source list selected by `kind`
+    uint8_t  kind;         // EntityKind: 1 = ship, 2 = guard, 3 = kill. 0/reserved is NEVER valid here.
     uint8_t  dead;         // death state: 1 = dead (*(*(e+0xE8)+0x1C)+0xB8 & 0xC == 4)
     uint8_t  stage;        // HumanGroundStage (Fight=4 = aggro, Navigation=1 = calm)
     uint8_t  _pad;
     float    pos[3];       // world position (x,y,z)
     float    quat[4];      // world rotation (x,y,z,w)
     uint32_t actionAlias;  // current action clip (file alias); 0 = none (guards only)
-    int      hullHP;       // ship hull HP (ships only; 0 for guards) - host-authoritative damage
+    int      hullHP;       // LEGACY int encoding of the hull value (ships only; 0 for guards). The
+                           // AUTHORITATIVE hull HP is PlayerState::shipHP (float, GcLShip+0xD0, see
+                           // ops/evidence/hull-hp-found.md); this lane predates proto 10 and keeps an
+                           // integer copy. net.cpp does not convert between the two - do not assume
+                           // the same units (wire-audit M5).
     uint64_t objId;        // host-assigned stable identity (HandleContainer::m_ObjectID); 0 = unknown
     uint16_t hp;           // host-authoritative Life (guards); 0xFFFF = dead
     uint16_t arch;         // archetype id at behaviour+0x14: lets the peer match class-to-class
@@ -153,21 +168,29 @@ struct EntityPacket {
 // ---- Phase 2: compact entity wire ------------------------------------------------------------
 // EntityPacket above remains the canonical DECODED form, so every consumer (ApplyShips/ApplyGuards/
 // ProcessKillEvents) is unchanged. On the wire each entity is:
-//     u32 key, u8 kind, u16 fieldMask, then only the fields whose bit is set (fixed order below).
-// A field is omitted when it equals the sender's shadow copy, so a static NPC costs 7 bytes instead
-// of 56. Every captured entity is still sent on every packet, so `count` keeps its old meaning.
-// Old (proto 8) peers are rejected by the protoVer check rather than mis-parsed.
+//     u32 key, u8 kind, u8 idKind, u16 fieldMask, u64 wireId,     <- 16-byte fixed part
+//     then only the fields whose bit is set (fixed order below).
+// `wireId` carries the entity's stable identity: the real objId when idKind == 0, otherwise a value
+// synthesised from kind+key. A field is omitted when it equals the sender's shadow copy, so an
+// UNCHANGED entity is omitted entirely (0 bytes) and a changed one costs at least 16 bytes - never
+// the 7 the old prose claimed (there is an idKind byte and an 8-byte wireId in the fixed part).
+// `count` keeps its old meaning: it is the number of element records the caller captured / the
+// number written on the wire, not the number of field groups.
+// Old (proto 8/9) peers are rejected by the protoVer check rather than mis-parsed (both lanes).
 enum EntityField : uint16_t {
     EF_POS    = 1u << 0,   // float pos[3]
     EF_QUAT   = 1u << 1,   // float quat[4]
     EF_ACTION = 1u << 2,   // u32 actionAlias
-    EF_HULLHP = 1u << 3,   // i32 hullHP
+    EF_HULLHP = 1u << 3,   // i32 hullHP (legacy int copy of PlayerState::shipHP, see EntityState)
     EF_HP     = 1u << 4,   // u16 hp
     EF_ARCH   = 1u << 5,   // u16 arch
     EF_DEAD   = 1u << 6,   // u8  dead
     EF_STAGE  = 1u << 7,   // u8  stage
-    EF_OBJID  = 1u << 8,   // u64 objId
-    EF_ALL    = 0x01FFu,
+    EF_OBJID  = 1u << 8,   // u64 objId - declared only so the set is complete. NOT a legal mask bit:
+                           // objId rides the record's wireId (idKind == 0), and net.cpp rejects a
+                           // mask containing this bit.
+    EF_ALL    = 0x01FFu,   // every declared bit. A LEGAL wire mask is EF_ALL & ~EF_OBJID == 0x00FF;
+                           // never send EF_ALL itself.
 };
 
 #pragma pack(push, 1)
@@ -180,4 +203,7 @@ struct EntityWireHeader {
 };
 #pragma pack(pop)
 static const int ENTITY_WIRE_HEADER_SIZE = 20;
-static const int ENTITY_WIRE_RECORD_MAX  = 16 + 50;  // key+kind+idKind+mask+id + every field (worst case)
+// Fixed part (key+kind+idKind+mask+wireId = 16) + every optional field. The true worst case is
+// 16 + 42 = 58 (objId is the wireId inside the fixed part, not an extra field); 66 is deliberate
+// headroom - do not "correct" this constant below 58.
+static const int ENTITY_WIRE_RECORD_MAX  = 16 + 50;

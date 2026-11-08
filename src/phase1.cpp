@@ -4278,6 +4278,71 @@ static bool GuestKillMirrorEntity(uint64_t objId, unsigned int ent, bool viaGues
 // GuestDeathScan's own per-tick generation counter (s_gktGen) - no threads, no timers.
 static void CorpseLatchTick();
 
+// ---- guest-side damage relay (C1 + X9) ---------------------------------------------------------
+// The snapshot's `hp` is the host's own Life, the int16 at CSrvNPCHealth+0x5C (class id 0x57EEEEC7,
+// setter 0x19FB4C0 = vtable off_2712F60 slot +0x40). Applying it on the guest obeys the guard proved in
+// ops/evidence/character-health-setter.md §4:
+//   * liveness is the SIGN of the int16 - a body already below 0 is a corpse. The setter accepts a
+//     negative -> positive transition, so writing there would REVIVE it; we never write at all.
+//   * the value is clamped to the LOCAL Max (+0x5E): the two worlds do not agree on a guard's max
+//     (host 36 vs guest 30 in the live logs), so the host's absolute value is only a target, not a truth.
+//   * on the wire 0xFFFF means the int16 -1, i.e. a KILL. It is routed through the same proven mirror
+//     kill the snapshot death path uses, never written as "life 0".
+//   * 0 is NOT applied: a record whose HP field was omitted by the delta encoder decodes to 0
+//     (net.cpp:174/332; g_remoteEntities is replaced, not merged), so 0 is indistinguishable from
+//     "unchanged" and treating it as damage would kill every guard on the first quiet snapshot.
+// Everything is behind [Coop] DamageRelay (default 0). With the key off this is one static int test per
+// matched entity and no engine access at all, so the build behaves exactly as before it existed.
+static int DamageRelayEnabled() {
+    static int s = -1;
+    if (s < 0) s = GetPrivateProfileIntA("Coop", "DamageRelay", 0, Paths::Ini()) != 0 ? 1 : 0;
+    return s;
+}
+
+static void ApplyRelayedHealth(uint64_t objId, Entity* e, const EntityState& es) {
+    if (!DamageRelayEnabled()) return;
+    if (!e || es.dead) return;                    // the host's death lane owns this body (below)
+    if (MirrorKilledLocally(e)) return;           // already a corpse locally
+    const int relayed = (int)(int16_t)es.hp;      // 0xFFFF -> -1 = kill
+    if (relayed == 0) return;                     // absent/unchanged, never "life 0"
+    const unsigned int ent = (unsigned int)e;
+    if (relayed < 0) {
+        // Death: the exact sequence the snapshot path runs (:4473), so the body dies through the proven
+        // mirror kill instead of a bare health write. GuestKillMirrorEntity re-checks the body is dead
+        // on both engine predicates before it touches the engine (double SetLife(-1) is the crash path).
+        if (GktAlreadyPushed(objId, ent) || DeathAppliedRecently(ent)) return;
+        __try {
+            GktMarkPushed(objId, ent);
+            MarkMirrorKilledLocally(e);
+            MarkDeathApplied(ent);
+            MirrorVisualDeath(e);
+            GuestKillMirrorEntity(objId, ent, true);
+            static int s_hpRelayDeaths = 0;
+            if (s_hpRelayDeaths < 10) { ++s_hpRelayDeaths;
+                L("[Mirror] hp relay death objId=%llu ent=%08X\n", (unsigned long long)objId, ent); }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        return;
+    }
+    __try {
+        unsigned int svc = CachedHealthForEntity(ent);
+        if (!HostHpSvcValid(svc))
+            svc = FindHealthInAI((unsigned int)AIEntityHelper::GetEntityAI(e));
+        if (!HostHpSvcValid(svc)) return;                    // vtable + plausible Max, nothing else may read it
+        const int cur = (int)*(int16_t*)(svc + 0x5C);         // signed: negative = dead
+        if (cur < 0) return;                                  // never revive a corpse
+        if ((*(unsigned int*)(svc + 0x60) & 0x01000000u) != 0) return;   // engine dead flag
+        const int maxLife = (int)*(int16_t*)(svc + 0x5E);     // HostHpSvcValid proved 1..2000
+        int want = relayed;
+        if (want > maxLife) want = maxLife;                   // already at/over max: no write
+        if (want <= 0 || want == cur) return;                 // idempotent: one write per real change
+        ((int (__thiscall*)(void*, int))0x19FB4C0)((void*)svc, want);   // CSrvNPCHealth::SetLife
+        static int s_hpRelayLines = 0;
+        if (s_hpRelayLines < 20) { ++s_hpRelayLines;
+            L("[Mirror] hp relay objId=%llu ent=%08X life %d -> %d (host %d, local max %d)\n",
+              (unsigned long long)objId, ent, cur, want, relayed, maxLife); }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
 static void ApplyGuards(const EntityPacket& pkt) {
     World* world = World::GetCurrentWorld();
     if (!world) return;
@@ -4460,6 +4525,9 @@ static void ApplyGuards(const EntityPacket& pkt) {
             // the real guard). Skipped when the death came from the host snapshot, so it can't echo.
             GuestObjAdd(es.objId, (unsigned int)best);   // objId -> local mirror, for inbound events
             TrackMirrorDeathForRelay(best, es);
+            // C1 + X9: relayed damage. After the relay tracker (so a host-sourced death is never echoed
+            // back as a guest kill) and before the local death lane below, which owns es.dead.
+            ApplyRelayedHealth(es.objId, best, es);
             // B-4 (TASK 4): the SNAPSHOT is the reliable death channel. `es.dead` is the host's own
             // engine predicate, evaluated on every capture (:2632), delta-encoded and repeated at
             // SnapshotHz - and the live logs show it already reaching the guest. The one-shot KIND_KILL
@@ -8234,10 +8302,10 @@ static void OnFrameInner(Human* updatedHuman) {
             }
             Net::Stats st; Net::GetStats(st);
             double secs = (stNow - s_statsLast) / 1000.0;
-            L("[Net] stats tx=%u pkt, %u B, %u ent  rx=%u pkt, %u B  |  %.1f kB/s up, %.1f kB/s down  |  mirror ok=%u nobod=%u steal=%u\n",
+            L("[Net] stats tx=%u pkt, %u B, %u ent  rx=%u pkt, %u B  |  %.1f kB/s up, %.1f kB/s down  |  mirror ok=%u nobod=%u steal=%u rejects=%u protoMismatch=%u\n",
               st.txPackets, st.txBytes, st.txEnts, st.rxPackets, st.rxBytes,
               (st.txBytes / 1024.0) / secs, (st.rxBytes / 1024.0) / secs,
-              s_covMatched, s_covNoBody, s_covStolen);
+              s_covMatched, s_covNoBody, s_covStolen, st.rejects, st.protoMismatch);
             // Scope line, same 5 s window as the wire stats above. It exists so one run PROVES the
             // filter: candidates minus enemies is the civilian mass that used to be shipped, sent is
             // what actually went out (it also includes ships, which are packed before the characters).

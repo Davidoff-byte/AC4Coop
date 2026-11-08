@@ -38,7 +38,7 @@ namespace {
     // snapshot (and cannot be processed twice).
     #define NET_KILLQ 32
     #define NET_KILL_DROP_LOGS 8      // log only the first N ring overflows (a burst must not spam)
-    const uint8_t      NET_KIND_KILL = 3;     // phase1.cpp:2379 KIND_KILL (wire value, unchanged)
+    const uint8_t      NET_KIND_KILL = EK_KILL;   // phase1.cpp:2379 KIND_KILL; value declared in netstate.h
     EntityState        g_killRing[NET_KILLQ];
     int                g_killHead = 0;        // next write slot
     int                g_killCount = 0;       // filled entries; full -> the OLDEST is overwritten
@@ -86,6 +86,11 @@ namespace {
     }
 
     volatile LONG g_txPackets = 0, g_txBytes = 0, g_txEnts = 0, g_rxPackets = 0, g_rxBytes = 0;
+    // Rejects: datagrams from the peer that arrived but contributed NO state (version mismatch, a
+    // failed decode, or an illegal entity kind). They still count in rxPackets/rxBytes - they really
+    // were on the wire - but they do NOT refresh g_lastRecvMs (see the liveness note in RecvThread).
+    volatile LONG g_rxRejects = 0;        // every dropped datagram, whatever the reason
+    volatile LONG g_rxProtoMismatch = 0;  // subset of the above: protoVer != NET_PROTO_VER on either lane
 
     // ---- Phase 2: compact entity wire ---------------------------------------------------------
     // A record carries a stable 64-bit identity. `key` is the entity-manager INDEX and is NOT stable
@@ -225,8 +230,22 @@ namespace {
         return o;
     }
 
+    // Why a datagram was dropped, so the recv thread can COUNT and LOG the reason instead of leaving
+    // a mis-versioned or malformed peer looking healthy (rxPackets used to climb for every drop).
+    enum DecodeReason : uint8_t {
+        DEC_OK = 0,    // decoded
+        DEC_SHORT,     // shorter than the wire header
+        DEC_MAGIC,     // wrong NET_ENTITY_MAGIC
+        DEC_PROTO,     // protoVer != NET_PROTO_VER
+        DEC_COUNT,     // count > MAX_SYNC_ENTITIES
+        DEC_TRUNC,     // a record, or one of its fields, runs past the datagram
+        DEC_MASK,      // a field bit outside the legal wire mask (EF_ALL & ~EF_OBJID)
+        DEC_KIND,      // entity kind not in {1 ship, 2 guard, 3 kill} (see EntityKind)
+    };
+
     // Oracle for the Phase 2 codec, run at startup on both peers:
-    bool DecodeEntityPacket(const uint8_t* in, size_t len, EntityPacket& out);   // fwd decl
+    bool DecodeEntityPacket(const uint8_t* in, size_t len, EntityPacket& out,
+                            DecodeReason* why = nullptr);   // fwd decl
 
     static bool SameEntity(const EntityState& a, const EntityState& b) {
         return a.key == b.key && a.kind == b.kind && a.dead == b.dead && a.stage == b.stage
@@ -271,12 +290,16 @@ namespace {
         return ok && ok2;
     }
 
-    bool DecodeEntityPacket(const uint8_t* in, size_t len, EntityPacket& out) {
-        if (len < sizeof(EntityWireHeader)) return false;
+    bool DecodeEntityPacket(const uint8_t* in, size_t len, EntityPacket& out, DecodeReason* why) {
+        // Records the drop reason before every `return false`, so one call site can count + log it.
+        auto fail = [why](DecodeReason r) -> bool { if (why) *why = r; return false; };
+        if (why) *why = DEC_OK;
+        if (len < sizeof(EntityWireHeader)) return fail(DEC_SHORT);
         EntityWireHeader h{};
         std::memcpy(&h, in, sizeof(h));
-        if (h.magic != NET_ENTITY_MAGIC || h.protoVer != NET_PROTO_VER) return false;
-        if (h.count > (uint32_t)MAX_SYNC_ENTITIES) return false;
+        if (h.magic != NET_ENTITY_MAGIC) return fail(DEC_MAGIC);
+        if (h.protoVer != NET_PROTO_VER) return fail(DEC_PROTO);
+        if (h.count > (uint32_t)MAX_SYNC_ENTITIES) return fail(DEC_COUNT);
         // Same epoch rule as the sender: a new epoch means the base is gone on both sides.
         if (h.epoch != g_rxEpoch) {
             std::memset(g_rxShadow, 0, sizeof(g_rxShadow));
@@ -285,33 +308,65 @@ namespace {
         out.magic = h.magic; out.protoVer = h.protoVer; out.seq = h.seq; out.count = 0;
         size_t o = sizeof(h);
         for (uint32_t i = 0; i < h.count; ++i) {
-            if (o + 16 > len) return false;
+            if (o + 16 > len) return fail(DEC_TRUNC);
             uint32_t key = 0; uint8_t kind = 0; uint8_t idKind = 0; uint16_t mask = 0; uint64_t wireId = 0;
             std::memcpy(&key, in + o, 4); o += 4;
             kind = in[o++];
             idKind = in[o++];
             std::memcpy(&mask, in + o, 2); o += 2;
             std::memcpy(&wireId, in + o, 8); o += 8;
-            if (mask & ~(uint16_t)(EF_ALL & ~EF_OBJID)) return false;
+            if (mask & ~(uint16_t)(EF_ALL & ~EF_OBJID)) return fail(DEC_MASK);
+            // Kind whitelist (X13): 0 is reserved and any value outside the enum is meaningless to
+            // ApplyShips/ApplyGuards/ProcessKillEvents. Publishing it only moves the failure
+            // downstream with the raw byte intact, so reject the datagram here and count it.
+            if (kind != EK_SHIP && kind != EK_GUARD && kind != EK_KILL) return fail(DEC_KIND);
             EntityState e{};
             e.key = key; e.kind = kind; e._pad = 0;
             e.objId = (idKind == 0) ? wireId : 0;
             ShadowSlot* sh = ShadowFind(g_rxShadow, ShadowId(kind, key, e.objId), true);
             if (sh) e = sh->st, e.key = key, e.kind = kind, e._pad = 0, e.objId = (idKind == 0) ? wireId : 0;
-            if (mask & EF_POS)    { if (o + 12 > len) return false; std::memcpy(e.pos, in + o, 12); o += 12; }
-            if (mask & EF_QUAT)   { if (o + 16 > len) return false; std::memcpy(e.quat, in + o, 16); o += 16; }
-            if (mask & EF_ACTION) { if (o + 4 > len) return false; std::memcpy(&e.actionAlias, in + o, 4); o += 4; }
-            if (mask & EF_HULLHP) { if (o + 4 > len) return false; std::memcpy(&e.hullHP, in + o, 4); o += 4; }
-            if (mask & EF_HP)     { if (o + 2 > len) return false; std::memcpy(&e.hp, in + o, 2); o += 2; }
-            if (mask & EF_ARCH)   { if (o + 2 > len) return false; std::memcpy(&e.arch, in + o, 2); o += 2; }
-            if (mask & EF_DEAD)   { if (o + 1 > len) return false; e.dead = in[o++]; }
-            if (mask & EF_STAGE)  { if (o + 1 > len) return false; e.stage = in[o++]; }
+            if (mask & EF_POS)    { if (o + 12 > len) return fail(DEC_TRUNC); std::memcpy(e.pos, in + o, 12); o += 12; }
+            if (mask & EF_QUAT)   { if (o + 16 > len) return fail(DEC_TRUNC); std::memcpy(e.quat, in + o, 16); o += 16; }
+            if (mask & EF_ACTION) { if (o + 4 > len) return fail(DEC_TRUNC); std::memcpy(&e.actionAlias, in + o, 4); o += 4; }
+            if (mask & EF_HULLHP) { if (o + 4 > len) return fail(DEC_TRUNC); std::memcpy(&e.hullHP, in + o, 4); o += 4; }
+            if (mask & EF_HP)     { if (o + 2 > len) return fail(DEC_TRUNC); std::memcpy(&e.hp, in + o, 2); o += 2; }
+            if (mask & EF_ARCH)   { if (o + 2 > len) return fail(DEC_TRUNC); std::memcpy(&e.arch, in + o, 2); o += 2; }
+            if (mask & EF_DEAD)   { if (o + 1 > len) return fail(DEC_TRUNC); e.dead = in[o++]; }
+            if (mask & EF_STAGE)  { if (o + 1 > len) return fail(DEC_TRUNC); e.stage = in[o++]; }
             if (sh) sh->st = e;
             out.ents[out.count++] = e;
         }
         return true;
     }
 
+
+    // ---- reject observability (X4/X18) -----------------------------------------------------------
+    // A version mismatch or a malformed packet used to be dropped with no trace: rxPackets climbed,
+    // so a mis-versioned peer looked alive while every one of its snapshots was discarded. One line
+    // per process per lane - a mismatched peer sends at SnapshotHz, so per-packet logging would flood
+    // net_log.txt - plus counters (g_rxRejects / g_rxProtoMismatch) that Net::GetStats exposes.
+    void LogProtoMismatch(const char* lane, uint32_t got) {
+        static bool s_player = false, s_entity = false;
+        bool& logged = (lane[0] == 'p') ? s_player : s_entity;
+        if (logged) return;
+        logged = true;
+        char m[160];
+        wsprintfA(m, "[Net] %s packet REJECTED protoVer=%u expected=%u (both peers must run the same build)\n",
+                  lane, (unsigned)got, (unsigned)NET_PROTO_VER);
+        dbg(m);
+    }
+    void LogKindRejected() {
+        static bool s_logged = false;
+        if (s_logged) return;
+        s_logged = true;
+        dbg("[Net] entity packet REJECTED: kind outside {1 ship, 2 guard, 3 kill} (netstate.h EntityKind)\n");
+    }
+    void LogRejectSummary(LONG rejects) {
+        char m[160];
+        wsprintfA(m, "[Net] rx rejects=%ld protoMismatch=%ld (datagrams dropped without applying state)\n",
+                  rejects, (LONG)InterlockedCompareExchange(&g_rxProtoMismatch, 0, 0));
+        dbg(m);
+    }
 
     DWORD WINAPI RecvThread(LPVOID) {
         // Read into a buffer sized for the LARGEST packet type (EntityPacket), then dispatch on the
@@ -340,10 +395,37 @@ namespace {
                     } else {
                         EntityPacket decoded{};
                         int killDrops = 0;   // kill-ring entries overwritten by this datagram
-                        const bool entityOk = !entityPkt ||
-                            DecodeEntityPacket((const uint8_t*)buf, (size_t)n, decoded);
+                        // Both packet types put magic first and protoVer second, so the version is
+                        // readable before the type-specific decode (a player datagram is 560 B, an
+                        // entity one >= 20 B, so bytes 4..8 are always inside it).
+                        uint32_t peerProto = NET_PROTO_VER;
+                        std::memcpy(&peerProto, buf + 4, sizeof(peerProto));
+                        // Player lane (X4): magic+length alone let a PROTO-9 peer through. 9 -> 10
+                        // turned shipHP from int32 to float WITHOUT changing sizeof(PlayerState), so
+                        // the length check cannot see it and an int hull reads back as a denormal.
+                        const bool playerOk = playerPkt && peerProto == NET_PROTO_VER;
+                        // Entity lane (X18): the decoder reports WHY it dropped the datagram.
+                        DecodeReason why = DEC_OK;
+                        const bool entityOk = entityPkt &&
+                            DecodeEntityPacket((const uint8_t*)buf, (size_t)n, decoded, &why);
+                        const bool accepted = playerPkt ? playerOk : entityOk;
+                        if (playerPkt && !playerOk) {
+                            InterlockedIncrement(&g_rxProtoMismatch);
+                            LogProtoMismatch("player", peerProto);            // one line per process
+                        } else if (entityPkt && !entityOk) {
+                            if (why == DEC_PROTO) {
+                                InterlockedIncrement(&g_rxProtoMismatch);
+                                LogProtoMismatch("entity", peerProto);        // one line per process
+                            } else if (why == DEC_KIND) {
+                                LogKindRejected();
+                            }
+                        }
+                        if (!accepted) {
+                            const LONG rejects = InterlockedIncrement(&g_rxRejects);
+                            if (rejects == 1 || (rejects % 256) == 0) LogRejectSummary(rejects);
+                        }
                         EnterCriticalSection(&g_lock);
-                        if (playerPkt) {
+                        if (playerOk) {
                             g_remote = *(PlayerState*)buf; g_haveRemote = true;
                             // Queue it too (overwrites the OLDEST when the ring is full), so a frame
                             // that drains several packets feeds the interpolator all of them.
@@ -351,7 +433,7 @@ namespace {
                             g_rxqHead = (g_rxqHead + 1) % NET_RXQ;
                             if (g_rxqCount < NET_RXQ) ++g_rxqCount;
                         }
-                        else if (entityOk) {
+                        else if (entityPkt && entityOk) {
                             // B-4: pull the death entries out into their own ring first. A packet made
                             // only of them (the dedicated one-entry death push) does not touch the
                             // snapshot slot at all, so it can neither be overwritten before the frame
@@ -375,8 +457,12 @@ namespace {
                         }
                         // A header-only entity packet carries no state at all: it is a heartbeat, not
                         // evidence that the peer is alive, so it must NOT refresh the presence timer.
-                        const bool heartbeatOnly = entityPkt && entityOk && decoded.count == 0;
-                        if (!heartbeatOnly) g_lastRecvMs = GetTickCount64();   // liveness for the presence check
+                        // A REJECTED datagram refreshes nothing either (X18): it used to bump
+                        // g_lastRecvMs, so a peer whose every snapshot failed to decode looked alive.
+                        // rxPackets/rxBytes still count it - it did arrive on the wire - and
+                        // g_rxRejects is the subset that produced no state.
+                        const bool heartbeatOnly = accepted && entityPkt && decoded.count == 0;
+                        if (accepted && !heartbeatOnly) g_lastRecvMs = GetTickCount64();
                         InterlockedIncrement(&g_rxPackets);
                         InterlockedAdd(&g_rxBytes, (LONG)n);
                         LeaveCriticalSection(&g_lock);
@@ -592,6 +678,8 @@ void GetStats(Stats& out) {
     out.txEnts    = (uint32_t)InterlockedCompareExchange(&g_txEnts,    0, 0);
     out.rxPackets = (uint32_t)InterlockedCompareExchange(&g_rxPackets, 0, 0);
     out.rxBytes   = (uint32_t)InterlockedCompareExchange(&g_rxBytes,   0, 0);
+    out.rejects       = (uint32_t)InterlockedCompareExchange(&g_rxRejects,       0, 0);
+    out.protoMismatch = (uint32_t)InterlockedCompareExchange(&g_rxProtoMismatch, 0, 0);
 }
 
 void ResetStats() {
@@ -600,6 +688,8 @@ void ResetStats() {
     InterlockedExchange(&g_txEnts,    0);
     InterlockedExchange(&g_rxPackets, 0);
     InterlockedExchange(&g_rxBytes,   0);
+    InterlockedExchange(&g_rxRejects,       0);
+    InterlockedExchange(&g_rxProtoMismatch, 0);
 }
 
 } // namespace Net

@@ -28,7 +28,9 @@ namespace Net {
 
     // Counters for the [Net] stats line. txBytes counts what sendto() was given (the full packet
     // struct), so the number is the real wire cost of this protocol, not an estimate.
-    struct Stats { uint32_t txPackets, txBytes, txEnts, rxPackets, rxBytes; };
+    // rejects = datagrams from the peer that were dropped without applying state; protoMismatch is
+    // the subset dropped because protoVer != NET_PROTO_VER. Both are 0 on a well-formed link.
+    struct Stats { uint32_t txPackets, txBytes, txEnts, rxPackets, rxBytes, rejects, protoMismatch; };
     void GetStats(Stats& out);
     void ResetStats();
 }
