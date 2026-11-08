@@ -1089,8 +1089,10 @@ static bool WriteShipHullMax(void* shipEnt, float maxHp) {
 // Jackdaw, so the ghost wears the peer's hull class. The duplicate does not copy +0xB4/+0xD0,
 // so after the duplicate the ghost's hull is re-established (max then current).
 // Tie-break: farthest from the camera (approximated by distance to the local ship, the camera's
-// focus in naval view), then lowest object id. Sources are never re-used: they stay visible, and
-// no supported hide seam exists (ops/evidence/entity-hide-seams.md).
+// focus in naval view), then lowest object id. A source is remembered as an id pair and excluded
+// while its duplicate lives; the ring is oldest-overwrite, so a source can become selectable again
+// after an eviction - bounded, never a permanent blacklist. There is no supported hide seam
+// (ops/evidence/entity-hide-seams.md), so a source stays visible either way.
 // -------------------------------------------------------------------------------------------
 static int s_ghostProxy = -1;
 static inline int GhostProxyEnabled() {
@@ -1098,23 +1100,123 @@ static inline int GhostProxyEnabled() {
         s_ghostProxy = GetPrivateProfileIntA("Coop", "GhostProxy", 0, Paths::Ini()) != 0 ? 1 : 0;
     return s_ghostProxy;
 }
-// Sources already used as a proxy. Bounded; a stale pointer (freed on world change) fails the
-// vtable / hull read below and is skipped harmlessly, so the list never needs pruning.
-static void* g_proxySrcs[8];
-static int   g_proxySrcCount = 0;
+// ---- Proxy source set (ids, not pointers) --------------------------------------------------
+// A pair records "this exact duplicate was made from this exact source object":
+//   srcId   = id of the ship we duplicated   (excluded from future selection)
+//   ghostId = id of the duplicate we created (excluded as a candidate; also the prune key)
+// Ids, not pointers, because the pointer form bought nothing: an entry was only ever compared by
+// identity, so a stale value could not "fail" a read - it silently blacklisted whatever later
+// occupied that address (the engine's allocator recycles freed entity blocks). The id is minted per
+// object instance: it survives a list reorder and dies with the object, which is exactly the
+// lifetime a pair has. Nothing here ever dereferences a stored id.
+// Oldest-overwrite ring: insertion never fails, and exclusion is always a finite set of <= 8 pairs,
+// so no code path can leave selection impossible. An eviction only lets the evicted source be
+// duplicated once more - bounded, never a disablement.
+struct ProxySrcPair { uint32_t srcId; uint32_t ghostId; };
+static ProxySrcPair g_proxySrcRing[8];
+static int g_proxySrcCount = 0;    // live pairs, <= 8 - diagnostic only, never gates selection
+static int g_proxySrcNext  = 0;    // next write slot
+// Every duplicate id we have ever created. DespawnGhostShip hides a ghost instead of destroying it
+// (SHIP-RE C11), so its id can stay live forever; this keeps such a ghost out of the candidate set.
+static uint32_t g_proxyGhostIds[8];
+static int      g_proxyGhostCount = 0, g_proxyGhostNext = 0;
 
-// Re-establish a freshly-duplicated ghost's hull identity. MAX first (vtable 0x130), then CURRENT
-// (raw write - the slot 0x12C setter faults on clones; WriteShipHullHPRaw is the duplicate-safe
-// path). Current defaults to max (full hull) unless ShipHPSync supplied a sane peer HP; it is
-// clamped to >= 1.0 so the ghost can never sink (a <= 0 current fires the zero-health event and
-// destroys the GcLShip - hull-hp-found.md P4).
-static void GhostSetHullIdentity(void* ghost, float peerMax) {
-    if (!ghost || !(peerMax > 0.0f)) return;
-    WriteShipHullMax(ghost, peerMax);
+// What the selector reports. A pure-query result: the selector records nothing.
+struct ProxyPick { uint32_t srcId; int idx; float srcMax; float tierDelta; uint32_t hint; };
+
+static Entity* ResolveEntityById(uint64_t id);   // engine registry, defined with the ApplyGuards
+static void ProxySrcClearAll();
+
+static void ProxySrcRemember(uint32_t srcId, uint32_t ghostId) {
+    g_proxySrcRing[g_proxySrcNext].srcId   = srcId;
+    g_proxySrcRing[g_proxySrcNext].ghostId = ghostId;
+    g_proxySrcNext = (g_proxySrcNext + 1) % 8;
+    // The two tables are written in one place so they can never disagree.
+    g_proxyGhostIds[g_proxyGhostNext] = ghostId;
+    g_proxyGhostNext = (g_proxyGhostNext + 1) % 8;
+    if (g_proxySrcCount   < 8) ++g_proxySrcCount;
+    if (g_proxyGhostCount < 8) ++g_proxyGhostCount;
+}
+static bool ProxySrcUsed(uint32_t srcId) {
+    if (!srcId) return false;
+    for (int k = 0; k < 8; ++k) if (g_proxySrcRing[k].srcId == srcId) return true;
+    return false;
+}
+static bool ProxyGhostIdKnown(uint32_t ghostId) {
+    if (!ghostId) return false;
+    for (int k = 0; k < 8; ++k) if (g_proxyGhostIds[k] == ghostId) return true;
+    return false;
+}
+static void ProxySrcClearAll() {
+    for (int k = 0; k < 8; ++k) {
+        g_proxySrcRing[k].srcId = 0; g_proxySrcRing[k].ghostId = 0;
+        g_proxyGhostIds[k] = 0;
+    }
+    g_proxySrcCount = g_proxySrcNext = 0;
+    g_proxyGhostCount = g_proxyGhostNext = 0;
+}
+// Drop a pair whose duplicate no longer exists. A null from ResolveEntityById is the only evidence
+// accepted here ("that duplicate is gone"); a non-null answer keeps the pair, because a ghost moved
+// far away is still ours and the resolver is not trusted to distinguish it by identity.
+static void ProxySrcPrune() {
+    int live = 0;
+    for (int k = 0; k < 8; ++k) {
+        if (!g_proxySrcRing[k].ghostId) continue;
+        if (ResolveEntityById(g_proxySrcRing[k].ghostId)) { ++live; continue; }
+        g_proxySrcRing[k].srcId = 0;
+        g_proxySrcRing[k].ghostId = 0;
+    }
+    g_proxySrcCount = live;   // diagnostic only
+}
+// World change: every entity in the old world is dead or unmoored, so every pair is meaningless.
+// This is the reset the review found missing; it runs on the selection path so it cannot be skipped.
+static uint64_t s_proxyWorldId = 0;
+static void ProxySrcWorldCheck() {
+    __try {
+        World* w = World::GetCurrentWorld();
+        if (!w) return;
+        const uint64_t wid = w->GetObjectID();
+        if (wid == s_proxyWorldId) return;
+        s_proxyWorldId = wid;
+        if (g_proxySrcCount || g_proxyGhostCount)
+            L("[GhostProxy] world change -> source set cleared (pairs=%d ghosts=%d)\n",
+              g_proxySrcCount, g_proxyGhostCount);
+        ProxySrcClearAll();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+// Re-establish a freshly-duplicated ghost's hull identity. Order is load-bearing:
+//   max (slot 0x130, a pure field write) -> clamp current <= max -> current (raw write) -> read-back.
+// The clone does not copy +0xB4/+0xD0, so its max may be 0 - and +0x1B8 (max) is the divisor
+// ShipHealthCondition::Evaluate uses, so the max write is CHECKED. Returning false means the caller
+// must not register the clone.
+// current is clamped to [1.0, peerMax]: >= 1.0 so the write can never fire the zero-health destroy
+// (hull-hp-found.md P4), <= peerMax so it can never exceed the max we just set. The read-back is
+// one-shot, never a retry loop: a refusal is for a human reading the line.
+static bool GhostSetHullIdentity(void* ghost, float peerMax) {
+    if (!ghost || !(peerMax > 0.0f)) return false;
+    float preMax = 0.0f;
+    const bool havePre = ReadShipHullMax(ghost, &preMax);   // probe: the clone's +0xB4 before our write
+    const bool maxOk   = WriteShipHullMax(ghost, peerMax);
     float cur = peerMax;
     if (ShipHPSyncEnabled() && g_ghostSyncHP > 0.0f) cur = g_ghostSyncHP;
-    if (cur < 1.0f) cur = 1.0f;
-    WriteShipHullHPRaw(ghost, cur);
+    if (cur > peerMax) cur = peerMax;
+    if (cur < 1.0f)    cur = 1.0f;
+    L("[GhostProxy] hull-prewrite max=%.0f cur=%.0f\n", havePre ? preMax : 0.0f, cur);
+    if (!maxOk) {
+        L("[GhostProxy] hull-readback FAIL want=%.1f/%.1f got=unwritten (max setter refused)\n", peerMax, cur);
+        return false;
+    }
+    WriteShipHullHPRaw(ghost, cur);   // a refusal only logs - the max is already correct
+    float maxBack = 0.0f, curBack = 0.0f;
+    const bool rbMax = ReadShipHullMax(ghost, &maxBack);
+    const bool rbCur = ReadShipHullHP(ghost, &curBack);
+    float dMax = 1.0e9f;
+    if (rbMax) dMax = (maxBack > peerMax) ? (maxBack - peerMax) : (peerMax - maxBack);
+    if (!rbMax || !(dMax <= 0.5f) || !rbCur || !(curBack > 0.0f) || !(curBack <= peerMax + 0.5f))
+        L("[GhostProxy] hull-readback FAIL want=%.1f/%.1f got=%.1f/%.1f\n",
+          peerMax, cur, rbMax ? maxBack : -1.0f, rbCur ? curBack : -1.0f);
+    return true;   // the max is what matters; a refused current or a failed read-back only logs
 }
 // T39: live ship-test harness. The 20 Hz poll thread in dllmain.cpp sets the request (ScrollLock =
 // damage, Pause = sink); CaptureShips consumes it, because this is where the naval manager and the
@@ -2109,12 +2211,13 @@ static void* DuplicateShip(void* shipEnt) {
 }
 
 // Forward declaration for the ghost-proxy route (defined after the naval-list helpers below).
-static Entity* SelectProxySource(float peerMax, int* outIdx, float* outMax);
+// Pure query: it returns the best candidate and reports it in *out; it records NOTHING.
+static Entity* SelectProxySource(float peerMax, ProxyPick* out);
 
 // Spawn the peer's ship ghost. With GhostProxy=1 and a known peer max, duplicate the local ship
 // whose class matches the peer's instead of the local Jackdaw; else (or on any failure) fall back
-// to the local ship exactly as today. With GhostProxy=0 (default) this is byte-identical to the
-// pre-proxy path: one int test on the cached flag and the same DuplicateShip(shipEnt) call.
+// to the local ship exactly as today. With GhostProxy=0 (default) nothing in this block runs: one
+// int test on the cached flag, then the same DuplicateShip(shipEnt) call as before the proxy route.
 static void* SpawnGhostShip() {
     __try {
         World* world = World::GetCurrentWorld();
@@ -2125,27 +2228,69 @@ static void* SpawnGhostShip() {
         if (!shipEnt) shipEnt = handleResolve(h->m_Data.m_Vehicle);
 
         if (GhostProxyEnabled()) {
-            static int g_proxyFallbackLog = 0;   // rate-limit the auto-path fallback (it retries per frame)
-            if (g_ghostPeerMaxHP > 0.0f) {
-                int idx = -1; float srcMax = 0.0f;
-                Entity* chosen = SelectProxySource(g_ghostPeerMaxHP, &idx, &srcMax);
+            // Backoff after a failed duplicate/hull write. Advisory only: it shapes WHEN we retry,
+            // and no counter here can ever gate SelectProxySource.
+            static uint64_t s_proxyDupFailUntil = 0;
+            static unsigned s_proxyDupFails     = 0;
+            static uint64_t s_proxyLogLast      = 0;   // wall-clock throttle, 1 s
+            const uint64_t nowMs = GetTickCount64();
+            ProxySrcWorldCheck();
+            if (nowMs < s_proxyDupFailUntil) {
+                // Backing off: the proxy path does not run this frame. The Jackdaw fallback below
+                // still does, so the ghost appears - degraded, exactly as before the proxy route.
+            } else if (g_ghostPeerMaxHP > 0.0f) {
+                ProxySrcPrune();   // once per selection pass, never per frame
+                ProxyPick pick;
+                Entity* chosen = SelectProxySource(g_ghostPeerMaxHP, &pick);
                 if (chosen) {
+                    L("[GhostProxy] pick src=%08X id=%u delta=%.0f idx=%d retry=%u hint=%u tierDelta=%.2f\n",
+                      (unsigned)chosen, (unsigned)pick.srcId, pick.srcMax, pick.idx,
+                      s_proxyDupFails, (unsigned)pick.hint, pick.tierDelta);
                     void* dup = DuplicateShip(chosen);
                     if (dup) {
-                        GhostSetHullIdentity(dup, g_ghostPeerMaxHP);
-                        L("[GhostProxy] peerMax=%.0f chose=%08X srcMax=%.0f idx=%d\n",
-                          g_ghostPeerMaxHP, (unsigned)chosen, srcMax, idx);
-                        return dup;
+                        uint32_t ghostId = 0;
+                        __try { ghostId = (uint32_t)((ManagedObject*)dup)->GetObjectID(); }
+                        __except (EXCEPTION_EXECUTE_HANDLER) { ghostId = 0; }
+                        if (GhostSetHullIdentity(dup, g_ghostPeerMaxHP)) {
+                            // The pair is recorded only now - after the duplicate exists. On any
+                            // failure no slot is consumed, so the next frame may retry the source.
+                            ProxySrcRemember(pick.srcId, ghostId);
+                            s_proxyDupFails = 0; s_proxyDupFailUntil = 0;
+                            return dup;
+                        }
+                        // The clone's max could not be established. Registering it would leave a
+                        // ghost whose max may be 0 - the divisor ShipHealthCondition::Evaluate uses
+                        // - so retire the clone the way DespawnGhostShip does (move it far away;
+                        // never World::RemoveEntity, SHIP-RE C11 erase crash) and record no pair, so
+                        // it can never be chosen as a ghost and never blacklists a source.
+                        __try {
+                            HookMath::Transform hide;
+                            hide.M41 = 0.0f; hide.M42 = -100000.0f; hide.M43 = 0.0f;
+                            ((Entity*)dup)->SetGlobalMatrixInternal(&hide, false);
+                        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+                        ++s_proxyDupFails;
+                        { unsigned sh = s_proxyDupFails < 4 ? s_proxyDupFails : 4;
+                          s_proxyDupFailUntil = nowMs + (250ULL << (sh - 1)); }   // 250/500/1000/2000 ms
+                        if (nowMs - s_proxyLogLast >= 1000) {
+                            s_proxyLogLast = nowMs;
+                            L("[GhostProxy] fallback reason=hull-write-failed\n");
+                        }
+                    } else {
+                        ++s_proxyDupFails;
+                        { unsigned sh = s_proxyDupFails < 4 ? s_proxyDupFails : 4;
+                          s_proxyDupFailUntil = nowMs + (250ULL << (sh - 1)); }
+                        if (nowMs - s_proxyLogLast >= 1000) {
+                            s_proxyLogLast = nowMs;
+                            L("[GhostProxy] fallback reason=dup-failed\n");
+                        }
                     }
-                    if ((g_proxyFallbackLog++ % 60) == 0)
-                        L("[GhostProxy] fallback reason=dup-failed\n");
-                } else {
-                    if ((g_proxyFallbackLog++ % 60) == 0)
-                        L("[GhostProxy] fallback reason=no-candidate\n");
+                } else if (nowMs - s_proxyLogLast >= 1000) {
+                    s_proxyLogLast = nowMs;
+                    L("[GhostProxy] fallback reason=no-candidate\n");
                 }
-            } else {
-                if ((g_proxyFallbackLog++ % 60) == 0)
-                    L("[GhostProxy] fallback reason=no-peer-max\n");
+            } else if (nowMs - s_proxyLogLast >= 1000) {
+                s_proxyLogLast = nowMs;
+                L("[GhostProxy] fallback reason=no-peer-max\n");
             }
         }
         return DuplicateShip(shipEnt);
@@ -2506,21 +2651,35 @@ static Entity* GetLocalShip() {
 }
 
 // Choose a naval-list ship to duplicate as the peer's class. Walks [mgr+0x3E8] (handle containers,
-// stride 0xD0, count u16 @ +0x3EE), excluding the local ship and any entity already used as a proxy
-// source, and keeps the candidate whose GcLShip+0xB4 (max hull) is closest to peerMax. Tie-break:
-// farthest from the camera (approximated by distance to the local ship), then lowest object id.
-// Returns the chosen entity (filling outIdx/outMax) or nullptr when no candidate matches.
-static Entity* SelectProxySource(float peerMax, int* outIdx, float* outMax) {
-    if (outIdx) *outIdx = -1;
-    if (outMax) *outMax = 0.0f;
+// stride 0xD0, count u16 @ +0x3EE).
+//
+// PURE QUERY: it records nothing. The pair is inserted by the caller, after DuplicateShip returns -
+// otherwise a failed duplicate burns a source slot and eight failures disable the feature.
+//
+// Matching, in the light of ops/evidence/ship-max-upgrades.md: GcLShip+0xB4 is PER-INSTANCE state
+// (the ctor writes 1000.0f, the live Jackdaw holds 12000, a duplicate reads 1000 again), so exact
+// float equality is not a class test - and a duplicate always reads 1000, which also makes it
+// self-matching. Ranking therefore is:
+//   1. nearest log-ratio hull tier, |log(candMax / peerMax)| - never equality;
+//   2. structural class hint, the ship's sub-entity count (u16 @ GcLShip+0x146). The peer's hint is
+//      not on the wire, so it cannot be the target today; among equally-tiered candidates the one
+//      that carries a readable hint wins, then the structurally simpler hull (fewer sub-entities -
+//      the duplicate deep-copies that array, and burning/wreck children come along with it);
+//   3. farther from the camera (approximated by distance to the local ship - the only F1 mitigation
+//      available, no hide seam exists), then lowest object id.
+// Both hint and tierDelta are reported so the rule is observable, and so a future wire field can
+// key on the hint directly.
+static Entity* SelectProxySource(float peerMax, ProxyPick* out) {
+    if (out) { out->srcId = 0; out->idx = -1; out->srcMax = 0.0f; out->tierDelta = 0.0f; out->hint = 0; }
+    if (!(peerMax > 0.0f)) return nullptr;
     __try {
         void* mgr = GetNavalManager();
         if (!mgr || !readable((char*)mgr + 0x3E8, 8)) return nullptr;
-        unsigned short n = *(unsigned short*)((char*)mgr + 0x3EE);
+        const unsigned short n = *(unsigned short*)((char*)mgr + 0x3EE);
         Entity* localShip = GetLocalShip();
+        const uint32_t curGhostId = (uint32_t)g_ghostObjId;
 
-        // Camera-focus proxy: the local ship's position (the naval camera orbits it). Preferring a
-        // far source is the only F1 mitigation available (no hide seam), per ghost-identity-by-proxy.md.
+        // Camera-focus proxy: the local ship's position (the naval camera orbits it).
         float camX = 0.0f, camZ = 0.0f;
         if (localShip && readable(localShip, sizeof(HookMath::Transform))) {
             camX = localShip->m_GlobalMatrix.M41;
@@ -2528,37 +2687,104 @@ static Entity* SelectProxySource(float peerMax, int* outIdx, float* outMax) {
         }
 
         Entity* best = nullptr;
-        float bestDelta = 0.0f, bestDist = -1.0f, bestMax = 0.0f;
-        uint64_t bestId = 0;
-        int bestIdx = -1;
+        float bestTier = 0.0f, bestDist = -1.0f, bestMax = 0.0f;
+        float bestTieDelta = 0.0f;
+        uint32_t bestId = 0;
+        int bestIdx = -1, bestHint = 0;
+        bool bestHintOk = false;
+        bool ghostInList = false;
+        float lastSkippedHp = 0.0f;
+        int   skippedDead = 0;
         for (int i = 0; i < (int)n && i < 128; ++i) {
             Entity* se = GetShipEntity(mgr, i);
             if (!se || !readable(se, 4) || *(uint32_t*)se != 0x01E4A128u) continue;
             if (se == localShip) continue;
-            bool used = false;
-            for (int k = 0; k < g_proxySrcCount; ++k) if (g_proxySrcs[k] == se) { used = true; break; }
-            if (used) continue;
+            // M3: after GhostSetHullIdentity the proxy ghost is a perfect fingerprint match, so it
+            // must be excluded by identity - never by its hull value.
+            if (se == (Entity*)g_ghostShip) { ghostInList = true; continue; }
+            void* hc = GetShipHandle(mgr, i);
+            if (!hc || !readable(hc, 0x14)) continue;
+            uint32_t candId = 0;
+            __try { candId = (uint32_t)(*(uint64_t*)((char*)hc + 0x0C)); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { candId = 0; }
+            if (!candId) continue;                        // no identity -> cannot be tracked/pruned
+            if (candId == curGhostId) { ghostInList = true; continue; }
+            if (ProxyGhostIdKnown(candId)) continue;      // a duplicate we created earlier
+            if (ProxySrcUsed(candId)) continue;           // id-keyed: a recycled address cannot match
+            // The object's own id must agree with the handle's cached id. A recycled entity block
+            // carries a different id, so address reuse can never blacklist a live ship.
+            uint32_t objId = 0;
+            __try { objId = (uint32_t)((ManagedObject*)se)->GetObjectID(); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { objId = 0; }
+            if (!objId || objId != candId) continue;
+            // Advisory only: a null here with a matching self-id above is logged once and the
+            // candidate is ACCEPTED. Minted ids are documented as absent from the reverse map, so a
+            // hard gate would silently empty the candidate set (a new M1-class bug).
+            {
+                static bool s_resolveMissLogged = false;
+                if (!ResolveEntityById(candId) && !s_resolveMissLogged) {
+                    s_resolveMissLogged = true;
+                    L("[GhostProxy] proxy-resolve-miss id=%u (accepted; resolver is advisory)\n", (unsigned)candId);
+                }
+            }
             float maxV = 0.0f;
             if (!ReadShipHullMax(se, &maxV)) continue;
-            float delta = (maxV >= peerMax) ? (maxV - peerMax) : (peerMax - maxV);
+            float curHp = 0.0f;
+            if (!ReadShipHullHP(se, &curHp) || !(curHp > 1.0f)) {
+                // M4: a sinking/wreck source would deep-copy a wreck's sub-entity state into a ghost
+                // we then teleport to the peer and drive. <= 1.0 is the boundary because every write
+                // this project makes is clamped to >= 1.0.
+                ++skippedDead; lastSkippedHp = curHp;
+                continue;
+            }
+            float tier = logf(maxV / peerMax);
+            if (tier < 0.0f) tier = -tier;     // log ratio: symmetric, never float equality
+            // Structural hint: sub-entity count, best-effort. An unavailable hint is NOT a failure.
+            int hint = 0; bool hintOk = false;
+            void* ho = ShipGcLObj(se);
+            if (ho && readable((char*)ho + 0x140, 0x0A)) {
+                __try { hint = (int)*(uint16_t*)((char*)ho + 0x146); hintOk = true; }
+                __except (EXCEPTION_EXECUTE_HANDLER) { hint = 0; hintOk = false; }
+            }
             float dist = 0.0f;
             if (readable(se, sizeof(HookMath::Transform))) {
                 float dx = se->m_GlobalMatrix.M41 - camX, dz = se->m_GlobalMatrix.M43 - camZ;
                 dist = dx * dx + dz * dz;
             }
-            uint64_t id = ((ManagedObject*)se)->GetObjectID();
-            if (!best ||
-                delta < bestDelta ||
-                (delta == bestDelta && dist > bestDist) ||
-                (delta == bestDelta && dist == bestDist && id < bestId)) {
-                best = se; bestDelta = delta; bestDist = dist; bestMax = maxV; bestIdx = i; bestId = id;
+            bool better = false;
+            if (!best) better = true;
+            else if (tier < bestTier - 1.0e-5f) better = true;
+            else if (tier <= bestTier + 1.0e-5f) {
+                if (hintOk != bestHintOk) better = hintOk;
+                else if (hintOk && hint != bestHint) better = hint < bestHint;
+                else if (dist > bestDist) better = true;
+                else if (dist == bestDist && candId < bestId) better = true;
+            }
+            if (better) {
+                best = se; bestTier = tier; bestDist = dist; bestMax = maxV;
+                bestTieDelta = tier; bestIdx = i; bestId = candId;
+                bestHint = hint; bestHintOk = hintOk;
             }
         }
+        // One line closing the review's open premise: does the ghost ever appear in [mgr+0x3E8]?
+        {
+            static bool s_ghostInListLogged = false;
+            if (g_ghostShip && !s_ghostInListLogged) {
+                s_ghostInListLogged = true;
+                L("[GhostProxy] ghostInList=%d n=%d g_ghostShip=%p g_ghostObjId=%u\n",
+                  ghostInList ? 1 : 0, (int)n, g_ghostShip, (unsigned)curGhostId);
+            }
+        }
+        if (skippedDead)
+            L("[GhostProxy] filter dead=%d lastCur=%.1f (skipped)\n", skippedDead, lastSkippedHp);
         if (!best) return nullptr;
-        // Remember the source so a later spawn cannot re-use it (it stays visible).
-        if (g_proxySrcCount < 8) g_proxySrcs[g_proxySrcCount++] = best;
-        if (outIdx) *outIdx = bestIdx;
-        if (outMax) *outMax = bestMax;
+        if (out) {
+            out->srcId     = bestId;
+            out->idx       = bestIdx;
+            out->srcMax    = bestMax;
+            out->tierDelta = bestTieDelta;
+            out->hint      = (uint32_t)bestHint;
+        }
         return best;
     } __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
 }
@@ -8100,6 +8326,9 @@ static void ProbeIdentityOnce() {
     static void* s_lastWorld = nullptr;
     if (w == s_lastWorld) return;
     s_lastWorld = w;
+    // [GhostProxy] world change: every entity of the old world is dead or unmoored, so every
+    // source/ghost pair is meaningless. Reset there, not in a new poller.
+    ProxySrcWorldCheck();
 
     __try {
         BaseBigArray<Reference>& ents = w->m_EntityManager.m_Entities;
