@@ -1,0 +1,15 @@
+{
+ "unit": "005FD730",
+ "addr": "0x005FD730",
+ "size": 95,
+ "name": "CrowdSpawnSlot39",
+ "submitted_at": "2026-11-08T12:06:29Z",
+ "original_sha": "0f50c239212bdc438a8190b3cd77cc0c78cd2802aed50a59f43ab74e755e09f2",
+ "candidate_src_sha": "486db5a120310bc7db8cba935e6feafb6a36c413e130e277662392dd66a3577d",
+ "candidate_src": "005FD730.cpp",
+ "arm": "probe",
+ "verdict": "UNVERIFIED-EVIDENCE",
+ "detail": "no object supplied: the pinned compiler (cl 16.00.40219.01) is not installed, so byte equality cannot be checked. Recorded as evidence only - never a match.",
+ "evidence": "005FD730.txt",
+ "evidence_sha": "8f568d60ecd6e52003db336abe0c482d0d6eb50ae94a6d288b42e74c60103684"
+}

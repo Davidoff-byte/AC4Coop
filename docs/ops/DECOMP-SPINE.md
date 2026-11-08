@@ -62,6 +62,11 @@ else — index, ownership, receipts, tamper detection — works and is exercised
 compiler is installed, `--obj` starts producing real `MATCH` receipts and the corpus begins to mean
 something.
 
+**Versioning (changed 2026-11-08).** `decomp/receipts/`, `decomp/candidates/` and `decomp/evidence/`
+are committed, not ignored: `check` re-hashes the candidate source and the evidence, so a receipt
+without them cannot be re-derived and a clone could not run `check` at all. `decomp/objects/` remains
+ignored — compiler output, reproducible from the candidate once the pinned toolchain exists.
+
 Seeded units (the load-bearing functions, not the 128 k):
 
 | address | size | what |

@@ -1,0 +1,15 @@
+{
+ "unit": "0054EC00",
+ "addr": "0x0054EC00",
+ "size": 31,
+ "name": "IsCivilianPredicate",
+ "submitted_at": "2026-11-08T12:06:29Z",
+ "original_sha": "721c987b8a072bf16cb1f782864b6c71e177677c722375c5ecdbe0e6bbf89fbf",
+ "candidate_src_sha": "8ad49f329fd036500dd3fe7f442360bed30d58a379469a18a87960134ae00a05",
+ "candidate_src": "0054EC00.cpp",
+ "arm": "probe",
+ "verdict": "UNVERIFIED-EVIDENCE",
+ "detail": "no object supplied: the pinned compiler (cl 16.00.40219.01) is not installed, so byte equality cannot be checked. Recorded as evidence only - never a match.",
+ "evidence": "0054EC00.txt",
+ "evidence_sha": "6640ff2e9bde95319a799c6467a57199ccc30a046aff69a77524a19386bcf7bd"
+}

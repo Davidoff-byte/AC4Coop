@@ -1,0 +1,15 @@
+CrowdSpawnSlot39 @ 0x5FD730  (size 95)   -- probe receipt, no cl 16.00.40219.01 on this machine
+measured 2026-11-08 by ORCH against the pinned binary
+  AC4BFSP.exe sha256 bc11ad7924e1eca7363ee86aa3332c05386d0a05896c0b7370131daee9ab5150
+  candidate body: ac4-decomp\5FD730.c (submitted verbatim)
+
+claim
+sub_5FD730 is the crowd/free-roam spawn reached through vtable 0x1E57790 slot 39. It is a
+thin wrapper over sub_5FAC60 gated on the byte at dword_2AC1E68.
+
+cross-check (independent of the decompiler)
+pe_probe on the pinned exe: vtable 0x1E57790 +0x9C (slot 39) = 0x005FD730.
+
+limits
+  probe arm only: this is UNVERIFIED-EVIDENCE, never a match. The byte arm needs the pinned
+  compiler; when it exists, re-submit with --obj and the receipt re-derives both sides.

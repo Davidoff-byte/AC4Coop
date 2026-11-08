@@ -1,0 +1,15 @@
+{
+ "unit": "0073B4B0",
+ "addr": "0x0073B4B0",
+ "size": 31,
+ "name": "IsSoldierPredicate",
+ "submitted_at": "2026-11-08T12:06:28Z",
+ "original_sha": "d014c0360bbc291228fce6f87cbe4b1a8e20602a67c4fd5cacf10fca86757802",
+ "candidate_src_sha": "e37dc44f59c60bfa3a24cdf130462fe2bd6a9ba1e270692e0ca052d95f9c7d16",
+ "candidate_src": "0073B4B0.cpp",
+ "arm": "probe",
+ "verdict": "UNVERIFIED-EVIDENCE",
+ "detail": "no object supplied: the pinned compiler (cl 16.00.40219.01) is not installed, so byte equality cannot be checked. Recorded as evidence only - never a match.",
+ "evidence": "0073B4B0.txt",
+ "evidence_sha": "217d34108cf0f119e411a98d092ef5439ff4146469f2c88d056894793fb4c603"
+}

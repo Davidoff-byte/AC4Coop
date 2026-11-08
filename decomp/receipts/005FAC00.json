@@ -1,0 +1,15 @@
+{
+ "unit": "005FAC00",
+ "addr": "0x005FAC00",
+ "size": 94,
+ "name": "BuildEntityWithSelector",
+ "submitted_at": "2026-11-08T12:06:27Z",
+ "original_sha": "2c57488bdf6cf54312791ce2cb5b3b45cee5a705fcdb4372047c34a67112f836",
+ "candidate_src_sha": "f001d9022adc48cce2ec485432f85df665c901924db370d387b7c78e8df1ae5a",
+ "candidate_src": "005FAC00.cpp",
+ "arm": "probe",
+ "verdict": "UNVERIFIED-EVIDENCE",
+ "detail": "no object supplied: the pinned compiler (cl 16.00.40219.01) is not installed, so byte equality cannot be checked. Recorded as evidence only - never a match.",
+ "evidence": "005FAC00.txt",
+ "evidence_sha": "6c2c3d2fd8fe0afa5c7162a89bfa8262008236020d83842d8ee46f0c1d26e0aa"
+}

@@ -1,0 +1,15 @@
+{
+ "unit": "019FB4C0",
+ "addr": "0x019FB4C0",
+ "size": 50,
+ "name": "SetLife",
+ "submitted_at": "2026-11-08T12:06:28Z",
+ "original_sha": "edb7281c6ad10ed513f3b66c33841bcaaa2590b2ae2cdcceaaf8a3f6b974ebfa",
+ "candidate_src_sha": "9438a2e83c1d06936cc697faf71c7187323bf822e897e4fffab34bbce2976614",
+ "candidate_src": "019FB4C0.cpp",
+ "arm": "probe",
+ "verdict": "UNVERIFIED-EVIDENCE",
+ "detail": "no object supplied: the pinned compiler (cl 16.00.40219.01) is not installed, so byte equality cannot be checked. Recorded as evidence only - never a match.",
+ "evidence": "019FB4C0.txt",
+ "evidence_sha": "f9eacd9b60c8a1ba7126e346df62ddc44b9bbaa31f0a9511b77a77176ebd59e3"
+}

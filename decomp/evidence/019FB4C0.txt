@@ -1,0 +1,18 @@
+SetLife @ 0x19FB4C0  (size 50)   -- probe receipt, no cl 16.00.40219.01 on this machine
+measured 2026-11-08 by ORCH against the pinned binary
+  AC4BFSP.exe sha256 bc11ad7924e1eca7363ee86aa3332c05386d0a05896c0b7370131daee9ab5150
+  candidate body: ac4-decomp\19FB4C0.c (submitted verbatim)
+
+claim
+sub_19FB4C0 is the health setter: it stores the new value at byte +0x5C of the object as an
+int16 and, when the value is negative, takes the death path sub_A014A0(dword_4E1CC40, 0).
+This is the "SetLife(hp, -1) is the kill" used by D-016.
+
+cross-check (independent of the decompiler)
+the decompiled body stores `*(this + 46)` on an `__int16*`, i.e. +0x5C bytes, not +0x2E;
+the negative branch is the only path that calls sub_A014A0. Recorded because the same
+expression in a `_DWORD*` body would mean a different offset.
+
+limits
+  probe arm only: this is UNVERIFIED-EVIDENCE, never a match. The byte arm needs the pinned
+  compiler; when it exists, re-submit with --obj and the receipt re-derives both sides.

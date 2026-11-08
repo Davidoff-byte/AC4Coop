@@ -18,6 +18,81 @@
    "size": 51,
    "status": "unknown"
   },
+  "0054EC00": {
+   "addr": "0054EC00",
+   "claimed_at": "2026-11-08T12:06:28Z",
+   "name": "IsCivilianPredicate",
+   "owner": "seat-orch",
+   "receipts": [
+    {
+     "arm": "probe",
+     "at": "2026-11-08T12:06:29Z",
+     "verdict": "UNVERIFIED-EVIDENCE"
+    }
+   ],
+   "size": 31,
+   "status": "claimed"
+  },
+  "005FAC00": {
+   "addr": "005FAC00",
+   "claimed_at": "2026-11-08T12:06:27Z",
+   "name": "BuildEntityWithSelector",
+   "owner": "seat-orch",
+   "receipts": [
+    {
+     "arm": "probe",
+     "at": "2026-11-08T12:06:27Z",
+     "verdict": "UNVERIFIED-EVIDENCE"
+    }
+   ],
+   "size": 94,
+   "status": "claimed"
+  },
+  "005FD730": {
+   "addr": "005FD730",
+   "claimed_at": "2026-11-08T12:06:29Z",
+   "name": "CrowdSpawnSlot39",
+   "owner": "seat-orch",
+   "receipts": [
+    {
+     "arm": "probe",
+     "at": "2026-11-08T12:06:29Z",
+     "verdict": "UNVERIFIED-EVIDENCE"
+    }
+   ],
+   "size": 95,
+   "status": "claimed"
+  },
+  "00679220": {
+   "addr": "00679220",
+   "claimed_at": "2026-11-08T12:06:27Z",
+   "name": "ActionGate",
+   "owner": "seat-orch",
+   "receipts": [
+    {
+     "arm": "probe",
+     "at": "2026-11-08T12:06:27Z",
+     "verdict": "UNVERIFIED-EVIDENCE"
+    }
+   ],
+   "size": 84,
+   "status": "claimed"
+  },
+  "0073B4B0": {
+   "addr": "0073B4B0",
+   "claimed_at": "2026-11-08T12:06:28Z",
+   "name": "IsSoldierPredicate",
+   "owner": "seat-orch",
+   "receipts": [
+    {
+     "arm": "probe",
+     "at": "2026-11-08T12:06:28Z",
+     "verdict": "UNVERIFIED-EVIDENCE"
+    }
+   ],
+   "size": 31,
+   "status": "claimed"
+  },
   "0133F630": {
    "addr": "0133F630",
    "claimed_at": null,
@@ -26,6 +101,21 @@
    "receipts": [],
    "size": 297,
    "status": "unknown"
+  },
+  "019FB4C0": {
+   "addr": "019FB4C0",
+   "claimed_at": "2026-11-08T12:06:28Z",
+   "name": "SetLife",
+   "owner": "seat-orch",
+   "receipts": [
+    {
+     "arm": "probe",
+     "at": "2026-11-08T12:06:28Z",
+     "verdict": "UNVERIFIED-EVIDENCE"
+    }
+   ],
+   "size": 50,
+   "status": "claimed"
   }
  }
 }
