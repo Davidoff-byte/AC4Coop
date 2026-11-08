@@ -1,0 +1,83 @@
+# 0x1038330 - disassembly excerpt (IDA Pro 9.3, AC4BFSP.exe, imagebase 0x400000)
+
+## Function entry (contract: __cdecl, 2 args, returns void*)
+
+```
+1038330  push ebp
+1038331  mov  ebp, esp
+1038333  sub  esp, 10h
+1038336  push esi
+1038337  mov  esi, [ebp+arg_0]      ; arg0 = entity
+103833a  test esi, esi
+103833c  jnz  short loc_1038345
+103833e  xor  eax, eax              ; entity == NULL -> return NULL
+1038340  pop  esi
+1038341  mov  esp, ebp
+1038343  pop  ebp
+1038344  retn
+1038345  push 1                     ; loc_1038345
+1038347  lea  ecx, [ebp+var_10]
+103834a  call sub_FA3AA0
+103834f  cmp  [ebp+arg_4], 0        ; arg1 = mode (byte)
+1038353  jz   short loc_1038364
+1038355  mov  eax, [esi]            ; mode != 0: entity->vtbl[0x68] fills var_10
+1038357  mov  edx, [eax+68h]
+103835a  lea  ecx, [ebp+var_10]
+103835d  push ecx
+103835e  mov  ecx, esi
+1038360  call edx
+1038362  jmp  short loc_1038375
+1038364  lea  eax, [ebp+var_10]     ; loc_1038364: mode == 0
+1038367  push eax
+1038368  call sub_79B5E0
+103836d  push eax
+103836e  mov  ecx, esi
+1038370  call sub_525590
+1038375  mov  ecx, [ebp+var_C]      ; loc_1038375: container walk
+1038378  push ebx
+1038379  mov  ebx, [ebp+var_10]
+103837c  shr  ecx, 10h
+103837f  lea  eax, [ebx+ecx*4]
+1038382  push edi
+1038383  mov  [ebp+arg_0], eax
+1038386  cmp  ebx, eax
+1038388  jz   loc_103840D
+```
+
+The remainder iterates `[ebx .. ebx+count*4]`, testing each entry through
+`[entry+0x0C] -> vtbl[3] -> [obj+0x64]` with `sub_101A430`, and returns the accepted object.
+
+## Consumer: sub_1913100 case 3 (the ship health read)
+
+```
+191316a  mov  eax, [esi]            ; case 3
+191316c  mov  edx, [eax+5Ch]        ; condition target: virtual slot +0x5C
+191316f  push 0
+1913171  call edx
+1913173  push eax
+1913174  call sub_1038330           ; sub_1038330(target, 0)
+1913179  add  esp, 8                ; 2 arguments consumed -> __cdecl
+191317c  test eax, eax
+191317e  jz   loc_191320B           ; NULL -> no health
+1913184  mov  edx, [eax]            ; edx = *obj (vtable)
+1913186  mov  edi, [esi]
+1913188  mov  ecx, eax              ; this = obj
+191318a  mov  eax, [edx+1B4h]       ; vtable slot 0x1B4
+1913190  call eax
+1913192  mov  edx, [edi+68h]        ; condition compare slot +0x68
+1913195  push ecx
+1913196  mov  ecx, esi
+1913198  fstp [esp+10h+var_10]      ; return value is a float
+191319b  call edx
+```
+
+Case 4 (0x19131a6) repeats the same `sub_1038330(target, 0)` + `vtbl[0x1B4]` read and additionally
+uses `vtbl[0x1B8]` scaled by `dword_1E42324` (displayed as 100.0 by Hex-Rays).
+
+## What this establishes and what it does not
+
+Established by the disassembly: the hull value is a **float returned by virtual slot 0x1B4** on the
+object returned by `sub_1038330(entity, 0)`; `0x1B8` is its sibling (max).
+
+NOT established: the class of that object, and therefore whether the value is a raw field read. The
+probe must resolve the runtime vtable identity before the value is used by the mod.

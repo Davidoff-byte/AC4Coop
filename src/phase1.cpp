@@ -2320,6 +2320,29 @@ static void CaptureShips(EntityPacket& pkt) {
                 }
             }
             if (dumpThisTick) {
+                // T36: hull health through the engine's own getter, not through a guessed offset.
+                // Verified chain (decomp/evidence/1038330.txt, receipt decomp/receipts/01038330.json):
+                //   sub_1913100 case 3:  obj = sub_1038330(entity, 0);
+                //                        float v = ((float(__thiscall*)(void*))(*obj)[0x1B4/4])(obj);
+                //   case 4 also reads slot 0x1B8 (max).  Both are __thiscall, float in st(0).
+                {
+                    void*  hobj = nullptr;
+                    float  hp = -1.0f, hpmax = -1.0f;
+                    uint32_t hvt = 0;
+                    __try {
+                        hobj = ((void* (__cdecl*)(void*, char))0x001038330)(ent, 0);
+                        if (hobj && readable(hobj, 4)) {
+                            void** vt = *(void***)hobj;
+                            hvt = (uint32_t)vt;
+                            if (vt && readable(vt, 4 * (0x1B8 / 4 + 1))) {
+                                hp = ((float (__thiscall*)(void*))vt[0x1B4 / 4])(hobj);
+                                hpmax = ((float (__thiscall*)(void*))vt[0x1B8 / 4])(hobj);
+                            }
+                        }
+                    } __except (EXCEPTION_EXECUTE_HANDLER) { hobj = nullptr; hp = -2.0f; }
+                    L("[ShipHP] ship=%d ent=%08X obj=%08X vt=%08X hp=%.3f max=%.3f local=%d\n",
+                      i, (unsigned)ent, (unsigned)hobj, hvt, hp, hpmax, ent == localShip ? 1 : 0);
+                }
                 const unsigned short cn = *(unsigned short*)((char*)ent + 0x66);
                 Component** cdata = *(Component***)((char*)ent + 0x60);
                 L("[ShipDump] idx=%d ent=%08X vt=%08X comps=%u local=%d\n",
