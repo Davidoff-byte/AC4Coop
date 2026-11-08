@@ -2198,6 +2198,39 @@ static void CaptureShips(EntityPacket& pkt) {
     // Dumped once a second so a single cannonball shows up as a step change in the log.
     static int s_dumpFloats = -1;
     if (s_dumpFloats < 0) s_dumpFloats = GetPrivateProfileIntA("Coop", "ShipDumpFloats", 0, Paths::Ini());
+    // T32: change-detector. Polling snapshots at 1 Hz misses the instant of a hit (and the game pauses
+    // when unfocused, so the window is short). Instead remember each watched block and log the exact
+    // dword deltas when they change - the damage step is captured whenever it happens, no timing race.
+    struct Watch { void* p; unsigned n; unsigned char prev[0x200]; };
+    static Watch s_watch[24];
+    static int   s_watchN = 0;
+    auto watchBlock = [&](void* p, unsigned bytes) {
+        if (!p || bytes == 0 || bytes > 0x200) return;
+        int slot = -1;
+        for (int w = 0; w < s_watchN; ++w) if (s_watch[w].p == p) { slot = w; break; }
+        if (slot < 0) {
+            if (s_watchN >= 24) return;
+            slot = s_watchN++;
+            s_watch[slot].p = p;
+            s_watch[slot].n = bytes;
+            memcpy(s_watch[slot].prev, p, bytes);
+            return;
+        }
+        Watch& w = s_watch[slot];
+        if (w.n != bytes) { w.n = bytes; memcpy(w.prev, p, bytes); return; }
+        unsigned char* cur = (unsigned char*)p;
+        if (memcmp(w.prev, cur, bytes) == 0) return;
+        int shown = 0;
+        for (unsigned o = 0; o + 4 <= bytes && shown < 12; o += 4) {
+            DWORD a = *(DWORD*)(w.prev + o), b = *(DWORD*)(cur + o);
+            if (a != b) {
+                L("[ShipDelta] p=%08X off=0x%03X 0x%08X -> 0x%08X (f %.3f -> %.3f)\n",
+                  (unsigned)p, o, a, b, *(float*)&a, *(float*)&b);
+                ++shown;
+            }
+        }
+        memcpy(w.prev, cur, bytes);
+    };
     static uint64_t s_dumpNextMs = 0;
     const uint64_t dumpNow = GetTickCount64();
     const bool dumpThisTick = s_shipDump && dumpNow >= s_dumpNextMs;
@@ -2208,6 +2241,22 @@ static void CaptureShips(EntityPacket& pkt) {
         for (int i = 0; i < (int)n && count < (uint32_t)MAX_SYNC_ENTITIES; ++i) {
             Entity* ent = GetShipEntity(mgr, i);
             if (!ent || *(uint32_t*)ent != 0x01E4A128u) continue;
+            // T32: watch every tick (not just on the 1 Hz dump) so a hit is caught the frame it lands.
+            if (s_dumpFloats) {
+                watchBlock(ent, 0x200);
+                const unsigned short cw = *(unsigned short*)((char*)ent + 0x66);
+                Component** cwdata = *(Component***)((char*)ent + 0x60);
+                if (cwdata && readable(cwdata, 4)) {
+                    for (int kw = 0; kw < (int)cw && kw < 96; ++kw) {
+                        Component* cc = cwdata[kw];
+                        if (!cc || !readable(cc, 4)) continue;
+                        int crcw = -1;
+                        __try { crcw = ((int(__thiscall*)(void*))0x00A1D0D0)(cc); }
+                        __except (EXCEPTION_EXECUTE_HANDLER) { crcw = -1; }
+                        if (crcw == 91423769 || crcw == 2036133539) watchBlock(cc, 0x100);
+                    }
+                }
+            }
             if (dumpThisTick) {
                 const unsigned short cn = *(unsigned short*)((char*)ent + 0x66);
                 Component** cdata = *(Component***)((char*)ent + 0x60);
