@@ -2189,12 +2189,34 @@ static void CaptureShips(EntityPacket& pkt) {
     if (!mgr || !readable((char*)mgr + 0x3E8, 8)) return;
     unsigned short n = *(unsigned short*)((char*)mgr + 0x3EE);
     Entity* localShip = GetLocalShip();
+    // T30: [Coop] ShipDump=1 prints every ship's component class IDs (the same CRC the health-service
+    // getters compare against), so the real hull-HP service can be found by matching
+    // ops/evidence/health-service-crcs.md instead of guessing a field. sub_A1D0D0 is __thiscall.
+    static int s_shipDump = -1;
+    if (s_shipDump < 0) s_shipDump = GetPrivateProfileIntA("Coop", "ShipDump", 0, Paths::Ini());
     uint32_t count = 0;
     uint32_t withId = 0;
     __try {
         for (int i = 0; i < (int)n && count < (uint32_t)MAX_SYNC_ENTITIES; ++i) {
             Entity* ent = GetShipEntity(mgr, i);
             if (!ent || *(uint32_t*)ent != 0x01E4A128u) continue;
+            if (s_shipDump) {
+                const unsigned short cn = *(unsigned short*)((char*)ent + 0x66);
+                Component** cdata = *(Component***)((char*)ent + 0x60);
+                L("[ShipDump] idx=%d ent=%08X vt=%08X comps=%u local=%d\n",
+                  i, (unsigned)ent, *(uint32_t*)ent, (unsigned)cn, ent == localShip ? 1 : 0);
+                if (cdata && readable(cdata, 4)) {
+                    for (int k = 0; k < (int)cn && k < 96; ++k) {
+                        Component* c = cdata[k];
+                        if (!c || !readable(c, 4)) continue;
+                        uint32_t vt = *(uint32_t*)c;
+                        int crc = 0;
+                        __try { crc = ((int(__thiscall*)(void*))0x00A1D0D0)(c); }
+                        __except (EXCEPTION_EXECUTE_HANDLER) { crc = -1; }
+                        L("[ShipDump]   c[%d] vt=%08X crc=%d\n", k, vt, crc);
+                    }
+                }
+            }
             if (ent == localShip) continue;   // skip the Jackdaw (synced via g_ghostShip)
             // [Relevance] Same combined rule as the guards, but with the (wider) ship radius.
             if (!IsRelevantToPeer(ent->m_GlobalMatrix.M41, ent->m_GlobalMatrix.M42, ent->m_GlobalMatrix.M43,
