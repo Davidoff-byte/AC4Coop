@@ -1,5 +1,20 @@
 {
  "units": {
+  "00503330": {
+   "addr": "00503330",
+   "claimed_at": "2026-11-08T19:48:44Z",
+   "name": "ShipEntityCtor",
+   "owner": "spine-baserel",
+   "receipts": [
+    {
+     "arm": "probe",
+     "at": "2026-11-08T19:48:44Z",
+     "verdict": "UNVERIFIED-EVIDENCE"
+    }
+   ],
+   "size": 322,
+   "status": "claimed"
+  },
   "00504F60": {
    "addr": "00504F60",
    "claimed_at": null,
@@ -21,12 +36,17 @@
   "00527BA0": {
    "addr": "00527BA0",
    "claimed_at": "2026-11-08T12:37:08Z",
-   "name": "EntityBuilderInstantiate",
+   "name": "ListNodeAcquireAndTag",
    "owner": "seat-orch",
    "receipts": [
     {
      "arm": "probe",
      "at": "2026-11-08T12:37:08Z",
+     "verdict": "UNVERIFIED-EVIDENCE"
+    },
+    {
+     "arm": "probe",
+     "at": "2026-11-08T19:48:39Z",
      "verdict": "UNVERIFIED-EVIDENCE"
     }
    ],
@@ -408,6 +428,21 @@
    "size": 759,
    "status": "claimed"
   },
+  "00FB3220": {
+   "addr": "00FB3220",
+   "claimed_at": "2026-11-08T19:48:45Z",
+   "name": "SubAtVA_00FB3220",
+   "owner": "spine-baserel",
+   "receipts": [
+    {
+     "arm": "probe",
+     "at": "2026-11-08T19:48:45Z",
+     "verdict": "UNVERIFIED-EVIDENCE"
+    }
+   ],
+   "size": 338,
+   "status": "claimed"
+  },
   "01038330": {
    "addr": "01038330",
    "claimed_at": "2026-11-08T16:48:59Z",
@@ -436,6 +471,21 @@
     }
    ],
    "size": 142,
+   "status": "claimed"
+  },
+  "01082810": {
+   "addr": "01082810",
+   "claimed_at": "2026-11-08T19:48:44Z",
+   "name": "SpawnRequestAlloc",
+   "owner": "spine-baserel",
+   "receipts": [
+    {
+     "arm": "probe",
+     "at": "2026-11-08T19:48:44Z",
+     "verdict": "UNVERIFIED-EVIDENCE"
+    }
+   ],
+   "size": 155,
    "status": "claimed"
   },
   "010EF8C0": {

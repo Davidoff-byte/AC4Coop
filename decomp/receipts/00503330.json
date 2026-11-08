@@ -1,0 +1,15 @@
+{
+ "unit": "00503330",
+ "addr": "0x00503330",
+ "size": 322,
+ "name": "ShipEntityCtor",
+ "submitted_at": "2026-11-08T19:48:44Z",
+ "original_sha": "fc369a0baf90f2349c1bf26739bb48d8fd79b09847b59dbc99a04cb49ff4aa8e",
+ "candidate_src_sha": "a76e0ff8ede5be3f2b2d11b46a2a31fd6eadca245833e80ca2870b2baef7158c",
+ "candidate_src": "00503330.cpp",
+ "arm": "probe",
+ "verdict": "UNVERIFIED-EVIDENCE",
+ "detail": "no object supplied: the pinned compiler (cl 16.00.40219.01) is not installed, so byte equality cannot be checked. Recorded as evidence only - never a match.",
+ "evidence": "00503330.txt",
+ "evidence_sha": "5e29246ce29aae7f3dc68cfffe44d75d998ce32d11aa07b51267e6ad3bcdf789"
+}

@@ -1,0 +1,59 @@
+SpawnRequestAlloc @ 0x01082810  (size 155)   -- probe receipt, no cl 16.00.40219.01 here
+measured 2026-11-08 against the pinned binary
+  AC4BFSP.exe sha256 bc11ad7924e1eca7363ee86aa3332c05386d0a05896c0b7370131daee9ab5150
+  image base 0x400000   (PE header ImageBase; phase1.cpp:9189 notes the same)
+  unit bytes sha256 9199457db51d8bcf92e3aaa2fc8349995d3ac0266adb6f29cabd2f09ecc89db5
+  size 155 = first 4-byte int3 run after the unit (function boundary)
+
+call site  phase1.cpp:7703
+    ShipSpawnReqFn fn = (ShipSpawnReqFn)(base() + 0x00C82810);
+
+RVA arithmetic (the form the textual gate rules could not see)
+    base() is GetModuleHandle(NULL) = the image base 0x400000
+    0x400000 + 0x00C82810 = 0x01082810   -> the VA this unit documents
+
+bytes (prologue / tail)
+    head 56 57 b9 cc 1f ac 02 e8 d4 5f cd ff 8b 0d 68 1f
+    tail fc b9 cc 1f ac 02 e8 da 3c a4 ff 8b c7 5f 5e c3
+
+disassembly (prologue and the instructions named in the candidate)
+    0x01082810  56                   push    esi
+    0x01082811  57                   push    edi
+    0x01082812  b9cc1fac02           mov     ecx, 0x2ac1fcc
+    0x01082817  e8d45fcdff           call    0xd587f0
+    0x0108281C  8b0d681fac02         mov     ecx, dword ptr [0x2ac1f68]
+    0x01082822  6a10                 push    0x10
+    0x01082824  68d00d0000           push    0xdd0
+    0x01082829  e8526239ff           call    0x418a80
+    0x0108282E  8bf8                 mov     edi, eax
+    0x01082830  85ff                 test    edi, edi
+    0x01082832  7407                 je      0x108283b
+    0x01082834  8bcf                 mov     ecx, edi
+    0x01082836  e8a53e4e00           call    0x15666e0
+    0x0108283B  0fb705c21fac02       movzx   eax, word ptr [0x2ac1fc2]
+    0x01082842  8b35c01fac02         mov     esi, dword ptr [0x2ac1fc0]
+    0x01082848  81e6ff3f0000         and     esi, 0x3fff
+    0x0108284E  40                   inc     eax
+    0x0108284F  3bc6                 cmp     eax, esi
+    0x01082851  7631                 jbe     0x1082884
+    0x01082853  8bce                 mov     ecx, esi
+    0x01082855  83f918               cmp     ecx, 0x18
+    0x01082858  7305                 jae     0x108285f
+    0x0108285A  83c104               add     ecx, 4
+    0x0108285D  eb0b                 jmp     0x108286a
+    0x0108285F  b8abaaaaaa           mov     eax, 0xaaaaaaab
+    0x01082864  f7e1                 mul     ecx
+    0x01082866  d1ea                 shr     edx, 1
+    0x01082868  03ca                 add     ecx, edx
+    0x0108286A  3bf1                 cmp     esi, ecx
+    0x0108286C  7316                 jae     0x1082884
+
+... tail:
+    0x01082893  a3c21fac02           mov     dword ptr [0x2ac1fc2], eax
+    0x01082898  897c81fc             mov     dword ptr [ecx + eax*4 - 4], edi
+    0x0108289C  b9cc1fac02           mov     ecx, 0x2ac1fcc
+    0x010828A1  e8da3ca4ff           call    0xac6580
+    0x010828A6  8bc7                 mov     eax, edi
+    0x010828A8  5f                   pop     edi
+    0x010828A9  5e                   pop     esi
+    0x010828AA  c3                   ret     
