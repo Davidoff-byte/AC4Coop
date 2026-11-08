@@ -8560,6 +8560,32 @@ static void OnFrameInner(Human* updatedHuman) {
         bool timerOk = (s_netStrictPeer == 0) || (Net::MillisSinceRecv() < 2000);
         bool peerPresent = rawSameWorld && (now - lastFreshMs) < 2000 && timerOk;
 
+        // X21: ONE line every ~10 s that says what every lane is doing and why it dropped work, so a
+        // session is diagnosed from one format instead of six ([Net]/[Sync]/[ShipSync]/[Net] scene ...).
+        // Telemetry only: no engine calls beyond the attribute reads this tick already performs, no
+        // allocation (fixed buffer + _snprintf_s), bounded length, and every value comes from a counter
+        // that already exists. bind/dmg values are the most recent 5 s window, because that is the
+        // window the [Net] stats block resets them at. `ents(recv=?)`: no received-entity counter
+        // exists, so it is printed as ? rather than inventing one.
+        static uint64_t s_healthLast = 0;                        // X21: 10 s window, block-scope only
+        if (s_healthLast == 0) s_healthLast = now;
+        if (now - s_healthLast >= 10000) {
+            s_healthLast = now;
+            Net::Stats hs; Net::GetStats(hs);                    // cheap struct copy, same as the 5 s line
+            const double hErr = s_bindBound ? (s_bindErrSum / (double)s_bindBound) : 0.0;
+            char hb[256];
+            _snprintf_s(hb, sizeof(hb), _TRUNCATE,
+                        "[Health] net=%d peerMs=%u proto=%u bind(sent=%u bound=%u unmatched=%u err=%.2f) "
+                        "ents(sent=%u recv=?) ships(ghost=%d hpWant=%.1f hpApplied=%.1f) "
+                        "dmgRelay=%d rejects=%u protoMismatch=%u world=%08X scene=%08X",
+                        Net::Enabled() ? 1 : 0, Net::MillisSinceRecv(), (unsigned)NET_PROTO_VER,
+                        s_bindSent, s_bindBound, s_bindUnmatched, hErr,
+                        hs.txEnts, g_ghostShip ? 1 : 0, (double)g_ghostSyncHP, (double)g_ghostAppliedHP,
+                        DamageRelayEnabled(), hs.rejects, hs.protoMismatch,
+                        localOk ? (unsigned)local.worldId : 0u, localOk ? (unsigned)local.sceneKey : 0u);
+            L("%s\n", hb);
+        }
+
         // Observability: log each scene transition once so the gating is visible in the log.
         // D-017: only an OBSERVED key may count as a change. Packets arrive at SnapshotHz (~20) while this
         // tick runs at frame rate (~60), so using a "no packet this frame" sentinel flips the peer key
