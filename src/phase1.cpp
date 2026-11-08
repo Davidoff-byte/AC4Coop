@@ -968,10 +968,21 @@ static uint32_t worldLastLoadCellId(World* world) {
 // Ghost ship sync state: the spawned second ship entity + the peer's ship position to drive it to
 // (via the SetGlobalMatrixInternal render override). g_ghostShip is set when m_Duplicate succeeds.
 static void*   g_ghostShip = nullptr;        // the spawned ghost ship entity
+static uint64_t g_ghostObjId = 0;            // its stable object id (0 = unknown) - liveness probe
 static float   g_ghostSyncPos[3] = {0,0,0};  // peer's ship world position (x,y,z)
 static float   g_ghostSyncQuat[4] = {0,0,0,1}; // peer's ship rotation quaternion (x,y,z,w)
 static float   g_ghostSyncHP = 0.0f;        // [ShipHPSync] peer's ship hull HP (GcLShip+0xD0)
 static float   g_ghostAppliedHP = -1.0f;    // hull HP last written to the ghost (-1 = not applied yet)
+// Assign the ghost and record its id, so the drive path can prove the clone still exists through the
+// engine registry (ResolveEntityById). Before this, g_ghostShip was only cleared by F11 or a drive
+// exception: a clone the engine had freed left a dangling ref that blocked the auto-respawn forever.
+static void GhostTrack(void* ent) {
+    g_ghostShip = ent;
+    g_ghostObjId = 0;
+    if (!ent) return;
+    __try { g_ghostObjId = ((ManagedObject*)ent)->GetObjectID(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { g_ghostObjId = 0; }
+}
 // ---- [Coop] ShipHPSync (default OFF) ---------------------------------------------------------
 // Hull HP lives at GcLShip+0xD0 (max at GcLShip+0xB4). A ship entity reaches its GcLShip through the
 // engine call at 0x01038330 (decomp unit "01038330"); null when the ship has no such object.
@@ -2149,7 +2160,7 @@ void Phase1::TryShipDupProbe() {
     }
     void* dup = SpawnGhostShip();
     if (dup) {
-        g_ghostShip = dup;
+        GhostTrack(dup);
         g_ghostAuto = false;   // manual F12 spawn: persists until F11 removes it (no auto-despawn)
         L("[ShipDup] spawned ghost ship %p vt=%08X (manual, will track peer)\n", dup, *(uint32_t*)dup);
     } else {
@@ -2165,6 +2176,7 @@ void Phase1::DespawnGhostShip() {
     if (!g_ghostShip) return;
     Entity* dead = (Entity*)g_ghostShip;
     g_ghostShip = nullptr;
+    g_ghostObjId = 0;           // the liveness probe must not resolve a hidden ghost
     g_ghostAppliedHP = -1.0f;   // ShipHPSync: re-apply the peer's HP to the next ghost
     g_ghostAuto = false;
     __try {
@@ -2351,11 +2363,28 @@ static void CaptureShips(EntityPacket& pkt) {
     static unsigned char s_prev[kSlots][0x1000];
     static unsigned char s_hits[kSlots][0x1000 / 4];
     static int           s_watchN = 0;
+    // Slot lookup is open addressing keyed on the watched pointer (linear probing, 4-byte key) instead
+    // of a linear scan of all 320 slots: at saturation the scan cost ~26 x 320 compares per ship per
+    // capture (~1 M/s). kHashCap is a power of two > 2 x kSlots so the probe sequence always
+    // terminates; entries are never removed (s_watch is append-only), so a miss still allocates the
+    // next slot exactly as before.
+    const int kHashCap = 512;
+    static int s_hash[kHashCap];              // slot index + 1; 0 = empty
+    auto hashOf = [](void* p) -> unsigned {
+        unsigned h = (unsigned)((uintptr_t)p >> 4);
+        h ^= h >> 13; h *= 2654435761u; h ^= h >> 11;
+        return h & 511u;                      // kHashCap - 1
+    };
     auto watchBlock = [&](void* p, uint32_t bytes, uint32_t crc, int ship) {
         if (!p || bytes < 4 || bytes > kMaxBlock) return;
         if (!readable(p, bytes)) return;
         int slot = -1;
-        for (int w = 0; w < s_watchN; ++w) if (s_watch[w].p == p) { slot = w; break; }
+        const unsigned h0 = hashOf(p);
+        for (int probe = 0; probe < kHashCap; ++probe) {
+            const int e = s_hash[(h0 + (unsigned)probe) & (unsigned)(kHashCap - 1)];
+            if (!e) break;                                    // empty: not watched yet
+            if (s_watch[e - 1].p == p) { slot = e - 1; break; }
+        }
         if (slot < 0) {
             if (s_watchN >= kSlots) return;
             slot = s_watchN++;
@@ -2363,6 +2392,10 @@ static void CaptureShips(EntityPacket& pkt) {
             s_watch[slot].n = bytes;
             s_watch[slot].crc = crc;
             s_watch[slot].ship = ship;
+            for (int probe = 0; probe < kHashCap; ++probe) {   // the miss above proved a free entry
+                int& e = s_hash[(h0 + (unsigned)probe) & (unsigned)(kHashCap - 1)];
+                if (!e) { e = slot + 1; break; }
+            }
             memcpy(s_prev[slot], p, bytes);
             return;
         }
@@ -3318,6 +3351,15 @@ static inline int SyncEnemiesOnly() {
     return s_syncEnemiesOnly;
 }
 
+// [Coop] Diag (default 0): gates the two diagnostics that used to run unconditionally in a shipping
+// build - the per-world [Ident] entity walk and the [Sync] comps/ai histograms (per-candidate sampling
+// and the 5 s formatting). With the key on they print exactly what they printed before.
+static inline int DiagEnabled() {
+    static int v = -1;
+    if (v < 0) v = GetPrivateProfileIntA("Coop", "Diag", 0, Paths::Ini());
+    return v;
+}
+
 // [Coop] SyncRadiusM (default 60): the proximity scope that replaced the class filter. 0 = no cutoff.
 static inline int SyncRadiusM() {
     static int v = -1;
@@ -3691,7 +3733,9 @@ static void CaptureGuards(EntityPacket& pkt) {
             // above) into the window histogram, plus its AI object vtable from the pointer the gate
             // above already obtained. Counted before any `continue`, so both tables describe the same
             // population as candidates/enemies. Position is kept per id as a cluster hint.
-            {
+            // [Coop] Diag (default 0): the whole comps/ai histogram lane (per-candidate sampling here,
+            // formatting in the 5 s block) is quiet unless the key is on.
+            if (DiagEnabled()) {
                 const float hx = e->m_GlobalMatrix.M41;
                 const float hy = e->m_GlobalMatrix.M42;
                 const float hz = e->m_GlobalMatrix.M43;
@@ -4823,10 +4867,12 @@ static void EntitySyncTick() {
     World* gateWorld = World::GetCurrentWorld();
     if (!gateWorld || gateWorld->m_CharacterList.GetSize() < 2) return;
 
-    // [Ident] One-shot identity probe (per world). Dumps every human's m_ObjectID + spawn position +
-    // archetype so two sessions (or two machines) can be compared: if the same NPC at the same place
-    // carries the same objId, the id is content-derived and can replace position matching entirely.
-    {
+    // [Ident] One-shot identity probe (per world) - [Coop] Diag (default 0): this was one of only two
+    // diagnostic workloads with no key, so it ran in every shipping build. Dumps every human's
+    // m_ObjectID + spawn position + archetype so two sessions (or two machines) can be compared: if the
+    // same NPC at the same place carries the same objId, the id is content-derived and can replace
+    // position matching entirely.
+    if (DiagEnabled()) {
         static void*    s_identWorld = nullptr;
         static uint64_t s_identWorldId = 0;
         uint64_t wid = gateWorld->GetObjectID();
@@ -7342,6 +7388,28 @@ static void lerpState(const PlayerState& a, const PlayerState& b, float t, Playe
     o.curSpeed  = lerpf(a.curSpeed,  b.curSpeed,  t);
     o.destSpeed = lerpf(a.destSpeed, b.destSpeed, t);
 
+    // Ghost ship (authority-model C4): X/Y are sender-authoritative and continuous, so lerp them; Z is
+    // derived-local at the drive site (the local water height at the peer's XZ), so it is carried as-is.
+    // Orientation is a nlerp in the same wire quaternion space, shortest-arc (dot<0 -> negate b), then
+    // renormalised; a degenerate pair keeps b's rotation (copied by o = b above).
+    if (a.shipValid && b.shipValid) {
+        o.shipPos[0] = lerpf(a.shipPos[0], b.shipPos[0], t);
+        o.shipPos[1] = lerpf(a.shipPos[1], b.shipPos[1], t);
+        o.shipPos[2] = b.shipPos[2];
+        float qw = b.shipQuat[3];
+        float qs = (a.shipQuat[0]*b.shipQuat[0] + a.shipQuat[1]*b.shipQuat[1] +
+                    a.shipQuat[2]*b.shipQuat[2] + a.shipQuat[3]*b.shipQuat[3]) < 0.0f ? -1.0f : 1.0f;
+        float qx = lerpf(a.shipQuat[0]*qs, b.shipQuat[0], t);
+        float qy = lerpf(a.shipQuat[1]*qs, b.shipQuat[1], t);
+        float qz = lerpf(a.shipQuat[2]*qs, b.shipQuat[2], t);
+        float qn = lerpf(a.shipQuat[3]*qs, qw, t);
+        const float len = sqrtf(qx*qx + qy*qy + qz*qz + qn*qn);
+        if (len > 1e-6f) {
+            o.shipQuat[0] = qx / len; o.shipQuat[1] = qy / len;
+            o.shipQuat[2] = qz / len; o.shipQuat[3] = qn / len;
+        }
+    }
+
     // Heading is a direction: component-lerp xyz then renormalize (keeps .w from the newer snapshot).
     o.heading.x = lerpf(a.heading.x, b.heading.x, t);
     o.heading.y = lerpf(a.heading.y, b.heading.y, t);
@@ -8372,7 +8440,7 @@ static void OnFrameInner(Human* updatedHuman) {
             // descending count (32 slots), then the two ids the enemies-only filter trusts, each as
             // "candidates carrying it". If enemies=0 while weapon_A8/icon_D0 are non-zero, the scope
             // gate is broken; if both stay 0 across a populated scene, those ids are absent here.
-            {
+            if (DiagEnabled()) {
                 char hist[1024]; hist[0] = 0;
                 HistFormatTop(hist, sizeof(hist), s_compVt, s_compCnt, s_compDistinct, COMP_HIST_CAP);
                 L("[Sync] comps n=%u%s  weapon_A8=%u icon_D0=%u  distinct=%d%s\n",
@@ -8382,7 +8450,7 @@ static void OnFrameInner(Human* updatedHuman) {
             // AI object vtable histogram: top 12 by descending count. If a single AI vtable dominates
             // the candidate population while comps shows no single dominant id, this is the real
             // discriminator for "soldier" in this scene.
-            {
+            if (DiagEnabled()) {
                 char hist[1024]; hist[0] = 0;
                 HistFormatTop(hist, sizeof(hist), s_aiVt, s_aiCnt, s_aiDistinct, 12);
                 L("[Sync] ai n=%u%s  distinct=%d%s\n",
@@ -8390,7 +8458,7 @@ static void OnFrameInner(Human* updatedHuman) {
             }
             // One example position per table for the highest-count id, so a guard cluster can be
             // located on the map. 0x00000000 with count 0 means "no data this window".
-            {
+            if (DiagEnabled()) {
                 int ci = HistBestIndex(s_compCnt, s_compDistinct);
                 if (ci >= 0)
                     L("[Sync] sample comp vt=%08X pos=(%.1f,%.1f,%.1f)\n",
@@ -8636,6 +8704,13 @@ static void OnFrameInner(Human* updatedHuman) {
             __try { puppetAlive = readable(g_puppet, 8) && (*(void**)g_puppet == g_puppetVtbl); }
             __except (EXCEPTION_EXECUTE_HANDLER) { puppetAlive = false; }
         }
+        // World-change gate (D3): g_puppetWorldId is recorded at spawn and was never compared. A puppet
+        // built in another world cannot be valid here. Evaluated only in a live local world (localOk is
+        // false while paused/loading, and a paused world reads as a different real world), so this does
+        // not reproduce the pause mis-drop the vtable test above exists to avoid.
+        bool puppetSameWorld = true;
+        if (g_puppet && puppetAlive && localOk && g_puppetWorldId && local.worldId)
+            puppetSameWorld = (local.worldId == g_puppetWorldId);
         if (g_puppet) {
             if (!puppetAlive) {                          // entity was freed (world change / teardown)
                 L("[Net] puppet entity gone -> drop ref\n");
@@ -8645,6 +8720,15 @@ static void OnFrameInner(Human* updatedHuman) {
                 g_bhvState = -1; g_switchCd = 0;
                 g_casActivated = false;
                 g_spawnTries = 0; g_spawnCd = 180;       // let the new world's builder settle before respawn
+                g_snapCount = 0; g_snapHead = 0; g_haveSnapSeq = false;
+                despawnGrace = 0;
+            } else if (!puppetSameWorld) {               // puppet belongs to a world we have left
+                L("[Net] puppet world changed (%08X%08X -> %08X%08X) -> despawn\n",
+                  (uint32_t)(g_puppetWorldId >> 32), (uint32_t)g_puppetWorldId,
+                  (uint32_t)(local.worldId >> 32), (uint32_t)local.worldId);
+                Phase1::DespawnPuppet();                 // the existing despawn path, never RemoveEntity here
+                g_puppetWorldId = 0; g_puppetVtbl = nullptr;
+                g_spawnTries = 0; g_spawnCd = 180;
                 g_snapCount = 0; g_snapHead = 0; g_haveSnapSeq = false;
                 despawnGrace = 0;
             } else if (!localOk) {
@@ -8756,8 +8840,24 @@ static void OnFrameInner(Human* updatedHuman) {
         }
         // Auto-spawn the ghost ship when the peer is aboard (and none exists yet). The render override
         // (LogSetGlobalMatrix) then drives it to the peer's position/rotation every frame.
+        // Ghost liveness: the engine/streamer can free the clone on a world change. g_ghostShip alone
+        // would then dangle and block the auto-respawn below, so re-resolve the id recorded at spawn
+        // and drop the ref when it no longer names the same entity. Id 0 = unknown (capture failed):
+        // probe nothing rather than null a live ghost.
+        if (g_ghostShip && g_ghostObjId) {
+            __try {
+                if (ResolveEntityById(g_ghostObjId) != (Entity*)g_ghostShip) {
+                    L("[ShipSync] ghost entity gone (id=%016llX) -> drop ref\n",
+                      (unsigned long long)g_ghostObjId);
+                    g_ghostShip = nullptr; g_ghostObjId = 0; g_ghostAuto = false; g_ghostAppliedHP = -1.0f;
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                L("[ShipSync] ghost liveness EXCEPTION code=0x%08X\n", GetExceptionCode());
+                g_ghostShip = nullptr; g_ghostObjId = 0;
+            }
+        }
         if (s_shipGhost && g_ghostHasSync && !g_ghostShip) {
-            g_ghostShip = SpawnGhostShip();
+            GhostTrack(SpawnGhostShip());
             if (g_ghostShip) { g_ghostAuto = true; L("[ShipSync] auto-spawned ghost ship %p\n", g_ghostShip); }
         } else if (!g_ghostHasSync && g_ghostAuto && g_ghostShip) {
             Phase1::DespawnGhostShip();   // peer disembarked -> hide the auto ghost
@@ -8770,6 +8870,10 @@ static void OnFrameInner(Human* updatedHuman) {
             q.x = g_ghostSyncQuat[0]; q.y = g_ghostSyncQuat[1]; q.z = g_ghostSyncQuat[2]; q.w = g_ghostSyncQuat[3];
             HookMath::Transform m;
             HookMath::ToMatrix(&q, &m);
+            // Authority (C4, decided in ops/evidence/authority-model.md): Z stays DERIVED-LOCAL.
+            // X/Y and the quaternion are sender-authoritative, but m.M43 must use this machine's water
+            // height at the peer's XZ - taking the peer's hull Z would make vertical lead horizontal by
+            // the ~100 ms render delay. The solo F12 self-test below also uses the local Z.
             m.M41 = g_ghostSyncPos[0]; m.M42 = g_ghostSyncPos[1]; m.M43 = g_localShipZ;
             // [Coop] ShipHPSync: apply a pending hull HP; a fresh ghost is normally spawned after the packet
             // that carried the value, so this cannot live only on the receive path.
