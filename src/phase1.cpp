@@ -1225,6 +1225,16 @@ static bool GhostSetHullIdentity(void* ghost, float peerMax) {
 static volatile long g_shipTestReq = 0;
 void Phase1::RequestShipTest(int mode) { if (mode) g_shipTestReq = mode; }
 static volatile long g_ghostHasSync = 0;     // 1 = we have a peer ship position to drive to
+// Liveness stamp for the latch above. g_ghostHasSync used to be cleared only by a *later*
+// ApplyRemoteState, so once the peer stopped talking it froze at 1 (auto-spawn + drive kept running
+// with no peer, at a stale position, through world changes). ApplyRemoteState stamps the time and the
+// world id here; EntitySyncTick clears the latch when either no longer matches (see kPeerLiveMs).
+static uint64_t g_ghostSyncMs = 0;           // GetTickCount64() of the last ship-state apply
+static uint64_t g_ghostSyncWorldId = 0;      // world id carried by that apply (0 = unknown)
+static bool    g_ghostPeerNoShip = false;    // 1 = that apply said "peer not aboard" (explicit disembark)
+// Peer liveness window (ms), shared by the puppet gate below and the ghost latch so the two lanes can
+// never disagree about what "the peer is still here" means. Same 2 s convention as the receive timer.
+static const uint64_t kPeerLiveMs = 2000;
 static bool    g_ghostAuto = false;          // 1 = spawned by the net path (despawn on disembark); 0 = manual F12
 static float   g_localShipZ = 0.0f;          // the LOCAL ship's current Z (water height, bobs with waves)
 // A1 ([Coop] ActionDeathLog): the local player's current action alias, mirrored here by
@@ -1477,6 +1487,9 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
         g_ghostSyncQuat[2] = s.shipQuat[2];
         g_ghostSyncQuat[3] = s.shipQuat[3];
         g_ghostHasSync = 1;
+        g_ghostSyncMs = GetTickCount64();   // liveness stamp: EntitySyncTick clears the latch when stale
+        g_ghostSyncWorldId = s.worldId;     // ...or when the clone's world stops matching the current one
+        g_ghostPeerNoShip = false;
         g_ghostPeerMaxHP = s.shipMaxHP;   // [GhostProxy] peer's class fingerprint (GcLShip+0xB4; 0 = unknown)
         // [Coop] ShipHPSync (default OFF): carry the peer's hull HP to the ghost. Change-guarded, so the
         // damage-aware setter (clamp + zero event + HUD republish) is not hammered once per packet.
@@ -1488,6 +1501,7 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
         }
     } else {
         g_ghostHasSync = 0;
+        g_ghostPeerNoShip = true;   // explicit "peer not aboard" -> this MAY hide the auto ghost (as before)
         g_ghostPeerMaxHP = 0.0f;   // peer not aboard -> no class fingerprint
     }
     if (!g_puppet || !s.valid) return;
@@ -9217,8 +9231,8 @@ static void OnFrameInner(Human* updatedHuman) {
         // timer — covers world change, disconnect, silence and unexpected-source drops, where GetRemote
         // keeps returning a stale last packet forever. With NetStrictPeer=0 the timer arm is inert, so
         // the condition reduces exactly to today's.
-        bool timerOk = (s_netStrictPeer == 0) || (Net::MillisSinceRecv() < 2000);
-        bool peerPresent = rawSameWorld && (now - lastFreshMs) < 2000 && timerOk;
+        bool timerOk = (s_netStrictPeer == 0) || (Net::MillisSinceRecv() < kPeerLiveMs);
+        bool peerPresent = rawSameWorld && (now - lastFreshMs) < kPeerLiveMs && timerOk;
 
         // X21: ONE line every ~10 s that says what every lane is doing and why it dropped work, so a
         // session is diagnosed from one format instead of six ([Net]/[Sync]/[ShipSync]/[Net] scene ...).
@@ -9450,11 +9464,34 @@ static void OnFrameInner(Human* updatedHuman) {
                 g_ghostShip = nullptr; g_ghostObjId = 0; g_ghostAuto = false; g_ghostAppliedHP = -1.0f;
             }
         }
+        // Ghost-sync latch liveness. ApplyRemoteState can only run inside the world-gated puppet block
+        // above, so clearing the latch there (peer disembark) never fires when the peer simply stops,
+        // leaves the world, or we change world: g_ghostHasSync then stayed 1 forever, and the
+        // auto-spawn + drive below kept running with no peer at a stale g_ghostSyncPos. Re-evaluate it
+        // here, OUTSIDE that gate: live == the last ship-state apply is inside kPeerLiveMs AND it came
+        // from the world we are in now. Clear the latch, but deliberately do NOT despawn/remove the
+        // clone in the same step - a frozen ghost in place beats a vanishing one; DespawnGhostShip
+        // (explicit disembark) and F11 still remove it.
+        if (g_ghostHasSync) {
+            bool fresh     = g_ghostSyncMs && (now - g_ghostSyncMs) < kPeerLiveMs;
+            bool sameWorld = true;
+            if (g_ghostSyncWorldId && localOk && local.worldId)
+                sameWorld = (local.worldId == g_ghostSyncWorldId);
+            if (!fresh || !sameWorld) {
+                const char* why = fresh ? "world" : "stale";
+                int ageMs = g_ghostSyncMs ? (int)(now - g_ghostSyncMs) : -1;
+                L("[ShipSync] ghost sync latch cleared reason=%s (peer=%d world=%d)\n",
+                  why, ageMs, sameWorld ? 1 : 0);
+                g_ghostHasSync = 0;   // re-set by the next ApplyRemoteState that carries a live ship state
+            }
+        }
         if (s_shipGhost && g_ghostHasSync && !g_ghostShip) {
             GhostTrack(SpawnGhostShip());
             if (g_ghostShip) { g_ghostAuto = true; L("[ShipSync] auto-spawned ghost ship %p\n", g_ghostShip); }
-        } else if (!g_ghostHasSync && g_ghostAuto && g_ghostShip) {
-            Phase1::DespawnGhostShip();   // peer disembarked -> hide the auto ghost
+        } else if (!g_ghostHasSync && g_ghostPeerNoShip && g_ghostAuto && g_ghostShip) {
+            // Only an explicit "peer not aboard" hides the auto ghost. A latch cleared for staleness /
+            // world change leaves the clone standing where it was (see above).
+            Phase1::DespawnGhostShip();
         }
         // Direct drive (F12 manual ghost + auto ghost): the ghost's RigidBody/AI components are disabled,
         // so the engine never writes its transform and the SetGlobalMatrixInternal hook can't fire for it.
