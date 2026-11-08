@@ -118,6 +118,41 @@ STORED_POINTER_ALLOWLIST = [
 ]
 
 
+# Rule 4 inputs: the extraction header every candidate carries, e.g.
+# `// 0x527BA0  ListNodeAcquireAndTag  size=117`. It is written from the function
+# boundary when the bytes are pinned, so it is an independent record of the size.
+CANDIDATES = os.path.join(ROOT, "decomp", "candidates")
+CAND_HEAD_RE = re.compile(r"^//\s*0x([0-9A-Fa-f]+)\s+\S+\s+size=(\d+)\s*$", re.M)
+
+
+def check_sizes(units):
+    """Rule 4: a unit's recorded size must equal the size it was extracted at.
+
+    Returns (checked, bad, unchecked). Units with no candidate file are unchecked, never
+    failed: the pinned IDB defines no function boundary at three of them, so failing
+    there would be a false positive.
+    """
+    checked, bad, unchecked = 0, {}, []
+    for k, u in units.items():
+        path = os.path.join(CANDIDATES, k + ".cpp")
+        if not os.path.isfile(path):
+            unchecked.append(k)
+            continue
+        try:
+            txt = open(path, encoding="utf-8", errors="replace").read()
+        except OSError:
+            unchecked.append(k)
+            continue
+        m = CAND_HEAD_RE.search(txt)
+        if not m or norm(m.group(1)) != k:
+            unchecked.append(k)
+            continue
+        checked += 1
+        if int(m.group(2)) != u.get("size"):
+            bad[k] = {"recorded": u.get("size"), "extracted": int(m.group(2))}
+    return checked, bad, unchecked
+
+
 def load_units():
     with open(UNITS, encoding="utf-8") as f:
         d = json.load(f)
@@ -241,8 +276,11 @@ def main():
     receipts_ok = (rc == 0)
     n_receipts = out.count("UNVERIFIED-EVIDENCE") + out.count("MATCH")
 
+    n_size_checked, size_bad, size_unchecked = check_sizes(units)
+
     ok = (receipts_ok and not missing and not missing_arg and not missing_baserel
-          and not baserel_unres and not exc_bad and not allow_bad and not nine)
+          and not baserel_unres and not exc_bad and not allow_bad and not nine
+          and not size_bad)
 
     report = {
         "receipts_ok": receipts_ok,
@@ -268,6 +306,10 @@ def main():
         "allowlist_bad": allow_bad,
         "allowlist_ok": allow_ok,
         "nine_digit_literals": nine,
+        "size_checked": n_size_checked,
+        "size_mismatches": len(size_bad),
+        "size_unchecked": sorted(size_unchecked),
+        "size_detail": {k: v for k, v in sorted(size_bad.items())},
         "ok": ok,
     }
 
@@ -306,6 +348,12 @@ def main():
         print(f"          9-digit literals in src/: {len(nine)}")
         for line in nine:
             print(f"  NINE-DIGIT {line}  [rule: no 0x literal of 9+ hex digits]")
+        print(f"          recorded sizes checked against the extraction header: {n_size_checked}"
+              f"   mismatched: {len(size_bad)}   no candidate to check: {len(size_unchecked)}")
+        for k, v in sorted(size_bad.items()):
+            print(f"  SIZE MISMATCH {k}  units.json says {v['recorded']},"
+                  f" extraction header says {v['extracted']}"
+                  f"  [units.json edited after the bytes were pinned]")
         if not receipts_ok:
             print("--- decomp.py check output ---")
             print(out.strip())
