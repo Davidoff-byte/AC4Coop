@@ -1,0 +1,15 @@
+{
+ "unit": "01A90920",
+ "addr": "0x01A90920",
+ "size": 123,
+ "name": "DeathStateMachineTick",
+ "submitted_at": "2026-11-08T12:12:52Z",
+ "original_sha": "e9fd622ec2739d64b07e5751d318757c6a27abae9348417bfa7ae8720dcbd04f",
+ "candidate_src_sha": "37ecc946b51a08c1567aff908440ee312047fd9f1fb1c0b6590a038c3d42e863",
+ "candidate_src": "01A90920.cpp",
+ "arm": "probe",
+ "verdict": "UNVERIFIED-EVIDENCE",
+ "detail": "no object supplied: the pinned compiler (cl 16.00.40219.01) is not installed, so byte equality cannot be checked. Recorded as evidence only - never a match.",
+ "evidence": "01A90920.txt",
+ "evidence_sha": "5a73b8c79c4e00103c3a1e4af92d3d809e0a3ed7600ce4a3151de334349d7954"
+}

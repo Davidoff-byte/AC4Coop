@@ -48,6 +48,21 @@
    "size": 94,
    "status": "claimed"
   },
+  "005FD520": {
+   "addr": "005FD520",
+   "claimed_at": "2026-11-08T12:12:55Z",
+   "name": "RowSelectorFactoryStage2",
+   "owner": "seat-orch",
+   "receipts": [
+    {
+     "arm": "probe",
+     "at": "2026-11-08T12:12:55Z",
+     "verdict": "UNVERIFIED-EVIDENCE"
+    }
+   ],
+   "size": 59,
+   "status": "claimed"
+  },
   "005FD730": {
    "addr": "005FD730",
    "claimed_at": "2026-11-08T12:06:29Z",
@@ -61,6 +76,36 @@
     }
    ],
    "size": 95,
+   "status": "claimed"
+  },
+  "00657BE0": {
+   "addr": "00657BE0",
+   "claimed_at": "2026-11-08T12:12:53Z",
+   "name": "FrameObserverPhase1",
+   "owner": "seat-orch",
+   "receipts": [
+    {
+     "arm": "probe",
+     "at": "2026-11-08T12:12:53Z",
+     "verdict": "UNVERIFIED-EVIDENCE"
+    }
+   ],
+   "size": 47,
+   "status": "claimed"
+  },
+  "0066F630": {
+   "addr": "0066F630",
+   "claimed_at": "2026-11-08T12:12:52Z",
+   "name": "ObserverListInsert",
+   "owner": "seat-orch",
+   "receipts": [
+    {
+     "arm": "probe",
+     "at": "2026-11-08T12:12:52Z",
+     "verdict": "UNVERIFIED-EVIDENCE"
+    }
+   ],
+   "size": 246,
    "status": "claimed"
   },
   "00679220": {
@@ -78,6 +123,21 @@
    "size": 84,
    "status": "claimed"
   },
+  "006F5F70": {
+   "addr": "006F5F70",
+   "claimed_at": "2026-11-08T12:12:53Z",
+   "name": "GetEntityAI",
+   "owner": "seat-orch",
+   "receipts": [
+    {
+     "arm": "probe",
+     "at": "2026-11-08T12:12:53Z",
+     "verdict": "UNVERIFIED-EVIDENCE"
+    }
+   ],
+   "size": 29,
+   "status": "claimed"
+  },
   "0073B4B0": {
    "addr": "0073B4B0",
    "claimed_at": "2026-11-08T12:06:28Z",
@@ -93,6 +153,66 @@
    "size": 31,
    "status": "claimed"
   },
+  "00744CF0": {
+   "addr": "00744CF0",
+   "claimed_at": "2026-11-08T12:12:54Z",
+   "name": "GetUnusedPadID",
+   "owner": "seat-orch",
+   "receipts": [
+    {
+     "arm": "probe",
+     "at": "2026-11-08T12:12:54Z",
+     "verdict": "UNVERIFIED-EVIDENCE"
+    }
+   ],
+   "size": 192,
+   "status": "claimed"
+  },
+  "0079B8D0": {
+   "addr": "0079B8D0",
+   "claimed_at": "2026-11-08T12:12:54Z",
+   "name": "SpawningRequestSpawn",
+   "owner": "seat-orch",
+   "receipts": [
+    {
+     "arm": "probe",
+     "at": "2026-11-08T12:12:54Z",
+     "verdict": "UNVERIFIED-EVIDENCE"
+    }
+   ],
+   "size": 74,
+   "status": "claimed"
+  },
+  "009F0B50": {
+   "addr": "009F0B50",
+   "claimed_at": "2026-11-08T12:12:53Z",
+   "name": "GetObjectID",
+   "owner": "seat-orch",
+   "receipts": [
+    {
+     "arm": "probe",
+     "at": "2026-11-08T12:12:54Z",
+     "verdict": "UNVERIFIED-EVIDENCE"
+    }
+   ],
+   "size": 16,
+   "status": "claimed"
+  },
+  "00A0BDE0": {
+   "addr": "00A0BDE0",
+   "claimed_at": "2026-11-08T12:12:55Z",
+   "name": "HandleManagerFindOrCreate",
+   "owner": "seat-orch",
+   "receipts": [
+    {
+     "arm": "probe",
+     "at": "2026-11-08T12:12:55Z",
+     "verdict": "UNVERIFIED-EVIDENCE"
+    }
+   ],
+   "size": 108,
+   "status": "claimed"
+  },
   "0133F630": {
    "addr": "0133F630",
    "claimed_at": null,
@@ -101,6 +221,51 @@
    "receipts": [],
    "size": 297,
    "status": "unknown"
+  },
+  "01371140": {
+   "addr": "01371140",
+   "claimed_at": "2026-11-08T12:12:51Z",
+   "name": "GetService_CSrvNPCHealth",
+   "owner": "seat-orch",
+   "receipts": [
+    {
+     "arm": "probe",
+     "at": "2026-11-08T12:12:51Z",
+     "verdict": "UNVERIFIED-EVIDENCE"
+    }
+   ],
+   "size": 80,
+   "status": "claimed"
+  },
+  "017106C0": {
+   "addr": "017106C0",
+   "claimed_at": "2026-11-08T12:12:51Z",
+   "name": "DamageFilter",
+   "owner": "seat-orch",
+   "receipts": [
+    {
+     "arm": "probe",
+     "at": "2026-11-08T12:12:51Z",
+     "verdict": "UNVERIFIED-EVIDENCE"
+    }
+   ],
+   "size": 104,
+   "status": "claimed"
+  },
+  "018B9EA0": {
+   "addr": "018B9EA0",
+   "claimed_at": "2026-11-08T12:12:51Z",
+   "name": "DamageAmountCompute",
+   "owner": "seat-orch",
+   "receipts": [
+    {
+     "arm": "probe",
+     "at": "2026-11-08T12:12:52Z",
+     "verdict": "UNVERIFIED-EVIDENCE"
+    }
+   ],
+   "size": 56,
+   "status": "claimed"
   },
   "019FB4C0": {
    "addr": "019FB4C0",
@@ -115,6 +280,21 @@
     }
    ],
    "size": 50,
+   "status": "claimed"
+  },
+  "01A90920": {
+   "addr": "01A90920",
+   "claimed_at": "2026-11-08T12:12:52Z",
+   "name": "DeathStateMachineTick",
+   "owner": "seat-orch",
+   "receipts": [
+    {
+     "arm": "probe",
+     "at": "2026-11-08T12:12:52Z",
+     "verdict": "UNVERIFIED-EVIDENCE"
+    }
+   ],
+   "size": 123,
    "status": "claimed"
   }
  }

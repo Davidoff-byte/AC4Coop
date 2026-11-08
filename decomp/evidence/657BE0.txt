@@ -1,0 +1,13 @@
+FrameObserverPhase1 @ 0x657BE0  (size 47)   -- probe receipt, no cl 16.00.40219.01 on this machine
+measured 2026-11-08 by ORCH against the pinned binary
+  AC4BFSP.exe sha256 bc11ad7924e1eca7363ee86aa3332c05386d0a05896c0b7370131daee9ab5150
+  candidate body: ac4-decomp\657BE0.c (submitted verbatim)
+
+claim
+    One of the five per-frame observer passes: walks the same list (this+8, u16
+    count at +0xE) and calls vtbl+0x3C on every non-null entry.
+
+cross-check / limit of this receipt
+    phase 1 of 5 (siblings 0x657C10/0x657C40/0x657C70/0x657CA0). The project's
+    note that none of the five is AI/perception is consistent with this body: it
+    dispatches blind, with no type test.

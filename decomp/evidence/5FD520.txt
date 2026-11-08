@@ -1,0 +1,14 @@
+RowSelectorFactoryStage2 @ 0x5FD520  (size 59)   -- probe receipt, no cl 16.00.40219.01 on this machine
+measured 2026-11-08 by ORCH against the pinned binary
+  AC4BFSP.exe sha256 bc11ad7924e1eca7363ee86aa3332c05386d0a05896c0b7370131daee9ab5150
+  candidate body: ac4-decomp\5FD520.c (submitted verbatim)
+
+claim
+    Stage 2 of the RowSelector-driven factory: sub_5FAC60(this,a2), take the
+    object's virtual at vtbl+0xC called with (0,0), then sub_526590(instance) and
+    sub_A2E820(). Returns the instance or null.
+
+cross-check / limit of this receipt
+    pairs with row-selector stage bodies already in the project (5FAC00 / 79BC50).
+    The (0,0) arguments to vtbl+0xC are the Instantiate contract; a caller that
+    passes anything else is not calling this path.

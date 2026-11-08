@@ -1,0 +1,15 @@
+{
+ "unit": "01371140",
+ "addr": "0x01371140",
+ "size": 80,
+ "name": "GetService_CSrvNPCHealth",
+ "submitted_at": "2026-11-08T12:12:51Z",
+ "original_sha": "a3b56364165e306247f5dda92d6659dbe5e715720479e3cd48751cdf403b9c94",
+ "candidate_src_sha": "02f18408d6c7b1fda6fa4f30083eca4a9a4518566bc21ed44157540644d68d4c",
+ "candidate_src": "01371140.cpp",
+ "arm": "probe",
+ "verdict": "UNVERIFIED-EVIDENCE",
+ "detail": "no object supplied: the pinned compiler (cl 16.00.40219.01) is not installed, so byte equality cannot be checked. Recorded as evidence only - never a match.",
+ "evidence": "01371140.txt",
+ "evidence_sha": "6b55145b117525ab68ca40843414bd1fda3b0cea09708c119a835bb6a640855d"
+}

@@ -1,0 +1,15 @@
+{
+ "unit": "00A0BDE0",
+ "addr": "0x00A0BDE0",
+ "size": 108,
+ "name": "HandleManagerFindOrCreate",
+ "submitted_at": "2026-11-08T12:12:55Z",
+ "original_sha": "47fd71bd1e247a3332c7507266c19857d1707a4c65d3acb0e7cf25403691085f",
+ "candidate_src_sha": "96b791b6cb327e9ea66a760b38d66025b2b06bc98d42b6e7ac6e98e584e952bf",
+ "candidate_src": "00A0BDE0.cpp",
+ "arm": "probe",
+ "verdict": "UNVERIFIED-EVIDENCE",
+ "detail": "no object supplied: the pinned compiler (cl 16.00.40219.01) is not installed, so byte equality cannot be checked. Recorded as evidence only - never a match.",
+ "evidence": "00A0BDE0.txt",
+ "evidence_sha": "638a957697f4544f6d1c8c5bd8fecab49ec0d204a17f46ffb5829cab6bae5929"
+}

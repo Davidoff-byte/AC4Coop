@@ -1,0 +1,15 @@
+{
+ "unit": "00657BE0",
+ "addr": "0x00657BE0",
+ "size": 47,
+ "name": "FrameObserverPhase1",
+ "submitted_at": "2026-11-08T12:12:53Z",
+ "original_sha": "f4445bb50614503b5229a8424bf62f024eb40aebcbe3857ca138106ac39980d0",
+ "candidate_src_sha": "7429b42ce9227f5ab77924cc20dc0f061f8159064cae2d781f82113ef6e3c517",
+ "candidate_src": "00657BE0.cpp",
+ "arm": "probe",
+ "verdict": "UNVERIFIED-EVIDENCE",
+ "detail": "no object supplied: the pinned compiler (cl 16.00.40219.01) is not installed, so byte equality cannot be checked. Recorded as evidence only - never a match.",
+ "evidence": "00657BE0.txt",
+ "evidence_sha": "79e6d8632b76cba0ceecb24cb31aaafd9df61f26ab5cb6015063a79d00a39352"
+}

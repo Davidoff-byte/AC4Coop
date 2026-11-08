@@ -1,0 +1,15 @@
+{
+ "unit": "00744CF0",
+ "addr": "0x00744CF0",
+ "size": 192,
+ "name": "GetUnusedPadID",
+ "submitted_at": "2026-11-08T12:12:54Z",
+ "original_sha": "62818ef058ba92c11da2fe9e991d8aa99fedf5ea6467d8632db0accb7ace77ab",
+ "candidate_src_sha": "25306df4b45b17f618a9443499cd01503363f1ee8217519fc5bcb4f03b4d0bdb",
+ "candidate_src": "00744CF0.cpp",
+ "arm": "probe",
+ "verdict": "UNVERIFIED-EVIDENCE",
+ "detail": "no object supplied: the pinned compiler (cl 16.00.40219.01) is not installed, so byte equality cannot be checked. Recorded as evidence only - never a match.",
+ "evidence": "00744CF0.txt",
+ "evidence_sha": "2cdb2b473739afd2c2f296be3cc9d37799783716b018078dfa6cbc2078b4d398"
+}

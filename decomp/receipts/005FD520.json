@@ -1,0 +1,15 @@
+{
+ "unit": "005FD520",
+ "addr": "0x005FD520",
+ "size": 59,
+ "name": "RowSelectorFactoryStage2",
+ "submitted_at": "2026-11-08T12:12:55Z",
+ "original_sha": "817ac37350b117b9c58fd92e1df48a3ae84dfcab06a6ff0d7be1cec1438ffbb4",
+ "candidate_src_sha": "5269466e39b3cf1e268e7de691483b147fdd14ee3b3d0060020926e3683cf08f",
+ "candidate_src": "005FD520.cpp",
+ "arm": "probe",
+ "verdict": "UNVERIFIED-EVIDENCE",
+ "detail": "no object supplied: the pinned compiler (cl 16.00.40219.01) is not installed, so byte equality cannot be checked. Recorded as evidence only - never a match.",
+ "evidence": "005FD520.txt",
+ "evidence_sha": "f663fbe1c866cebc2f83e50ef9233115e3a9dc454419201caf77b5ac1f96fff0"
+}

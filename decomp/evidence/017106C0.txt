@@ -1,0 +1,16 @@
+DamageFilter @ 0x17106C0  (size 104)   -- probe receipt, no cl 16.00.40219.01 on this machine
+measured 2026-11-08 by ORCH against the pinned binary
+  AC4BFSP.exe sha256 bc11ad7924e1eca7363ee86aa3332c05386d0a05896c0b7370131daee9ab5150
+  candidate body: ac4-decomp\17106C0.c (submitted verbatim)
+
+claim
+    Predicate + dispatch on a damage event. Reads the packed word at target+0x9C
+    and requires (w & 7) == 2 and (w & 0x1F8) == 152, i.e. role 19 = Animal.
+    Then switches on event kinds ([a3+0x20] in {3,6,14} and [a3+0x10] in
+    {5,14,23,25,26}) and forwards to the death state-machine sub_1A90920.
+
+cross-check / limit of this receipt
+    152 = 19 << 3, and 19 is EntityDescriptorNPC_Animal in the PS3 ELF enum
+    (DIE 0x2BAEC3) - the packing matches IsSoldier/IsCivilian exactly. So this
+    filter is the ANIMAL damage path, not a generic one; code that reuses it for
+    human NPCs would be filtering on the wrong role.

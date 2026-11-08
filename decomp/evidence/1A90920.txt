@@ -1,0 +1,14 @@
+DeathStateMachineTick @ 0x1A90920  (size 123)   -- probe receipt, no cl 16.00.40219.01 on this machine
+measured 2026-11-08 by ORCH against the pinned binary
+  AC4BFSP.exe sha256 bc11ad7924e1eca7363ee86aa3332c05386d0a05896c0b7370131daee9ab5150
+  candidate body: ac4-decomp\1A90920.c (submitted verbatim)
+
+claim
+    Drives a small state machine on a stack context: returns 3 when the subject
+    pointer is null; otherwise sub_A00CB0, then loops sub_9F6260 while the last
+    handler return is 2, calling v4[0x30](v4[0x28]) each pass, and finally
+    sub_A01070. Return 2 means 'continue', 3 means 'stop'.
+
+cross-check / limit of this receipt
+    the 2/3 return contract is what the damage filter above relies on; both bodies
+    are now receipts, so a future change that treats 2 as terminal is refutable.
