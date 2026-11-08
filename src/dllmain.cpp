@@ -330,8 +330,8 @@ static unsigned __stdcall PollThread(void*)
         }
 
         // NOTE 2026-11-08: the one-off probe hotkeys (F1 guard-health map, F2 health-heap, F3 input-state,
-        // F4 entity-enum, F5 ship-drive, F6 spawn, F7 dump, F8 crowd, F9 scene, F10 ship probe, F12
-        // ship-ctor) were RETIRED so those keys are free for the game or for rebinding. Their
+        // F4 entity-enum, F5 ship-drive, F6 spawn, F7 dump, F8 crowd, F12 ship-ctor) were RETIRED so those
+        // keys are free for the game or for rebinding. F9/F10 now drive the ship-test harness. Their
         // Phase1::Request* functions are still compiled and callable - rebinding one is a single block
         // like the F11 handler below. Only keys with ongoing operational use remain bound.
 
@@ -341,18 +341,19 @@ static unsigned __stdcall PollThread(void*)
         if (f11 && !f11prev) { logline("[AC4Coop] F11 -> remove ghost ship\n"); Phase1::RequestGhostDespawn(); }
         f11prev = f11;
 
-        // ScrollLock / Pause (edge-triggered): live ship-damage harness. ScrollLock damages every ship
-        // within Coop:ShipTestRadiusM by Coop:ShipTestFracPct of its own max; Pause drives the hull to
-        // -1 so the engine's own zero-health event sinks it. Both go through the real setter (slot
-        // 0x12C), so the HUD fraction and the death event behave exactly as in combat.
-        static bool scrollPrev = false;
-        bool scroll = (GetAsyncKeyState(VK_SCROLL) & 0x8000) != 0;
-        if (scroll && !scrollPrev) { logline("[AC4Coop] ScrollLock -> damage nearby ships\n"); Phase1::RequestShipTest(1); }
-        scrollPrev = scroll;
-        static bool pausePrev = false;
-        bool pauseKey = (GetAsyncKeyState(VK_PAUSE) & 0x8000) != 0;
-        if (pauseKey && !pausePrev) { logline("[AC4Coop] Pause -> sink nearby ships\n"); Phase1::RequestShipTest(2); }
-        pausePrev = pauseKey;
+        // F9 / F10 (edge-triggered): live ship-damage harness. F9 damages every ship within
+        // Coop:ShipTestRadiusM by Coop:ShipTestFracPct of its own max; F10 drives the hull to -1 so the
+        // engine's own zero-health event sinks it. Both go through the real setter (slot 0x12C), so the
+        // HUD fraction and the death event behave exactly as in combat. (These were probe keys; the
+        // probes behind them were retired so the keys are free for this.)
+        static bool f9prev = false;
+        bool f9 = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
+        if (f9 && !f9prev) { logline("[AC4Coop] F9 -> damage nearby ships\n"); Phase1::RequestShipTest(1); }
+        f9prev = f9;
+        static bool f10prev = false;
+        bool f10 = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
+        if (f10 && !f10prev) { logline("[AC4Coop] F10 -> sink nearby ships\n"); Phase1::RequestShipTest(2); }
+        f10prev = f10;
 
         // V (edge-triggered): toggle the pad-1 test stick and compare player vs puppet movement.
         static bool vprev = false;
