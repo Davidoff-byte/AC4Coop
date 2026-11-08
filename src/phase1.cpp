@@ -2194,13 +2194,21 @@ static void CaptureShips(EntityPacket& pkt) {
     // ops/evidence/health-service-crcs.md instead of guessing a field. sub_A1D0D0 is __thiscall.
     static int s_shipDump = -1;
     if (s_shipDump < 0) s_shipDump = GetPrivateProfileIntA("Coop", "ShipDump", 0, Paths::Ini());
+    // T31: floats of the component whose class id is WatercraftAttributes (crc32("WatercraftAttributes")).
+    // Dumped once a second so a single cannonball shows up as a step change in the log.
+    static int s_dumpFloats = -1;
+    if (s_dumpFloats < 0) s_dumpFloats = GetPrivateProfileIntA("Coop", "ShipDumpFloats", 0, Paths::Ini());
+    static uint64_t s_dumpNextMs = 0;
+    const uint64_t dumpNow = GetTickCount64();
+    const bool dumpThisTick = s_shipDump && dumpNow >= s_dumpNextMs;
+    if (dumpThisTick) s_dumpNextMs = dumpNow + 1000;
     uint32_t count = 0;
     uint32_t withId = 0;
     __try {
         for (int i = 0; i < (int)n && count < (uint32_t)MAX_SYNC_ENTITIES; ++i) {
             Entity* ent = GetShipEntity(mgr, i);
             if (!ent || *(uint32_t*)ent != 0x01E4A128u) continue;
-            if (s_shipDump) {
+            if (dumpThisTick) {
                 const unsigned short cn = *(unsigned short*)((char*)ent + 0x66);
                 Component** cdata = *(Component***)((char*)ent + 0x60);
                 L("[ShipDump] idx=%d ent=%08X vt=%08X comps=%u local=%d\n",
@@ -2213,7 +2221,20 @@ static void CaptureShips(EntityPacket& pkt) {
                         int crc = 0;
                         __try { crc = ((int(__thiscall*)(void*))0x00A1D0D0)(c); }
                         __except (EXCEPTION_EXECUTE_HANDLER) { crc = -1; }
-                        L("[ShipDump]   c[%d] vt=%08X crc=%d\n", k, vt, crc);
+                        L("[ShipDump]   c[%d] ptr=%08X vt=%08X crc=%d\n", k, (unsigned)c, vt, crc);
+                        // WatercraftAttributes = 91423769: print the first 32 dwords as floats, which is
+                        // where max/current hull values would live. Read-only; nothing is written.
+                        if (s_dumpFloats && crc == 91423769 && readable(c, 0x80)) {
+                            char line[512]; int o = 0;
+                            for (int f = 0; f < 32; ++f) {
+                                DWORD bits = *(DWORD*)((char*)c + 4 * f);
+                                float fv = *(float*)((char*)c + 4 * f);
+                                o += _snprintf_s(line + o, sizeof(line) - o, _TRUNCATE,
+                                                 " %d:%.3f", f, fv);
+                                if (o > 400) break;
+                            }
+                            L("[ShipFloat] idx=%d ent=%08X c=%08X%s\n", i, (unsigned)ent, (unsigned)c, line);
+                        }
                     }
                 }
             }
