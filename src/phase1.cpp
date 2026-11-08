@@ -9233,15 +9233,15 @@ static void OnFrameInner(Human* updatedHuman) {
             s_healthLast = now;
             Net::Stats hs; Net::GetStats(hs);                    // cheap struct copy, same as the 5 s line
             const double hErr = s_bindBound ? (s_bindErrSum / (double)s_bindBound) : 0.0;
-            char hb[256];
+            char hb[288];
             _snprintf_s(hb, sizeof(hb), _TRUNCATE,
                         "[Health] net=%d peerMs=%u proto=%u bind(sent=%u bound=%u unmatched=%u err=%.2f) "
                         "ents(sent=%u recv=?) ships(ghost=%d hpWant=%.1f hpApplied=%.1f) "
-                        "dmgRelay=%d rejects=%u protoMismatch=%u world=%08X scene=%08X",
+                        "dmgRelay=%d rejects=%u protoMismatch=%u sizeMismatch=%u world=%08X scene=%08X",
                         Net::Enabled() ? 1 : 0, Net::MillisSinceRecv(), (unsigned)NET_PROTO_VER,
                         s_bindSent, s_bindBound, s_bindUnmatched, hErr,
                         hs.txEnts, g_ghostShip ? 1 : 0, (double)g_ghostSyncHP, (double)g_ghostAppliedHP,
-                        DamageRelayEnabled(), hs.rejects, hs.protoMismatch,
+                        DamageRelayEnabled(), hs.rejects, hs.protoMismatch, hs.sizeMismatch,
                         localOk ? (unsigned)local.worldId : 0u, localOk ? (unsigned)local.sceneKey : 0u);
             L("%s\n", hb);
         }

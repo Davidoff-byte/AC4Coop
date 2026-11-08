@@ -91,6 +91,7 @@ namespace {
     // were on the wire - but they do NOT refresh g_lastRecvMs (see the liveness note in RecvThread).
     volatile LONG g_rxRejects = 0;        // every dropped datagram, whatever the reason
     volatile LONG g_rxProtoMismatch = 0;  // subset of the above: protoVer != NET_PROTO_VER on either lane
+    volatile LONG g_rxSizeMismatch = 0;   // player lane only: magic matched but n != sizeof(PlayerState)
 
     // ---- Phase 2: compact entity wire ---------------------------------------------------------
     // A record carries a stable 64-bit identity. `key` is the entity-manager INDEX and is NOT stable
@@ -490,6 +491,25 @@ namespace {
                   lane, (unsigned)got, (unsigned)NET_PROTO_VER);
         dbg(m);
     }
+    // Player lane, anonymous-vs-named: a peer built against a different PlayerState sends a datagram
+    // whose leading magic is OUR magic but whose length is not sizeof(PlayerState). playerPkt is
+    // false for it, so the version branch below never runs - the datagram used to vanish without a
+    // single line in net_log.txt AND without touching g_rxRejects (the outer gate only lets
+    // playerPkt / entityPkt in). Name the cause once per process per lane; protoVer sits in the
+    // shared prefix at +4 and is only printed when the datagram is long enough to hold it.
+    void LogSizeMismatch(int n, bool haveProto, uint32_t got) {
+        static bool s_logged = false;
+        if (s_logged) return;
+        s_logged = true;
+        char m[160];
+        if (haveProto)
+            wsprintfA(m, "[Net] player packet SIZE MISMATCH n=%d expected=%d (peer build differs; protoVer=%u)\n",
+                      n, (int)sizeof(PlayerState), (unsigned)got);
+        else
+            wsprintfA(m, "[Net] player packet SIZE MISMATCH n=%d expected=%d (peer build differs; protoVer=?)\n",
+                      n, (int)sizeof(PlayerState));
+        dbg(m);
+    }
     void LogKindRejected() {
         static bool s_logged = false;
         if (s_logged) return;
@@ -503,9 +523,10 @@ namespace {
         dbg("[Net] entity packet REJECTED: header worldId != local world (world change in progress?)\n");
     }
     void LogRejectSummary(LONG rejects) {
-        char m[160];
-        wsprintfA(m, "[Net] rx rejects=%ld protoMismatch=%ld (datagrams dropped without applying state)\n",
-                  rejects, (LONG)InterlockedCompareExchange(&g_rxProtoMismatch, 0, 0));
+        char m[192];
+        wsprintfA(m, "[Net] rx rejects=%ld protoMismatch=%ld sizeMismatch=%ld (datagrams dropped without applying state)\n",
+                  rejects, (LONG)InterlockedCompareExchange(&g_rxProtoMismatch, 0, 0),
+                  (LONG)InterlockedCompareExchange(&g_rxSizeMismatch, 0, 0));
         dbg(m);
     }
 
@@ -518,6 +539,20 @@ namespace {
             int n = recvfrom(g_sock, buf, sizeof(buf), 0, (sockaddr*)&from, &flen);
             if (n >= 4) {
                 uint32_t magic = *(uint32_t*)buf;
+                // X4b: player SIZE mismatch, named instead of anonymous. A peer on a different build
+                // (older/newer struct) sends our player magic with a foreign length, so playerPkt is
+                // false and `if (playerPkt && !playerOk)` below never runs: no protoMismatch line, no
+                // reject line, no evidence at all. Detect it from the magic alone (before the length
+                // gate decides anything), count it, and log once per process. Same source filtering
+                // as the strict-peer gate so foreign traffic cannot trip the one-shot log.
+                if (magic == NET_MAGIC && n != (int)sizeof(PlayerState) &&
+                    (!g_strictPeer || from.sin_addr.s_addr == g_peer.sin_addr.s_addr)) {
+                    uint32_t peerProto = 0;
+                    const bool haveProto = (n >= 8);            // protoVer is the second u32
+                    if (haveProto) std::memcpy(&peerProto, buf + 4, sizeof(peerProto));
+                    InterlockedIncrement(&g_rxSizeMismatch);
+                    LogSizeMismatch(n, haveProto, peerProto);
+                }
                 bool playerPkt = (magic == NET_MAGIC        && n == (int)sizeof(PlayerState));
                 bool entityPkt = (magic == NET_ENTITY_MAGIC && n >= ENTITY_WIRE_HEADER_SIZE);
                 if (playerPkt || entityPkt) {
@@ -537,8 +572,9 @@ namespace {
                         EntityPacket decoded{};
                         int killDrops = 0;   // kill-ring entries overwritten by this datagram
                         // Both packet types put magic first and protoVer second, so the version is
-                        // readable before the type-specific decode (a player datagram is 560 B, an
-                        // entity one >= 20 B, so bytes 4..8 are always inside it).
+                        // readable before the type-specific decode (a player datagram is exactly
+                        // sizeof(PlayerState) = 576 B, an entity one >= ENTITY_WIRE_HEADER_SIZE, so
+                        // bytes 4..8 are always inside it).
                         uint32_t peerProto = NET_PROTO_VER;
                         std::memcpy(&peerProto, buf + 4, sizeof(peerProto));
                         // Player lane (X4): magic+length alone let a PROTO-9 peer through. 9 -> 10
@@ -848,6 +884,7 @@ void GetStats(Stats& out) {
     out.rxBytes   = (uint32_t)InterlockedCompareExchange(&g_rxBytes,   0, 0);
     out.rejects       = (uint32_t)InterlockedCompareExchange(&g_rxRejects,       0, 0);
     out.protoMismatch = (uint32_t)InterlockedCompareExchange(&g_rxProtoMismatch, 0, 0);
+    out.sizeMismatch  = (uint32_t)InterlockedCompareExchange(&g_rxSizeMismatch,  0, 0);
 }
 
 void ResetStats() {
@@ -858,6 +895,7 @@ void ResetStats() {
     InterlockedExchange(&g_rxBytes,   0);
     InterlockedExchange(&g_rxRejects,       0);
     InterlockedExchange(&g_rxProtoMismatch, 0);
+    InterlockedExchange(&g_rxSizeMismatch,  0);
 }
 
 } // namespace Net
