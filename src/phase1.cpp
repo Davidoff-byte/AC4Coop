@@ -4582,6 +4582,54 @@ static int GktMarkPushed(uint64_t objId, unsigned int ent) {
     return slot;
 }
 
+// ---- C2 §3.4: per-claim retry counter for the snapshot death lane ------------------------------
+// The tombstone is now written only once a death is SETTLED (engine killed it, or the engine's own
+// predicate already said dead). An unsettled claim keeps no tombstone and is retried on the next
+// snapshot, which is what makes `applied=0` a retry instead of a permanent dead-on-paper latch. The
+// counter bounds the retry (and therefore the log), it never clears the claim.
+static const unsigned int CLAIM_MAX_ATTEMPTS   = 20;   // ≈1-2 s at the snapshot tick rate
+static const unsigned int CLAIM_EPOCH_SNAPSHOTS = 64;  // EPOCH_PACKETS (net.cpp:109) - the retry
+                                                       // fallback cadence only; not a wire constant
+struct GktAttempt { uint64_t objId; unsigned int ent; unsigned int n; unsigned int skip; int escalated; };
+static GktAttempt s_gktAttempt[256];
+static int        s_gktAttemptN = 0;
+static int        s_gktAttemptNext = 0;               // overwrite cursor once full (evict, never refuse)
+
+static GktAttempt& GktAttemptSlot(uint64_t objId, unsigned int ent) {
+    for (int i = 0; i < s_gktAttemptN; ++i) {
+        if (objId) { if (s_gktAttempt[i].objId == objId) return s_gktAttempt[i]; }
+        else       { if (s_gktAttempt[i].objId == 0 && s_gktAttempt[i].ent == ent) return s_gktAttempt[i]; }
+    }
+    int slot;
+    if (s_gktAttemptN < 256) {
+        slot = s_gktAttemptN++;
+    } else {
+        slot = s_gktAttemptNext % 256;
+        ++s_gktAttemptNext;
+    }
+    s_gktAttempt[slot].objId     = objId;
+    s_gktAttempt[slot].ent       = ent;
+    s_gktAttempt[slot].n         = 0;
+    s_gktAttempt[slot].skip      = 0;
+    s_gktAttempt[slot].escalated = 0;
+    return s_gktAttempt[slot];
+}
+
+// Settlement resets the counters in place (the slot stays allocated and keyed, at zero): dropping the
+// key would let a rebind to a different body inherit nothing anyway, and re-creating it costs a scan.
+static void GktAttemptClear(uint64_t objId, unsigned int ent) {
+    for (int i = 0; i < s_gktAttemptN; ++i) {
+        if (objId ? (s_gktAttempt[i].objId == objId)
+                  : (s_gktAttempt[i].objId == 0 && s_gktAttempt[i].ent == ent)) {
+            s_gktAttempt[i].n = 0;
+            s_gktAttempt[i].skip = 0;
+            s_gktAttempt[i].escalated = 0;
+            return;
+        }
+    }
+    (void)ent;
+}
+
 // objId == 0 is legal: a guard the host never described (locally spawned) has no host id, and
 // ApplyPeerHealth falls back to the 4 m position match (phase1.cpp:4944) exactly for that case.
 static void GuestPushDeath(uint64_t objId, unsigned int ent, float x, float y, float z) {
@@ -4913,7 +4961,12 @@ static unsigned int GuestObjFindResolve(uint64_t objId) {
 
 // Defined next to ApplyPeerHealth (:5191): the proven-mirror engine kill. ApplyGuards needs it for the
 // snapshot death path below, which runs long before the definition.
-static bool GuestKillMirrorEntity(uint64_t objId, unsigned int ent, bool viaGuestObj);
+// C2 §3.3: the bool alone cannot separate "refused" from "already dead" (both return false - see the
+// already-dead skip, no-behaviour-component skip and the hp-not-ok tail). `alreadyDead` is the
+// out-param that carries the settled case, so the caller can tombstone on "engine says dead" without
+// inferring it. It is only set true on the explicit already-dead branch.
+static bool GuestKillMirrorEntity(uint64_t objId, unsigned int ent, bool viaGuestObj,
+                                  bool* alreadyDead = nullptr);
 // Defined beside GuestKillMirrorEntity (:5390): fires the deferred corpse re-disable. Driven from
 // GuestDeathScan's own per-tick generation counter (s_gktGen) - no threads, no timers.
 static void CorpseLatchTick();
@@ -5179,20 +5232,51 @@ static void ApplyGuards(const EntityPacket& pkt) {
             // Ordering: GuestKillMirrorEntity's own "already 0xFFFF / engine dead flag" skip runs before
             // any engine write, so a body that is already dead is refused there and never killed twice.
             if (es.dead && !GktAlreadyPushed(es.objId, (unsigned int)best)) {
-                GktMarkPushed(es.objId, (unsigned int)best);
-                MarkMirrorKilledLocally(best);             // stop driving the corpse, stop the echo
-                bool applied = false;
-                if (!DeathAppliedRecently((unsigned int)best)) {
-                    MarkDeathApplied((unsigned int)best);
-                    MirrorVisualDeath(best);               // visual death first, as on the packet path
-                    GuestKillMirrorEntity(es.objId, (unsigned int)best, true);
-                    applied = true;
-                }
-                static int s_snapDeathLines = 0;
-                if (s_snapDeathLines < 10) {
-                    ++s_snapDeathLines;
-                    L("[Mirror] snapshot death objId=%llu ent=%08X applied=%d\n",
-                      (unsigned long long)es.objId, (unsigned int)best, applied ? 1 : 0);
+                const unsigned int dent = (unsigned int)best;
+                // C2 §3.2: the tombstone is written only once the death is SETTLED. The old order
+                // tombstoned before the attempt, so an `applied=0` skip latched the objId as
+                // dead-on-paper for ever while the body stayed alive. Order now:
+                //   1. MarkMirrorKilledLocally (I5: before any engine call, unchanged)
+                //   2. presentation, and ONLY presentation, behind DeathAppliedRecently
+                //   3. GuestKillMirrorEntity, never inside a gate
+                //   4. GktMarkPushed only if settled (killed, or already dead by the engine)
+                // A failed attempt keeps the claim: no tombstone is written, so the next snapshot
+                // retries. The claim is never cleared on failure - only the counter is bounded.
+                GktAttempt& at = GktAttemptSlot(es.objId, dent);
+                const bool dueNow = (at.n < CLAIM_MAX_ATTEMPTS) || (++at.skip >= CLAIM_EPOCH_SNAPSHOTS);
+                if (dueNow) {
+                    at.skip = 0;
+                    MarkMirrorKilledLocally(best);         // stop driving the corpse, stop the echo
+                    if (!DeathAppliedRecently(dent)) {
+                        MarkDeathApplied(dent);
+                        MirrorVisualDeath(best);           // visual death first, as on the packet path
+                    }
+                    bool alreadyDead = false;
+                    const bool killed = GuestKillMirrorEntity(es.objId, dent, true, &alreadyDead);
+                    const bool settled = killed || alreadyDead;
+                    ++at.n;
+                    if (settled) {
+                        GktMarkPushed(es.objId, dent);     // ONLY now
+                        // C2 §6: this is the line that makes C_applied0 == 0 measurable. `applied`
+                        // means SETTLED (engine dead, or made dead), never "presented": a bare
+                        // applied=0 without retry= is a bug, and applied=0 retry=1 is legal.
+                        L("[Mirror] snapshot death objId=%llu ent=%08X applied=1 retry=0 attempts=%u\n",
+                          (unsigned long long)es.objId, dent, at.n);
+                        GktAttemptClear(es.objId, dent);
+                    } else {
+                        if (at.n <= CLAIM_MAX_ATTEMPTS) {
+                            L("[Mirror] snapshot death objId=%llu ent=%08X applied=0 retry=1 attempts=%u\n",
+                              (unsigned long long)es.objId, dent, at.n);
+                        } else if (!at.escalated) {
+                            // C2 §3.4: bounded, never abandoned. Retries continue at the epoch
+                            // cadence above, because an unprovable identity can become provable
+                            // later (address/binding reuse) and a permanent one is an identity bug
+                            // that must not also be a silent one.
+                            at.escalated = 1;
+                            L("[Death] unresolved objId=%llu ent=%08X attempts=%u reason=not-settled\n",
+                              (unsigned long long)es.objId, dent, at.n);
+                        }
+                    }
                 }
             }
             // Visibility: log each guard the first time it becomes a playback dummy, so a live test can
@@ -7210,7 +7294,9 @@ static void CorpseLatchTick() {
 //      (src/phase1.cpp:2197). SetLife on a recycled service is exactly the fault this guards against.
 // Anything else touches no entity at all and only logs. A proximity kill here would be far worse than a
 // corpse that keeps standing, so the default for an unprovable target is "do nothing".
-static bool GuestKillMirrorEntity(uint64_t objId, unsigned int ent, bool viaGuestObj) {
+static bool GuestKillMirrorEntity(uint64_t objId, unsigned int ent, bool viaGuestObj,
+                                  bool* alreadyDead /* = nullptr in the declaration */) {
+    if (alreadyDead) *alreadyDead = false;   // C2 §3.3: only the already-dead branch below sets it
     const int flag = GuestKillMirrorEnabled();
     // GuestKillMirror=0 is the escape hatch: nothing below runs at all - no health read, no
     // re-enable, no engine call - so the crash path is unreachable with the flag off.
@@ -7239,6 +7325,7 @@ static bool GuestKillMirrorEntity(uint64_t objId, unsigned int ent, bool viaGues
     // dispatcher - the state in which this->[0x114] is null (crash at 0x67B2EA, 0xC0000005).
     // A body that is dead on any of the two proven predicates is never killed a second time.
     if (hpOk && (life == 0xFFFFu || deadFlag)) {
+        if (alreadyDead) *alreadyDead = true;   // settled: the engine predicate already says dead
         L("[Mirror] dead ent=%08X skipped reason=already-dead life=%u\n", ent, (unsigned)life);
         return false;
     }

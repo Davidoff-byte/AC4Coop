@@ -221,7 +221,15 @@ namespace {
                 if (e.actionAlias != sh->st.actionAlias) mask |= EF_ACTION;
                 if (e.hp          != sh->st.hp)          mask |= EF_HP;
                 if (e.arch        != sh->st.arch)        mask |= EF_ARCH;
-                if (e.dead        != sh->st.dead)        mask |= EF_DEAD;
+                // C2 §2.1: the dead bit is a LEVEL, not a delta. A corpse whose other fields have
+                // stopped changing would otherwise be omitted entirely (mask == 0) and its death
+                // would survive only through the epoch re-baseline. `|| e.dead != 0` re-sends the bit
+                // on every snapshot while dead; the `!=` term still fires 1 -> 0 on resurrection,
+                // which is the only way a body may come back.
+                // WIRE: this changes FREQUENCY, not layout - no new field, no new kind, no size
+                // change, NET_PROTO_VER stays 11. An unmodified peer decodes a repeated
+                // EF_DEAD = 1 and re-applies it idempotently.
+                if (e.dead != sh->st.dead || e.dead != 0u) mask |= EF_DEAD;
                 if (e.stage       != sh->st.stage)       mask |= EF_STAGE;
                 // objId is carried by the record identity, never by a field bit.
             }
@@ -313,7 +321,10 @@ namespace {
             e.pos[0] = 10.5f + i; e.pos[1] = -3.25f * i; e.pos[2] = 7.0f;
             e.quat[0] = 0.1f; e.quat[1] = 0.2f; e.quat[2] = 0.3f; e.quat[3] = 0.9f;
             e.actionAlias = 0x11223344u + i;
-            e.objId = 0xAABBCCDD00000000ull + i; e.hp = (uint16_t)(50 + i); e.arch = (uint16_t)(0x35F7 + i);
+            e.objId = 0xAABBCCDD00000000ull + i; e.arch = (uint16_t)(0x35F7 + i);
+            // C2 §4.1: `dead` and `hp` are one value. A dead body carries the 0xFFFF sentinel, so the
+            // fixture is what a cross-check-normalised sender emits: never dead=1 with a live hp.
+            e.hp = (i == 1) ? 0xFFFFu : (uint16_t)(50 + i);
         }
         std::memset(g_txShadow, 0, sizeof(g_txShadow));
         std::memset(g_rxShadow, 0, sizeof(g_rxShadow));
@@ -323,19 +334,38 @@ namespace {
         EntityPacket b{};
         bool ok = n1 > 0 && DecodeEntityPacket(buf, n1, b) && b.count == 3;
         if (ok) for (int i = 0; i < 3; ++i) ok = ok && SameEntity(a.ents[i], b.ents[i]);
-        // Second pass: nothing changed, so every entity must be omitted (header only).
+        // C2 §2.4 (2): second pass, nothing changed. The DEAD body must still be re-sent - the dead
+        // bit is a level, not a delta - while the two live bodies must still be omitted.
         const size_t n2 = EncodeEntityPacket(a, buf, sizeof(buf));
         EntityPacket c{};
-        bool ok2 = (n2 == sizeof(EntityWireHeader)) && DecodeEntityPacket(buf, n2, c) && c.count == 0;
+        bool ok2 = n2 > sizeof(EntityWireHeader) && DecodeEntityPacket(buf, n2, c)
+                   && c.count == 1 && c.ents[0].key == 1u && c.ents[0].dead == 1;
+        // C2 §2.4 (3): third pass, resurrection. `dead` falls back to 0 and hp must come back off the
+        // 0xFFFF sentinel with it, which is what the cross-check requires of a live body. Exactly one
+        // record, EF_DEAD set on the wire, decoded dead == 0.
+        a.ents[1].dead = 0; a.ents[1].hp = 40;
+        const size_t n3 = EncodeEntityPacket(a, buf, sizeof(buf));
+        EntityPacket d{};
+        bool ok3 = n3 > sizeof(EntityWireHeader) && DecodeEntityPacket(buf, n3, d)
+                   && d.count == 1 && d.ents[0].key == 1u && d.ents[0].dead == 0
+                   && d.ents[0].hp == 40;
+        // C2 §2.4 (1): the no-change omission assertion STAYS, for live entities. This is the only
+        // test protecting snapshot size; it is re-fixtured, never deleted, to make §2 pass.
+        const size_t n4 = EncodeEntityPacket(a, buf, sizeof(buf));
+        EntityPacket f{};
+        bool ok4 = (n4 == sizeof(EntityWireHeader)) && DecodeEntityPacket(buf, n4, f) && f.count == 0;
         // Both peers must start from an empty shadow.
         std::memset(g_txShadow, 0, sizeof(g_txShadow));
         std::memset(g_rxShadow, 0, sizeof(g_rxShadow));
         g_txEpoch = g_rxEpoch = 1; g_txSinceReset = 0;
-        char m[160];
-        wsprintfA(m, "[Net] wire codec selftest: roundtrip=%s nochange=%s (full=%u B, unchanged=%u B for 3 ents)\n",
-                  ok ? "PASS" : "FAIL", ok2 ? "PASS" : "FAIL", (unsigned)n1, (unsigned)n2);
+        char m[256];
+        wsprintfA(m, "[Net] wire codec selftest: roundtrip=%s nochange=%s deaddelta=%s resurrect=%s"
+                     " (full=%u B, repeat=%u B, res=%u B, idle=%u B)\n",
+                  ok ? "PASS" : "FAIL", ok4 ? "PASS" : "FAIL", ok2 ? "PASS" : "FAIL",
+                  ok3 ? "PASS" : "FAIL",
+                  (unsigned)n1, (unsigned)n2, (unsigned)n3, (unsigned)n4);
         dbg(m);
-        return ok && ok2;
+        return ok && ok2 && ok3 && ok4;
     }
 
     bool DecodeEntityPacket(const uint8_t* in, size_t len, EntityPacket& out, DecodeReason* why) {
@@ -395,6 +425,18 @@ namespace {
             if (mask & EF_ARCH)   { if (o + 2 > len) return fail(DEC_TRUNC); std::memcpy(&e.arch, in + o, 2); o += 2; }
             if (mask & EF_DEAD)   { if (o + 1 > len) return fail(DEC_TRUNC); e.dead = in[o++]; }
             if (mask & EF_STAGE)  { if (o + 1 > len) return fail(DEC_TRUNC); e.stage = in[o++]; }
+            // C2 §4.2 cross-check: one record may not present two answers for one fact. Only a
+            // record that actually carried one of the two death fields is normalised - an untouched
+            // shadow value must not ratchet, or a shadow of dead=1 would be re-derived as dead for
+            // ever and a delta that legitimately omits `dead` could never be trusted. Kill-lane
+            // records are exempt: hp is their payload and dead is unused (I1: kind 3 && hp == 0xFFFF,
+            // one entry per packet), so the rule is gated on kind not being a kill kind.
+            if (kind != EK_KILL && (mask & (EF_DEAD | EF_HP)) && (e.dead || e.hp == 0xFFFFu)) {
+                e.dead = 1; e.hp = 0xFFFFu;
+            }
+            // The writeback below stores the normalised value, so the receiver's shadow agrees with
+            // what the apply path will see and a sender-side inconsistency is not re-amplified into
+            // every later delta.
             if (sh) sh->st = e;
             out.ents[out.count++] = e;
         }
