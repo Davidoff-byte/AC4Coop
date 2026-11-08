@@ -8101,6 +8101,19 @@ static void OnFrameInner(Human* updatedHuman) {
             hm->M41 = g_holdPos[0]; hm->M42 = g_holdPos[1]; hm->M43 = g_holdPos[2];
         }
     }
+    // Heartbeat: an unconditional line every 30 s, before any net/world gate. Without it, "the frame
+    // hook died" and "the hook is idle" look identical in the log - which cost the 2026-11-08 evening
+    // three blind runs (the log simply stopped at 17:30 and nothing said so).
+    {
+        static uint64_t s_hbNext = 0;
+        uint64_t hbNow = GetTickCount64();
+        if (hbNow >= s_hbNext) {
+            s_hbNext = hbNow + 30000;
+            L("[HB] tick=%llu net=%d entSync=%d host=%d world=%p\n",
+              (unsigned long long)hbNow, Net::Enabled() ? 1 : 0, g_entSync, g_entHost,
+              (void*)World::GetCurrentWorld());
+        }
+    }
     if (Net::Enabled()) {
         EntitySyncTick();   // host broadcasts entity transforms; peer mirrors them (synced worlds)
         // Capture only succeeds in a real playable world (not title/whiteroom). Require it to be
