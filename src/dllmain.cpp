@@ -329,35 +329,11 @@ static unsigned __stdcall PollThread(void*)
             logline("[AC4Coop] poll-tick tick=%llu ts=%s\n", (unsigned long long)ticks, ts);
         }
 
-        // F6 (edge-triggered): request a spawn; the actual work runs on the main thread (frame hook).
-        static bool f6prev = false;
-        bool f6 = (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
-        if (f6 && !f6prev) { logline("[AC4Coop] F6 -> spawn requested\n"); Phase1::RequestSpawn(); }
-        f6prev = f6;
-
-        // F7 (edge-triggered): dump the player Human* + swim chain (for Cheat Engine verification).
-        static bool f7prev = false;
-        bool f7 = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
-        if (f7 && !f7prev) { logline("[AC4Coop] F7 -> dump requested\n"); Phase1::RequestDump(); }
-        f7prev = f7;
-
-        // F8 (edge-triggered): crowd (non-player) body probe — GO/NO-GO for the ambient-NPC-sync plan.
-        static bool f8prev = false;
-        bool f8 = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
-        if (f8 && !f8prev) { logline("[AC4Coop] F8 -> crowd probe requested\n"); Phase1::RequestCrowdProbe(); }
-        f8prev = f8;
-
-        // F9 (edge-triggered): scene/interior probe — observation only, logs the [Scene] block.
-        static bool f9prev = false;
-        bool f9 = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
-        if (f9 && !f9prev) { logline("[AC4Coop] F9 -> scene probe requested\n"); Phase1::RequestSceneProbe(); }
-        f9prev = f9;
-
-        // F10 (edge-triggered): ship/boarding probe -- observation only, logs the [Ship] block.
-        static bool f10prev = false;
-        bool f10 = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
-        if (f10 && !f10prev) { logline("[AC4Coop] F10 -> ship probe requested\n"); Phase1::RequestShipProbe(); }
-        f10prev = f10;
+        // NOTE 2026-11-08: the one-off probe hotkeys (F1 guard-health map, F2 health-heap, F3 input-state,
+        // F4 entity-enum, F5 ship-drive, F6 spawn, F7 dump, F8 crowd, F9 scene, F10 ship probe, F12
+        // ship-ctor) were RETIRED so those keys are free for the game or for rebinding. Their
+        // Phase1::Request* functions are still compiled and callable - rebinding one is a single block
+        // like the F11 handler below. Only keys with ongoing operational use remain bound.
 
         // F11 (edge-triggered): REMOVE the ghost ship (safe hide) — press before switching worlds.
         static bool f11prev = false;
@@ -378,53 +354,11 @@ static unsigned __stdcall PollThread(void*)
         if (pauseKey && !pausePrev) { logline("[AC4Coop] Pause -> sink nearby ships\n"); Phase1::RequestShipTest(2); }
         pausePrev = pauseKey;
 
-        // F12 (edge-triggered): construct-ship experiment -- build a SHIP entity at the ctor VA and add it
-        // to the world so the USER can see whether the engine streams its model (hull/masts) on its own.
-        static bool f12prev = false;
-        bool f12 = (GetAsyncKeyState(VK_F12) & 0x8000) != 0;
-        if (f12 && !f12prev) { logline("[AC4Coop] F12 -> construct-ship experiment\n"); Phase1::RequestShipCtorProbe(); }
-        f12prev = f12;
-
-        // F13 (edge-triggered): ship-drive test -- write +50 X onto the LOCAL ship's transform, then let the
-        // USER watch whether the ship jumps and STAYS (transform writable -> we can drive it) or snaps back
-        // (physics owns the transform). Observation only; no wire/co-op state touched.
-        static bool f13prev = false;
-        bool f13 = (GetAsyncKeyState(VK_F5) & 0x8000) != 0;
-        if (f13 && !f13prev) { logline("[AC4Coop] F5 -> ship-drive test\n"); Phase1::RequestShipDriveProbe(); }
-        f13prev = f13;
-
-        // F1 (edge-triggered): guard -> CSrvNPCHealth mapping probe — test which owner object holds
-        // the guard's health service.
-        static bool f1prev = false;
-        bool f1 = (GetAsyncKeyState(VK_F1) & 0x8000) != 0;
-        if (f1 && !f1prev) { logline("[AC4Coop] F1 -> guard health map\n"); Phase1::RequestGuardHealthMap(); }
-        f1prev = f1;
-
-        // F2 (edge-triggered): health heap-scan probe — find the live CSrvHealth objects by vtable.
-        static bool f2prev = false;
-        bool f2 = (GetAsyncKeyState(VK_F2) & 0x8000) != 0;
-        if (f2 && !f2prev) { logline("[AC4Coop] F2 -> health heap probe\n"); Phase1::RequestHealthProbe(); }
-        f2prev = f2;
-
-        // F3 (edge-triggered): input-state probe — dump the input manager + device input state to pin
-        // the per-pad buttons + stick layout for the input relay. Read-only.
-        static bool f3prev = false;
-        bool f3 = (GetAsyncKeyState(VK_F3) & 0x8000) != 0;
-        if (f3 && !f3prev) { logline("[AC4Coop] F3 -> input-state probe\n"); Phase1::RequestInputProbe(); }
-        f3prev = f3;
-
         // V (edge-triggered): toggle the pad-1 test stick and compare player vs puppet movement.
         static bool vprev = false;
         bool v = (GetAsyncKeyState('V') & 0x8000) != 0;
         if (v && !vprev) { logline("[AC4Coop] V -> toggle virtual pad stick\n"); Phase1::ToggleVirtualPad(); }
         vprev = v;
-
-        // F4 (edge-triggered): entity-enumeration probe — dump the world's entity lists (ship list,
-        // character list, object list, entity manager) to verify the offsets live. Observation only.
-        static bool f14prev = false;
-        bool f14 = (GetAsyncKeyState(VK_F4) & 0x8000) != 0;
-        if (f14 && !f14prev) { logline("[AC4Coop] F4 -> entity-enumeration probe\n"); Phase1::RequestEntityEnum(); }
-        f14prev = f14;
 
         // Ctrl+Alt+K (edge-triggered): [Coop] CombatTest=1 -> kill the nearest guard inside 25 m and
         // watch it for 10 s. With CombatTest=0 the request is refused and NOTHING is logged or queued,
