@@ -573,7 +573,7 @@ def main(argv):
                         # guest matches it against (0,0,0) and every candidate is "far".
                         rec = {"key": 0, "kind": 2, "idKind": 0, "wireId": args.ent,
                                "hp": args.hp, "dead": 0,
-                               "pos": (x, y, z), "quat": (0.0, 0.0, 0.0, 1.0)}
+                               "pos": (x, y, z)}
                         sock.sendto(encode_entity_wire(seq, 1, [rec]), dest)
                         tx += 1
                 interval = INTERVAL
