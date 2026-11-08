@@ -1019,6 +1019,20 @@ static bool ReadShipHullHP(void* shipEnt, float* out) {
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
+// Max hull HP for the same ship: a plain field at GcLShip+0xB4 (a class-level value with a single
+// writer, vtable slot 0x130 - not a per-damage value), NOT behind a getter. It is the fingerprint the
+// ghost's proxy selection matches on ({maxHP, subEntityCount, flags}), so it rides the player lane.
+// False (and *out untouched) when the GcLShip is unreachable or the value is insane.
+static bool ReadShipHullMax(void* shipEnt, float* out) {
+    void* hobj = ShipGcLObj(shipEnt);          // validates readable(hobj, 0xD4), which covers +0xB4
+    if (!hobj || !out) return false;
+    __try {
+        float v = *(float*)((char*)hobj + 0xB4);
+        if (!(v > 0.0f) || !(v <= 1.0e7f)) return false;   // 0 / NaN / absurd -> treat as unknown
+        *out = v;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
 // Write a hull HP onto a ship through slot 0x12C. False when unreachable or rejected as insane.
 // The slot holds thunk 0x12279B0, whose body is `movss xmm0,[ebp+8]; push ecx; movss [esp],xmm0;
 // call sub_1225A10; retn 4` - i.e. `this` arrives in ECX and the float on the stack, so the call is
@@ -1241,6 +1255,7 @@ bool Phase1::CaptureLocalState(PlayerState& s) {
         s.shipPos[0] = s.shipPos[1] = s.shipPos[2] = 0.0f;
         s.shipQuat[0] = s.shipQuat[1] = s.shipQuat[2] = 0.0f; s.shipQuat[3] = 1.0f;
         s.shipHP = 0.0f;
+        s.shipMaxHP = 0.0f;   // 0 = unknown (no ship aboard / GcLShip unreachable)
         void* ship = handleResolve(h->m_IsOnShipEntity);
         if (!ship) ship = handleResolve(h->m_Data.m_Vehicle);
         if (ship && readable(ship, sizeof(HookMath::Transform))) {
@@ -1255,6 +1270,13 @@ bool Phase1::CaptureLocalState(PlayerState& s) {
             if (ShipHPSyncEnabled()) {
                 float hp = 0.0f;
                 if (ReadShipHullHP(ship, &hp)) s.shipHP = hp;
+            }
+            // Max hull HP is deliberately NOT behind ShipHPSync: it is identity, not a value applied to
+            // the ghost. The proxy selection needs it to choose WHICH local ship to duplicate, and that
+            // path runs with HP sync off (the default). Same guarded GcLShip lookup as shipHP above.
+            {
+                float maxHp = 0.0f;
+                if (ReadShipHullMax(ship, &maxHp)) s.shipMaxHP = maxHp;
             }
             s.shipValid = true;
         }

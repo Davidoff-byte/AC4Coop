@@ -108,6 +108,13 @@ struct PlayerState {
                            // (max at GcLShip + 0xB4), read through the object's vtable slot 0x1B4 and
                            // applied through slot 0x12C. Verified - see ops/evidence/hull-hp-found.md.
                            // (The entity lane's legacy int copy, EntityState::hullHP, was removed at proto 11.)
+    float    shipMaxHP;    // peer's ship MAX hull HP: *(float*)(GcLShip+0xB4). Unlike shipHP this is a
+                           // class-level value (one writer, vtable slot 0x130), i.e. the ship's identity
+                           // fingerprint as far as damage behaviour goes. It rides the wire so the guest
+                           // can choose WHICH local ship to duplicate for the ghost (proxy route): the
+                           // selection keys on {maxHP, subEntityCount, flags} - see
+                           // ops/evidence/ghost-identity-implementation.md. 0.0f = unknown (not aboard,
+                           // or the GcLShip could not be resolved).
 
     uint8_t  valid;                 // 1 = a live player was captured
 };
@@ -116,7 +123,12 @@ struct PlayerState {
 static const uint32_t NET_MAGIC = 0x43344341; // 'AC4C'
 // Wire/struct-layout version. PlayerState is #pragma pack(1): adding a field shifts every following
 // offset, so both peers MUST run the same build. Bump this whenever the layout changes.
-static const uint32_t NET_PROTO_VER = 11;  // 11: entity chunking + worldId, hullHP removed; 10: float shipHP (GcLShip+0xD0)
+static const uint32_t NET_PROTO_VER = 11;  // 11: entity chunking + worldId, hullHP removed, shipMaxHP
+                                           // (GcLShip+0xB4) added; 10: float shipHP (GcLShip+0xD0)
+// Why adding shipMaxHP to 11 needs NO further bump: 11 has never run on a second machine (no released
+// build speaks it), so there is no deployed proto-11 peer to stay compatible with. The layout guard is
+// already structural - the receive path requires n == sizeof(PlayerState), so a stale build is rejected
+// rather than mis-parsed; bumping again would only rename the number with nothing on the other end.
 
 // ---- entity sync (host-authoritative "synced worlds") -------------------------------
 // One replicated entity's transform. `key` is the index in the host's enumeration; `kind` (EntityKind
