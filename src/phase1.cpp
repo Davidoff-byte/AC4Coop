@@ -1076,6 +1076,7 @@ bool Phase1::CaptureLocalState(PlayerState& s) {
             return false;
 
         s.worldId = world->GetObjectID();
+        Net::SetLocalWorldId(s.worldId);   // X5: the entity lane stamps/checks this id
         s.protoVer = NET_PROTO_VER;
 
         Entity* player = world->GetPlayer();
@@ -2408,14 +2409,16 @@ static void fillShipState(EntityState& es, Entity* ent, uint32_t key, uint64_t o
     es.pos[0] = m->M41; es.pos[1] = m->M42; es.pos[2] = m->M43;
     HookMath::Quaternion q; HookMath::FromMatrix(m, &q);
     es.quat[0] = q.x; es.quat[1] = q.y; es.quat[2] = q.z; es.quat[3] = q.w;
-    // Hull HP (host-authoritative ship damage): *(ship+0x5C) -> +0x84.
-    es.hullHP = 0;
-    void* stat = readable((char*)ent + 0x5C, 4) ? *(void**)((char*)ent + 0x5C) : nullptr;
-    if (stat && readable((char*)stat + 0x84, 4)) es.hullHP = *(int*)((char*)stat + 0x84);
 }
 
 static void CaptureShips(EntityPacket& pkt) {
     pkt.magic = NET_ENTITY_MAGIC; pkt.protoVer = NET_PROTO_VER; pkt.count = 0;
+    // X5: stamp the entity lane with the CURRENT world id so a world change is reflected in the very
+    // next snapshot (the host sends entities before CaptureLocalState updates the id in the same frame).
+    {
+        World* w = World::GetCurrentWorld();
+        if (w) Net::SetLocalWorldId(w->GetObjectID());
+    }
     // [Coop] ShipSync=0 -> the header above still has to be written (CaptureGuards appends after us),
     // but no ship entry and no packet is produced.
     if (!ShipSyncEnabled()) return;

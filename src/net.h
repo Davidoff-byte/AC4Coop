@@ -23,6 +23,9 @@ namespace Net {
 
     // Session-lifecycle hardening (Feature #3, ini [Coop] NetStrictPeer):
     void     SetStrictPeer(bool strict); // accept datagrams only from the configured PeerIP (default true)
+    // X5: the local world id (World::GetObjectID()), set by phase1.cpp each frame. The entity encoder
+    // stamps it into the wire header; the decoder drops snapshots whose world differs from the local one.
+    void     SetLocalWorldId(uint64_t id);
     uint64_t LastRecvMs();               // GetTickCount64() of the last ACCEPTED packet (0 = none yet)
     uint32_t MillisSinceRecv();          // ms since the last accepted packet; 0xFFFFFFFF if none yet
 

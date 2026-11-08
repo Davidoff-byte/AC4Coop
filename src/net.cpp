@@ -110,6 +110,36 @@ namespace {
     uint32_t   g_wireFullRecs = 0;               // instrumentation: records that carried every field
     uint32_t   g_wireRecs = 0;                   // instrumentation: records in the last packet
 
+    // ---- X15 (chunked transport) + X5 (world identity on the entity lane) ----------------------
+    // A snapshot whose encoded record region would exceed ENTITY_CHUNK_MAX (1400 B UDP payload) is
+    // split into chunkTotal datagrams, each <= 1400 B, so no chunk IP-fragments at MTU 1500 (one lost
+    // fragment no longer discards the whole snapshot). The header repeats in every chunk.
+    static const int ENTITY_CHUNK_MAX       = 1400;                              // UDP payload budget
+    static const int ENTITY_CHUNK_DATA      = ENTITY_CHUNK_MAX - ENTITY_WIRE_HEADER_SIZE; // 1368 B records/chunk
+    static const int ENTITY_CHUNK_MAX_TOTAL = 16;                                // g_txBuf/1368 = 12, 16 is headroom
+    static const uint64_t ENTITY_CHUNK_TIMEOUT_MS = 1000;   // drop an incomplete set after 1 s
+
+    // Local world id, set by phase1.cpp (World::GetObjectID()) and read by BOTH the encoder (main
+    // thread) and the decoder (recv thread). Interlocked 64-bit because this is an x86 build, where a
+    // plain u64 read can tear across its two 32-bit halves.
+    volatile LONGLONG g_localWorldId = 0;
+    inline uint64_t ReadLocalWorldId() {
+        return (uint64_t)InterlockedCompareExchange64(&g_localWorldId, 0, 0);
+    }
+
+    // Receiver reassembly: one in-flight snapshot (seq is monotonic; a new seq discards the old one).
+    struct RxAssembly {
+        uint32_t seq;
+        uint32_t epoch;
+        uint16_t chunkTotal;
+        uint16_t receivedMask;   // bit i set once chunk i has arrived
+        uint32_t receivedBytes;  // record bytes buffered so far
+        uint64_t firstMs;        // first chunk arrival (bounded drop)
+        bool     active;
+        uint8_t  data[16384];    // header + record region (reassembled)
+    };
+    RxAssembly g_asm;
+
     inline uint64_t ShadowId(uint8_t kind, uint32_t key, uint64_t objId) {
         if (objId) return objId;
         return 0x8000000000000000ull | ((uint64_t)(kind & 3) << 32) | (uint64_t)key;
@@ -146,6 +176,7 @@ namespace {
         }
         EntityWireHeader h{};
         h.magic = p.magic; h.protoVer = p.protoVer; h.seq = p.seq; h.epoch = g_txEpoch;
+        h.worldId = ReadLocalWorldId();      // X5: sender's world id rides the header
         h.count = 0;                         // patched to the WRITTEN count after the loop
         std::memcpy(out, &h, sizeof(h));
         size_t o = sizeof(h);
@@ -170,7 +201,6 @@ namespace {
                 for (int q = 0; q < 4; ++q) { float d = e.quat[q] - sh->st.quat[q]; dq += (d < 0.0f ? -d : d); }
                 if (dq > 0.005f) mask |= EF_QUAT;
                 if (e.actionAlias != sh->st.actionAlias) mask |= EF_ACTION;
-                if (e.hullHP      != sh->st.hullHP)      mask |= EF_HULLHP;
                 if (e.hp          != sh->st.hp)          mask |= EF_HP;
                 if (e.arch        != sh->st.arch)        mask |= EF_ARCH;
                 if (e.dead        != sh->st.dead)        mask |= EF_DEAD;
@@ -190,7 +220,6 @@ namespace {
             if (mask & EF_POS)    need += 12;
             if (mask & EF_QUAT)   need += 16;
             if (mask & EF_ACTION) need += 4;
-            if (mask & EF_HULLHP) need += 4;
             if (mask & EF_HP)     need += 2;
             if (mask & EF_ARCH)   need += 2;
             if (mask & EF_DEAD)   need += 1;
@@ -204,7 +233,6 @@ namespace {
             if (mask & EF_POS)    { std::memcpy(out + o, e.pos, 12); o += 12; }
             if (mask & EF_QUAT)   { std::memcpy(out + o, e.quat, 16); o += 16; }
             if (mask & EF_ACTION) { std::memcpy(out + o, &e.actionAlias, 4); o += 4; }
-            if (mask & EF_HULLHP) { std::memcpy(out + o, &e.hullHP, 4); o += 4; }
             if (mask & EF_HP)     { std::memcpy(out + o, &e.hp, 2); o += 2; }
             if (mask & EF_ARCH)   { std::memcpy(out + o, &e.arch, 2); o += 2; }
             if (mask & EF_DEAD)   { out[o++] = e.dead; }
@@ -214,7 +242,6 @@ namespace {
                 if (mask & EF_POS)    std::memcpy(sh->st.pos,  e.pos,  sizeof(e.pos));
                 if (mask & EF_QUAT)   std::memcpy(sh->st.quat, e.quat, sizeof(e.quat));
                 if (mask & EF_ACTION) sh->st.actionAlias = e.actionAlias;
-                if (mask & EF_HULLHP) sh->st.hullHP = e.hullHP;
                 if (mask & EF_HP)     sh->st.hp = e.hp;
                 if (mask & EF_ARCH)   sh->st.arch = e.arch;
                 if (mask & EF_DEAD)   sh->st.dead = e.dead;
@@ -241,6 +268,8 @@ namespace {
         DEC_TRUNC,     // a record, or one of its fields, runs past the datagram
         DEC_MASK,      // a field bit outside the legal wire mask (EF_ALL & ~EF_OBJID)
         DEC_KIND,      // entity kind not in {1 ship, 2 guard, 3 kill} (see EntityKind)
+        DEC_WORLD,     // header worldId != local world id (world-transitions X5)
+        DEC_PENDING,   // chunk buffered for reassembly; snapshot not complete yet (X15)
     };
 
     // Oracle for the Phase 2 codec, run at startup on both peers:
@@ -252,7 +281,7 @@ namespace {
             && a.pos[0] == b.pos[0] && a.pos[1] == b.pos[1] && a.pos[2] == b.pos[2]
             && a.quat[0] == b.quat[0] && a.quat[1] == b.quat[1]
             && a.quat[2] == b.quat[2] && a.quat[3] == b.quat[3]
-            && a.actionAlias == b.actionAlias && a.hullHP == b.hullHP
+            && a.actionAlias == b.actionAlias
             && a.objId == b.objId && a.hp == b.hp && a.arch == b.arch;
     }
 
@@ -264,7 +293,7 @@ namespace {
             e.key = (uint32_t)i; e.kind = 2; e.dead = (uint8_t)(i == 1); e.stage = (uint8_t)(i + 1);
             e.pos[0] = 10.5f + i; e.pos[1] = -3.25f * i; e.pos[2] = 7.0f;
             e.quat[0] = 0.1f; e.quat[1] = 0.2f; e.quat[2] = 0.3f; e.quat[3] = 0.9f;
-            e.actionAlias = 0x11223344u + i; e.hullHP = 100 + i;
+            e.actionAlias = 0x11223344u + i;
             e.objId = 0xAABBCCDD00000000ull + i; e.hp = (uint16_t)(50 + i); e.arch = (uint16_t)(0x35F7 + i);
         }
         std::memset(g_txShadow, 0, sizeof(g_txShadow));
@@ -300,6 +329,13 @@ namespace {
         if (h.magic != NET_ENTITY_MAGIC) return fail(DEC_MAGIC);
         if (h.protoVer != NET_PROTO_VER) return fail(DEC_PROTO);
         if (h.count > (uint32_t)MAX_SYNC_ENTITIES) return fail(DEC_COUNT);
+        // X5: drop snapshots whose world differs from the local one. 0 on either side means "unknown
+        // yet" (first frame / not loaded) and is accepted; the apply path still needs a matching local
+        // world (phase1.cpp localOk) before it drives anything.
+        {
+            const uint64_t localWorld = ReadLocalWorldId();
+            if (localWorld != 0 && h.worldId != 0 && h.worldId != localWorld) return fail(DEC_WORLD);
+        }
         // Same epoch rule as the sender: a new epoch means the base is gone on both sides.
         if (h.epoch != g_rxEpoch) {
             std::memset(g_rxShadow, 0, sizeof(g_rxShadow));
@@ -328,7 +364,6 @@ namespace {
             if (mask & EF_POS)    { if (o + 12 > len) return fail(DEC_TRUNC); std::memcpy(e.pos, in + o, 12); o += 12; }
             if (mask & EF_QUAT)   { if (o + 16 > len) return fail(DEC_TRUNC); std::memcpy(e.quat, in + o, 16); o += 16; }
             if (mask & EF_ACTION) { if (o + 4 > len) return fail(DEC_TRUNC); std::memcpy(&e.actionAlias, in + o, 4); o += 4; }
-            if (mask & EF_HULLHP) { if (o + 4 > len) return fail(DEC_TRUNC); std::memcpy(&e.hullHP, in + o, 4); o += 4; }
             if (mask & EF_HP)     { if (o + 2 > len) return fail(DEC_TRUNC); std::memcpy(&e.hp, in + o, 2); o += 2; }
             if (mask & EF_ARCH)   { if (o + 2 > len) return fail(DEC_TRUNC); std::memcpy(&e.arch, in + o, 2); o += 2; }
             if (mask & EF_DEAD)   { if (o + 1 > len) return fail(DEC_TRUNC); e.dead = in[o++]; }
@@ -339,6 +374,68 @@ namespace {
         return true;
     }
 
+    // X15: consume one entity datagram (a chunk). Returns:
+    //   DEC_OK      - a complete snapshot was decoded into `out` (single chunk, or the final chunk).
+    //   DEC_PENDING - the chunk was buffered; the snapshot is not complete yet (never applied).
+    //   any other   - the datagram was rejected (malformed / wrong version / wrong world / bad kind).
+    DecodeReason DecodeEntityChunk(const uint8_t* in, size_t len, EntityPacket& out, DecodeReason* why) {
+        auto fail = [why](DecodeReason r) -> DecodeReason { if (why) *why = r; return r; };
+        if (why) *why = DEC_OK;
+        if (len < sizeof(EntityWireHeader)) return fail(DEC_SHORT);
+        EntityWireHeader h{};
+        std::memcpy(&h, in, sizeof(h));
+        if (h.magic != NET_ENTITY_MAGIC) return fail(DEC_MAGIC);
+        if (h.protoVer != NET_PROTO_VER) return fail(DEC_PROTO);
+        if (h.chunkTotal == 0 || h.chunkTotal > ENTITY_CHUNK_MAX_TOTAL) return fail(DEC_MASK);
+        if (h.chunkIndex >= h.chunkTotal) return fail(DEC_MASK);
+        if (h.count > (uint32_t)MAX_SYNC_ENTITIES) return fail(DEC_COUNT);
+
+        const size_t hdr = sizeof(h);
+        const size_t chunkBytes = len - hdr;
+
+        // Fast path: a single-chunk snapshot (the common case) decodes straight out of the datagram.
+        if (h.chunkTotal == 1) {
+            if (!DecodeEntityPacket(in, len, out, why)) return *why;   // reason already set
+            return DEC_OK;
+        }
+
+        // Multi-chunk: reassemble. A new seq, or an incomplete set that has aged out, discards the old.
+        const uint64_t now = GetTickCount64();
+        if (g_asm.active && (h.seq != g_asm.seq || (now - g_asm.firstMs) > ENTITY_CHUNK_TIMEOUT_MS)) {
+            std::memset(&g_asm, 0, sizeof(g_asm));
+        }
+        if (!g_asm.active) {
+            g_asm.active = true;
+            g_asm.seq = h.seq;
+            g_asm.epoch = h.epoch;
+            g_asm.chunkTotal = h.chunkTotal;
+            g_asm.receivedMask = 0;
+            g_asm.receivedBytes = 0;
+            g_asm.firstMs = now;
+            std::memcpy(g_asm.data, in, hdr);   // chunk 0's header is the canonical one
+        } else if (h.epoch != g_asm.epoch || h.chunkTotal != g_asm.chunkTotal) {
+            return fail(DEC_MASK);              // same seq but inconsistent split -> malformed
+        }
+        // Place this chunk's record bytes (chunks are fixed-size except the last); a duplicate chunk
+        // is ignored so the byte count is never double-counted.
+        if (!(g_asm.receivedMask & (uint16_t)(1u << h.chunkIndex))) {
+            const size_t off = (size_t)h.chunkIndex * ENTITY_CHUNK_DATA;
+            if (off + chunkBytes > sizeof(g_asm.data) - hdr) return fail(DEC_TRUNC);
+            std::memcpy(g_asm.data + hdr + off, in + hdr, chunkBytes);
+            g_asm.receivedMask |= (uint16_t)(1u << h.chunkIndex);
+            g_asm.receivedBytes += (uint32_t)chunkBytes;
+        }
+
+        if (g_asm.receivedMask == (uint16_t)((1u << h.chunkTotal) - 1)) {
+            // Complete: decode the reassembled snapshot, then consume the assembler.
+            const size_t total = hdr + g_asm.receivedBytes;
+            const bool ok = DecodeEntityPacket(g_asm.data, total, out, why);
+            std::memset(&g_asm, 0, sizeof(g_asm));
+            if (!ok) return *why;
+            return DEC_OK;
+        }
+        return DEC_PENDING;
+    }
 
     // ---- reject observability (X4/X18) -----------------------------------------------------------
     // A version mismatch or a malformed packet used to be dropped with no trace: rxPackets climbed,
@@ -360,6 +457,12 @@ namespace {
         if (s_logged) return;
         s_logged = true;
         dbg("[Net] entity packet REJECTED: kind outside {1 ship, 2 guard, 3 kill} (netstate.h EntityKind)\n");
+    }
+    void LogWorldMismatch() {
+        static bool s_logged = false;
+        if (s_logged) return;
+        s_logged = true;
+        dbg("[Net] entity packet REJECTED: header worldId != local world (world change in progress?)\n");
     }
     void LogRejectSummary(LONG rejects) {
         char m[160];
@@ -404,10 +507,11 @@ namespace {
                         // turned shipHP from int32 to float WITHOUT changing sizeof(PlayerState), so
                         // the length check cannot see it and an int hull reads back as a denormal.
                         const bool playerOk = playerPkt && peerProto == NET_PROTO_VER;
-                        // Entity lane (X18): the decoder reports WHY it dropped the datagram.
+                        // Entity lane (X18/X15/X5): the chunk decoder reports WHY it dropped or deferred.
                         DecodeReason why = DEC_OK;
                         const bool entityOk = entityPkt &&
-                            DecodeEntityPacket((const uint8_t*)buf, (size_t)n, decoded, &why);
+                            (DecodeEntityChunk((const uint8_t*)buf, (size_t)n, decoded, &why) == DEC_OK);
+                        const bool entityPending = entityPkt && !entityOk && why == DEC_PENDING;
                         const bool accepted = playerPkt ? playerOk : entityOk;
                         if (playerPkt && !playerOk) {
                             InterlockedIncrement(&g_rxProtoMismatch);
@@ -418,9 +522,12 @@ namespace {
                                 LogProtoMismatch("entity", peerProto);        // one line per process
                             } else if (why == DEC_KIND) {
                                 LogKindRejected();
+                            } else if (why == DEC_WORLD) {
+                                LogWorldMismatch();
                             }
+                            // DEC_PENDING: a chunk buffered for reassembly - neither accepted nor rejected.
                         }
-                        if (!accepted) {
+                        if (!accepted && !entityPending) {
                             const LONG rejects = InterlockedIncrement(&g_rxRejects);
                             if (rejects == 1 || (rejects % 256) == 0) LogRejectSummary(rejects);
                         }
@@ -588,17 +695,35 @@ int DrainRemote(PlayerState* out, int max) {
 
 void SendEntities(const EntityPacket& p) {
     if (!g_enabled) return;
-    const size_t n = EncodeEntityPacket(p, g_txBuf, sizeof(g_txBuf));
+    const size_t n = EncodeEntityPacket(p, g_txBuf, sizeof(g_txBuf));   // [header][records]
     if (n == 0) return;
-    sendto(g_sock, (const char*)g_txBuf, (int)n, 0, (sockaddr*)&g_peer, sizeof(g_peer));
-    InterlockedIncrement(&g_txPackets);
-    InterlockedAdd(&g_txBytes, (LONG)n);          // actual encoded size, not sizeof(EntityPacket)
+    const size_t hdr = sizeof(EntityWireHeader);
+    const size_t recordBytes = n - hdr;
+    // X15: chunk the record region so every UDP payload stays <= ENTITY_CHUNK_MAX. A header-only
+    // snapshot (recordBytes == 0) still sends one chunk so the peer sees the heartbeat.
+    const uint16_t total = (recordBytes == 0) ? 1u
+                            : (uint16_t)((recordBytes + ENTITY_CHUNK_DATA - 1) / ENTITY_CHUNK_DATA);
+    uint8_t chunk[ENTITY_CHUNK_MAX];
+    for (uint16_t i = 0; i < total; ++i) {
+        const size_t off = (size_t)i * ENTITY_CHUNK_DATA;
+        size_t len = recordBytes - off;
+        if (len > (size_t)ENTITY_CHUNK_DATA) len = (size_t)ENTITY_CHUNK_DATA;
+        EntityWireHeader h{};
+        std::memcpy(&h, g_txBuf, sizeof(h));   // magic/proto/seq/epoch/count/worldId already set
+        h.chunkIndex = i;
+        h.chunkTotal = total;
+        std::memcpy(chunk, &h, sizeof(h));
+        std::memcpy(chunk + hdr, g_txBuf + hdr + off, len);
+        sendto(g_sock, (const char*)chunk, (int)(hdr + len), 0, (sockaddr*)&g_peer, sizeof(g_peer));
+        InterlockedIncrement(&g_txPackets);
+        InterlockedAdd(&g_txBytes, (LONG)(hdr + len));   // actual bytes on the wire (per chunk)
+    }
     InterlockedAdd(&g_txEnts, (LONG)g_wireRecs);
     static uint32_t s_logCounter = 0;
     if ((++s_logCounter % 60) == 0) {
         char m[160];
-        wsprintfA(m, "[Net] entwire pkt=%u B sent=%u/%u full=%u/%u\n",
-                  (unsigned)n, (unsigned)g_wireRecs, (unsigned)p.count,
+        wsprintfA(m, "[Net] entwire pkt=%u B chunks=%u sent=%u/%u full=%u/%u\n",
+                  (unsigned)n, (unsigned)total, (unsigned)g_wireRecs, (unsigned)p.count,
                   (unsigned)g_wireFullRecs, (unsigned)g_wireRecs);
         dbg(m);
     }
@@ -653,6 +778,11 @@ uint32_t GetKillEntities(EntityPacket& out, uint32_t max) {
 
 // ---- session-lifecycle hardening (Feature #3) --------------------------------------
 void SetStrictPeer(bool strict) { g_strictPeer = strict; }
+
+// X5: the local world id (World::GetObjectID()). The entity encoder stamps it into the wire header;
+// the decoder drops snapshots whose world differs from the local one. Interlocked 64-bit write so the
+// recv thread's read (ReadLocalWorldId) never tears on this x86 build.
+void SetLocalWorldId(uint64_t id) { InterlockedExchange64(&g_localWorldId, (LONGLONG)id); }
 
 uint64_t LastRecvMs() {
     if (!g_enabled) return 0;

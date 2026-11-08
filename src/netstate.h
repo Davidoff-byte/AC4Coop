@@ -107,7 +107,7 @@ struct PlayerState {
     float    shipHP;       // AUTHORITATIVE ship hull HP for the player lane: *(float*)(GcLShip+0xD0)
                            // (max at GcLShip + 0xB4), read through the object's vtable slot 0x1B4 and
                            // applied through slot 0x12C. Verified - see ops/evidence/hull-hp-found.md.
-                           // EntityState::hullHP is the legacy int copy of the same quantity.
+                           // (The entity lane's legacy int copy, EntityState::hullHP, was removed at proto 11.)
 
     uint8_t  valid;                 // 1 = a live player was captured
 };
@@ -116,7 +116,7 @@ struct PlayerState {
 static const uint32_t NET_MAGIC = 0x43344341; // 'AC4C'
 // Wire/struct-layout version. PlayerState is #pragma pack(1): adding a field shifts every following
 // offset, so both peers MUST run the same build. Bump this whenever the layout changes.
-static const uint32_t NET_PROTO_VER = 10;  // 10: float shipHP (GcLShip+0xD0); 9: compact per-field entity wire
+static const uint32_t NET_PROTO_VER = 11;  // 11: entity chunking + worldId, hullHP removed; 10: float shipHP (GcLShip+0xD0)
 
 // ---- entity sync (host-authoritative "synced worlds") -------------------------------
 // One replicated entity's transform. `key` is the index in the host's enumeration; `kind` (EntityKind
@@ -146,11 +146,6 @@ struct EntityState {
     float    pos[3];       // world position (x,y,z)
     float    quat[4];      // world rotation (x,y,z,w)
     uint32_t actionAlias;  // current action clip (file alias); 0 = none (guards only)
-    int      hullHP;       // LEGACY int encoding of the hull value (ships only; 0 for guards). The
-                           // AUTHORITATIVE hull HP is PlayerState::shipHP (float, GcLShip+0xD0, see
-                           // ops/evidence/hull-hp-found.md); this lane predates proto 10 and keeps an
-                           // integer copy. net.cpp does not convert between the two - do not assume
-                           // the same units (wire-audit M5).
     uint64_t objId;        // host-assigned stable identity (HandleContainer::m_ObjectID); 0 = unknown
     uint16_t hp;           // host-authoritative Life (guards); 0xFFFF = dead
     uint16_t arch;         // archetype id at behaviour+0x14: lets the peer match class-to-class
@@ -176,12 +171,16 @@ struct EntityPacket {
 // the 7 the old prose claimed (there is an idKind byte and an 8-byte wireId in the fixed part).
 // `count` keeps its old meaning: it is the number of element records the caller captured / the
 // number written on the wire, not the number of field groups.
-// Old (proto 8/9) peers are rejected by the protoVer check rather than mis-parsed (both lanes).
+// Proto 11 (X15/X5): the header now also carries `worldId` (the sender's world; a mismatched snapshot
+// is dropped) and `chunkIndex`/`chunkTotal`, so a snapshot whose encoded records exceed 1400 B is split
+// into several UDP datagrams and reassembled on the receive side (a partial set is never applied).
+// Old (proto <= 10) peers are rejected by the protoVer check rather than mis-parsed (both lanes).
 enum EntityField : uint16_t {
     EF_POS    = 1u << 0,   // float pos[3]
     EF_QUAT   = 1u << 1,   // float quat[4]
     EF_ACTION = 1u << 2,   // u32 actionAlias
-    EF_HULLHP = 1u << 3,   // i32 hullHP (legacy int copy of PlayerState::shipHP, see EntityState)
+    // bit 3 retired: EF_HULLHP (i32 hullHP) was captured+transmitted and never read (authority-model
+    // C3). Removed at proto 11; bit 3 is NEVER reused by a future field.
     EF_HP     = 1u << 4,   // u16 hp
     EF_ARCH   = 1u << 5,   // u16 arch
     EF_DEAD   = 1u << 6,   // u8  dead
@@ -189,21 +188,25 @@ enum EntityField : uint16_t {
     EF_OBJID  = 1u << 8,   // u64 objId - declared only so the set is complete. NOT a legal mask bit:
                            // objId rides the record's wireId (idKind == 0), and net.cpp rejects a
                            // mask containing this bit.
-    EF_ALL    = 0x01FFu,   // every declared bit. A LEGAL wire mask is EF_ALL & ~EF_OBJID == 0x00FF;
-                           // never send EF_ALL itself.
+    EF_ALL    = 0x01F7u,   // every live bit (bit 3 retired). A LEGAL wire mask is
+                           // EF_ALL & ~EF_OBJID == 0x00F7; never send EF_ALL itself.
 };
 
 #pragma pack(push, 1)
 struct EntityWireHeader {
-    uint32_t magic;    // NET_ENTITY_MAGIC
-    uint32_t protoVer; // NET_PROTO_VER
-    uint32_t seq;
-    uint32_t epoch;    // shadow generation: both peers drop their delta base when this changes
-    uint32_t count;
+    uint32_t magic;       // NET_ENTITY_MAGIC
+    uint32_t protoVer;    // NET_PROTO_VER
+    uint32_t seq;         // sender frame counter; every chunk of one snapshot shares this seq
+    uint32_t epoch;       // shadow generation: both peers drop their delta base when this changes
+    uint32_t count;       // number of records in the FULL snapshot (all chunks together)
+    uint64_t worldId;     // sender's World::GetObjectID(); the receiver rejects a snapshot whose
+                          // world differs from the local one (world-transitions X5).
+    uint16_t chunkIndex;  // this chunk's 0-based index
+    uint16_t chunkTotal;  // chunks in this snapshot (1 = single-chunk, the common case)
 };
 #pragma pack(pop)
-static const int ENTITY_WIRE_HEADER_SIZE = 20;
+static const int ENTITY_WIRE_HEADER_SIZE = 32;
 // Fixed part (key+kind+idKind+mask+wireId = 16) + every optional field. The true worst case is
-// 16 + 42 = 58 (objId is the wireId inside the fixed part, not an extra field); 66 is deliberate
-// headroom - do not "correct" this constant below 58.
-static const int ENTITY_WIRE_RECORD_MAX  = 16 + 50;
+// 16 + 38 = 54 (objId is the wireId inside the fixed part, not an extra field); 62 is deliberate
+// headroom - do not "correct" this constant below 54.
+static const int ENTITY_WIRE_RECORD_MAX  = 16 + 46;
