@@ -4487,7 +4487,18 @@ static void EntitySyncTick() {
     // Poll incoming packets BEFORE the self-test branch (D-019). The old order returned early with
     // EntitySelfTest=1, so every incoming entity and kill packet was dropped.
     EntityPacket in;
-    const bool haveIn = Net::GetEntities(in) && in.protoVer == NET_PROTO_VER;
+    const bool gotPacket = Net::GetEntities(in);
+    const bool haveIn = gotPacket && in.protoVer == NET_PROTO_VER;
+    // T27: one join line per process. Until now the only evidence that a peer had ever been heard was
+    // the absence of failures; a version mismatch was silent. Values are what the packet itself said.
+    {
+        static bool s_joinLogged = false;
+        if (gotPacket && !s_joinLogged) {
+            s_joinLogged = true;
+            L("[Join] first entity packet: protoVer=%u expected=%u accepted=%d count=%u\n",
+              (unsigned)in.protoVer, (unsigned)NET_PROTO_VER, haveIn ? 1 : 0, (unsigned)in.count);
+        }
+    }
     // B-4: drain the death entries the recv thread queued. A one-entry KIND_KILL packet is no longer
     // inside `in` at all (it cannot clobber the snapshot slot, net.cpp) and could not be relied on being
     // there even before, because the snapshot slot is last-writer-wins. This is the queue that guarantees
