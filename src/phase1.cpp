@@ -1139,7 +1139,7 @@ static uint32_t g_proxyGhostIds[8];
 static int      g_proxyGhostCount = 0, g_proxyGhostNext = 0;
 
 // What the selector reports. A pure-query result: the selector records nothing.
-struct ProxyPick { uint32_t srcId; int idx; float srcMax; float tierDelta; uint32_t hint; uint32_t cls; int classMiss; };
+struct ProxyPick { uint32_t srcId; int idx; float srcMax; float tierDelta; uint32_t hint; uint32_t cls; int classMiss; const char* camSrc; };
 
 static Entity* ResolveEntityById(uint64_t id);   // engine registry, defined with the ApplyGuards
 static void ProxySrcClearAll();
@@ -1539,7 +1539,29 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
         // [Coop] ShipHPSync (default OFF): carry the peer's hull HP to the ghost. Change-guarded, so the
         // damage-aware setter (clamp + zero event + HUD republish) is not hammered once per packet.
         if (ShipHPSyncEnabled()) {
-            g_ghostSyncHP = s.shipHP;
+            // PX-m2: g_ghostSyncHP is taken raw off the wire and written by WriteShipHullHPRaw at two
+            // sites, so a peer sending NaN / 0 / a garbage negative would write it into GcLShip+0xD0.
+            // Clamp here at the assignment (both write sites inherit it): NaN and <= 0 -> 0 (the same
+            // bit-test pattern as the shipMaxHP clamp above, so /fp:fast cannot fold the NaN test; a
+            // sinking hull may sit slightly below 0, but a non-positive raw write is the
+            // zero-health-destroy hazard); > 1e7 -> clamped to 1e7 (the band ReadShipHullHP uses).
+            float raw = s.shipHP;
+            const uint32_t bits = *(uint32_t*)&raw;
+            const bool isNan = ((bits & 0x7F800000u) == 0x7F800000u) && ((bits & 0x007FFFFFu) != 0);
+            float clean = raw;
+            const char* why = nullptr;
+            if (isNan)                  { clean = 0.0f; why = "nan"; }
+            else if (!(raw > 0.0f))     { clean = 0.0f; why = "non-positive"; }   // 0 / negative / -inf
+            else if (!(raw <= 1e7f))    { clean = 1e7f; why = "above-band"; }     // +inf / absurd
+            if (why) {
+                static bool s_shipHpClampLogged = false;
+                if (!s_shipHpClampLogged) {
+                    s_shipHpClampLogged = true;
+                    L("[GhostProxy] shipHP out of band raw=%g -> %g reason=%s\n", raw, clean, why);
+                }
+            }
+            if (clean == 0.0f) g_ghostAppliedHP = -1.0f;   // PX-m2: a cleaned (no-hull) value re-applies the next valid one
+            g_ghostSyncHP = clean;
             if (g_ghostShip && g_ghostSyncHP != g_ghostAppliedHP) {
                 if (WriteShipHullHPRaw(g_ghostShip, g_ghostSyncHP)) g_ghostAppliedHP = g_ghostSyncHP;
             }
@@ -2303,6 +2325,8 @@ static void* SpawnGhostShip() {
             static unsigned s_proxyDupFails     = 0;   // saturated at 8: only the shift (clamped to 4)
                                                        // and the [GhostProxy] log field consume it
             static uint64_t s_proxyLogLast      = 0;   // wall-clock throttle, 1 s
+            static uint32_t s_pickLastSrcId     = 0;   // PX-m5: last pick line's source id
+            static int      s_pickSpawn         = 0;   // PX-m5: pick count (first spawn always logs)
             const uint64_t nowMs = GetTickCount64();
             ProxySrcWorldCheck();
             if (nowMs < s_proxyDupFailUntil) {
@@ -2313,9 +2337,19 @@ static void* SpawnGhostShip() {
                 ProxyPick pick;
                 Entity* chosen = SelectProxySource(g_ghostPeerMaxHP, g_ghostPeerClass, &pick);
                 if (chosen) {
-                    L("[GhostProxy] pick src=%08X id=%u cls=%u peerCls=%u delta=%.0f idx=%d retry=%u classMiss=%d\n",
-                      (unsigned)chosen, (unsigned)pick.srcId, (unsigned)pick.cls, (unsigned)g_ghostPeerClass,
-                      pick.srcMax, pick.idx, s_proxyDupFails, pick.classMiss);
+                    // PX-m5: throttle the pick line (1 s wall-clock, shared with the fallback lines);
+                    // a first spawn or a source change always logs, so a live test still sees the
+                    // source identity it cares about.
+                    const bool firstSpawn = (s_pickSpawn == 0);
+                    const bool srcChanged = (pick.srcId != s_pickLastSrcId);
+                    if (firstSpawn || srcChanged || (nowMs - s_proxyLogLast >= 1000)) {
+                        s_proxyLogLast = nowMs;
+                        s_pickLastSrcId = pick.srcId;
+                        L("[GhostProxy] pick src=%08X id=%u cls=%u peerCls=%u delta=%.0f idx=%d retry=%u classMiss=%d camSrc=%s\n",
+                          (unsigned)chosen, (unsigned)pick.srcId, (unsigned)pick.cls, (unsigned)g_ghostPeerClass,
+                          pick.srcMax, pick.idx, s_proxyDupFails, pick.classMiss, pick.camSrc ? pick.camSrc : "?");
+                    }
+                    ++s_pickSpawn;
                     void* dup = DuplicateShip(chosen);
                     if (dup) {
                         uint32_t ghostId = 0;
@@ -2743,18 +2777,31 @@ static Entity* GetLocalShip() {
 //      available, no hide seam exists), then lowest object id.
 // cls, peerCls, classMiss, hint and tierDelta are all reported so the rule is observable.
 static Entity* SelectProxySource(float peerMax, uint32_t peerClass, ProxyPick* out) {
-    if (out) { out->srcId = 0; out->idx = -1; out->srcMax = 0.0f; out->tierDelta = 0.0f; out->hint = 0; out->cls = 0; out->classMiss = 0; }
+    if (out) { out->srcId = 0; out->idx = -1; out->srcMax = 0.0f; out->tierDelta = 0.0f; out->hint = 0; out->cls = 0; out->classMiss = 0; out->camSrc = nullptr; }
     if (!(peerMax > 0.0f)) return nullptr;
     __try {
         void* mgr = GetNavalManager();
         if (!mgr || !readable((char*)mgr + 0x3E8, 8)) return nullptr;
         const unsigned short n = *(unsigned short*)((char*)mgr + 0x3EE);
+        // PX-m6: the 128-ship selection window is silent when clamped - log once per distinct n so a
+        // worse source chosen silently is at least visible in the capture.
+        if (n > 128) {
+            static unsigned short s_clampLoggedN = 0;
+            if (s_clampLoggedN != n) {
+                s_clampLoggedN = n;
+                L("[GhostProxy] selection window clamped=128 of n=%u\n", (unsigned)n);
+            }
+        }
         Entity* localShip = GetLocalShip();
         const uint32_t curGhostId = (uint32_t)g_ghostObjId;
 
-        // Camera-focus proxy: the local ship's position (the naval camera orbits it).
+        // Camera-focus proxy: the local ship's position (the naval camera orbits it). When the local
+        // ship cannot be read the tie-break silently degrades to "distance from world origin", so the
+        // source is reported for the pick log (camSrc=ship|origin).
+        const bool camFromShip = localShip && readable(localShip, sizeof(HookMath::Transform));
+        if (out) out->camSrc = camFromShip ? "ship" : "origin";
         float camX = 0.0f, camZ = 0.0f;
-        if (localShip && readable(localShip, sizeof(HookMath::Transform))) {
+        if (camFromShip) {
             camX = localShip->m_GlobalMatrix.M41;
             camZ = localShip->m_GlobalMatrix.M43;
         }
@@ -7421,7 +7468,14 @@ static bool GuestKillMirrorEntity(uint64_t objId, unsigned int ent, bool viaGues
     // GuestKillMirror=0 is the escape hatch: nothing below runs at all - no health read, no
     // re-enable, no engine call - so the crash path is unreachable with the flag off.
     if (!flag) {
-        L("[Mirror] dead ent=%08X -> KillGuardEntity applied=0 (GuestKillMirror=%d)\n", ent, flag);
+        // C2-m4: a disabled kill used to return false with no claim bookkeeping, so the snapshot death
+        // caller never settled (no GktMarkPushed, no GktAttemptClear) and the claim lived for ever while
+        // MirrorVisualDeath had already shown the corpse. Retire the claim here: clear the attempt slot
+        // and count the disabled path (bounded) - a disabled mirror is "handled", not retried.
+        static int s_gktKillDisabled = 0;
+        if (s_gktKillDisabled < 10) ++s_gktKillDisabled;
+        GktAttemptClear(objId, ent);
+        L("[Mirror] dead ent=%08X -> KillGuardEntity applied=0 killDisabled=1 (GuestKillMirror=%d)\n", ent, flag);
         return false;
     }
     bool hpOk = false;
@@ -7577,12 +7631,11 @@ static void ApplyPeerHealth(uint64_t objId, unsigned short life, float x, float 
             // GuestKillMirrorEntity); MirrorVisualDeath stays first so the "[Mirror] dead ..." line is
             // still emitted exactly as before.
             bool applied = false;
-            if (g_entHost) { KillGuardEntity((Entity*)ent); applied = true; }
+            if (g_entHost) { applied = KillGuardEntity((Entity*)ent); }
             else if (!DeathAppliedRecently(ent)) {
                 MarkDeathApplied(ent);
                 MirrorVisualDeath((Entity*)ent);
-                GuestKillMirrorEntity(objId, ent, viaGuestObj);
-                applied = true;
+                applied = GuestKillMirrorEntity(objId, ent, viaGuestObj);
             }
             if (KtOn(KT_RECV))
                 L("[KT] death recv objId=%llu -> ent=%08X ok=1 applied=%d\n",
