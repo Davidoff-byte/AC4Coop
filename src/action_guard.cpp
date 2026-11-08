@@ -254,7 +254,7 @@ void ActionGuard::Init()
 
     // Config gate: [Coop] GuardNullActionTarget=0 leaves the game completely unpatched (A/B without a
     // rebuild). No detour, no trampoline, no writes -- but the resolved address above is still logged.
-    if (GetPrivateProfileIntA("Coop", "GuardNullActionTarget", 0, Paths::Ini()) == 0) {
+    if (GetPrivateProfileIntA("Coop", "GuardNullActionTarget", 1, Paths::Ini()) == 0) {
         Log("[AG] disabled by GuardNullActionTarget=0 (resolved, not installed)\n");
         return;
     }
