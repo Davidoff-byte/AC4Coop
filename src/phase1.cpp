@@ -2711,6 +2711,24 @@ static inline bool IsFighterBody(const KindRole& kr) {
 }
 static inline bool IsCivilianBody(const KindRole& kr) { return kr.ok && kr.kind == 2 && kr.role == 2; }
 
+// ---- T26: faction hostility (RE 2026-11-08) ------------------------------------------------------
+// The engine's own player-relative test, found by call-graph (no PS3 name survives on PC):
+//   sub_1719FF0(entity) = faction(entity) is in faction(ownerOf(entity))+0x14   (the ENEMY array)
+//   sub_171A040(entity) = same faction or in +0x0C                              (the ALLY array)
+// Both are __cdecl, one entity pointer, and return false when either faction is null
+// (sub_133A4C0 resolves entity -> faction). Polarity is proven by the debug handler sub_13C1040:
+// it kills when sub_1719FF0 is true for "Nuke Enemies" and false for "Nuke Allies".
+// Receipts: 17114C0 / 1711500 / 1719FF0 / 171A040 / 133A4C0. Default 0: the list layout is
+// verified, but calling into it has never run in a game, so it stays opt-in until a live run.
+static int HostileOnly() {
+    static int s = -1;
+    if (s < 0) s = GetPrivateProfileIntA("Coop", "HostileOnly", 0, Paths::Ini());
+    return s;
+}
+static inline bool IsEnemyOfOwner(const void* e) {
+    return ((bool(__cdecl*)(void*))0x01719FF0)((void*)e);
+}
+
 // ---- sync scope (TASK: proximity to the PEER) ------------------------------------------------
 // History: the capture used to accept EVERY Skeleton + BhvGenericNPC + health-service entity, i.e.
 // the whole civilian crowd. The first attempt to narrow it was [Coop] SyncEnemiesOnly, which keyed
@@ -3332,6 +3350,9 @@ static void CaptureGuards(EntityPacket& pkt) {
                   (bhvC && readable(bhvC, 4)) ? *(uint32_t*)bhvC : 0u, skel ? 1u : 0u, (unsigned)n);
             }
             if (SyncEnemiesOnly() && !IsFighterBody(kr)) { KrRejectAdd(kr); continue; }
+            // T26: keep only bodies the engine itself calls enemies of the owner. Costs one call into
+            // 0x1719FF0 per candidate, so it is a separate, default-off gate rather than the default.
+            if (HostileOnly() && !IsEnemyOfOwner(e)) { KrRejectAdd(kr); continue; }
             // ---- scope counters ----
             // Candidates = every body that survived skeleton + BhvGenericNPC + the health service and
             // the T13 soldier filter above (so with SyncEnemiesOnly=1 this counts soldiers only; the
