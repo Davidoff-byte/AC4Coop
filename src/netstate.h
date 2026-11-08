@@ -115,20 +115,36 @@ struct PlayerState {
                            // selection keys on {maxHP, subEntityCount, flags} - see
                            // ops/evidence/ghost-identity-implementation.md. 0.0f = unknown (not aboard,
                            // or the GcLShip could not be resolved).
+    uint32_t shipClass;    // peer's ship CLASS index, read off the ship ENTITY (not GcLShip): exactly the
+                           // engine's sub_11AA850 -  f = *(u32*)(entity+0x9C);
+                           //   return ((f & 7)==3 && (f & 0x1F8)==0xE8) ? ((f>>9)&0x3F) : 0;
+                           // The tag/subtype gate is mandatory: without it +0x9C is arbitrary data
+                           // (ops/evidence/ship-type-entity-field.md). Mapping (sub_1045CD0,
+                           // ops/evidence/ship-class-index.md): 1 GunBoat 2 Schooner 3 Brig 4 Frigate
+                           // 6 ManOfWar 7 Jackdaw 8-11 SuperShip 12 Qar 13 Revenge 14 Begin
+                           // 15 NossoSenhor 16 Eldorado; 0 = gate failed / unknown. Lets the guest
+                           // proxy match the peer's class EXACTLY instead of by nearest hull tier.
 
     uint8_t  valid;                 // 1 = a live player was captured
 };
 #pragma pack(pop)
+// Machine-checked wire-layout guard: pack(1) caps natural alignment at 1, but the align(16) members
+// (Transform, Vector4) keep 16-byte alignment, so the struct alignment is 16. shipClass (u32) lands at
+// +560 inside what was 15 B of tail pad, so adding it does NOT grow the struct: still 576 B. The peer9
+// model and ops/tools/wire_model_test.py assert the same number; if any field here changes the size,
+// this fails the build and the peer/tools must move in lockstep.
+static_assert(sizeof(PlayerState) == 576, "PlayerState wire size changed - update peer9.py and wire_model_test.py");
 
 static const uint32_t NET_MAGIC = 0x43344341; // 'AC4C'
 // Wire/struct-layout version. PlayerState is #pragma pack(1): adding a field shifts every following
 // offset, so both peers MUST run the same build. Bump this whenever the layout changes.
 static const uint32_t NET_PROTO_VER = 11;  // 11: entity chunking + worldId, hullHP removed, shipMaxHP
-                                           // (GcLShip+0xB4) added; 10: float shipHP (GcLShip+0xD0)
-// Why adding shipMaxHP to 11 needs NO further bump: 11 has never run on a second machine (no released
-// build speaks it), so there is no deployed proto-11 peer to stay compatible with. The layout guard is
-// already structural - the receive path requires n == sizeof(PlayerState), so a stale build is rejected
-// rather than mis-parsed; bumping again would only rename the number with nothing on the other end.
+                                           // (GcLShip+0xB4) + shipClass (entity+0x9C) added; 10: float shipHP (GcLShip+0xD0)
+// Why adding shipMaxHP (and now shipClass) to 11 needs NO further bump: 11 has never run on a second
+// machine (no released build speaks it), so there is no deployed proto-11 peer to stay compatible with.
+// The layout guard is already structural - the receive path requires n == sizeof(PlayerState), so a
+// stale build is rejected rather than mis-parsed; bumping again would only rename the number with
+// nothing on the other end.
 
 // ---- entity sync (host-authoritative "synced worlds") -------------------------------
 // One replicated entity's transform. `key` is the index in the host's enumeration; `kind` (EntityKind

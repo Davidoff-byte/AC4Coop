@@ -974,6 +974,7 @@ static float   g_ghostSyncQuat[4] = {0,0,0,1}; // peer's ship rotation quaternio
 static float   g_ghostSyncHP = 0.0f;        // [ShipHPSync] peer's ship hull HP (GcLShip+0xD0)
 static float   g_ghostAppliedHP = -1.0f;    // hull HP last written to the ghost (-1 = not applied yet)
 static float   g_ghostPeerMaxHP = 0.0f;     // [GhostProxy] peer's ship MAX hull HP (GcLShip+0xB4); 0 = unknown
+static uint32_t g_ghostPeerClass = 0;       // [GhostProxy] peer's ship CLASS (entity+0x9C, see ReadShipClass); 0 = unknown
 // Assign the ghost and record its id, so the drive path can prove the clone still exists through the
 // engine registry (ResolveEntityById). Before this, g_ghostShip was only cleared by F11 or a drive
 // exception: a clone the engine had freed left a dangling ref that blocked the auto-respawn forever.
@@ -1033,6 +1034,22 @@ static bool ReadShipHullMax(void* shipEnt, float* out) {
         *out = v;
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+// Ship class index off the ship ENTITY: *(u32*)(entity+0x9C) is a packed word {tag:3 @ bits0-2,
+// subtype @ bits3-8, class:6 @ bits9-14}. Byte-for-byte the engine's sub_11AA850
+// (ops/evidence/ship-type-entity-field.md); the gate (tag==3 && subtype==0xE8) is mandatory - without
+// it +0x9C is arbitrary data. Mapping (sub_1045CD0, ops/evidence/ship-class-index.md):
+// 1 GunBoat 2 Schooner 3 Brig 4 Frigate 6 ManOfWar 7 Jackdaw 8-11 SuperShip 12 Qar 13 Revenge
+// 14 Begin 15 NossoSenhor 16 Eldorado; 0 = gate failed / not a ship entity. Reads the entity itself,
+// never the GcLShip (the ship subsystem reads this off the object it holds at S+0xD4 - the entity,
+// not the component-derived GcLShip - ship-type-entity-field.md §2.1).
+static uint32_t ReadShipClass(Entity* ent) {
+    if (!ent || !readable((const char*)ent + 0x9C, 4)) return 0;
+    __try {
+        uint32_t f = *(uint32_t*)((const char*)ent + 0x9C);
+        if ((f & 7u) == 3u && (f & 0x1F8u) == 0xE8u) return (f >> 9) & 0x3Fu;
+        return 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
 }
 // Write a hull HP onto a ship through slot 0x12C. False when unreachable or rejected as insane.
 // The slot holds thunk 0x12279B0, whose body is `movss xmm0,[ebp+8]; push ecx; movss [esp],xmm0;
@@ -1122,7 +1139,7 @@ static uint32_t g_proxyGhostIds[8];
 static int      g_proxyGhostCount = 0, g_proxyGhostNext = 0;
 
 // What the selector reports. A pure-query result: the selector records nothing.
-struct ProxyPick { uint32_t srcId; int idx; float srcMax; float tierDelta; uint32_t hint; };
+struct ProxyPick { uint32_t srcId; int idx; float srcMax; float tierDelta; uint32_t hint; uint32_t cls; int classMiss; };
 
 static Entity* ResolveEntityById(uint64_t id);   // engine registry, defined with the ApplyGuards
 static void ProxySrcClearAll();
@@ -1418,6 +1435,7 @@ bool Phase1::CaptureLocalState(PlayerState& s) {
         s.shipQuat[0] = s.shipQuat[1] = s.shipQuat[2] = 0.0f; s.shipQuat[3] = 1.0f;
         s.shipHP = 0.0f;
         s.shipMaxHP = 0.0f;   // 0 = unknown (no ship aboard / GcLShip unreachable)
+        s.shipClass = 0;      // 0 = unknown (not aboard, or the ship entity's class tag failed)
         void* ship = handleResolve(h->m_IsOnShipEntity);
         if (!ship) ship = handleResolve(h->m_Data.m_Vehicle);
         if (ship && readable(ship, sizeof(HookMath::Transform))) {
@@ -1440,6 +1458,9 @@ bool Phase1::CaptureLocalState(PlayerState& s) {
                 float maxHp = 0.0f;
                 if (ReadShipHullMax(ship, &maxHp)) s.shipMaxHP = maxHp;
             }
+            // Ship class, straight off the ship ENTITY (not the GcLShip). Like shipMaxHP it is identity
+            // for the proxy selector, so it is not behind ShipHPSync (which is off by default).
+            s.shipClass = ReadShipClass((Entity*)ship);
             s.shipValid = true;
         }
 
@@ -1491,6 +1512,7 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
         g_ghostSyncWorldId = s.worldId;     // ...or when the clone's world stops matching the current one
         g_ghostPeerNoShip = false;
         g_ghostPeerMaxHP = s.shipMaxHP;   // [GhostProxy] peer's class fingerprint (GcLShip+0xB4; 0 = unknown)
+        g_ghostPeerClass = s.shipClass;   // [GhostProxy] peer's ship class (entity+0x9C; 0 = unknown)
         // [Coop] ShipHPSync (default OFF): carry the peer's hull HP to the ghost. Change-guarded, so the
         // damage-aware setter (clamp + zero event + HUD republish) is not hammered once per packet.
         if (ShipHPSyncEnabled()) {
@@ -1503,6 +1525,7 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
         g_ghostHasSync = 0;
         g_ghostPeerNoShip = true;   // explicit "peer not aboard" -> this MAY hide the auto ghost (as before)
         g_ghostPeerMaxHP = 0.0f;   // peer not aboard -> no class fingerprint
+        g_ghostPeerClass = 0;      // peer not aboard -> no ship class
     }
     if (!g_puppet || !s.valid) return;
     __try {
@@ -2235,7 +2258,7 @@ static void* DuplicateShip(void* shipEnt) {
 
 // Forward declaration for the ghost-proxy route (defined after the naval-list helpers below).
 // Pure query: it returns the best candidate and reports it in *out; it records NOTHING.
-static Entity* SelectProxySource(float peerMax, ProxyPick* out);
+static Entity* SelectProxySource(float peerMax, uint32_t peerClass, ProxyPick* out);
 
 // Spawn the peer's ship ghost. With GhostProxy=1 and a known peer max, duplicate the local ship
 // whose class matches the peer's instead of the local Jackdaw; else (or on any failure) fall back
@@ -2265,11 +2288,11 @@ static void* SpawnGhostShip() {
             } else if (g_ghostPeerMaxHP > 0.0f) {
                 ProxySrcPrune();   // once per selection pass, never per frame
                 ProxyPick pick;
-                Entity* chosen = SelectProxySource(g_ghostPeerMaxHP, &pick);
+                Entity* chosen = SelectProxySource(g_ghostPeerMaxHP, g_ghostPeerClass, &pick);
                 if (chosen) {
-                    L("[GhostProxy] pick src=%08X id=%u delta=%.0f idx=%d retry=%u hint=%u tierDelta=%.2f\n",
-                      (unsigned)chosen, (unsigned)pick.srcId, pick.srcMax, pick.idx,
-                      s_proxyDupFails, (unsigned)pick.hint, pick.tierDelta);
+                    L("[GhostProxy] pick src=%08X id=%u cls=%u peerCls=%u delta=%.0f idx=%d retry=%u classMiss=%d\n",
+                      (unsigned)chosen, (unsigned)pick.srcId, (unsigned)pick.cls, (unsigned)g_ghostPeerClass,
+                      pick.srcMax, pick.idx, s_proxyDupFails, pick.classMiss);
                     void* dup = DuplicateShip(chosen);
                     if (dup) {
                         uint32_t ghostId = 0;
@@ -2684,17 +2707,20 @@ static Entity* GetLocalShip() {
 // (the ctor writes 1000.0f, the live Jackdaw holds 12000, a duplicate reads 1000 again), so exact
 // float equality is not a class test - and a duplicate always reads 1000, which also makes it
 // self-matching. Ranking therefore is:
-//   1. nearest log-ratio hull tier, |log(candMax / peerMax)| - never equality;
-//   2. structural class hint, the ship's sub-entity count (u16 @ GcLShip+0x146). The peer's hint is
+//   1. ship CLASS (when peerClass != 0, the peer's class read from its own ship entity): candidates
+//      whose ReadShipClass(se) equals peerClass are preferred over any that do not - the exact-class
+//      match the wire now provides. If none matches, this tier is vacuous (every candidate ties) and
+//      rules 2-4 still apply; classMiss is reported so the fallback is observable;
+//   2. nearest log-ratio hull tier, |log(candMax / peerMax)| - never equality;
+//   3. structural class hint, the ship's sub-entity count (u16 @ GcLShip+0x146). The peer's hint is
 //      not on the wire, so it cannot be the target today; among equally-tiered candidates the one
 //      that carries a readable hint wins, then the structurally simpler hull (fewer sub-entities -
 //      the duplicate deep-copies that array, and burning/wreck children come along with it);
-//   3. farther from the camera (approximated by distance to the local ship - the only F1 mitigation
+//   4. farther from the camera (approximated by distance to the local ship - the only F1 mitigation
 //      available, no hide seam exists), then lowest object id.
-// Both hint and tierDelta are reported so the rule is observable, and so a future wire field can
-// key on the hint directly.
-static Entity* SelectProxySource(float peerMax, ProxyPick* out) {
-    if (out) { out->srcId = 0; out->idx = -1; out->srcMax = 0.0f; out->tierDelta = 0.0f; out->hint = 0; }
+// cls, peerCls, classMiss, hint and tierDelta are all reported so the rule is observable.
+static Entity* SelectProxySource(float peerMax, uint32_t peerClass, ProxyPick* out) {
+    if (out) { out->srcId = 0; out->idx = -1; out->srcMax = 0.0f; out->tierDelta = 0.0f; out->hint = 0; out->cls = 0; out->classMiss = 0; }
     if (!(peerMax > 0.0f)) return nullptr;
     __try {
         void* mgr = GetNavalManager();
@@ -2716,6 +2742,8 @@ static Entity* SelectProxySource(float peerMax, ProxyPick* out) {
         uint32_t bestId = 0;
         int bestIdx = -1, bestHint = 0;
         bool bestHintOk = false;
+        uint32_t bestCls = 0;
+        bool bestClsMatch = false;
         bool ghostInList = false;
         float lastSkippedHp = 0.0f;
         int   skippedDead = 0;
@@ -2763,6 +2791,9 @@ static Entity* SelectProxySource(float peerMax, ProxyPick* out) {
             }
             float tier = logf(maxV / peerMax);
             if (tier < 0.0f) tier = -tier;     // log ratio: symmetric, never float equality
+            // Ship class off the candidate's own entity (never the GcLShip); 0 = unreadable/not a ship.
+            uint32_t cls = ReadShipClass(se);
+            const bool clsMatch = (peerClass != 0u) && (cls == peerClass);
             // Structural hint: sub-entity count, best-effort. An unavailable hint is NOT a failure.
             int hint = 0; bool hintOk = false;
             void* ho = ShipGcLObj(se);
@@ -2777,6 +2808,7 @@ static Entity* SelectProxySource(float peerMax, ProxyPick* out) {
             }
             bool better = false;
             if (!best) better = true;
+            else if (peerClass != 0u && clsMatch != bestClsMatch) better = clsMatch;  // class match wins
             else if (tier < bestTier - 1.0e-5f) better = true;
             else if (tier <= bestTier + 1.0e-5f) {
                 if (hintOk != bestHintOk) better = hintOk;
@@ -2788,6 +2820,7 @@ static Entity* SelectProxySource(float peerMax, ProxyPick* out) {
                 best = se; bestTier = tier; bestDist = dist; bestMax = maxV;
                 bestTieDelta = tier; bestIdx = i; bestId = candId;
                 bestHint = hint; bestHintOk = hintOk;
+                bestCls = cls; bestClsMatch = clsMatch;
             }
         }
         // One line closing the review's open premise: does the ghost ever appear in [mgr+0x3E8]?
@@ -2808,6 +2841,8 @@ static Entity* SelectProxySource(float peerMax, ProxyPick* out) {
             out->srcMax    = bestMax;
             out->tierDelta = bestTieDelta;
             out->hint      = (uint32_t)bestHint;
+            out->cls       = bestCls;
+            out->classMiss = (peerClass != 0u && !bestClsMatch) ? 1 : 0;
         }
         return best;
     } __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
@@ -9371,11 +9406,12 @@ static void OnFrameInner(Human* updatedHuman) {
             char hb[288];
             _snprintf_s(hb, sizeof(hb), _TRUNCATE,
                         "[Health] net=%d peerMs=%u proto=%u bind(sent=%u bound=%u unmatched=%u err=%.2f) "
-                        "ents(sent=%u recv=?) ships(ghost=%d hpWant=%.1f hpApplied=%.1f) "
+                        "ents(sent=%u recv=?) ships(ghost=%d hpWant=%.1f hpApplied=%.1f cls=%u) "
                         "dmgRelay=%d rejects=%u protoMismatch=%u sizeMismatch=%u world=%08X scene=%08X",
                         Net::Enabled() ? 1 : 0, Net::MillisSinceRecv(), (unsigned)NET_PROTO_VER,
                         s_bindSent, s_bindBound, s_bindUnmatched, hErr,
                         hs.txEnts, g_ghostShip ? 1 : 0, (double)g_ghostSyncHP, (double)g_ghostAppliedHP,
+                        (unsigned)g_ghostPeerClass,
                         DamageRelayEnabled(), hs.rejects, hs.protoMismatch, hs.sizeMismatch,
                         localOk ? (unsigned)local.worldId : 0u, localOk ? (unsigned)local.sceneKey : 0u);
             L("%s\n", hb);
