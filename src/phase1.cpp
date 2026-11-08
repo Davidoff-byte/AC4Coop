@@ -2799,6 +2799,17 @@ static void KrRejectAdd(const KindRole& kr) {
 // large max is one badly bound body; a large mean everywhere is a systematic binding error.
 static unsigned s_bindSent      = 0;
 static unsigned s_bindBound     = 0;
+// T28 (2026-11-08): why a guest record binds nothing. Counted per window and logged only when
+// [Coop] BindDiag=1, so the coop_report.py bind-line format is untouched.
+static unsigned s_bindScanN     = 0;
+static unsigned s_bindRejSelf   = 0;
+static unsigned s_bindRejSkel   = 0;
+static unsigned s_bindRejBhv    = 0;
+static unsigned s_bindRejAi     = 0;
+static unsigned s_bindRejHp     = 0;
+static unsigned s_bindRejArch   = 0;
+static unsigned s_bindRejTaken  = 0;
+static unsigned s_bindRejComps  = 0;
 static unsigned s_bindUnmatched = 0;
 static double   s_bindErrSum    = 0.0;
 static float    s_bindErrMax    = 0.0f;
@@ -4015,13 +4026,14 @@ static void ApplyGuards(const EntityPacket& pkt) {
                 }
             }
             const int scanN = best ? 0 : nobj;               // a resolver hit skips the legacy scan
+            s_bindScanN += (unsigned)scanN;
             for (int j = 0; j < scanN; ++j) {
                 Reference* ref = ents.GetElement(j);
                 if (!ref || !readable(ref, 4)) break;
                 HandleContainer* hc = ref->m_HandleContainer;
-                if (!hc || !readable(hc, 4)) continue;
+                if (!hc || !readable(hc, 4)) { ++s_bindRejComps; continue; }
                 Entity* e = (Entity*)hc->m_Object;
-                if (!e || !readable(e, 4) || e == player) continue;
+                if (!e || !readable(e, 4) || e == player) { ++s_bindRejSelf; continue; }
                 uint16_t n = *(uint16_t*)((uint8_t*)e + 0x66);   // authoritative count @ +0x66 (never +0x64)
                 if (n < 1 || n > 96) n = 0;   // clamp: 1..96 safety net
                 Component** data = *(Component***)((uint8_t*)e + 0x60);   // re-read live: a grow frees the old block
@@ -4033,21 +4045,22 @@ static void ApplyGuards(const EntityPacket& pkt) {
                     if (vt == 0x01E41E58) skel = true;
                     if (vt == 0x026E34D8) bhvC = c;   // BhvGenericNPC only
                 }
-                if (!skel || !bhvC) continue;
+                if (!skel || !bhvC) { if (!skel) ++s_bindRejSkel; else ++s_bindRejBhv; continue; }
                 {
                     // Same predicate as the capture side: any human NPC with a health service.
                     AbstractEntityAI* aiPre = AIEntityHelper::GetEntityAI(e);
                     unsigned int hpPre = FindHealthInAI((unsigned int)aiPre);
-                    if (!aiPre || !hpPre || !readable(aiPre, 0xC0)) continue;
+                    if (!aiPre) { ++s_bindRejAi; continue; }
+                    if (!hpPre || !readable(aiPre, 0xC0)) { ++s_bindRejHp; continue; }
                 }
                 // Class-aware matching: if the host told us the archetype, only consider bodies of that
                 // class. Without this a heavy could be played by a civilian standing nearby.
-                if (es.arch && (uint16_t)(*(uint32_t*)((char*)bhvC + 0x14) & 0xFFFF) != es.arch) continue;
+                if (es.arch && (uint16_t)(*(uint32_t*)((char*)bhvC + 0x14) & 0xFFFF) != es.arch) { ++s_bindRejArch; continue; }
                 // One body per host entity per snapshot: skip anything already claimed this packet.
                 {
                     bool taken = false;
                     for (int u = 0; u < usedN; ++u) if (usedEnt[u] == (unsigned int)e) { taken = true; break; }
-                    if (taken) continue;
+                    if (taken) { ++s_bindRejTaken; continue; }
                 }
                 // Stable binding: once an objId is tied to a local entity, keep that body - but only while
                 // the body is plausibly still the same one. If it sits far from where the host says the
@@ -7960,6 +7973,17 @@ static void OnFrameInner(Human* updatedHuman) {
                 L("[Sync] bind sent=%u bound=%u unmatched=%u meanErr=%.2f maxErr=%.2f\n",
                   s_bindSent, s_bindBound, s_bindUnmatched, meanErr, (double)s_bindErrMax);
             }
+            // T28: WHY the guest bound nothing. Separate line, [Coop] BindDiag=1, so the oracle's
+            // [Sync] bind format above stays exactly as coop_report.py expects it.
+            {
+                static int s_diag = -1;
+                if (s_diag < 0) s_diag = GetPrivateProfileIntA("Coop", "BindDiag", 0, Paths::Ini());
+                if (s_diag)
+                    L("[BindDiag] recs=%u scan=%u rej(self=%u comps=%u skel=%u bhv=%u ai=%u hp=%u arch=%u taken=%u) noBody=%u\n",
+                      s_bindSent, s_bindScanN, s_bindRejSelf, s_bindRejComps, s_bindRejSkel,
+                      s_bindRejBhv, s_bindRejAi, s_bindRejHp, s_bindRejArch, s_bindRejTaken,
+                      s_bindUnmatched);
+            }
             // Component histogram, same window. ALL non-zero distinct component vtable ids by
             // descending count (32 slots), then the two ids the enemies-only filter trusts, each as
             // "candidates carrying it". If enemies=0 while weapon_A8/icon_D0 are non-zero, the scope
@@ -8000,6 +8024,9 @@ static void OnFrameInner(Human* updatedHuman) {
             s_krRejN = 0; s_krRejTotal = 0; s_krRejOverflow = 0;   // T21: rejection histogram
             // TASK 3 oracle counters, same window.
             s_bindSent = 0; s_bindBound = 0; s_bindUnmatched = 0;
+            s_bindScanN = 0; s_bindRejSelf = 0; s_bindRejComps = 0; s_bindRejSkel = 0;
+            s_bindRejBhv = 0; s_bindRejAi = 0; s_bindRejHp = 0; s_bindRejArch = 0;
+            s_bindRejTaken = 0;
             s_bindErrSum = 0.0; s_bindErrMax = 0.0f;
             // One-shot receive watchdog: counters reset every poll, so 2 polls with tx and no rx
             // means ~10 s of transmitting into the void. Say so once - silence is the failure mode
