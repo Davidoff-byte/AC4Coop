@@ -116,7 +116,8 @@ namespace {
     // fragment no longer discards the whole snapshot). The header repeats in every chunk.
     static const int ENTITY_CHUNK_MAX       = 1400;                              // UDP payload budget
     static const int ENTITY_CHUNK_DATA      = ENTITY_CHUNK_MAX - ENTITY_WIRE_HEADER_SIZE; // 1368 B records/chunk
-    static const int ENTITY_CHUNK_MAX_TOTAL = 16;                                // g_txBuf/1368 = 12, 16 is headroom
+    static const int ENTITY_CHUNK_MAX_TOTAL = 12;                                // = ceil((16384-32)/1368): the
+                                                                                 // receive buffer cannot hold more
     static const uint64_t ENTITY_CHUNK_TIMEOUT_MS = 1000;   // drop an incomplete set after 1 s
 
     // Local world id, set by phase1.cpp (World::GetObjectID()) and read by BOTH the encoder (main
@@ -139,6 +140,22 @@ namespace {
         uint8_t  data[16384];    // header + record region (reassembled)
     };
     RxAssembly g_asm;
+
+    // M1 hardening: the mask has one bit per chunk, and the receive buffer must hold the largest set
+    // the encoder can ever emit. recordBytes <= sizeof(g_txBuf) - header = 16352, and
+    // ceil(16352/1368) = 12 chunks (the last one short): 11*1368 = 15048 < 16352, 15*1368 = 20520 does not.
+    static_assert(ENTITY_CHUNK_MAX_TOTAL <= 16,
+                  "receivedMask is uint16_t: one bit per chunk index");
+    static_assert((ENTITY_CHUNK_MAX_TOTAL - 1) * ENTITY_CHUNK_DATA
+                      < (int)sizeof(g_asm.data) - ENTITY_WIRE_HEADER_SIZE,
+                  "a full chunk set does not fit RxAssembly::data");
+    static_assert((int)((sizeof(g_txBuf) - ENTITY_WIRE_HEADER_SIZE + ENTITY_CHUNK_DATA - 1)
+                        / ENTITY_CHUNK_DATA) <= ENTITY_CHUNK_MAX_TOTAL,
+                  "encoder can emit more chunks than the validator accepts");
+
+    // RFC 1982 serial-number comparison on the uint32 seq counter: valid while |a-b| < 2^31, i.e. for
+    // any reordering distance a real link can produce.
+    static inline int32_t SeqDiff(uint32_t a, uint32_t b) { return (int32_t)(a - b); }
 
     inline uint64_t ShadowId(uint8_t kind, uint32_t key, uint64_t objId) {
         if (objId) return objId;
@@ -270,6 +287,7 @@ namespace {
         DEC_KIND,      // entity kind not in {1 ship, 2 guard, 3 kill} (see EntityKind)
         DEC_WORLD,     // header worldId != local world id (world-transitions X5)
         DEC_PENDING,   // chunk buffered for reassembly; snapshot not complete yet (X15)
+        DEC_STALE,     // chunk for a snapshot OLDER than the one being reassembled: dropped (M1)
     };
 
     // Oracle for the Phase 2 codec, run at startup on both peers:
@@ -399,10 +417,19 @@ namespace {
             return DEC_OK;
         }
 
-        // Multi-chunk: reassemble. A new seq, or an incomplete set that has aged out, discards the old.
+        // Multi-chunk: reassemble. A chunk belonging to a NEWER snapshot, or a set that has aged out,
+        // discards the old. A chunk belonging to an OLDER snapshot (late / reordered) is DROPPED so it
+        // cannot destroy an in-progress newer set: with no retransmit, losing one already-arrived chunk
+        // makes a snapshot unreassemblable forever (M1). seq is a uint32 counter, so direction is a
+        // signed difference - (int32_t)(a - b) > 0 is "a newer than b" and is correct across the 2^32
+        // wrap (RFC 1982 serial-number comparison; valid for any |a-b| < 2^31).
         const uint64_t now = GetTickCount64();
-        if (g_asm.active && (h.seq != g_asm.seq || (now - g_asm.firstMs) > ENTITY_CHUNK_TIMEOUT_MS)) {
-            std::memset(&g_asm, 0, sizeof(g_asm));
+        if (g_asm.active) {
+            const int32_t dseq = SeqDiff(h.seq, g_asm.seq);
+            if (dseq < 0) return fail(DEC_STALE);           // late chunk of a superseded snapshot
+            if (dseq > 0 || (now - g_asm.firstMs) > ENTITY_CHUNK_TIMEOUT_MS) {
+                std::memset(&g_asm, 0, sizeof(g_asm));
+            }
         }
         if (!g_asm.active) {
             g_asm.active = true;
@@ -414,6 +441,9 @@ namespace {
             g_asm.firstMs = now;
             std::memcpy(g_asm.data, in, hdr);   // chunk 0's header is the canonical one
         } else if (h.epoch != g_asm.epoch || h.chunkTotal != g_asm.chunkTotal) {
+            // Same seq but an inconsistent split: malformed. Drop the whole set rather than keeping a
+            // partially-filled assembly that would otherwise survive until the 1 s timeout (M1 review).
+            std::memset(&g_asm, 0, sizeof(g_asm));
             return fail(DEC_MASK);              // same seq but inconsistent split -> malformed
         }
         // Place this chunk's record bytes (chunks are fixed-size except the last); a duplicate chunk
