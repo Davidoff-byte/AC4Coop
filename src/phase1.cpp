@@ -8664,6 +8664,12 @@ static void OnFrameInner(Human* updatedHuman) {
             // [Coop] ShipHPSync: apply a pending hull HP; a fresh ghost is normally spawned after the packet
             // that carried the value, so this cannot live only on the receive path.
             if (ShipHPSyncEnabled() && g_ghostShip && g_ghostSyncHP != g_ghostAppliedHP) {
+                // Diagnostic: a failed apply is silent otherwise. Logs at 2 Hz only while the target
+                // value has not been reached, so it cannot spam once it works.
+                { static int hpdbg = 0; if ((hpdbg++ % 30) == 0)
+                    L("[ShipHPSync] want=%.1f applied=%.1f ghost=%08X gcL=%08X\n",
+                      g_ghostSyncHP, g_ghostAppliedHP, (unsigned)g_ghostShip,
+                      (unsigned)ShipGcLObj(g_ghostShip)); }
                 if (WriteShipHullHP(g_ghostShip, g_ghostSyncHP)) g_ghostAppliedHP = g_ghostSyncHP;
             }
             __try {
