@@ -2216,13 +2216,13 @@ static void CaptureShips(EntityPacket& pkt) {
         {2299661283u, 0x42C}, {3374079800u, 0x14},   {3417066870u, 0x58},  {2455389939u, 0x540},
         {3195084550u, 0x128}, {492202595u, 0x80},    {3144731556u, 0x78},
     };
-    const unsigned kMaxBlock = 0x8C0;
-    const int      kSlots    = 240;
+    const unsigned kMaxBlock = 0x1000;
+    const int      kSlots    = 320;
     const int      kPerOff   = 3;   // log an offset at most this many times (physics churn otherwise drowns the log)
     struct Watch { void* p; uint32_t n; uint32_t crc; int ship; };
     static Watch         s_watch[kSlots];
-    static unsigned char s_prev[kSlots][0x8C0];
-    static unsigned char s_hits[kSlots][0x8C0 / 4];
+    static unsigned char s_prev[kSlots][0x1000];
+    static unsigned char s_hits[kSlots][0x1000 / 4];
     static int           s_watchN = 0;
     auto watchBlock = [&](void* p, uint32_t bytes, uint32_t crc, int ship) {
         if (!p || bytes < 4 || bytes > kMaxBlock) return;
@@ -2273,7 +2273,7 @@ static void CaptureShips(EntityPacket& pkt) {
             if (!ent || *(uint32_t*)ent != 0x01E4A128u) continue;
             // T32/T33: watch every tick (not just on the 1 Hz dump) so a hit is caught the frame it lands.
             if (s_dumpFloats) {
-                watchBlock(ent, 0x200, 0x01E4A128u, i);
+                watchBlock(ent, 0x1000, 0x01E4A128u, i);
                 const unsigned short cw = *(unsigned short*)((char*)ent + 0x66);
                 Component** cwdata = *(Component***)((char*)ent + 0x60);
                 if (cwdata && readable(cwdata, 4)) {
