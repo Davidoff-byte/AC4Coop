@@ -4149,6 +4149,36 @@ static void EmitGuardEntity(EntityPacket& pkt, uint32_t& count, int idx, Entity*
             }
         }
     }
+    // C2 4.1 encode-side cross-check - the mirror of the decode gate. `dead` and hp==0xFFFF are one
+    // fact (the engine sets Life=0xFFFF and the dead flag together, "[KF] after ... life=65535
+    // flags=01000004"), so the sender must never put a half-dead record on the wire. A body the
+    // engine calls dead carries Life==0xFFFF; a body reading the 0xFFFF sentinel is by definition
+    // not alive. Normalise here - AFTER the life-watch block above, which must keep reading the raw
+    // engine values exactly as before, and BEFORE the record is packed - so the peer's gate never
+    // has to invent a value. Wire layout, struct and NET_PROTO_VER are untouched: only the values
+    // already in this record are made consistent.
+    {
+        const unsigned short rawHp = es.hp;
+        const uint8_t rawDead = es.dead;
+        if (es.dead) es.hp = 0xFFFFu;
+        else if (es.hp == 0xFFFFu) es.dead = 1;
+        if (es.hp != rawHp || es.dead != rawDead) {
+            // Hot path (per snapshot, per body): dedupe on (entity, new dead, raw hp), same style
+            // and same 64-slot budget as the [Cap] dead line below.
+            static void*          s_normEnt[64];
+            static uint8_t        s_normDead[64];
+            static unsigned short s_normHp[64];
+            static int            s_normN = 0;
+            bool seen = false;
+            for (int nq = 0; nq < s_normN; ++nq)
+                if (s_normEnt[nq] == e && s_normDead[nq] == es.dead && s_normHp[nq] == rawHp) { seen = true; break; }
+            if (!seen && s_normN < 64) {
+                s_normEnt[s_normN] = e; s_normDead[s_normN] = es.dead; s_normHp[s_normN] = rawHp; ++s_normN;
+                L("[Cap] death-cross-check ent=%08X dead=%d hp=%u -> dead=%d hp=%u\n",
+                  (unsigned)e, (int)rawDead, (unsigned)rawHp, (int)es.dead, (unsigned)es.hp);
+            }
+        }
+    }
     if (es.dead) {
         static void* s_capDead[64];
         static int   s_capDeadN = 0;
