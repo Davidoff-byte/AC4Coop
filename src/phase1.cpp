@@ -8689,7 +8689,7 @@ void Phase1::InstallFrameHook() {
 
     // SetGlobalMatrixInternal (VA 0x00528200, RVA 0x128200) __thiscall: ECX=this, [EBP+8]=matrix*, [EBP+0xC]=updatePhysics.
     // Steal 6 bytes (55 8B EC 8B 45 08); trace the caller when the ship's transform is written.
-    {
+    if (GetPrivateProfileIntA("Coop", "HookSgm", 1, Paths::Ini()) != 0) {
         uint8_t* sgm = (uint8_t*)(b + 0x128200);
         g_sgmJmpBack = (uint32_t)(b + 0x128200 + 6);
         VirtualProtect(sgm, 6, PAGE_EXECUTE_READWRITE, &old);
