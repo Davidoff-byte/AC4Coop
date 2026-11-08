@@ -2198,38 +2198,68 @@ static void CaptureShips(EntityPacket& pkt) {
     // Dumped once a second so a single cannonball shows up as a step change in the log.
     static int s_dumpFloats = -1;
     if (s_dumpFloats < 0) s_dumpFloats = GetPrivateProfileIntA("Coop", "ShipDumpFloats", 0, Paths::Ini());
-    // T32: change-detector. Polling snapshots at 1 Hz misses the instant of a hit (and the game pauses
-    // when unfocused, so the window is short). Instead remember each watched block and log the exact
-    // dword deltas when they change - the damage step is captured whenever it happens, no timing race.
-    struct Watch { void* p; unsigned n; unsigned char prev[0x200]; };
-    static Watch s_watch[24];
-    static int   s_watchN = 0;
-    auto watchBlock = [&](void* p, unsigned bytes) {
-        if (!p || bytes == 0 || bytes > 0x200) return;
+    // T32/T33: change-detector. Polling snapshots at 1 Hz misses the instant of a hit (and the game
+    // pauses when unfocused, so the window is short). Instead remember each watched block and log the
+    // exact dword deltas when they change - the damage step is captured whenever it happens.
+    //
+    // T33 widens it to the object's REAL size instead of a guessed 0x100. Sizes are not guesses: the
+    // engine class descriptor is [name ptr][base id][class id][object size], so class_size.py reads the
+    // size straight out of .data (ops/evidence/class-descriptor-sizes.md). WatercraftAttributes is 0xC4
+    // (fully covered and it never changed - not hull HP); ShipPhysicComponent is 0x8C0, so the earlier
+    // 0x100 window only saw 11% of it.
+    struct CompSize { uint32_t crc; uint32_t size; };
+    static const CompSize kCompSize[] = {
+        {2036133539u, 0x8C0}, {91423769u, 0xC4},    {3118473014u, 0x34},  {1804543191u, 0x2D0},
+        {3780995325u, 0xA0},  {1364444245u, 0xA0},   {2357895581u, 0x210}, {870870259u, 0xE0},
+        {3893575776u, 0x140}, {3669238175u, 0x28},   {715225515u, 0x1C},   {2918307302u, 0xB8},
+        {3683139299u, 0x130}, {1303865978u, 0x20},   {476739111u, 0x1C},   {1139133171u, 0x18},
+        {2299661283u, 0x42C}, {3374079800u, 0x14},   {3417066870u, 0x58},  {2455389939u, 0x540},
+        {3195084550u, 0x128}, {492202595u, 0x80},    {3144731556u, 0x78},
+    };
+    const unsigned kMaxBlock = 0x8C0;
+    const int      kSlots    = 240;
+    const int      kPerOff   = 3;   // log an offset at most this many times (physics churn otherwise drowns the log)
+    struct Watch { void* p; uint32_t n; uint32_t crc; int ship; };
+    static Watch         s_watch[kSlots];
+    static unsigned char s_prev[kSlots][0x8C0];
+    static unsigned char s_hits[kSlots][0x8C0 / 4];
+    static int           s_watchN = 0;
+    auto watchBlock = [&](void* p, uint32_t bytes, uint32_t crc, int ship) {
+        if (!p || bytes < 4 || bytes > kMaxBlock) return;
+        if (!readable(p, bytes)) return;
         int slot = -1;
         for (int w = 0; w < s_watchN; ++w) if (s_watch[w].p == p) { slot = w; break; }
         if (slot < 0) {
-            if (s_watchN >= 24) return;
+            if (s_watchN >= kSlots) return;
             slot = s_watchN++;
             s_watch[slot].p = p;
             s_watch[slot].n = bytes;
-            memcpy(s_watch[slot].prev, p, bytes);
+            s_watch[slot].crc = crc;
+            s_watch[slot].ship = ship;
+            memcpy(s_prev[slot], p, bytes);
             return;
         }
         Watch& w = s_watch[slot];
-        if (w.n != bytes) { w.n = bytes; memcpy(w.prev, p, bytes); return; }
+        if (w.n != bytes) { w.n = bytes; memcpy(s_prev[slot], p, bytes); return; }
         unsigned char* cur = (unsigned char*)p;
-        if (memcmp(w.prev, cur, bytes) == 0) return;
-        int shown = 0;
-        for (unsigned o = 0; o + 4 <= bytes && shown < 12; o += 4) {
-            DWORD a = *(DWORD*)(w.prev + o), b = *(DWORD*)(cur + o);
-            if (a != b) {
-                L("[ShipDelta] p=%08X off=0x%03X 0x%08X -> 0x%08X (f %.3f -> %.3f)\n",
-                  (unsigned)p, o, a, b, *(float*)&a, *(float*)&b);
-                ++shown;
-            }
+        if (memcmp(s_prev[slot], cur, bytes) == 0) return;
+        const uint64_t now = GetTickCount64();
+        for (unsigned o = 0; o + 4 <= bytes; o += 4) {
+            DWORD a = *(DWORD*)(s_prev[slot] + o), b = *(DWORD*)(cur + o);
+            if (a == b) continue;
+            unsigned& h = *(unsigned*)&s_hits[slot][o >> 2];
+            if (h >= (unsigned)kPerOff) continue;
+            ++h;
+            L("[ShipDelta] t=%llu ship=%d crc=%u p=%08X off=0x%03X 0x%08X -> 0x%08X (i %d -> %d, f %.3f -> %.3f)\n",
+              (unsigned long long)now, w.ship, w.crc, (unsigned)p, o, a, b, (int)a, (int)b,
+              *(float*)&a, *(float*)&b);
         }
-        memcpy(w.prev, cur, bytes);
+        memcpy(s_prev[slot], cur, bytes);
+    };
+    auto compBytes = [](uint32_t crc) -> uint32_t {
+        for (unsigned i = 0; i < sizeof(kCompSize) / sizeof(kCompSize[0]); ++i)
+            if (kCompSize[i].crc == crc) return kCompSize[i].size;
+        return 0;   // unknown class: skip rather than guess a window
     };
     static uint64_t s_dumpNextMs = 0;
     const uint64_t dumpNow = GetTickCount64();
@@ -2241,9 +2271,9 @@ static void CaptureShips(EntityPacket& pkt) {
         for (int i = 0; i < (int)n && count < (uint32_t)MAX_SYNC_ENTITIES; ++i) {
             Entity* ent = GetShipEntity(mgr, i);
             if (!ent || *(uint32_t*)ent != 0x01E4A128u) continue;
-            // T32: watch every tick (not just on the 1 Hz dump) so a hit is caught the frame it lands.
+            // T32/T33: watch every tick (not just on the 1 Hz dump) so a hit is caught the frame it lands.
             if (s_dumpFloats) {
-                watchBlock(ent, 0x200);
+                watchBlock(ent, 0x200, 0x01E4A128u, i);
                 const unsigned short cw = *(unsigned short*)((char*)ent + 0x66);
                 Component** cwdata = *(Component***)((char*)ent + 0x60);
                 if (cwdata && readable(cwdata, 4)) {
@@ -2253,7 +2283,9 @@ static void CaptureShips(EntityPacket& pkt) {
                         int crcw = -1;
                         __try { crcw = ((int(__thiscall*)(void*))0x00A1D0D0)(cc); }
                         __except (EXCEPTION_EXECUTE_HANDLER) { crcw = -1; }
-                        if (crcw == 91423769 || crcw == 2036133539) watchBlock(cc, 0x100);
+                        if (crcw < 0) continue;
+                        const uint32_t cb = compBytes((uint32_t)crcw);
+                        if (cb) watchBlock(cc, cb, (uint32_t)crcw, i);
                     }
                 }
             }
