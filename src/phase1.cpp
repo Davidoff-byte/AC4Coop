@@ -2329,6 +2329,7 @@ static void CaptureShips(EntityPacket& pkt) {
                     void*  hobj = nullptr;
                     float  hp = -1.0f;
                     uint32_t hvt = 0;
+                    float  fD0 = -1.0f, fB4 = -1.0f;
                     // Only slot 0x1B4 is called. Case 3 of sub_1913100 calls it as
                     // (__thiscall)(obj) with no other argument; case 4 calls slot 0x1B8 as
                     // (__thiscall)(obj, arg) - a different signature - so calling 0x1B8 without
@@ -2340,10 +2341,14 @@ static void CaptureShips(EntityPacket& pkt) {
                             hvt = (uint32_t)vt;
                             if (vt && readable(vt, 4 * (0x1B4 / 4 + 1)))
                                 hp = ((float (__thiscall*)(void*))vt[0x1B4 / 4])(hobj);
+                            // The identified class is GcLShip (ops/evidence/hull-hp-found.md):
+                            // current at +0xD0, max at +0xB4, both read by 7-byte `fld; ret` getters.
+                            if (readable((char*)hobj + 0xD0, 4)) fD0 = *(float*)((char*)hobj + 0xD0);
+                            if (readable((char*)hobj + 0xB4, 4)) fB4 = *(float*)((char*)hobj + 0xB4);
                         }
                     } __except (EXCEPTION_EXECUTE_HANDLER) { hobj = nullptr; hp = -2.0f; }
-                    L("[ShipHP] ship=%d ent=%08X obj=%08X vt=%08X hp=%.3f local=%d\n",
-                      i, (unsigned)ent, (unsigned)hobj, hvt, hp, ent == localShip ? 1 : 0);
+                    L("[ShipHP] ship=%d ent=%08X obj=%08X vt=%08X hp=%.3f d0=%.3f b4=%.3f local=%d\n",
+                      i, (unsigned)ent, (unsigned)hobj, hvt, hp, fD0, fB4, ent == localShip ? 1 : 0);
                 }
                 const unsigned short cn = *(unsigned short*)((char*)ent + 0x66);
                 Component** cdata = *(Component***)((char*)ent + 0x60);
