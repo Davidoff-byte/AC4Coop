@@ -2327,21 +2327,23 @@ static void CaptureShips(EntityPacket& pkt) {
                 //   case 4 also reads slot 0x1B8 (max).  Both are __thiscall, float in st(0).
                 {
                     void*  hobj = nullptr;
-                    float  hp = -1.0f, hpmax = -1.0f;
+                    float  hp = -1.0f;
                     uint32_t hvt = 0;
+                    // Only slot 0x1B4 is called. Case 3 of sub_1913100 calls it as
+                    // (__thiscall)(obj) with no other argument; case 4 calls slot 0x1B8 as
+                    // (__thiscall)(obj, arg) - a different signature - so calling 0x1B8 without
+                    // knowing whether it ends in `ret` or `ret 4` risks a stack imbalance. Not called.
                     __try {
                         hobj = ((void* (__cdecl*)(void*, char))0x01038330)(ent, 0);
                         if (hobj && readable(hobj, 4)) {
                             void** vt = *(void***)hobj;
                             hvt = (uint32_t)vt;
-                            if (vt && readable(vt, 4 * (0x1B8 / 4 + 1))) {
+                            if (vt && readable(vt, 4 * (0x1B4 / 4 + 1)))
                                 hp = ((float (__thiscall*)(void*))vt[0x1B4 / 4])(hobj);
-                                hpmax = ((float (__thiscall*)(void*))vt[0x1B8 / 4])(hobj);
-                            }
                         }
                     } __except (EXCEPTION_EXECUTE_HANDLER) { hobj = nullptr; hp = -2.0f; }
-                    L("[ShipHP] ship=%d ent=%08X obj=%08X vt=%08X hp=%.3f max=%.3f local=%d\n",
-                      i, (unsigned)ent, (unsigned)hobj, hvt, hp, hpmax, ent == localShip ? 1 : 0);
+                    L("[ShipHP] ship=%d ent=%08X obj=%08X vt=%08X hp=%.3f local=%d\n",
+                      i, (unsigned)ent, (unsigned)hobj, hvt, hp, ent == localShip ? 1 : 0);
                 }
                 const unsigned short cn = *(unsigned short*)((char*)ent + 0x66);
                 Component** cdata = *(Component***)((char*)ent + 0x60);
