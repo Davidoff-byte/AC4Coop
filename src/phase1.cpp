@@ -2053,7 +2053,8 @@ static int GhostMarkerProbe(void* obj, int* kindOut, uint32_t* handleOut)
     return 1;
 }
 
-// Run the class's own deactivate virtual (a3 = 1). Returns 1 if it ran, 0 if it was refused.
+// Run the class's own deactivate virtual (a3 = 1). Returns 1 if the marker is neutralised (engine
+// teardown ran, or the shared-sub-object fallback cleared the registration), 0 if it was refused.
 static int GhostMarkerDeactivate(void* comp, int* kindOut, uint32_t* handleOut)
 {
     if (!GhostMarkerProbe(comp, kindOut, handleOut)) return 0;
@@ -2063,11 +2064,19 @@ static int GhostMarkerDeactivate(void* comp, int* kindOut, uint32_t* handleOut)
     MarkerDeactivateFn fn = *(MarkerDeactivateFn*)(uintptr_t)(vt + 0x0C);
     if (!fn) return 0;
     if (shared) {
-        // Do not free a sub-object the clone may be sharing with the source component.
-        L("[GhostMarker] teardown skipped: +0x3C=%08X (shared) — clearing registration only\n", shared);
+        // m3: the clone's marker component shares its +0x3C sub-object with the source component (the
+        // deep copy copied the pointer by reference), so running the class deactivate would free that
+        // sub-object from under the player's own marker. Engine-side MARKER_REMOVE is skipped on
+        // purpose; the fallback is explicit and logged so the omission is never silent.
+        // The registration is still cleared - bit 0 of +0x44, the handle at +0x30 and the marker kind
+        // byte at +0x26 (0 is not one of the player kinds {1,2,3,31,32,38,39,42,43}) - and we report
+        // the marker as handled, so no caller needs a second attempt at the same component.
+        L("[GhostMarker] skip engine-teardown reason=shared-subobject +0x3C=%08X (registration cleared)\n",
+          shared);
         *(uint8_t*)((char*)comp + 0x44) &= (uint8_t)~1u;
         *(uint32_t*)((char*)comp + 0x30) = 0;
-        return 0;
+        *(uint8_t*)((char*)comp + 0x26) = 0;
+        return 1;
     }
     __try {
         fn(comp, nullptr, (void*)1);            // -> MARKER_REMOVE + clear +0x44 bit 0
@@ -3904,12 +3913,22 @@ static inline int SyncEnemiesOnly() {
     return s_syncEnemiesOnly;
 }
 
-// [Coop] Diag (default 0): gates the two diagnostics that used to run unconditionally in a shipping
-// build - the per-world [Ident] entity walk and the [Sync] comps/ai histograms (per-candidate sampling
-// and the 5 s formatting). With the key on they print exactly what they printed before.
+// Diagnostic keys - both default 0, so a shipping build prints neither:
+//   [Coop] Diag=1  - HIGH-VOLUME lane only: the [Sync] comps / ai / sample histograms (per-candidate
+//                    sampling at the walk plus the 5 s formatting). This is all Diag still owns.
+//   [Coop] Probe=1 - LOW-VOLUME probe lane: the one-shot per-world [Ident] entity walk. Diag=1 also
+//                    enables it, so a session already configured with Diag=1 prints what it printed
+//                    before m2. The [Sync] scope line is not gated by either key.
 static inline int DiagEnabled() {
     static int v = -1;
     if (v < 0) v = GetPrivateProfileIntA("Coop", "Diag", 0, Paths::Ini());
+    return v;
+}
+
+// [Coop] Probe (default 0): the one-shot probe lane that must not be silenced by Diag=0.
+static inline int ProbeEnabled() {
+    static int v = -1;
+    if (v < 0) v = GetPrivateProfileIntA("Coop", "Probe", 0, Paths::Ini());
     return v;
 }
 
@@ -5430,12 +5449,12 @@ static void EntitySyncTick() {
     World* gateWorld = World::GetCurrentWorld();
     if (!gateWorld || gateWorld->m_CharacterList.GetSize() < 2) return;
 
-    // [Ident] One-shot identity probe (per world) - [Coop] Diag (default 0): this was one of only two
-    // diagnostic workloads with no key, so it ran in every shipping build. Dumps every human's
-    // m_ObjectID + spawn position + archetype so two sessions (or two machines) can be compared: if the
-    // same NPC at the same place carries the same objId, the id is content-derived and can replace
-    // position matching entirely.
-    if (DiagEnabled()) {
+    // [Ident] One-shot identity probe (per world) - gated on [Coop] Probe (or Diag), never on Diag
+    // alone: it is one line-set per world, so a probe job must be able to get it without turning on the
+    // high-volume [Sync] histograms. Dumps every human's m_ObjectID + spawn position + archetype so two
+    // sessions (or two machines) can be compared: if the same NPC at the same place carries the same
+    // objId, the id is content-derived and can replace position matching entirely.
+    if (DiagEnabled() || ProbeEnabled()) {
         static void*    s_identWorld = nullptr;
         static uint64_t s_identWorldId = 0;
         uint64_t wid = gateWorld->GetObjectID();
@@ -9426,7 +9445,9 @@ static void OnFrameInner(Human* updatedHuman) {
                 }
             } __except (EXCEPTION_EXECUTE_HANDLER) {
                 L("[ShipSync] ghost liveness EXCEPTION code=0x%08X\n", GetExceptionCode());
-                g_ghostShip = nullptr; g_ghostObjId = 0;
+                // m1: this is a clear path like the drop above - without the HP reset the next ghost
+                // would match the stale g_ghostAppliedHP and skip its initial hull apply.
+                g_ghostShip = nullptr; g_ghostObjId = 0; g_ghostAuto = false; g_ghostAppliedHP = -1.0f;
             }
         }
         if (s_shipGhost && g_ghostHasSync && !g_ghostShip) {
@@ -9465,7 +9486,8 @@ static void OnFrameInner(Human* updatedHuman) {
                     L("[ShipSync] driving ghost to (%.1f, %.1f, %.1f)\n", m.M41, m.M42, m.M43); }
             } __except (EXCEPTION_EXECUTE_HANDLER) {
                 L("[ShipSync] drive EXCEPTION code=0x%08X\n", GetExceptionCode());
-                g_ghostShip = nullptr;
+                // m1: the ref is dropped here too, so the next ghost must re-apply the peer's hull HP.
+                g_ghostShip = nullptr; g_ghostAppliedHP = -1.0f;
             }
         } else if (g_ghostShip && s_ghostSelfTest) {
             // Solo self-test: drive the ghost to the LOCAL ship's transform + an X offset, so the user

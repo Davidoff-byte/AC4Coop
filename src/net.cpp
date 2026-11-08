@@ -347,12 +347,20 @@ namespace {
         if (h.magic != NET_ENTITY_MAGIC) return fail(DEC_MAGIC);
         if (h.protoVer != NET_PROTO_VER) return fail(DEC_PROTO);
         if (h.count > (uint32_t)MAX_SYNC_ENTITIES) return fail(DEC_COUNT);
-        // X5: drop snapshots whose world differs from the local one. 0 on either side means "unknown
-        // yet" (first frame / not loaded) and is accepted; the apply path still needs a matching local
-        // world (phase1.cpp localOk) before it drives anything.
+        // X5: drop snapshots whose world differs from the local one. A worldId of 0 means "unknown
+        // yet" (first frame / world not loaded on the sender) and is tolerated ONLY while this
+        // session has never confirmed a world match - the bootstrap allowance. After the first
+        // successful resolution (sender and local agree on a non-zero world) a sender that still
+        // reports 0 cannot prove it is looking at the same world as us, so it is DEC_WORLD. m4.
         {
             const uint64_t localWorld = ReadLocalWorldId();
+            static bool s_worldConfirmed = false;
             if (localWorld != 0 && h.worldId != 0 && h.worldId != localWorld) return fail(DEC_WORLD);
+            if (localWorld != 0 && h.worldId == 0 && s_worldConfirmed) return fail(DEC_WORLD);
+            if (!s_worldConfirmed && localWorld != 0 && h.worldId == localWorld) {
+                s_worldConfirmed = true;   // one-shot: the bootstrap allowance ends here
+                dbg("[Net] X5 world rule: bootstrap allowance ended - sender worldId=0 is now DEC_WORLD\n");
+            }
         }
         // Same epoch rule as the sender: a new epoch means the base is gone on both sides.
         if (h.epoch != g_rxEpoch) {
