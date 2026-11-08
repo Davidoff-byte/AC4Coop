@@ -1,0 +1,16 @@
+IsAliveByCrcService @ 0x133F550  (size 70)   -- probe receipt, no cl 16.00.40219.01 on this machine
+measured 2026-11-08 by ORCH against the pinned binary
+  AC4BFSP.exe sha256 bc11ad7924e1eca7363ee86aa3332c05386d0a05896c0b7370131daee9ab5150
+  candidate body: ac4-decomp\133F550.c (submitted verbatim)
+
+claim
+    __cdecl(int entity) -> bool: false when the entity has no AI; otherwise false
+    when sub_7025F0(entity) yields a byte at +184 whose bits 0xC equal 4; else
+    look up the 1588608236 service via 0x10EF8C0 and return false when its dword
+    [1] has bit 0x1000 set. True only when neither test fires.
+
+cross-check / limit of this receipt
+    this is the 'is this body alive' predicate combat_observe already watches at
+    0x133F550 (its site 4). The receipt fixes the polarity: TRUE = alive, and the
+    service's bit 0x1000 is the DEAD bit, matching the svc+0x60 dead-flag family
+    used elsewhere.

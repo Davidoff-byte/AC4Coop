@@ -108,6 +108,21 @@
    "size": 95,
    "status": "claimed"
   },
+  "00636480": {
+   "addr": "00636480",
+   "claimed_at": "2026-11-08T15:31:22Z",
+   "name": "StateBitfieldSetter",
+   "owner": "seat-orch",
+   "receipts": [
+    {
+     "arm": "probe",
+     "at": "2026-11-08T15:31:22Z",
+     "verdict": "UNVERIFIED-EVIDENCE"
+    }
+   ],
+   "size": 421,
+   "status": "claimed"
+  },
   "00657BE0": {
    "addr": "00657BE0",
    "claimed_at": "2026-11-08T12:12:53Z",
@@ -348,6 +363,21 @@
    "size": 108,
    "status": "claimed"
   },
+  "00A1D0D0": {
+   "addr": "00A1D0D0",
+   "claimed_at": "2026-11-08T15:31:22Z",
+   "name": "ComponentClassId",
+   "owner": "seat-orch",
+   "receipts": [
+    {
+     "arm": "probe",
+     "at": "2026-11-08T15:31:23Z",
+     "verdict": "UNVERIFIED-EVIDENCE"
+    }
+   ],
+   "size": 11,
+   "status": "claimed"
+  },
   "0106ABF0": {
    "addr": "0106ABF0",
    "claimed_at": "2026-11-08T12:37:08Z",
@@ -363,6 +393,21 @@
    "size": 142,
    "status": "claimed"
   },
+  "010EF8C0": {
+   "addr": "010EF8C0",
+   "claimed_at": "2026-11-08T15:31:23Z",
+   "name": "GetComponentByCrc1588608236",
+   "owner": "seat-orch",
+   "receipts": [
+    {
+     "arm": "probe",
+     "at": "2026-11-08T15:31:23Z",
+     "verdict": "UNVERIFIED-EVIDENCE"
+    }
+   ],
+   "size": 72,
+   "status": "claimed"
+  },
   "0133A4C0": {
    "addr": "0133A4C0",
    "claimed_at": "2026-11-08T12:57:24Z",
@@ -376,6 +421,21 @@
     }
    ],
    "size": 125,
+   "status": "claimed"
+  },
+  "0133F550": {
+   "addr": "0133F550",
+   "claimed_at": "2026-11-08T15:31:23Z",
+   "name": "IsAliveByCrcService",
+   "owner": "seat-orch",
+   "receipts": [
+    {
+     "arm": "probe",
+     "at": "2026-11-08T15:31:23Z",
+     "verdict": "UNVERIFIED-EVIDENCE"
+    }
+   ],
+   "size": 70,
    "status": "claimed"
   },
   "0133F630": {

@@ -1,0 +1,14 @@
+ComponentClassId @ 0xA1D0D0  (size 11)   -- probe receipt, no cl 16.00.40219.01 on this machine
+measured 2026-11-08 by ORCH against the pinned binary
+  AC4BFSP.exe sha256 bc11ad7924e1eca7363ee86aa3332c05386d0a05896c0b7370131daee9ab5150
+  candidate body: ac4-decomp\A1D0D0.c (submitted verbatim)
+
+claim
+    __thiscall(void* component) -> int: calls the component vtable slot at +20
+    and returns the dword at +20 of its result. That is the class id / CRC the
+    health-service getters compare against (see ops/evidence/health-service-crcs.md).
+
+cross-check / limit of this receipt
+    the entire 13-getter health-service block keys on this value, so its ABI
+    matters: __thiscall, one pointer, returns int in EAX. Verified from the body
+    (`*(_DWORD *)this + 20` call, then `+ 20` load).

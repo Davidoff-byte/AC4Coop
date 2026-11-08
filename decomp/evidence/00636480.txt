@@ -1,0 +1,14 @@
+StateBitfieldSetter @ 0x636480  (size 421)   -- probe receipt, no cl 16.00.40219.01 on this machine
+measured 2026-11-08 by ORCH against the pinned binary
+  AC4BFSP.exe sha256 bc11ad7924e1eca7363ee86aa3332c05386d0a05896c0b7370131daee9ab5150
+  candidate body: ac4-decomp\636480.c (submitted verbatim)
+
+claim
+    State/index setter on a small object: reads (*this & 0x3F) as the current
+    state, writes bits 26/27/28 of *this according to which state is being
+    entered, updates the low 6 bits, and notifies the object at *(this+2).
+
+cross-check / limit of this receipt
+    found by the cite gate: phase1.cpp calls it directly and it had no unit.
+    The body is what the gate exists to force - the call had been made without a
+    written claim about what the function does.

@@ -1,0 +1,15 @@
+{
+ "unit": "010EF8C0",
+ "addr": "0x010EF8C0",
+ "size": 72,
+ "name": "GetComponentByCrc1588608236",
+ "submitted_at": "2026-11-08T15:31:23Z",
+ "original_sha": "e9849e994ccba8a5dc36aa50e1fea0910f2b5f8e5d537be0e1843944b284702c",
+ "candidate_src_sha": "6716b88853b2dd5ad58330e25ed7e2ef4efc82622f15bf1a9cef0ab5464daae7",
+ "candidate_src": "010EF8C0.cpp",
+ "arm": "probe",
+ "verdict": "UNVERIFIED-EVIDENCE",
+ "detail": "no object supplied: the pinned compiler (cl 16.00.40219.01) is not installed, so byte equality cannot be checked. Recorded as evidence only - never a match.",
+ "evidence": "010EF8C0.txt",
+ "evidence_sha": "be9d8a018fa2f7d51728aa10d4ab1e62acbbcc8465264ad336eeff41a17d2edd"
+}
