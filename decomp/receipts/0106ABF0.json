@@ -1,0 +1,15 @@
+{
+ "unit": "0106ABF0",
+ "addr": "0x0106ABF0",
+ "size": 142,
+ "name": "DominoSpawnOp",
+ "submitted_at": "2026-11-08T12:37:08Z",
+ "original_sha": "79b877cce31a295e0857e41ccf38ccffb3b72d7d57eec1255b5df7a016bbfa86",
+ "candidate_src_sha": "dc380563dc60ab90886e10fced8fb8b969c75f58e43b9ab661eee39e5ea8a69f",
+ "candidate_src": "0106ABF0.cpp",
+ "arm": "probe",
+ "verdict": "UNVERIFIED-EVIDENCE",
+ "detail": "no object supplied: the pinned compiler (cl 16.00.40219.01) is not installed, so byte equality cannot be checked. Recorded as evidence only - never a match.",
+ "evidence": "0106ABF0.txt",
+ "evidence_sha": "8232a151e0f4c3b60b20bc7ef4c259576630e1a7d2c40ae530c2401b34b30641"
+}

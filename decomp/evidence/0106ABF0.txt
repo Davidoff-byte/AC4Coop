@@ -1,0 +1,17 @@
+DominoSpawnOp @ 0x106ABF0  (size 142)   -- probe receipt, no cl 16.00.40219.01 on this machine
+measured 2026-11-08 by ORCH against the pinned binary
+  AC4BFSP.exe sha256 bc11ad7924e1eca7363ee86aa3332c05386d0a05896c0b7370131daee9ab5150
+  candidate body: ac4-decomp\106ABF0.c (submitted verbatim)
+
+claim
+    The domino spawn op: requires *(this+0x32C) handle and a4; instantiate via
+    sub_527BA0(a4), place with sub_431490(instance, a3), enqueue with
+    sub_5A8A80(world, instance, 0xFFFF, 1), resolve the component with
+    sub_5200C0(instance, sub_15C92E0()) and attach with sub_105AE30 - except when
+    the caller's handle is the &dword_4DD5F8C singleton, where attach is skipped.
+
+cross-check / limit of this receipt
+    this is the exact chain WP8/AMBIENT call the 'working' spawn, and the body
+    confirms the singleton guard at the end: an unregistered caller gets an
+    instance with no component attached. That is the documented 'spawns but is
+    inert' behaviour, not a failure.

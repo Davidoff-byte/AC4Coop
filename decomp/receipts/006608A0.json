@@ -1,0 +1,15 @@
+{
+ "unit": "006608A0",
+ "addr": "0x006608A0",
+ "size": 246,
+ "name": "StrongHandleRegister",
+ "submitted_at": "2026-11-08T12:37:09Z",
+ "original_sha": "1e075aad0f39f3b69f063b846e2c2c53eb8e4399c54ca4364f47f2e679936fa1",
+ "candidate_src_sha": "f460a3e98c44bc56be167409ba53f13d08b9b6c90fbe7e71f9db3c54e5c3eded",
+ "candidate_src": "006608A0.cpp",
+ "arm": "probe",
+ "verdict": "UNVERIFIED-EVIDENCE",
+ "detail": "no object supplied: the pinned compiler (cl 16.00.40219.01) is not installed, so byte equality cannot be checked. Recorded as evidence only - never a match.",
+ "evidence": "006608A0.txt",
+ "evidence_sha": "01cae23d7d3b1052807e8e1a3e66fb98112caa1a6043967da067dd26ad483c73"
+}

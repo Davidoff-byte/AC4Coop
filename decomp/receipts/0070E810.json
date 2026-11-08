@@ -1,0 +1,15 @@
+{
+ "unit": "0070E810",
+ "addr": "0x0070E810",
+ "size": 14,
+ "name": "WorldGetPlayer",
+ "submitted_at": "2026-11-08T12:37:07Z",
+ "original_sha": "38a763e9268684893a078509ec7b3e3e29ddb06a6bd52b48dacf3f5a46bd0fb8",
+ "candidate_src_sha": "7c64f88e22b27ead0f2d97333d61213f59c64c90f964f8421faf9fe4802a6b84",
+ "candidate_src": "0070E810.cpp",
+ "arm": "probe",
+ "verdict": "UNVERIFIED-EVIDENCE",
+ "detail": "no object supplied: the pinned compiler (cl 16.00.40219.01) is not installed, so byte equality cannot be checked. Recorded as evidence only - never a match.",
+ "evidence": "0070E810.txt",
+ "evidence_sha": "2a0c88b654a0b21cbe7e286b77c0991db083be0aa4275074e8ad48e338543471"
+}

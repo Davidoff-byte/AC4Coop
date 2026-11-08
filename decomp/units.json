@@ -18,6 +18,36 @@
    "size": 51,
    "status": "unknown"
   },
+  "00527BA0": {
+   "addr": "00527BA0",
+   "claimed_at": "2026-11-08T12:37:08Z",
+   "name": "EntityBuilderInstantiate",
+   "owner": "seat-orch",
+   "receipts": [
+    {
+     "arm": "probe",
+     "at": "2026-11-08T12:37:08Z",
+     "verdict": "UNVERIFIED-EVIDENCE"
+    }
+   ],
+   "size": 117,
+   "status": "claimed"
+  },
+  "00528200": {
+   "addr": "00528200",
+   "claimed_at": "2026-11-08T12:37:06Z",
+   "name": "SetGlobalMatrixInternal",
+   "owner": "seat-orch",
+   "receipts": [
+    {
+     "arm": "probe",
+     "at": "2026-11-08T12:37:06Z",
+     "verdict": "UNVERIFIED-EVIDENCE"
+    }
+   ],
+   "size": 139,
+   "status": "claimed"
+  },
   "0054EC00": {
    "addr": "0054EC00",
    "claimed_at": "2026-11-08T12:06:28Z",
@@ -93,6 +123,36 @@
    "size": 47,
    "status": "claimed"
   },
+  "006608A0": {
+   "addr": "006608A0",
+   "claimed_at": "2026-11-08T12:37:09Z",
+   "name": "StrongHandleRegister",
+   "owner": "seat-orch",
+   "receipts": [
+    {
+     "arm": "probe",
+     "at": "2026-11-08T12:37:09Z",
+     "verdict": "UNVERIFIED-EVIDENCE"
+    }
+   ],
+   "size": 246,
+   "status": "claimed"
+  },
+  "006609A0": {
+   "addr": "006609A0",
+   "claimed_at": "2026-11-08T12:37:09Z",
+   "name": "StrongHandleUnregister",
+   "owner": "seat-orch",
+   "receipts": [
+    {
+     "arm": "probe",
+     "at": "2026-11-08T12:37:09Z",
+     "verdict": "UNVERIFIED-EVIDENCE"
+    }
+   ],
+   "size": 173,
+   "status": "claimed"
+  },
   "0066F630": {
    "addr": "0066F630",
    "claimed_at": "2026-11-08T12:12:52Z",
@@ -136,6 +196,51 @@
     }
    ],
    "size": 29,
+   "status": "claimed"
+  },
+  "0070E810": {
+   "addr": "0070E810",
+   "claimed_at": "2026-11-08T12:37:07Z",
+   "name": "WorldGetPlayer",
+   "owner": "seat-orch",
+   "receipts": [
+    {
+     "arm": "probe",
+     "at": "2026-11-08T12:37:07Z",
+     "verdict": "UNVERIFIED-EVIDENCE"
+    }
+   ],
+   "size": 14,
+   "status": "claimed"
+  },
+  "0070E860": {
+   "addr": "0070E860",
+   "claimed_at": "2026-11-08T12:37:07Z",
+   "name": "WorldAddEntity",
+   "owner": "seat-orch",
+   "receipts": [
+    {
+     "arm": "probe",
+     "at": "2026-11-08T12:37:07Z",
+     "verdict": "UNVERIFIED-EVIDENCE"
+    }
+   ],
+   "size": 27,
+   "status": "claimed"
+  },
+  "00733FB0": {
+   "addr": "00733FB0",
+   "claimed_at": "2026-11-08T12:37:07Z",
+   "name": "NullReturnSubject",
+   "owner": "seat-orch",
+   "receipts": [
+    {
+     "arm": "probe",
+     "at": "2026-11-08T12:37:07Z",
+     "verdict": "UNVERIFIED-EVIDENCE"
+    }
+   ],
+   "size": 50,
    "status": "claimed"
   },
   "0073B4B0": {
@@ -211,6 +316,21 @@
     }
    ],
    "size": 108,
+   "status": "claimed"
+  },
+  "0106ABF0": {
+   "addr": "0106ABF0",
+   "claimed_at": "2026-11-08T12:37:08Z",
+   "name": "DominoSpawnOp",
+   "owner": "seat-orch",
+   "receipts": [
+    {
+     "arm": "probe",
+     "at": "2026-11-08T12:37:08Z",
+     "verdict": "UNVERIFIED-EVIDENCE"
+    }
+   ],
+   "size": 142,
    "status": "claimed"
   },
   "0133F630": {

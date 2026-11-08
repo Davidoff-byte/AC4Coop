@@ -1,0 +1,16 @@
+SetGlobalMatrixInternal @ 0x528200  (size 139)   -- probe receipt, no cl 16.00.40219.01 on this machine
+measured 2026-11-08 by ORCH against the pinned binary
+  AC4BFSP.exe sha256 bc11ad7924e1eca7363ee86aa3332c05386d0a05896c0b7370131daee9ab5150
+  candidate body: ac4-decomp\528200.c (submitted verbatim)
+
+claim
+    Applies a matrix through sub_63C2D0(a2, a3), marks the object dirty with
+    0x20000 at +0x50, kicks sub_520F80(this+0xE1) -> sub_423470, calls the
+    virtual at vtbl+0x80(this, a3), and when a3 is non-zero walks the child list
+    (sub_5269A0/sub_526A60 over this+0xDB) calling vtbl+0xBC(child, this+0x10).
+
+cross-check / limit of this receipt
+    the +0x50 flag write is the same 'dirty' word the project's transform probes
+    watch, and the a3 boolean is the updatePhysics argument the SPAWN path passes
+    as 1. The receipt explains why a teleport needs the boolean: the child
+    notification only runs when it is set.

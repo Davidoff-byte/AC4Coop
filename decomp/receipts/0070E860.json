@@ -1,0 +1,15 @@
+{
+ "unit": "0070E860",
+ "addr": "0x0070E860",
+ "size": 27,
+ "name": "WorldAddEntity",
+ "submitted_at": "2026-11-08T12:37:07Z",
+ "original_sha": "70886e74bffe5d0f818134072a3ba5f2aac167760692741489beac69f6cecd5c",
+ "candidate_src_sha": "f6eefe812c64463b0047bc7a24e1dfdf1c03fe11b24cfda7622e91f253aecaa4",
+ "candidate_src": "0070E860.cpp",
+ "arm": "probe",
+ "verdict": "UNVERIFIED-EVIDENCE",
+ "detail": "no object supplied: the pinned compiler (cl 16.00.40219.01) is not installed, so byte equality cannot be checked. Recorded as evidence only - never a match.",
+ "evidence": "0070E860.txt",
+ "evidence_sha": "47703f7b6b2f61967a7829a21fa2a9f542c3599a6c7a3111f84e316fb16ced75"
+}

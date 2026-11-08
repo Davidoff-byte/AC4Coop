@@ -1,0 +1,15 @@
+NullReturnSubject @ 0x733FB0  (size 50)   -- probe receipt, no cl 16.00.40219.01 on this machine
+measured 2026-11-08 by ORCH against the pinned binary
+  AC4BFSP.exe sha256 bc11ad7924e1eca7363ee86aa3332c05386d0a05896c0b7370131daee9ab5150
+  candidate body: ac4-decomp\733FB0.c (submitted verbatim)
+
+claim
+    Two-state dispatcher keyed on the byte at +0xD4: 4 returns the object itself;
+    5 takes *(this+0x230), returns sub_E10E50(that), and if that is zero returns
+    sub_4956E0(that); any other state returns 0.
+
+cross-check / limit of this receipt
+    this is the function the NULL-return observer detours (HOOK-TABLE #21), so the
+    receipt fixes what a NULL result means: either state != 4/5, or state 5 with
+    sub_E10E50 returning 0 and sub_4956E0 also returning 0. The observer's
+    caller-RA logging therefore covers three distinct causes, not one.
