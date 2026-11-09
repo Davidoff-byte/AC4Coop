@@ -173,6 +173,31 @@ def cmd_claim(argv):
     return 0
 
 
+def attach_evidence(receipt, k, ev):
+    """One evidence path for submit and check (UNIT-4).
+
+    The receipt names the COPY under decomp/evidence/ and `evidence_sha` is taken from that copy,
+    so `check` re-derives exactly the bytes `submit` recorded.  Doing this once, for BOTH arms, is
+    the fix: the probe arm used to hash the user-supplied path while the copy was written from a
+    second read, and a byte-arm submission (`--obj ... --evidence ...`) copied the file but recorded
+    no `evidence_sha` at all - `check` then compared the copy against None and failed every time.
+    A zero-byte evidence file is rejected before it is hashed (UNIT-5): an empty proof would
+    otherwise be recorded as a valid receipt and verified as "not drifted" for ever.
+    """
+    if not ev:
+        return
+    if not os.path.exists(ev):
+        raise SystemExit(f"evidence not found: {ev}")
+    b = open(ev, "rb").read()
+    if len(b) == 0:
+        raise SystemExit(f"evidence is zero bytes ({ev}); refusing to hash an empty proof")
+    os.makedirs(os.path.join(ROOT, "evidence"), exist_ok=True)
+    evname = f"{k}.txt"
+    open(os.path.join(ROOT, "evidence", evname), "wb").write(b)
+    receipt["evidence"] = evname
+    receipt["evidence_sha"] = sha(b)
+
+
 def cmd_submit(argv):
     if len(argv) < 2:
         print("usage: decomp.py submit <addr> <candidate.cpp> [--obj x.obj] [--evidence log.txt]")
@@ -229,21 +254,15 @@ def cmd_submit(argv):
         receipt["detail"] = ("no object supplied: the pinned compiler "
                              f"(cl {PINNED_CL}) is not installed, so byte equality cannot be "
                              "checked. Recorded as evidence only - never a match.")
-        if ev and os.path.exists(ev):
-            b = open(ev, "rb").read()
-            receipt["evidence_sha"] = sha(b)
-            receipt["evidence"] = os.path.basename(ev)
+
+    # UNIT-4/5: one canonical evidence path for both arms, hashed after the copy is written.
+    attach_evidence(receipt, k, ev)
 
     os.makedirs(RECEIPTS, exist_ok=True)
     os.makedirs(CANDIDATES, exist_ok=True)
     candname = f"{k}.cpp"
     open(os.path.join(CANDIDATES, candname), "wb").write(cand_src)
     receipt["candidate_src"] = candname
-    if ev and os.path.exists(ev):
-        os.makedirs(os.path.join(ROOT, "evidence"), exist_ok=True)
-        evname = f"{k}.txt"
-        open(os.path.join(ROOT, "evidence", evname), "wb").write(open(ev, "rb").read())
-        receipt["evidence"] = evname
     json.dump(receipt, open(os.path.join(RECEIPTS, f"{k}.json"), "w", encoding="utf-8"), indent=1)
 
     u.setdefault("receipts", []).append({"at": receipt["submitted_at"], "arm": receipt["arm"],
@@ -285,6 +304,11 @@ def cmd_check(argv):
             ev = os.path.join(ROOT, "evidence", r["evidence"])
             if not os.path.exists(ev):
                 print(f"FAIL {r['unit']}: evidence file missing")
+                bad += 1
+                continue
+            # UNIT-5: an empty evidence file must never verify, even if its hash matches.
+            if os.path.getsize(ev) == 0:
+                print(f"FAIL {r['unit']}: evidence file is empty")
                 bad += 1
                 continue
             if sha(open(ev, "rb").read()) != r.get("evidence_sha"):

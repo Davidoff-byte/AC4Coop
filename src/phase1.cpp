@@ -3782,7 +3782,10 @@ static Hostility HostilityToPlayer(const void* player, const void* e) {
 // Read once (lazy, -1 = not read yet) from the ini, like the other [Coop] flags.
 static int      s_syncEnemiesOnly = -1;
 static unsigned s_scopeCand     = 0;  // characters that passed skeleton+bhv+health (+ T13 soldier filter)
-static unsigned s_scopeEnemies  = 0;  // of those, the ones carrying the (dead) weapon/icon ids
+// HO-3: no `enemies=` counter here. It was `weapon || guardIcon`, two component ids this file
+// itself documents as never attached to a live body, so it printed a hostile-looking number from a
+// dead discriminator beside the real one. One fact, one channel: `hostile=`/`unknown=` (A28) are
+// the only hostile reporting on this line.
 static unsigned s_scopeInRadius = 0;  // of those, the ones inside SyncRadiusM of the peer
 static unsigned s_scopeSent     = 0;  // character states actually packed into a snapshot
 // A28: counted per candidate BEFORE the HostileOnly gate, so the filter is observable even when the
@@ -3911,11 +3914,12 @@ static inline bool ScopeLess(const ScopeSel& a, const ScopeSel& b) {
     if (a.objId != b.objId) return a.objId < b.objId;   // stable, machine-independent tie-break
     return a.idx < b.idx;                          // last resort: the capture's own order
 }
-// ---- component histogram (diagnostic for the enemies-only filter) -----------------------------
-// `enemies=0` over thousands of candidates is either "no armed NPCs here" or "one/both vtable ids
-// are wrong for this build". One run has to tell those apart, so every CANDIDATE's component array
-// is tallied into a small fixed histogram of component vtable ids, and each of the two ids the
-// filter trusts gets its own candidate count. The ids are collected on the component walk the
+// ---- component histogram (diagnostic for the soldier filter) ----------------------------------
+// The OLD `enemies=` counter read 0 over thousands of candidates while standing among soldiers -
+// either "no armed NPCs here" or "one/both vtable ids are wrong for this build". That counter is
+// retired (HO-3); this histogram answers the same question directly. One run tells the two apart,
+// so every CANDIDATE's component array is tallied into a small fixed histogram of component vtable
+// ids, and each of the two ids the soldier filter trusts gets its own candidate count. The ids are collected on the component walk the
 // capture already performs (:2708) and flushed into the histogram only once the entity passes the
 // candidate gate, so no second array walk and no change to what is captured.
 #define COMP_HIST_CAP 32          // component vtable ids per window (was 16; the discriminator is in the tail)
@@ -4138,6 +4142,87 @@ static void StageLogEmit(const EntityState& es, float gx, float gy, float gz,
     s.used = true; s.objId = es.objId; s.stage = es.stage; s.alias = es.actionAlias; s.ms = nowMs;
 }
 
+// ---- C2-m3: corpse budget (a PACKING decision only) -------------------------------------------
+// A corpse's record is never omitted by the encoder - net.cpp forces EF_DEAD for any dead entity
+// (`if (e.dead != sh->st.dead || e.dead != 0u) mask |= EF_DEAD;`) - so every corpse is a permanent
+// resident of every snapshot. A chunk holds ENTITY_CHUNK_DATA / 52 = 26 records, and reassembly is
+// all-or-nothing (losing one chunk loses the whole snapshot), so the corpse share of a snapshot is
+// kept below one chunk:
+//   * age a corpse out of the PACKET after [Coop] CorpseKeepSec seconds (default 30, floor 0 =
+//     never age), and
+//   * cap corpse records per snapshot at CORPSE_BUDGET_MAX (24 < 26), oldest-first,
+// whichever binds first.  Ageing out means "stop including it in the packet" - the entity is not
+// deleted, es.dead is not touched, and the death lanes/tombstone/life-watch above all still run.
+// A corpse that is not packed keeps its first-seen stamp, so it cannot flap back in on the next
+// capture; the table is bounded and recycles the oldest entry when full.
+#define CORPSE_AGE_CAP    256          // tracked corpses (>= CORPSE_BUDGET_MAX with room to spare)
+#define CORPSE_BUDGET_MAX 24           // corpse records per snapshot, strictly below the 26/chunk
+
+struct CorpseAge { void* ent; uint64_t objId; uint64_t firstMs; };
+static CorpseAge s_corpseAge[CORPSE_AGE_CAP];
+static int      s_corpseAgeN     = 0;
+static int      s_corpseKeepSec  = -1;    // lazy, -1 = not read yet (like the other [Coop] keys)
+static unsigned s_corpseKept     = 0;     // corpse records packed in the CURRENT capture
+static unsigned s_corpseDropAge  = 0;     // ... dropped by age in the current capture
+static unsigned s_corpseDropCap  = 0;     // ... dropped by the count cap in the current capture
+static int      s_corpseBound    = 0;     // last reported binder: 0 none, 1 age, 2 count
+
+static int CorpseKeepSec() {
+    if (s_corpseKeepSec < 0) {
+        int v = GetPrivateProfileIntA("Coop", "CorpseKeepSec", 30, Paths::Ini());
+        if (v < 0) v = 0;                  // floor 0 = never age out
+        s_corpseKeepSec = v;
+    }
+    return s_corpseKeepSec;
+}
+static void CorpseBudgetBeginCapture() { s_corpseKept = 0; s_corpseDropAge = 0; s_corpseDropCap = 0; }
+static void CorpseAgeForget(void* ent, uint64_t objId) {
+    for (int i = 0; i < s_corpseAgeN; ++i) {
+        if (s_corpseAge[i].ent == ent || (objId && s_corpseAge[i].objId == objId)) {
+            s_corpseAge[i] = s_corpseAge[--s_corpseAgeN];   // order is irrelevant
+            return;
+        }
+    }
+}
+// true = pack the corpse this capture. Never mutates the entity, es, or any death state.
+static bool CorpseBudgetKeep(void* ent, uint64_t objId, uint64_t nowMs) {
+    int at = -1;
+    for (int i = 0; i < s_corpseAgeN; ++i) {
+        if (s_corpseAge[i].ent == ent || (objId && s_corpseAge[i].objId == objId)) { at = i; break; }
+    }
+    if (at < 0) {
+        if (s_corpseAgeN < CORPSE_AGE_CAP) {
+            at = s_corpseAgeN++;
+        } else {
+            at = 0;                        // full: recycle the oldest first-seen entry
+            for (int i = 1; i < s_corpseAgeN; ++i)
+                if (s_corpseAge[i].firstMs < s_corpseAge[at].firstMs) at = i;
+        }
+        s_corpseAge[at].ent = ent;
+        s_corpseAge[at].objId = objId;
+        s_corpseAge[at].firstMs = nowMs;
+    } else if (objId && s_corpseAge[at].objId != objId) {
+        s_corpseAge[at].objId = objId;     // identity refreshed, the age is kept
+    }
+    const int keepSec = CorpseKeepSec();
+    if (keepSec > 0 && nowMs - s_corpseAge[at].firstMs >= (uint64_t)keepSec * 1000u) {
+        ++s_corpseDropAge;
+        return false;
+    }
+    if (s_corpseKept >= CORPSE_BUDGET_MAX) { ++s_corpseDropCap; return false; }
+    ++s_corpseKept;
+    return true;
+}
+// Once per BIND CHANGE (age/count), not once per capture: a steady scene logs one line.
+static void CorpseBudgetReport() {
+    const int bound = s_corpseDropAge ? 1 : (s_corpseDropCap ? 2 : 0);
+    if (bound == s_corpseBound) return;
+    s_corpseBound = bound;
+    if (!bound) return;                    // nothing bound this capture: the next bind logs again
+    L("[Cap] corpse budget bound=%s kept=%u dropped=%u\n",
+      bound == 1 ? "age" : "count", s_corpseKept, s_corpseDropAge + s_corpseDropCap);
+}
+
 // ---- one synced guard: pack its wire record ---------------------------------------------------
 // Extracted from CaptureGuards so the capture can select a set FIRST (nearest to the peer) and only
 // then serialise it. Callers run it inside CaptureGuards' __try, so the same readable() discipline
@@ -4307,6 +4392,14 @@ static void EmitGuardEntity(EntityPacket& pkt, uint32_t& count, int idx, Entity*
             }
         }
     }
+    // C2-m3: corpse budget decision (see CorpseBudgetKeep above). PACKING ONLY, and deliberately
+    // taken BEFORE the one-shot [Cap] dead line so a corpse that is aged or capped out of this
+    // packet still produces its dead=1 evidence (P7). Nothing here deletes the entity, marks it
+    // dead again, or touches es.dead - a dropped record simply does not reach `++count`, and the
+    // death push below still runs.
+    bool corpsePack = true;
+    if (es.dead) corpsePack = CorpseBudgetKeep(e, es.objId, nowMs);
+    else         CorpseAgeForget(e, es.objId);   // alive (or a recycled objId): drop the age entry
     if (es.dead) {
         static void* s_capDead[64];
         static int   s_capDeadN = 0;
@@ -4323,6 +4416,10 @@ static void EmitGuardEntity(EntityPacket& pkt, uint32_t& count, int idx, Entity*
             L("[Cap] ent=%08X dead=1 via=%s ai=%08X (captured into the snapshot)\n", e, via, ai);
         }
     }
+    if (!corpsePack) {
+        if (deathId) PushHostDeath(deathId, (unsigned int)e, deathPos);
+        return;                            // not packed this snapshot; the entity is untouched
+    }
     ++count;
     ++s_scopeSent;
     if (deathId) PushHostDeath(deathId, (unsigned int)e, deathPos);
@@ -4334,6 +4431,7 @@ static void CaptureGuards(EntityPacket& pkt) {
     // (no world loaded yet) is still in the denominator - otherwise sentPerCap is biased high by
     // dividing a window's sends by only the captures that happened to run with a world present.
     ++s_scopeCaps;
+    CorpseBudgetBeginCapture();          // C2-m3: per-snapshot corpse budget counters
     ObjMapReset();                       // rebuild the objId table for this capture
     World* world = World::GetCurrentWorld();
     if (!world) return;
@@ -4485,15 +4583,15 @@ static void CaptureGuards(EntityPacket& pkt) {
             // Candidates = every body that survived skeleton + BhvGenericNPC + the health service and
             // the T13 soldier filter above (so with SyncEnemiesOnly=1 this counts soldiers only; the
             // pre-filter population is what [Sync] kindrole reports), counted PRE-hostility-gate, so
-            // `candidates` is the population and not the survivor count.  Enemies = the subset carrying
-            // WeaponComponent or MapIconBehaviorGuard (legacy dead counter, meaning unchanged).  Counted
-            // before the relevance test on purpose: the numbers must describe the SCOPE, not the radius.
-            const bool isEnemy = weapon || guardIcon;
-            if (isEnemy) ++s_scopeEnemies;
+            // `candidates` is the population and not the survivor count.  Hostile/unknown are the
+            // only enemy counts (A28): the old `enemies=` counter was `weapon || guardIcon`, a pair
+            // of vtable ids this file documents as dead, and it was retired rather than renamed so
+            // that "one fact, one channel" holds on the [Sync] scope line (HO-3).  Counted before
+            // the relevance test on purpose: the numbers must describe the SCOPE, not the radius.
             // Diagnostic only: fold this candidate's component ids (already collected on the walk
             // above) into the window histogram, plus its AI object vtable from the pointer the gate
             // above already obtained. Counted before any `continue`, so both tables describe the same
-            // population as candidates/enemies. Position is kept per id as a cluster hint.
+            // population as candidates. Position is kept per id as a cluster hint.
             // [Coop] Diag (default 0): the whole comps/ai histogram lane (per-candidate sampling here,
             // formatting in the 5 s block) is quiet unless the key is on.
             if (DiagEnabled()) {
@@ -4568,6 +4666,8 @@ static void CaptureGuards(EntityPacket& pkt) {
             EmitGuardEntity(pkt, count, i, e, bhvC, hc, px, py, pz, nowMs);
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    // C2-m3: one line per bind change (age|count), not per capture - a steady scene stays quiet.
+    CorpseBudgetReport();
     // A28: the per-capture increment now happens at function entry (see the note there), before the
     // `if (!world) return;` early exit, so the denominator counts every attempt. SyncSlotSweep below
     // still only runs when a world exists.
@@ -9301,18 +9401,26 @@ static void OnFrameInner(Human* updatedHuman) {
               (st.txBytes / 1024.0) / secs, (st.rxBytes / 1024.0) / secs,
               s_covMatched, s_covNoBody, s_covStolen, st.rejects, st.protoMismatch);
             // Scope line, same 5 s window as the wire stats above. It exists so one run PROVES the
-            // filter: candidates minus enemies is the civilian mass that used to be shipped, sent is
-            // what actually went out (it also includes ships, which are packed before the characters).
-            // The guest never runs CaptureGuards, so candidates/enemies/sent stay 0 there by design.
+            // filter: `hostile`/`unknown` are the hostile population (A28), `sent` is what actually
+            // went out (it also includes ships, which are packed before the characters).
+            // The guest never runs CaptureGuards, so candidates/hostile/sent stay 0 there by design.
+            // HO-3: `enemies=` was removed on purpose - it counted `weapon || guardIcon`, two ids
+            // this file documents as never attached to a live body, and sat beside the real
+            // `hostile=`. One fact, one channel; no scraper reads `enemies=` (checked: the only
+            // other occurrences are a sample line in tools/coop_report.py's selftest fixture and
+            // historical captures kept in ops/).
             // Scope (TASK 1): candidates that passed the validity gate, how many of them are inside
             // SyncRadiusM of the peer, and how many were actually emitted (nearest-first, capped by
             // SyncMaxEntities; `sent` also includes ships, packed before the characters).
             // A28: HostileOnly is printed here for the first time (it was invisible in every capture),
             // and `captures`/`sentPerCap` are added because `sent` is a WINDOW SUM, not a per-snapshot
             // figure -- only sentPerCap is bounded by SyncMaxEntities.  L() formats into char buf[1024]
-            // (see the definition above), so the 187-char line cannot truncate.
-            L("[Sync] scope candidates=%u inRadius=%u enemies=%u hostile=%u unknown=%u sent=%u captures=%u sentPerCap=%.2f (SyncEnemiesOnly=%d, SyncRadiusM=%d, SyncMaxEntities=%d, HostileOnly=%d)\n",
-              s_scopeCand, s_scopeInRadius, s_scopeEnemies, s_scopeHostile, s_scopeUnknown, s_scopeSent,
+            // (see the definition above), so the shortened line cannot truncate.
+            // HO-3: `enemies=%u` is gone. It was fed by `weapon || guardIcon`, not by hostility, and
+            // a reader of the runbook would take it as the hostile count. `hostile=`/`unknown=` are
+            // the only hostile reporting now; older captures in ops/ still show the field as history.
+            L("[Sync] scope candidates=%u inRadius=%u hostile=%u unknown=%u sent=%u captures=%u sentPerCap=%.2f (SyncEnemiesOnly=%d, SyncRadiusM=%d, SyncMaxEntities=%d, HostileOnly=%d)\n",
+              s_scopeCand, s_scopeInRadius, s_scopeHostile, s_scopeUnknown, s_scopeSent,
               s_scopeCaps,
               s_scopeCaps ? (double)s_scopeSent / (double)s_scopeCaps : 0.0,
               SyncEnemiesOnly(), SyncRadiusM(), SyncMaxEntities(), HostileOnly());
@@ -9369,9 +9477,9 @@ static void OnFrameInner(Human* updatedHuman) {
                       s_bindUnmatched, (s_bindMinD < 1e8f) ? sqrtf(s_bindMinD) : -1.0f);
             }
             // Component histogram, same window. ALL non-zero distinct component vtable ids by
-            // descending count (32 slots), then the two ids the enemies-only filter trusts, each as
-            // "candidates carrying it". If enemies=0 while weapon_A8/icon_D0 are non-zero, the scope
-            // gate is broken; if both stay 0 across a populated scene, those ids are absent here.
+            // descending count (32 slots), then the two ids the soldier filter trusts, each as
+            // "candidates carrying it". If weapon_A8/icon_D0 stay 0 across a populated scene, those
+            // ids are absent here (the retired `enemies=` counter said nothing either way).
             if (DiagEnabled()) {
                 char hist[1024]; hist[0] = 0;
                 HistFormatTop(hist, sizeof(hist), s_compVt, s_compCnt, s_compDistinct, COMP_HIST_CAP);
@@ -9402,7 +9510,7 @@ static void OnFrameInner(Human* updatedHuman) {
             }
             CompHistReset();
             AiHistReset();
-            s_scopeCand = 0; s_scopeEnemies = 0; s_scopeInRadius = 0; s_scopeSent = 0;
+            s_scopeCand = 0; s_scopeInRadius = 0; s_scopeSent = 0;
             s_scopeHostile = 0; s_scopeUnknown = 0; s_scopeCaps = 0;   // A28: same window boundary
             s_krN = 0; s_krSoldier = 0; s_krCivilian = 0; s_krOther = 0;
             s_krWinLines = 0;   // T17: the per-window [KR] budget refills with the other counters
