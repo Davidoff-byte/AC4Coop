@@ -2146,15 +2146,25 @@ static int GhostMarkerDeactivate(void* comp, int* kindOut, uint32_t* handleOut)
     MarkerDeactivateFn fn = *(MarkerDeactivateFn*)(uintptr_t)(vt + 0x0C);
     if (!fn) return 0;
     if (shared) {
-        // m3: the clone's marker component shares its +0x3C sub-object with the source component (the
-        // deep copy copied the pointer by reference), so running the class deactivate would free that
-        // sub-object from under the player's own marker. Engine-side MARKER_REMOVE is skipped on
-        // purpose; the fallback is explicit and logged so the omission is never silent.
-        // The registration is still cleared - bit 0 of +0x44, the handle at +0x30 and the marker kind
-        // byte at +0x26 (0 is not one of the player kinds {1,2,3,31,32,38,39,42,43}) - and we report
-        // the marker as handled, so no caller needs a second attempt at the same component.
-        L("[GhostMarker] skip engine-teardown reason=shared-subobject +0x3C=%08X (registration cleared)\n",
-          shared);
+        // m3 (outcome b, 2026-11-09): the engine teardown (`fn`) is NOT run. `fn` is sub_114CC30 and it
+        // frees *(this+0x3C) (sub_7FA170) before emitting MARKER_REMOVE. Whether that sub-object is
+        // private to the clone is NOT proved anywhere in the tree - the duplicate path's treatment of
+        // +0x3C has never been decompiled, so emitting the remove risks a double free of the player's
+        // own marker sub-object.
+        // SETTLING FACT: decompile the duplicate/clone routine the ghost spawn uses and check whether it
+        // deep-copies +0x3C (a fresh allocation) or leaves it NULL on the clone. Deep copy => the remove
+        // is safe here; a shared pointer => the fallback below is correct as written.
+        //
+        // Residual, logged once per process so the omission is never silent: MARKER_REMOVE and the free
+        // of +0x3C are skipped; the local registration is still cleared - bit 0 of +0x44, the handle at
+        // +0x30 and the marker kind byte at +0x26 (0 is not one of the player kinds {1,2,3,31,32,38,39,
+        // 42,43}) - and the marker is reported handled, so no caller needs a second attempt.
+        static int s_markerSharedLogged = 0;
+        if (s_markerSharedLogged < 1) {
+            ++s_markerSharedLogged;
+            L("[GhostMarker] skip MARKER_REMOVE reason=shared-subobject +0x3C=%08X skipped=MARKER_REMOVE,free(+0x3C) (registration cleared)\n",
+              shared);
+        }
         *(uint8_t*)((char*)comp + 0x44) &= (uint8_t)~1u;
         *(uint32_t*)((char*)comp + 0x30) = 0;
         *(uint8_t*)((char*)comp + 0x26) = 0;
@@ -4158,6 +4168,9 @@ static void EmitGuardEntity(EntityPacket& pkt, uint32_t& count, int idx, Entity*
     AbstractEntityAI* ai = AIEntityHelper::GetEntityAI(e);
     // P0: identity + health that survive the AI being torn down after death.
     unsigned int hpSvc = FindHealthInAI((unsigned int)ai);
+    // C2-n3: which predicate set es.dead - 1 = health dead flag (+0x60), 2 = combat is-alive,
+    // 3 = no health service (is-alive only), 0 = alive. Named on the [Cap] dead=1 line.
+    unsigned int deadVia = 0;
     bool hpSvcOk = HostHpSvcValid(hpSvc);          // D-016(1): validate before caching or reading
     if (hpSvcOk) RememberEntityHealth((unsigned int)e, hpSvc);
     else { hpSvc = CachedHealthForEntity((unsigned int)e); hpSvcOk = HostHpSvcValid(hpSvc); }
@@ -4171,10 +4184,15 @@ static void EmitGuardEntity(EntityPacket& pkt, uint32_t& count, int idx, Entity*
         // real death); secondary: combat is-alive. Do NOT use ai+0x8C here - that is a different
         // (AI-side) predicate, not the combat one.
         bool flagsDead = (*(unsigned int*)(hpSvc + 0x60) & 0x01000000u) != 0;
-        es.dead = (flagsDead || !EngineIsAlive((unsigned int)e)) ? 1 : 0;
+        const bool combatAlive = EngineIsAlive((unsigned int)e);
+        es.dead = (flagsDead || !combatAlive) ? 1 : 0;
+        // C2-n3: remember WHICH of the two predicates decided, so the [Cap] dead=1 line can name it.
+        // The branch above is the only place es.dead is produced on the capture path (:4174).
+        deadVia = flagsDead ? 1u : (combatAlive ? 0u : 2u);
     } else {
         es.hp = 0;
         es.dead = EngineIsAlive((unsigned int)e) ? 0 : 1;
+        deadVia = es.dead ? 3u : 0u;      // no health service: the combat predicate alone decided
     }
     ObjMapAdd(es.objId, (unsigned int)e, hpSvc);
     // Host -> guest death lane. D-016(3/4): a death is a TRANSITION - the same objId must have been
@@ -4296,7 +4314,13 @@ static void EmitGuardEntity(EntityPacket& pkt, uint32_t& count, int idx, Entity*
         for (int cq = 0; cq < s_capDeadN; ++cq) if (s_capDead[cq] == e) { seen = true; break; }
         if (!seen && s_capDeadN < 64) {
             s_capDead[s_capDeadN++] = e;
-            L("[Cap] ent=%08X dead=1 ai=%08X (captured into the snapshot)\n", e, ai);
+            // C2-n3: `dead=1` alone cannot tell a flag-driven death from an is-alive one any more, so
+            // the deciding predicate is printed. 1 = health dead flag (+0x60 & 0x01000000),
+            // 2 = combat is-alive (EngineIsAlive) said dead, 3 = no health service, is-alive alone.
+            const char* via = (deadVia == 1) ? "engine-flag"
+                            : (deadVia == 2) ? "engine-alive"
+                            : (deadVia == 3) ? "no-health-service" : "none";
+            L("[Cap] ent=%08X dead=1 via=%s ai=%08X (captured into the snapshot)\n", e, via, ai);
         }
     }
     ++count;
@@ -4732,7 +4756,42 @@ static int GktMarkPushed(uint64_t objId, unsigned int ent) {
 static const unsigned int CLAIM_MAX_ATTEMPTS   = 20;   // ≈1-2 s at the snapshot tick rate
 static const unsigned int CLAIM_EPOCH_SNAPSHOTS = 64;  // EPOCH_PACKETS (net.cpp:109) - the retry
                                                        // fallback cadence only; not a wire constant
-struct GktAttempt { uint64_t objId; unsigned int ent; unsigned int n; unsigned int skip; int escalated; };
+// C2-m1: why a mirror kill refused to settle. GuestKillMirrorEntity / KillGuardEntityInner already
+// compute this on every early return; it used to be thrown away, so the escalation line could only say
+// "terminal-drop". Carried on the claim slot so the 20th attempt names the refusal that kept failing.
+enum KillRefusal {
+    KILL_OK = 0,               // not refused: killed, or the engine already says dead (settled)
+    KILL_REFUSED_DISABLED,     // GuestKillMirror=0 - the escape hatch ran and touched nothing
+    KILL_REFUSED_NO_ID,        // ent == 0, or the entity is not the guest mirror bound to objId
+    KILL_REFUSED_NO_HEALTH,    // no valid health service -> no proven Life predicate
+    KILL_REFUSED_AI_UNREADABLE,// the AI pointer fails readable() in KillGuardEntityInner
+    KILL_REFUSED_NO_BEHAVIOUR, // behaviour component unreachable -> kill refused, not attempted
+    KILL_REFUSED_ENGINE_ALIVE, // the kill writes ran, the engine still reports Life != 0xFFFF
+    KILL_REFUSED_EXCEPTION,    // the kill path faulted
+};
+static const char* KillRefusalName(KillRefusal r) {
+    switch (r) {
+    case KILL_REFUSED_DISABLED:       return "kill-disabled";
+    case KILL_REFUSED_NO_ID:          return "id-mismatch";
+    case KILL_REFUSED_NO_HEALTH:      return "no-health-service";
+    case KILL_REFUSED_AI_UNREADABLE:  return "ai-unreadable";
+    case KILL_REFUSED_NO_BEHAVIOUR:   return "no-behaviour-component";
+    case KILL_REFUSED_ENGINE_ALIVE:   return "engine-said-alive";
+    case KILL_REFUSED_EXCEPTION:      return "kill-exception";
+    default:                          return "none";
+    }
+}
+
+// C2-m1: global per-process cap on the per-attempt claim lines. The per-body counter bounds each
+// claim to CLAIM_MAX_ATTEMPTS, but not the product: 24 unsettled bodies produced ~480 lines. After
+// CLAIM_LOG_MAX the per-attempt lines go silent for the rest of the process. `applied=1` lines are
+// one per body and are deliberately NOT routed through here.
+static const int CLAIM_LOG_MAX = 200;
+static int s_claimLogs = 0;
+static inline bool ClaimLogAllowed() { return s_claimLogs < CLAIM_LOG_MAX ? (++s_claimLogs, true) : false; }
+
+struct GktAttempt { uint64_t objId; unsigned int ent; unsigned int n; unsigned int skip; int escalated;
+                    KillRefusal lastRefusal; };
 static GktAttempt s_gktAttempt[256];
 static int        s_gktAttemptN = 0;
 static int        s_gktAttemptNext = 0;               // overwrite cursor once full (evict, never refuse)
@@ -4751,9 +4810,10 @@ static GktAttempt& GktAttemptSlot(uint64_t objId, unsigned int ent) {
     }
     s_gktAttempt[slot].objId     = objId;
     s_gktAttempt[slot].ent       = ent;
-    s_gktAttempt[slot].n         = 0;
-    s_gktAttempt[slot].skip      = 0;
-    s_gktAttempt[slot].escalated = 0;
+    s_gktAttempt[slot].n           = 0;
+    s_gktAttempt[slot].skip        = 0;
+    s_gktAttempt[slot].escalated   = 0;
+    s_gktAttempt[slot].lastRefusal = KILL_OK;
     return s_gktAttempt[slot];
 }
 
@@ -4766,6 +4826,7 @@ static void GktAttemptClear(uint64_t objId, unsigned int ent) {
             s_gktAttempt[i].n = 0;
             s_gktAttempt[i].skip = 0;
             s_gktAttempt[i].escalated = 0;
+            s_gktAttempt[i].lastRefusal = KILL_OK;
             return;
         }
     }
@@ -5108,7 +5169,7 @@ static unsigned int GuestObjFindResolve(uint64_t objId) {
 // out-param that carries the settled case, so the caller can tombstone on "engine says dead" without
 // inferring it. It is only set true on the explicit already-dead branch.
 static bool GuestKillMirrorEntity(uint64_t objId, unsigned int ent, bool viaGuestObj,
-                                  bool* alreadyDead = nullptr);
+                                  bool* alreadyDead = nullptr, KillRefusal* why = nullptr);
 // Defined beside GuestKillMirrorEntity (:5390): fires the deferred corpse re-disable. Driven from
 // GuestDeathScan's own per-tick generation counter (s_gktGen) - no threads, no timers.
 static void CorpseLatchTick();
@@ -5399,8 +5460,8 @@ static void ApplyGuards(const EntityPacket& pkt) {
                     if (terminal) {
                         if (!at.escalated) {
                             at.escalated = 1;
-                            L("[Death] unresolved objId=%llu ent=%08X attempts=%u reason=terminal-drop\n",
-                              (unsigned long long)es.objId, dent, at.n);
+                            L("[Death] unresolved objId=%llu ent=%08X attempts=%u reason=terminal-drop lastRefusal=%s\n",
+                              (unsigned long long)es.objId, dent, at.n, KillRefusalName(at.lastRefusal));
                         }
                         // Terminal: the body is no longer touched and no tombstone is written. The
                         // claim re-enters each snapshot but immediately lands on this branch.
@@ -5411,17 +5472,19 @@ static void ApplyGuards(const EntityPacket& pkt) {
                             MirrorVisualDeath(best);           // visual death first, as on the packet path
                         }
                         bool alreadyDead = false;
-                        const bool killed = GuestKillMirrorEntity(es.objId, dent, true, &alreadyDead);
+                        KillRefusal why = KILL_OK;      // C2-m1: the refusal the kill already computed
+                        const bool killed = GuestKillMirrorEntity(es.objId, dent, true, &alreadyDead, &why);
                         const bool settled = killed || alreadyDead;
+                        at.lastRefusal = why;           // last attempt decides what escalated
                         ++at.n;
                         if (settled) {
                             GktMarkPushed(es.objId, dent);     // ONLY now
                             L("[Mirror] snapshot death objId=%llu ent=%08X applied=1 retry=0 attempts=%u\n",
                               (unsigned long long)es.objId, dent, at.n);
                             GktAttemptClear(es.objId, dent);
-                        } else if (at.n <= CLAIM_MAX_ATTEMPTS) {
-                            L("[Mirror] snapshot death objId=%llu ent=%08X applied=0 retry=1 attempts=%u\n",
-                              (unsigned long long)es.objId, dent, at.n);
+                        } else if (at.n <= CLAIM_MAX_ATTEMPTS && ClaimLogAllowed()) {
+                            L("[Mirror] snapshot death objId=%llu ent=%08X applied=0 retry=1 attempts=%u lastRefusal=%s\n",
+                              (unsigned long long)es.objId, dent, at.n, KillRefusalName(why));
                         }
                     }
                 }
@@ -7264,11 +7327,11 @@ static void MirrorVisualDeathInner(Entity* e) {
 // stands there. Every pre-existing call site goes through KillGuardEntity(Entity*) and still notifies.
 // C2-M1: the return value is "the ENGINE says this body is dead after this call", never "the function
 // reached its end". notifyPeer selects only the peer push; the verdict means the same on both paths.
-static bool KillGuardEntityInner(Entity* e, bool notifyPeer);     // wrapped below
+static bool KillGuardEntityInner(Entity* e, bool notifyPeer, KillRefusal* why);     // wrapped below
 static bool KillGuardEntity(Entity* e) {
     if (!e || !readable(e, 4)) return false;
     bool dead = false;
-    __try { dead = KillGuardEntityInner(e, true); }
+    __try { dead = KillGuardEntityInner(e, true, nullptr); }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         L("[KF] EXCEPTION 0x%08X (ent=%08X) - kill aborted\n", GetExceptionCode(), e);
         dead = false;
@@ -7276,19 +7339,21 @@ static bool KillGuardEntity(Entity* e) {
     return dead;
 }
 
-static bool KillGuardEntityQuiet(Entity* e) {
-    if (!e || !readable(e, 4)) return false;
+static bool KillGuardEntityQuiet(Entity* e, KillRefusal* why) {
+    if (why) *why = KILL_OK;
+    if (!e || !readable(e, 4)) { if (why) *why = KILL_REFUSED_NO_ID; return false; }
     bool dead = false;
-    __try { dead = KillGuardEntityInner(e, false); }
+    __try { dead = KillGuardEntityInner(e, false, why); }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         L("[KF] EXCEPTION 0x%08X (ent=%08X) - kill aborted\n", GetExceptionCode(), e);
         dead = false;
+        if (why) *why = KILL_REFUSED_EXCEPTION;
     }
     return dead;
 }
 
-static bool KillGuardEntityInner(Entity* e, bool notifyPeer) {
-    if (!e) return false;                                  // no body: engine says nothing
+static bool KillGuardEntityInner(Entity* e, bool notifyPeer, KillRefusal* why) {
+    if (!e) { if (why) *why = KILL_REFUSED_NO_ID; return false; }   // no body: engine says nothing
 
     unsigned int ai = (unsigned int)AIEntityHelper::GetEntityAI(e);
     unsigned int hp = FindHealthInAI(ai);
@@ -7297,8 +7362,10 @@ static bool KillGuardEntityInner(Entity* e, bool notifyPeer) {
     // No health service means this is not a killable NPC (stale/duplicated entity, or a junk AI pointer).
     // Everything below walks the AI, so stop here - a tester crash came from exactly this: ai=10251025
     // passed the readable() test and EngineIsAlive() faulted on it.
-    if (!hp) { L("[KF] no health service (ai=%08X) -> skip\n", ai); return false; }   // nothing was killed
-    if (!ai || !readable((void*)ai, 0xC0)) { L("[KF] ai unreadable\n"); return false; }
+    if (!hp) { if (why) *why = KILL_REFUSED_NO_HEALTH;
+               L("[KF] no health service (ai=%08X) -> skip\n", ai); return false; }   // nothing was killed
+    if (!ai || !readable((void*)ai, 0xC0)) { if (why) *why = KILL_REFUSED_AI_UNREADABLE;
+                                             L("[KF] ai unreadable\n"); return false; }
 
     L("[KF] before: alive=%d  health life=%u/%u flags=%08X\n", (int)EngineIsAlive((unsigned int)e),
       hp ? *(unsigned short*)(hp + 0x5C) : 0, hp ? *(unsigned short*)(hp + 0x5E) : 0,
@@ -7373,6 +7440,7 @@ static bool KillGuardEntityInner(Entity* e, bool notifyPeer) {
     bool engineDead = false;
     if (readable((void*)(hp + 0x60), 4))
         engineDead = (*(unsigned short*)(hp + 0x5C) == 0xFFFFu);
+    if (!engineDead && why) *why = KILL_REFUSED_ENGINE_ALIVE;
     L("[KF] verdict ent=%08X life=%u engineDead=%d\n", e,
       readable((void*)(hp + 0x5C), 2) ? (unsigned)*(unsigned short*)(hp + 0x5C) : 0, (int)engineDead);
     return engineDead;
@@ -7462,8 +7530,10 @@ static void CorpseLatchTick() {
 // Anything else touches no entity at all and only logs. A proximity kill here would be far worse than a
 // corpse that keeps standing, so the default for an unprovable target is "do nothing".
 static bool GuestKillMirrorEntity(uint64_t objId, unsigned int ent, bool viaGuestObj,
-                                  bool* alreadyDead /* = nullptr in the declaration */) {
+                                  bool* alreadyDead /* = nullptr in the declaration */,
+                                  KillRefusal* why /* = nullptr in the declaration */) {
     if (alreadyDead) *alreadyDead = false;   // C2 §3.3: only the already-dead branch below sets it
+    if (why) *why = KILL_OK;
     const int flag = GuestKillMirrorEnabled();
     // GuestKillMirror=0 is the escape hatch: nothing below runs at all - no health read, no
     // re-enable, no engine call - so the crash path is unreachable with the flag off.
@@ -7475,7 +7545,9 @@ static bool GuestKillMirrorEntity(uint64_t objId, unsigned int ent, bool viaGues
         static int s_gktKillDisabled = 0;
         if (s_gktKillDisabled < 10) ++s_gktKillDisabled;
         GktAttemptClear(objId, ent);
-        L("[Mirror] dead ent=%08X -> KillGuardEntity applied=0 killDisabled=1 (GuestKillMirror=%d)\n", ent, flag);
+        if (why) *why = KILL_REFUSED_DISABLED;   // C2-m1: the escalation line reports this
+        if (ClaimLogAllowed())
+            L("[Mirror] dead ent=%08X -> KillGuardEntity applied=0 killDisabled=1 (GuestKillMirror=%d)\n", ent, flag);
         return false;
     }
     bool hpOk = false;
@@ -7493,6 +7565,10 @@ static bool GuestKillMirrorEntity(uint64_t objId, unsigned int ent, bool viaGues
                 deadFlag = (*(unsigned int*)(hpSvc + 0x60) & 0x01000000u) != 0;   // engine dead flag
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) { hpOk = false; }
+    } else if (why) {
+        // C2-m1: the identity gate refused before any health read. ent==0 and a mirror-table mismatch
+        // are the same refusal from the caller's point of view (unprovable identity).
+        *why = KILL_REFUSED_NO_ID;
     }
     // D: SetLife(-1) on an ALREADY dead body is refused by the engine (live log: "rc=-1
     // life 65535 -> 65535") but still walks the health-event path that drives the action/blend
@@ -7530,15 +7606,20 @@ static bool GuestKillMirrorEntity(uint64_t objId, unsigned int ent, bool viaGues
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) { prepared = false; }
         if (!prepared) {
-            L("[Mirror] dead ent=%08X skipped reason=no-behaviour-component\n", ent);
+            if (why) *why = KILL_REFUSED_NO_BEHAVIOUR;
+            if (ClaimLogAllowed())
+                L("[Mirror] dead ent=%08X skipped reason=no-behaviour-component\n", ent);
             return false;
         }
-        const bool engineDead = KillGuardEntityQuiet((Entity*)ent);   // own __try/__except; real verdict
+        const bool engineDead = KillGuardEntityQuiet((Entity*)ent, why);   // own __try/__except; real verdict
         if (!engineDead) {
             // C2-M1: no SetLife, or the engine refused it. Do NOT arm the latch here -- CorpseLatchTick
             // does SetEnabled(false) + m_DriveEntity = false, which would freeze a body that is still
             // alive. Report unsettled so the claim retries (settled = killed || alreadyDead).
-            L("[Mirror] dead ent=%08X -> KillGuardEntity applied=0 reason=engine-not-dead (GuestKillMirror=%d)\n", ent, flag);
+            // C2-m1: `why` already carries the inner refusal (no-health / ai-unreadable / engine-alive).
+            if (ClaimLogAllowed())
+                L("[Mirror] dead ent=%08X -> KillGuardEntity applied=0 reason=engine-not-dead inner=%s (GuestKillMirror=%d)\n",
+                  ent, KillRefusalName(why ? *why : KILL_REFUSED_ENGINE_ALIVE), flag);
             return false;
         }
         // The enable above only buys the engine the samples it needs to start the death transition.
@@ -7548,7 +7629,9 @@ static bool GuestKillMirrorEntity(uint64_t objId, unsigned int ent, bool viaGues
         L("[Mirror] dead ent=%08X -> KillGuardEntity applied=1 (GuestKillMirror=%d)\n", ent, flag);
         return true;
     }
-    L("[Mirror] dead ent=%08X -> KillGuardEntity applied=0 (GuestKillMirror=%d)\n", ent, flag);
+    if (why && *why == KILL_OK) *why = KILL_REFUSED_NO_HEALTH;   // C2-m1: no valid service -> nothing attempted
+    if (ClaimLogAllowed())
+        L("[Mirror] dead ent=%08X -> KillGuardEntity applied=0 reason=no-health-service (GuestKillMirror=%d)\n", ent, flag);
     return false;
 }
 

@@ -364,18 +364,33 @@ namespace {
         const size_t n4 = EncodeEntityPacket(a, buf, sizeof(buf));
         EntityPacket f{};
         bool ok4 = (n4 == sizeof(EntityWireHeader)) && DecodeEntityPacket(buf, n4, f) && f.count == 0;
+        // C2-n1: a genuinely HALF-DEAD record - dead = 1 with a live hp (50). At HEAD the codec's own
+        // encoder does NOT normalise (net.cpp:272 writes e.hp verbatim); the dead=>sentinel step lives
+        // in the capture path (phase1.cpp EmitGuardEntity) and the DECODER is the backstop
+        // (net.cpp:444-445). So this shape can be emitted and must come back dead=1, hp=0xFFFF.
+        // Scratch packets are reused: sizeof(EntityPacket) is ~93 KB and five of them are already here.
+        EntityPacket& half = f;
+        EntityPacket& halfOut = d;
+        half = EntityPacket{};
+        half.magic = NET_ENTITY_MAGIC; half.protoVer = NET_PROTO_VER; half.seq = 2; half.count = 1;
+        half.ents[0].key = 7; half.ents[0].kind = 2; half.ents[0].dead = 1; half.ents[0].hp = 50;
+        half.ents[0].stage = 1; half.ents[0].arch = 0x35F7;
+        const size_t n5 = EncodeEntityPacket(half, buf, sizeof(buf));
+        bool ok5 = n5 > sizeof(EntityWireHeader) && DecodeEntityPacket(buf, n5, halfOut)
+                   && halfOut.count == 1 && halfOut.ents[0].key == 7u && halfOut.ents[0].dead == 1
+                   && halfOut.ents[0].hp == 0xFFFFu;
         // Both peers must start from an empty shadow.
         std::memset(g_txShadow, 0, sizeof(g_txShadow));
         std::memset(g_rxShadow, 0, sizeof(g_rxShadow));
         g_txEpoch = g_rxEpoch = 1; g_txSinceReset = 0;
         char m[256];
-        wsprintfA(m, "[Net] wire codec selftest: roundtrip=%s nochange=%s deaddelta=%s resurrect=%s"
-                     " (full=%u B, repeat=%u B, res=%u B, idle=%u B)\n",
+        wsprintfA(m, "[Net] wire codec selftest: roundtrip=%s nochange=%s deaddelta=%s resurrect=%s halfdead=%s"
+                     " (full=%u B, repeat=%u B, res=%u B, idle=%u B, half=%u B)\n",
                   ok ? "PASS" : "FAIL", ok4 ? "PASS" : "FAIL", ok2 ? "PASS" : "FAIL",
-                  ok3 ? "PASS" : "FAIL",
-                  (unsigned)n1, (unsigned)n2, (unsigned)n3, (unsigned)n4);
+                  ok3 ? "PASS" : "FAIL", ok5 ? "PASS" : "FAIL",
+                  (unsigned)n1, (unsigned)n2, (unsigned)n3, (unsigned)n4, (unsigned)n5);
         dbg(m);
-        return ok && ok2 && ok3 && ok4;
+        return ok && ok2 && ok3 && ok4 && ok5;
     }
 
     bool DecodeEntityPacket(const uint8_t* in, size_t len, EntityPacket& out, DecodeReason* why) {
