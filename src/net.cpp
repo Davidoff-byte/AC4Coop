@@ -557,6 +557,7 @@ namespace {
         wsprintfA(m, "[Net] %s packet REJECTED protoVer=%u expected=%u (both peers must run the same build)\n",
                   lane, (unsigned)got, (unsigned)NET_PROTO_VER);
         dbg(m);
+        { char e[96]; wsprintfA(e, "[E] ev=proto-mismatch lane=%s got=%u expected=%u\n", lane, (unsigned)got, (unsigned)NET_PROTO_VER); dbg(e); }
     }
     // Player lane, anonymous-vs-named: a peer built against a different PlayerState sends a datagram
     // whose leading magic is OUR magic but whose length is not sizeof(PlayerState). playerPkt is
@@ -576,18 +577,21 @@ namespace {
             wsprintfA(m, "[Net] player packet SIZE MISMATCH n=%d expected=%d (peer build differs; protoVer=?)\n",
                       n, (int)sizeof(PlayerState));
         dbg(m);
+        { char e[96]; wsprintfA(e, "[E] ev=size-mismatch n=%d expected=%d\n", n, (int)sizeof(PlayerState)); dbg(e); }
     }
     void LogKindRejected() {
         static bool s_logged = false;
         if (s_logged) return;
         s_logged = true;
         dbg("[Net] entity packet REJECTED: kind outside {1 ship, 2 guard, 3 kill} (netstate.h EntityKind)\n");
+        dbg("[E] ev=reject lane=entity reason=kind\n");
     }
     void LogWorldMismatch() {
         static bool s_logged = false;
         if (s_logged) return;
         s_logged = true;
         dbg("[Net] entity packet REJECTED: header worldId != local world (world change in progress?)\n");
+        dbg("[E] ev=reject lane=entity reason=world-mismatch\n");
     }
     void LogRejectSummary(LONG rejects) {
         char m[224];

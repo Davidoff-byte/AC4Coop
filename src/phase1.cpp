@@ -4,6 +4,7 @@
 #include "paths.h"
 #include "net.h"
 #include "Hook.h"
+#include "build_info.h"
 #include <windows.h>
 #include <cstdint>
 #include <cstdio>
@@ -2358,6 +2359,8 @@ static void* SpawnGhostShip() {
                         L("[GhostProxy] pick src=%08X id=%u cls=%u peerCls=%u delta=%.0f idx=%d retry=%u classMiss=%d camSrc=%s\n",
                           (unsigned)chosen, (unsigned)pick.srcId, (unsigned)pick.cls, (unsigned)g_ghostPeerClass,
                           pick.srcMax, pick.idx, s_proxyDupFails, pick.classMiss, pick.camSrc ? pick.camSrc : "?");
+                        L("[E] ev=proxy-pick src=%08X id=%u cls=%u peerCls=%u idx=%d\n",
+                          (unsigned)chosen, (unsigned)pick.srcId, (unsigned)pick.cls, (unsigned)g_ghostPeerClass, pick.idx);
                     }
                     ++s_pickSpawn;
                     void* dup = DuplicateShip(chosen);
@@ -4221,6 +4224,8 @@ static void CorpseBudgetReport() {
     if (!bound) return;                    // nothing bound this capture: the next bind logs again
     L("[Cap] corpse budget bound=%s kept=%u dropped=%u\n",
       bound == 1 ? "age" : "count", s_corpseKept, s_corpseDropAge + s_corpseDropCap);
+    L("[E] ev=corpse-budget bound=%s kept=%u dropped=%u\n",
+      bound == 1 ? "age" : "count", s_corpseKept, s_corpseDropAge + s_corpseDropCap);
 }
 
 // ---- one synced guard: pack its wire record ---------------------------------------------------
@@ -5514,6 +5519,8 @@ static void ApplyGuards(const EntityPacket& pkt) {
                     gs.used = 1; gs.ent = (unsigned int)best; gs.objId = es.objId;
                     L("[Slot] bind slot=%u objId=%llu -> ent=%08X via=%s\n",
                       slotIdx, (unsigned long long)es.objId, (unsigned int)best, via);
+                    L("[E] ev=bind slot=%u objId=%llu ent=%08X via=%s\n",
+                      slotIdx, (unsigned long long)es.objId, (unsigned int)best, via);
                 }
                 gs.lastPktMs = nowMs;
             }
@@ -5562,6 +5569,8 @@ static void ApplyGuards(const EntityPacket& pkt) {
                             at.escalated = 1;
                             L("[Death] unresolved objId=%llu ent=%08X attempts=%u reason=terminal-drop lastRefusal=%s\n",
                               (unsigned long long)es.objId, dent, at.n, KillRefusalName(at.lastRefusal));
+                            L("[E] ev=death-unsettled objId=%llu ent=%08X attempts=%u reason=terminal-drop lastRefusal=%s\n",
+                              (unsigned long long)es.objId, dent, at.n, KillRefusalName(at.lastRefusal));
                         }
                         // Terminal: the body is no longer touched and no tombstone is written. The
                         // claim re-enters each snapshot but immediately lands on this branch.
@@ -5581,9 +5590,13 @@ static void ApplyGuards(const EntityPacket& pkt) {
                             GktMarkPushed(es.objId, dent);     // ONLY now
                             L("[Mirror] snapshot death objId=%llu ent=%08X applied=1 retry=0 attempts=%u\n",
                               (unsigned long long)es.objId, dent, at.n);
+                            L("[E] ev=death-applied objId=%llu ent=%08X attempts=%u\n",
+                              (unsigned long long)es.objId, dent, at.n);
                             GktAttemptClear(es.objId, dent);
                         } else if (at.n <= CLAIM_MAX_ATTEMPTS && ClaimLogAllowed()) {
                             L("[Mirror] snapshot death objId=%llu ent=%08X applied=0 retry=1 attempts=%u lastRefusal=%s\n",
+                              (unsigned long long)es.objId, dent, at.n, KillRefusalName(why));
+                            L("[E] ev=death-unsettled objId=%llu ent=%08X attempts=%u lastRefusal=%s\n",
                               (unsigned long long)es.objId, dent, at.n, KillRefusalName(why));
                         }
                     }
@@ -5928,6 +5941,8 @@ static void EntitySyncTick() {
         if (gotPacket && !s_joinLogged) {
             s_joinLogged = true;
             L("[Join] first entity packet: protoVer=%u expected=%u accepted=%d count=%u\n",
+              (unsigned)in.protoVer, (unsigned)NET_PROTO_VER, haveIn ? 1 : 0, (unsigned)in.count);
+            L("[E] ev=peer-first-packet protoVer=%u expected=%u accepted=%d count=%u\n",
               (unsigned)in.protoVer, (unsigned)NET_PROTO_VER, haveIn ? 1 : 0, (unsigned)in.count);
         }
     }
@@ -9288,6 +9303,79 @@ static void __cdecl OnFrame(Human* updatedHuman) {
     }
 }
 
+// ---- Config dump + RUN provenance --------------------------------------------------------
+// One line per key the code actually reads, once per process, BEFORE the net lane opens. The
+// RESOLVED value (post-default) is printed, so an absent key shows the default the code chose.
+// GetPrivateProfile* is a deterministic disk read of an ini that is not rewritten at runtime, so
+// re-reading here yields exactly the value each call site uses later (same section/key/default).
+// Absence is detected with a sentinel: GetPrivateProfileStringA returns lpDefault only when the
+// key is missing, so a sentinel hit == "absent" and is annotated "(default)".
+static void DumpConfigOnce()
+{
+    static bool s_done = false;
+    if (s_done) return;
+    s_done = true;
+
+    char mod[MAX_PATH] = "?";
+    HMODULE self = nullptr;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)&L, &self) && self)
+        GetModuleFileNameA(self, mod, MAX_PATH);
+
+    L("[AC4Coop] RUN build=%s tree=%s proto=%u ini=%s pid=%u exe=%s\n",
+      BUILD_GIT_COMMIT, BUILD_GIT_TREE, (unsigned)NET_PROTO_VER, Paths::Ini(),
+      (unsigned)GetCurrentProcessId(), mod);
+
+    struct K { const char* s; const char* k; int d; };
+    static const K keys[] = {
+        { "Coop", "ActionDeathLog", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "CombatObserve", 0 },
+        { "Coop", "CombatTest", 0 }, { "Coop", "CorpseKeepSec", 30 }, { "Coop", "CrowdProbeIntegrate", 1 },
+        { "Coop", "CrowdProbeLiveKeys", 1 }, { "Coop", "DamageRelay", 0 }, { "Coop", "Diag", 0 },
+        { "Coop", "DisableCrowd", 0 }, { "Coop", "DisablePuppetAI", 1 }, { "Coop", "DisableSpawns", 0 },
+        { "Coop", "DriveActions", 1 }, { "Coop", "DriveContext", 0 }, { "Coop", "DriveLocomotion", 0 },
+        { "Coop", "EntityHost", 0 }, { "Coop", "EntitySelfTest", 0 }, { "Coop", "EntitySelfTestMax", 1 },
+        { "Coop", "EntitySelfTestOffset", 0 }, { "Coop", "EntitySync", 0 }, { "Coop", "FixNullReturn", 1 },
+        { "Coop", "ForceUnknownBuild", 0 }, { "Coop", "GhostMarkerSuppress", 1 }, { "Coop", "GhostProxy", 0 },
+        { "Coop", "GuardNullActionTarget", 0 }, { "Coop", "GuardNullTarget", 1 }, { "Coop", "GuardStaleTarget", 1 },
+        { "Coop", "GuestKillMirror", 1 }, { "Coop", "HookSgm", 1 }, { "Coop", "HostileOnly", 0 },
+        { "Coop", "HybridLoco", 1 }, { "Coop", "IdentityBand", 0 }, { "Coop", "IdResolver", 1 },
+        { "Coop", "InstallHooks", 1 }, { "Coop", "IntegratePuppet", 0 }, { "Coop", "KillTrace", 1 },
+        { "Coop", "KrLog", 0 }, { "Coop", "LegacyPadIdHook", 1 }, { "Coop", "MinBlendInMs", 100 },
+        { "Coop", "NetStrictPeer", 1 }, { "Coop", "NullReturnObserver", 1 }, { "Coop", "Probe", 0 },
+        { "Coop", "PuppetParkX", 0 }, { "Coop", "PuppetPhysics", 0 }, { "Coop", "RegisterPad1", 0 },
+        { "Coop", "RelevanceRadiusM", 250 }, { "Coop", "ReloadBuilder", 1 }, { "Coop", "SceneAware", 1 },
+        { "Coop", "SeekOnSwitch", 1 }, { "Coop", "ShipDump", 0 }, { "Coop", "ShipDumpFloats", 0 },
+        { "Coop", "ShipGhost", 0 }, { "Coop", "ShipGhostSelfTest", 0 }, { "Coop", "ShipHPSync", 0 },
+        { "Coop", "ShipPassenger", 0 }, { "Coop", "ShipRelevanceRadiusM", 1000 }, { "Coop", "ShipSync", 1 },
+        { "Coop", "ShipTest", 0 }, { "Coop", "ShipTestFracPct", 45 }, { "Coop", "ShipTestRadiusM", 250 },
+        { "Coop", "StageLog", 0 }, { "Coop", "SyncEnemiesOnly", 1 }, { "Coop", "SyncMaxEntities", 32 },
+        { "Coop", "SyncRadiusM", 60 }, { "Coop", "TransformProbe", 0 }, { "Coop", "VPadEnable", 0 },
+        { "Coop", "VPadTest", 0 }, { "Coop", "WatchDeadBit", 0 }, { "Coop", "WatchTarget", 0 },
+        { "Coop", "HookFrame", 1 }, { "Coop", "HookPad", 1 }, { "Coop", "HookWindowed", 1 },
+        { "Coop", "HookMultiInstance", 1 },
+        { "Display", "Borderless", 0 }, { "Display", "ForceWindowedMs", 5000 }, { "Display", "Fullscreen", 0 },
+        { "Net", "Enabled", 0 }, { "Net", "InterpDelayMs", 100 }, { "Net", "InterpMaxExtrapMs", 100 },
+        { "Net", "Interpolation", 1 }, { "Net", "LocalPort", 47801 }, { "Net", "PeerPort", 47801 },
+        { "Net", "SnapshotHz", 20 },
+    };
+
+    const char sent[] = "\x1A\x1B absent";
+    char sv[64];
+    const size_t n = sizeof(keys) / sizeof(keys[0]);
+    for (size_t i = 0; i < n; ++i) {
+        GetPrivateProfileStringA(keys[i].s, keys[i].k, sent, sv, sizeof(sv), Paths::Ini());
+        const bool absent = (strcmp(sv, sent) == 0);
+        const int v = GetPrivateProfileIntA(keys[i].s, keys[i].k, keys[i].d, Paths::Ini());
+        L("[AC4Coop] CFG %s.%s=%d%s\n", keys[i].s, keys[i].k, v, absent ? " (default)" : "");
+    }
+
+    char str[128];
+    GetPrivateProfileStringA("Net", "PeerIP", "127.0.0.1", str, sizeof(str), Paths::Ini());
+    L("[AC4Coop] CFG Net.PeerIP=%s\n", str);
+    GetPrivateProfileStringA("Coop", "DriveContextMask", "", str, sizeof(str), Paths::Ini());
+    L("[AC4Coop] CFG Coop.DriveContextMask=%s%s\n", str[0] ? str : "(empty)", str[0] ? "" : " (default)");
+}
+
 static void OnFrameInner(Human* updatedHuman) {
     if (!isPlayerUpdate(base(), updatedHuman)) return;
 
@@ -9336,6 +9424,7 @@ static void OnFrameInner(Human* updatedHuman) {
         g_watchDeadBit   = GetPrivateProfileIntA("Coop", "WatchDeadBit",   0, Paths::Ini());
         if (g_watchTarget  > 0) L("[TD] WatchTarget=1 hotkey=Ctrl+Alt+J (address dump only)\n");
         if (g_watchDeadBit > 0) L("[WB] WatchDeadBit=1 hotkey=Ctrl+Alt+L (PAGE_GUARD on svc+4, cap %d)\n", WB_MAX_EXC);
+        DumpConfigOnce();   // RUN + full CFG dump, once, before the link opens
         Net::SetStrictPeer(s_netStrictPeer != 0);   // before Init: the recv thread filters from the start
         bool netOk = Net::Init();
         L("[Net] init=%d  (bound/peer line goes to OutputDebugString)\n", netOk ? 1 : 0);
@@ -9668,6 +9757,22 @@ static void OnFrameInner(Human* updatedHuman) {
         // the condition reduces exactly to today's.
         bool timerOk = (s_netStrictPeer == 0) || (Net::MillisSinceRecv() < kPeerLiveMs);
         bool peerPresent = rawSameWorld && (now - lastFreshMs) < kPeerLiveMs && timerOk;
+        // [E] link-up / link-down: edge-triggered, one line per transition (never per frame).
+        {
+            static bool s_peerWasPresent = false;
+            if (peerPresent && !s_peerWasPresent) {
+                L("[E] ev=link-up peerMs=%u world=%08X scene=%08X\n",
+                  Net::MillisSinceRecv(),
+                  localOk ? (unsigned)local.worldId : 0u,
+                  localOk ? (unsigned)local.sceneKey : 0u);
+            } else if (!peerPresent && s_peerWasPresent) {
+                L("[E] ev=link-down peerMs=%u world=%08X scene=%08X\n",
+                  Net::MillisSinceRecv(),
+                  localOk ? (unsigned)local.worldId : 0u,
+                  localOk ? (unsigned)local.sceneKey : 0u);
+            }
+            s_peerWasPresent = peerPresent;
+        }
 
         // X21: ONE line every ~10 s that says what every lane is doing and why it dropped work, so a
         // session is diagnosed from one format instead of six ([Net]/[Sync]/[ShipSync]/[Net] scene ...).
@@ -9682,17 +9787,18 @@ static void OnFrameInner(Human* updatedHuman) {
             s_healthLast = now;
             Net::Stats hs; Net::GetStats(hs);                    // cheap struct copy, same as the 5 s line
             const double hErr = s_bindBound ? (s_bindErrSum / (double)s_bindBound) : 0.0;
-            char hb[288];
+            char hb[384];
             _snprintf_s(hb, sizeof(hb), _TRUNCATE,
                         "[Health] net=%d peerMs=%u proto=%u bind(sent=%u bound=%u unmatched=%u err=%.2f) "
                         "ents(sent=%u recv=?) ships(ghost=%d hpWant=%.1f hpApplied=%.1f cls=%u) "
-                        "dmgRelay=%d rejects=%u protoMismatch=%u sizeMismatch=%u world=%08X scene=%08X",
+                        "dmgRelay=%d rejects=%u protoMismatch=%u sizeMismatch=%u stale=%u world=%08X scene=%08X hostile=%u unknown=%u",
                         Net::Enabled() ? 1 : 0, Net::MillisSinceRecv(), (unsigned)NET_PROTO_VER,
                         s_bindSent, s_bindBound, s_bindUnmatched, hErr,
                         hs.txEnts, g_ghostShip ? 1 : 0, (double)g_ghostSyncHP, (double)g_ghostAppliedHP,
                         (unsigned)g_ghostPeerClass,
-                        DamageRelayEnabled(), hs.rejects, hs.protoMismatch, hs.sizeMismatch,
-                        localOk ? (unsigned)local.worldId : 0u, localOk ? (unsigned)local.sceneKey : 0u);
+                        DamageRelayEnabled(), hs.rejects, hs.protoMismatch, hs.sizeMismatch, hs.staleChunks,
+                        localOk ? (unsigned)local.worldId : 0u, localOk ? (unsigned)local.sceneKey : 0u,
+                        s_scopeHostile, s_scopeUnknown);
             L("%s\n", hb);
         }
 
@@ -9729,6 +9835,8 @@ static void OnFrameInner(Human* updatedHuman) {
                     const bool shown = (s_sceneAware == 0) || !localValid || !gotRaw || (pk == lk);
                     L("[Net] scene change: localKey=%08X peerKey=%08X%s -> puppet %s\n",
                       localShow, peerShow, gotRaw ? "" : " (last)", shown ? "shown" : "hidden");
+                    L("[E] ev=world-change localKey=%08X peerKey=%08X world=%08X puppet=%s\n",
+                      localShow, peerShow, localOk ? (unsigned)local.worldId : 0u, shown ? "shown" : "hidden");
                 }
                 if (localValid) { lastLocalKey = lk; lastLocalValid = true; }
                 if (gotRaw)     { lastPeerKey  = pk; lastPkValid  = true; }
@@ -9918,15 +10026,19 @@ static void OnFrameInner(Human* updatedHuman) {
                 int ageMs = g_ghostSyncMs ? (int)(now - g_ghostSyncMs) : -1;
                 L("[ShipSync] ghost sync latch cleared reason=%s (peer=%d world=%d)\n",
                   why, ageMs, sameWorld ? 1 : 0);
+                L("[E] ev=ghost-latch-clear reason=%s peer=%d world=%d\n",
+                  why, ageMs, sameWorld ? 1 : 0);
                 g_ghostHasSync = 0;   // re-set by the next ApplyRemoteState that carries a live ship state
             }
         }
         if (s_shipGhost && g_ghostHasSync && !g_ghostShip) {
             GhostTrack(SpawnGhostShip());
-            if (g_ghostShip) { g_ghostAuto = true; L("[ShipSync] auto-spawned ghost ship %p\n", g_ghostShip); }
+            if (g_ghostShip) { g_ghostAuto = true; L("[ShipSync] auto-spawned ghost ship %p\n", g_ghostShip);
+                               L("[E] ev=ghost-spawn ent=%p auto=1\n", g_ghostShip); }
         } else if (!g_ghostHasSync && g_ghostPeerNoShip && g_ghostAuto && g_ghostShip) {
             // Only an explicit "peer not aboard" hides the auto ghost. A latch cleared for staleness /
             // world change leaves the clone standing where it was (see above).
+            L("[E] ev=ghost-despawn reason=peer-not-aboard\n");
             Phase1::DespawnGhostShip();
         }
         // Direct drive (F12 manual ghost + auto ghost): the ghost's RigidBody/AI components are disabled,
