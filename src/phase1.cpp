@@ -5263,7 +5263,14 @@ static unsigned int GuestObjFindResolve(uint64_t objId) {
         return 0;
     }
     GuestObjAdd(objId, ent);
-    L("[Mirror] objId=%llu rebound via resolver ent=%08X\n", (unsigned long long)objId, ent);
+    uint64_t resId = 0;
+    __try { resId = ((ManagedObject*)ent)->GetObjectID(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { resId = 0; }
+    const unsigned int reqBand = (objId >= 0xF0000000ull && objId < 0xF8000000ull) ? 1u : 0u;
+    const unsigned int resBand = (resId >= 0xF0000000ull && resId < 0xF8000000ull) ? 1u : 0u;
+    L("[Mirror] objId=%llu rebound via resolver ent=%08X reqBand=%s resId=%llu resBand=%s\n",
+      (unsigned long long)objId, ent, reqBand ? "minted" : "authored",
+      (unsigned long long)resId, resBand ? "minted" : "authored");
     return ent;
 }
 
@@ -9485,7 +9492,7 @@ static void OnFrameInner(Human* updatedHuman) {
             }
             Net::Stats st; Net::GetStats(st);
             double secs = (stNow - s_statsLast) / 1000.0;
-            L("[Net] stats tx=%u pkt, %u B, %u ent  rx=%u pkt, %u B  |  %.1f kB/s up, %.1f kB/s down  |  mirror ok=%u nobod=%u steal=%u rejects=%u protoMismatch=%u\n",
+            L("[Net] stats tx=%u pkt, %u B, %u recs  rx=%u pkt, %u B  |  %.1f kB/s up, %.1f kB/s down  |  mirror ok=%u nobod=%u steal=%u rejects=%u protoMismatch=%u\n",
               st.txPackets, st.txBytes, st.txEnts, st.rxPackets, st.rxBytes,
               (st.txBytes / 1024.0) / secs, (st.rxBytes / 1024.0) / secs,
               s_covMatched, s_covNoBody, s_covStolen, st.rejects, st.protoMismatch);
@@ -9779,7 +9786,7 @@ static void OnFrameInner(Human* updatedHuman) {
         // Telemetry only: no engine calls beyond the attribute reads this tick already performs, no
         // allocation (fixed buffer + _snprintf_s), bounded length, and every value comes from a counter
         // that already exists. bind/dmg values are the most recent 5 s window, because that is the
-        // window the [Net] stats block resets them at. `ents(recv=?)`: no received-entity counter
+        // window the [Net] stats block resets them at. `recs(recv=?)`: no received-record counter
         // exists, so it is printed as ? rather than inventing one.
         static uint64_t s_healthLast = 0;                        // X21: 10 s window, block-scope only
         if (s_healthLast == 0) s_healthLast = now;
@@ -9790,7 +9797,7 @@ static void OnFrameInner(Human* updatedHuman) {
             char hb[384];
             _snprintf_s(hb, sizeof(hb), _TRUNCATE,
                         "[Health] net=%d peerMs=%u proto=%u bind(sent=%u bound=%u unmatched=%u err=%.2f) "
-                        "ents(sent=%u recv=?) ships(ghost=%d hpWant=%.1f hpApplied=%.1f cls=%u) "
+                        "recs(sent=%u recv=?) ships(ghost=%d hpWant=%.1f hpApplied=%.1f cls=%u) "
                         "dmgRelay=%d rejects=%u protoMismatch=%u sizeMismatch=%u stale=%u world=%08X scene=%08X hostile=%u unknown=%u",
                         Net::Enabled() ? 1 : 0, Net::MillisSinceRecv(), (unsigned)NET_PROTO_VER,
                         s_bindSent, s_bindBound, s_bindUnmatched, hErr,
@@ -9811,6 +9818,8 @@ static void OnFrameInner(Human* updatedHuman) {
         {
             static uint32_t lastLocalKey = 0, lastPeerKey = 0;
             static bool     lastLocalValid = false, lastPkValid = false;
+            static uint32_t lastWorldId = 0;       // previous world id (world-change vs scene-change)
+            static bool     haveWorldId  = false;
             const bool     localValid = localOk;
             const uint32_t lk = localOk ? local.sceneKey : 0u;
             const uint32_t pk = gotRaw  ? raw.sceneKey   : 0u;
@@ -9835,8 +9844,16 @@ static void OnFrameInner(Human* updatedHuman) {
                     const bool shown = (s_sceneAware == 0) || !localValid || !gotRaw || (pk == lk);
                     L("[Net] scene change: localKey=%08X peerKey=%08X%s -> puppet %s\n",
                       localShow, peerShow, gotRaw ? "" : " (last)", shown ? "shown" : "hidden");
-                    L("[E] ev=world-change localKey=%08X peerKey=%08X world=%08X puppet=%s\n",
-                      localShow, peerShow, localOk ? (unsigned)local.worldId : 0u, shown ? "shown" : "hidden");
+                    const uint32_t curWorld = localOk ? (unsigned)local.worldId : 0u;
+                    if (haveWorldId && curWorld != lastWorldId) {
+                        L("[E] ev=world-change world=%08X->%08X localKey=%08X\n",
+                          lastWorldId, curWorld, localShow);
+                    } else {
+                        L("[E] ev=scene-change localKey=%08X world=%08X\n",
+                          localShow, curWorld);
+                    }
+                    lastWorldId = curWorld;
+                    haveWorldId = true;
                 }
                 if (localValid) { lastLocalKey = lk; lastLocalValid = true; }
                 if (gotRaw)     { lastPeerKey  = pk; lastPkValid  = true; }
