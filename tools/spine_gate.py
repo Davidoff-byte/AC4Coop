@@ -122,7 +122,7 @@ STORED_POINTER_ALLOWLIST = [
 # `// 0x527BA0  ListNodeAcquireAndTag  size=117`. It is written from the function
 # boundary when the bytes are pinned, so it is an independent record of the size.
 CANDIDATES = os.path.join(ROOT, "decomp", "candidates")
-CAND_HEAD_RE = re.compile(r"^//\s*0x([0-9A-Fa-f]+)\s+\S+\s+size=(\d+)\s*$", re.M)
+CAND_HEAD_RE = re.compile(r"^//\s*0x([0-9A-Fa-f]+)\s+\S+\s+size=(\d+)\b", re.M)
 
 
 def check_sizes(units):
@@ -136,16 +136,20 @@ def check_sizes(units):
     for k, u in units.items():
         path = os.path.join(CANDIDATES, k + ".cpp")
         if not os.path.isfile(path):
-            unchecked.append(k)
+            unchecked.append((k, "no file"))
             continue
         try:
             txt = open(path, encoding="utf-8", errors="replace").read()
         except OSError:
-            unchecked.append(k)
+            unchecked.append((k, "unreadable"))
             continue
         m = CAND_HEAD_RE.search(txt)
-        if not m or norm(m.group(1)) != k:
-            unchecked.append(k)
+        if not m:
+            # a file exists but its header carries no size= — not the same as no candidate
+            unchecked.append((k, "header has no size="))
+            continue
+        if norm(m.group(1)) != k:
+            unchecked.append((k, f"header says 0x{m.group(1)}"))
             continue
         checked += 1
         if int(m.group(2)) != u.get("size"):
@@ -350,6 +354,9 @@ def main():
             print(f"  NINE-DIGIT {line}  [rule: no 0x literal of 9+ hex digits]")
         print(f"          recorded sizes checked against the extraction header: {n_size_checked}"
               f"   mismatched: {len(size_bad)}   no candidate to check: {len(size_unchecked)}")
+        # name them and say WHY: a bare count hid six real candidates (UNIT-2).
+        for k, why in size_unchecked:
+            print(f"  NO SIZE CHECK {k}  [{why}]")
         for k, v in sorted(size_bad.items()):
             print(f"  SIZE MISMATCH {k}  units.json says {v['recorded']},"
                   f" extraction header says {v['extracted']}"
