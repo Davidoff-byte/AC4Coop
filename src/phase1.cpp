@@ -1887,6 +1887,7 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
                 // Full array, bounded by BOTH the peer's slot count and the puppet's own controller size
                 // (sized per action; the engine drops writes past it anyway).
                 int n = s.blendCount;
+                if (n > BLEND_MAX) n = BLEND_MAX;
                 int pn = ac->GetBlendFactorCount(0, ACTLAYER_PRIMARY);
                 if (pn < n) n = pn;
                 for (int i = 0; i < n; ++i) {
@@ -8510,7 +8511,7 @@ static void lerpState(const PlayerState& a, const PlayerState& b, float t, Playe
     // (they index that action's clips). Same action -> lerp for a smooth speed ramp; different action ->
     // keep b's (the alias we're switching to, copied by o = b) so we don't cross-blend unrelated clips.
     if (a.actionAlias == b.actionAlias && a.actionChannel == b.actionChannel && a.blendCount == b.blendCount) {
-        for (int i = 0; i < b.blendCount; ++i) o.blendFactors[i] = lerpf(a.blendFactors[i], b.blendFactors[i], t);
+        for (int i = 0; i < b.blendCount && i < BLEND_MAX; ++i) o.blendFactors[i] = lerpf(a.blendFactors[i], b.blendFactors[i], t);
         o.timeScale = lerpf(a.timeScale, b.timeScale, t);   // clip speed is continuous too
         // Phase: lerp unless the clip looped between snapshots (b < a), then keep b's (o = b) — never
         // interpolate backwards across the wrap.
@@ -9574,7 +9575,7 @@ static void OnFrameInner(Human* updatedHuman) {
                     if (w < 0) break;
                     off += w;
                 }
-                L("[Sync] krreject total=%u%s%s\n", s_krRejTotal, rej, s_krRejOverflow ? " (+overflow)" : "");
+                L("[Sync] krreject total=%u %s%s\n", s_krRejTotal, rej, s_krRejOverflow ? " (+overflow)" : "");
             }
             // G7 oracle (TASK 3), guest side: did every character record get a body, and how far is
             // that body from where the host says it is at APPLY time? sent == bound + unmatched.

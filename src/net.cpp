@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <share.h>
+#include <process.h>      // _beginthreadex: RecvThread calls CRT (dbg -> printf/fputs); see dllmain.cpp "_beginthreadex, not CreateThread"
 #include "net.h"
 #include "paths.h"
 
@@ -684,7 +685,10 @@ namespace {
                         }
                         EnterCriticalSection(&g_lock);
                         if (playerOk) {
-                            g_remote = *(PlayerState*)buf; g_haveRemote = true;
+                            std::memcpy(&g_remote, buf, sizeof(g_remote));   // not *(PlayerState*)buf: buf is not 16-byte aligned
+                            // blendCount indexes blendFactors[BLEND_MAX] in lerpState/apply; a wire value above it is an OOB write.
+                            if (g_remote.blendCount > BLEND_MAX) g_remote.blendCount = BLEND_MAX;
+                            g_haveRemote = true;
                             // Queue it too (overwrites the OLDEST when the ring is full), so a frame
                             // that drains several packets feeds the interpolator all of them.
                             g_rxq[g_rxqHead] = g_remote;
@@ -800,11 +804,11 @@ bool Init() {
     inet_pton(AF_INET, peerIp, &g_peer.sin_addr);
 
     InitializeCriticalSection(&g_lock);
-    CreateThread(nullptr, 0, RecvThread, nullptr, 0, nullptr);
 
     g_enabled = true;
     g_lastRecvMs = 0;   // no packet accepted yet
     SelfTestWire();     // [Phase 2] prove the compact codec round-trips before any traffic
+    _beginthreadex(nullptr, 0, (unsigned (__stdcall*)(void*))RecvThread, nullptr, 0, nullptr);   // after the self-test (it resets the rx shadow)
     char m[128]; wsprintfA(m, "[Net] up: bound:%d -> %s:%d\n", bindPort, peerIp, sendPort); dbg(m);
     return true;
 }
