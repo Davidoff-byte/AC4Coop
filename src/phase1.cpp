@@ -5200,10 +5200,32 @@ static bool IdResLogNow(int* counter) {
     return *counter <= 20 || (*counter % 500) == 0;
 }
 
+static int  s_idResRetry = 0;   // RES-1 retry throttle (bounded source-3 retry in ResolveEntityById)
+
 // The entity that currently owns `id`, or nullptr. The return value is only ever a pointer whose own id
 // reads back as `id`, so a stale-past-destroy hit degrades to a miss (and the caller falls back).
 static Entity* ResolveEntityById(uint64_t id) {
     void* obj = ResolveEntityByIdRaw(id);
+    if (!obj) {
+        // RES-1 bounded retry (ops/evidence/register-re-closures-4.md): 0xA1F160's owner-first
+        // scan short-circuits on a slot whose entry+8 == 0 and returns null before reaching its
+        // own sources 2/3. One direct source-3 call (0x00A1DC00, the two-level id->object lookup)
+        // restores those ids. Never re-call 0xA1F160 - it recurses into the same broken match.
+        // Id halves are the same split ResolveEntityByIdRaw passes to 0xA1F160:
+        //   lo = (uint32_t)id,  hi = (uint32_t)(id >> 32).
+        __try {
+            if (*(void**)0x04DD601C != nullptr) {   // registry lock/service up, as in ResolveEntityByIdRaw
+                int ent = Hook::CallClassMethod<int, void*, uint32_t, uint32_t>(
+                    0x00A1DC00, (void*)0x04DD9824, (uint32_t)id, (uint32_t)(id >> 32));
+                if (IdResLogNow(&s_idResRetry))
+                    L("[Mirror] resolver retry id=%llu hit=%d\n",
+                      (unsigned long long)id, ent ? 1 : 0);
+                obj = (void*)ent;   // 0 on miss: the null path stays exactly as it is today
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            obj = nullptr;
+        }
+    }
     if (!obj) return nullptr;
     __try {
         if (!readable(obj, 8)) return nullptr;

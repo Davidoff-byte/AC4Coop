@@ -398,6 +398,15 @@
    "size": 11,
    "status": "claimed"
   },
+  "00A1DC00": {
+   "addr": "00A1DC00",
+   "claimed_at": null,
+   "name": "ObjectRegistryFindById",
+   "owner": null,
+   "receipts": [],
+   "size": 59,
+   "status": "unknown"
+  },
   "00A1F160": {
    "addr": "00A1F160",
    "claimed_at": "2026-11-08T19:43:31Z",
