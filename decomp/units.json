@@ -1,5 +1,14 @@
 {
  "units": {
+  "0045ABB0": {
+   "addr": "0045ABB0",
+   "claimed_at": null,
+   "name": "SkeletonComponentSetModel",
+   "owner": null,
+   "receipts": [],
+   "size": 119,
+   "status": "unknown"
+  },
   "00503330": {
    "addr": "00503330",
    "claimed_at": "2026-11-08T19:48:44Z",
@@ -52,6 +61,15 @@
    ],
    "size": 117,
    "status": "claimed"
+  },
+  "00527CC0": {
+   "addr": "00527CC0",
+   "claimed_at": null,
+   "name": "EntityAddComponent",
+   "owner": null,
+   "receipts": [],
+   "size": 442,
+   "status": "unknown"
   },
   "00528200": {
    "addr": "00528200",
@@ -421,6 +439,15 @@
    ],
    "size": 181,
    "status": "claimed"
+  },
+  "00A38120": {
+   "addr": "00A38120",
+   "claimed_at": null,
+   "name": "ClassInfoCreateObject",
+   "owner": null,
+   "receipts": [],
+   "size": 65,
+   "status": "unknown"
   },
   "00C4F2A0": {
    "addr": "00C4F2A0",

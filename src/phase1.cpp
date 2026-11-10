@@ -468,6 +468,65 @@ static void FinishPadProbe() {    World* world = World::GetCurrentWorld();
     L("[VPad] verdict: whichever moved owns the pad-1 input\n");
 }
 
+// ---- F2: give the built puppet a skeleton so it animates instead of gliding ([Coop] SkelAttach, default 0) ----
+// Recipe: ops/evidence/skeleton-attach-recipe-2026-11-10.md (all four calls verified in IDA, AC4BFSP md5 2058342866…):
+//   M1 create  sub_A38120(SkeletonComponent class-info 0x02749420, 0)  __cdecl; allocs desc+0x18 = 0x340 B, ctor desc+0x30
+//   M4 attach  sub_527CC0(entity, comp)  __thiscall, retn 4 (edi=ecx, comp from [ebx+8]); appends to entity+0x60,
+//              re-sorts, bumps the generation, calls comp->OnAttach (sets comp+8 = owner), world attach if entity+0x5C
+//   M2 model   sub_45ABB0(comp, &model)  __thiscall; stores model at comp+0x20 (+1 ref) and, if !(comp+0x335 & 4),
+//   M3 build   runs sub_45A830(comp): +0x124 = owner, +0x128 = bone-name map, pose buffers.
+// ORDER MATTERS: M3 dereferences comp+8 (owner), which only M4 sets. Model source: the player's own skeleton (+0x20),
+// so the puppet wears Edward's rig. Every step is guarded; nothing runs unless SkelAttach=1.
+static const uint32_t VT_SKELETON_COMPONENT = 0x01E41E58;   // class-info-map.tsv
+static void* FindComponentByVtable(Entity* e, uint32_t vt) {
+    if (!readable(e, 0x68)) return nullptr;
+    uint16_t n = *(uint16_t*)((uint8_t*)e + 0x66);            // authoritative count (CLAIMS C1)
+    void** arr = *(void***)((uint8_t*)e + 0x60);
+    if (n == 0 || n > 96 || !readable(arr, 4u * n)) return nullptr;
+    for (uint16_t i = 0; i < n; ++i)
+        if (readable(arr[i], 4) && *(uint32_t*)arr[i] == vt) return arr[i];
+    return nullptr;
+}
+static void LogSkel(const char* who, const void* s) {
+    if (!readable(s, 0x340)) { L("[Skel] %s skel=%p (unreadable)\n", who, s); return; }
+    const uint8_t* b = (const uint8_t*)s;
+    L("[Skel] %s skel=%p owner(+8)=%08X model(+0x20)=%08X +0x124=%08X +0x128=%08X +0x134=%08X flags(+0x335)=%02X\n",
+      who, s, *(uint32_t*)(b + 0x8), *(uint32_t*)(b + 0x20), *(uint32_t*)(b + 0x124), *(uint32_t*)(b + 0x128),
+      *(uint32_t*)(b + 0x134), b[0x335]);
+}
+static void PuppetSkelAttach(Entity* puppet, Entity* player) {
+    static int s_on = -1;
+    if (s_on < 0) s_on = GetPrivateProfileIntA("Coop", "SkelAttach", 0, Paths::Ini()) != 0 ? 1 : 0;
+    if (!s_on || !puppet || !player) return;
+    __try {
+        void* existing = FindComponentByVtable(puppet, VT_SKELETON_COMPONENT);
+        if (existing) { L("[Skel] puppet already has a SkeletonComponent - nothing to do\n"); LogSkel("ghost", existing); return; }
+        void* pskel = FindComponentByVtable(player, VT_SKELETON_COMPONENT);
+        if (!pskel || !readable(pskel, 0x340)) { L("[Skel] player SkeletonComponent not found - skipped\n"); return; }
+        void* model = *(void**)((uint8_t*)pskel + 0x20);
+        if (!readable(model, 0x10)) { L("[Skel] player model (+0x20) unreadable - skipped\n"); return; }
+        LogSkel("player", pskel);                                           // G-GLIDE-2 positive control
+
+        void* skel = ((void* (__cdecl*)(void*, int))0x00A38120)((void*)0x02749420, 0);                 // M1
+        if (!readable(skel, 0x340) || *(uint32_t*)skel != VT_SKELETON_COMPONENT) {
+            L("[Skel] M1 create failed skel=%p\n", skel); return;
+        }
+        ((void (__thiscall*)(void*, void*))0x00527CC0)(puppet, skel);                                    // M4
+        if (*(void**)((uint8_t*)skel + 0x8) != (void*)puppet) {
+            L("[Skel] M4 attach did not set owner (+8=%08X) - M2 NOT run (would fault in M3)\n",
+              *(uint32_t*)((uint8_t*)skel + 0x8));
+            return;
+        }
+        ((void (__thiscall*)(void*, void**))0x0045ABB0)(skel, &model);                                    // M2 (=> M3)
+        L("[Skel] attached: puppet=%p skel=%p comps=%u\n", puppet, skel, (unsigned)*(uint16_t*)((uint8_t*)puppet + 0x66));
+        LogSkel("ghost", skel);                                              // G-GLIDE-1
+        L("[E] ev=skel-attach ok=1\n");
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        L("[Skel] EXCEPTION during attach (code=0x%08X)\n", GetExceptionCode());
+        L("[E] ev=skel-attach ok=0\n");
+    }
+}
+
 void* Phase1::TrySpawnPuppet() {
     Entity* newEntity = nullptr;
     __try {
@@ -582,6 +641,12 @@ void* Phase1::TrySpawnPuppet() {
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         L("[Phase1] EXCEPTION during integrate (code=0x%08X)\n", GetExceptionCode());
+    }
+    // F2: after AddEntity was issued (deferred to next frame) but before the world processes it, so the new
+    // component is in the array when the entity joins the world, like a normally built body's skeleton.
+    if (g_puppet == newEntity) {
+        World* w = World::GetCurrentWorld();
+        PuppetSkelAttach(newEntity, w ? w->GetPlayer() : nullptr);
     }
     return newEntity;
 }
@@ -9374,7 +9439,7 @@ static void DumpConfigOnce()
         { "Coop", "NetStrictPeer", 1 }, { "Coop", "NullReturnObserver", 1 }, { "Coop", "Probe", 0 },
         { "Coop", "PuppetParkX", 0 }, { "Coop", "PuppetPhysics", 0 }, { "Coop", "RegisterPad1", 0 },
         { "Coop", "RelevanceRadiusM", 250 }, { "Coop", "ReloadBuilder", 1 }, { "Coop", "SceneAware", 1 },
-        { "Coop", "SeekOnSwitch", 1 }, { "Coop", "ShipDump", 0 }, { "Coop", "ShipDumpFloats", 0 },
+        { "Coop", "SeekOnSwitch", 1 }, { "Coop", "SkelAttach", 0 }, { "Coop", "ShipDump", 0 }, { "Coop", "ShipDumpFloats", 0 },
         { "Coop", "ShipGhost", 0 }, { "Coop", "ShipGhostSelfTest", 0 }, { "Coop", "ShipHPSync", 0 },
         { "Coop", "ShipPassenger", 0 }, { "Coop", "ShipRelevanceRadiusM", 1000 }, { "Coop", "ShipSync", 1 },
         { "Coop", "ShipTest", 0 }, { "Coop", "ShipTestFracPct", 45 }, { "Coop", "ShipTestRadiusM", 250 },
