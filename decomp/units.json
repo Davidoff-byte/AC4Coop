@@ -539,6 +539,24 @@
    "size": 72,
    "status": "claimed"
   },
+  "01207960": {
+   "addr": "01207960",
+   "claimed_at": null,
+   "name": "NavalObjectSetBoardable",
+   "owner": null,
+   "receipts": [],
+   "size": 85,
+   "status": "unknown"
+  },
+  "0122BA20": {
+   "addr": "0122BA20",
+   "claimed_at": null,
+   "name": "ShipEntityToNavalObject",
+   "owner": null,
+   "receipts": [],
+   "size": 19,
+   "status": "unknown"
+  },
   "0133A4C0": {
    "addr": "0133A4C0",
    "claimed_at": "2026-11-08T12:57:24Z",
