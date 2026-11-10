@@ -9840,6 +9840,9 @@ static void OnFrameInner(Human* updatedHuman) {
               (void*)World::GetCurrentWorld());
         }
     }
+    // F8 live test (no-op unless [Coop] BoardableTest=1). Must sit ABOVE the Net::Enabled() block: that block always
+    // returns, so anything after it never runs in a networked session (first placement, 19788a1, never fired).
+    BoardableTestTick();
     if (Net::Enabled()) {
         EntitySyncTick();   // host broadcasts entity transforms; peer mirrors them (synced worlds)
         // Capture only succeeds in a real playable world (not title/whiteroom). Require it to be
@@ -10249,7 +10252,6 @@ static void OnFrameInner(Human* updatedHuman) {
         return;
     }
     if (g_spawnReq) { g_spawnReq = 0; Phase1::TrySpawnPuppet(); }
-    BoardableTestTick();                                   // F8 live test, no-op unless [Coop] BoardableTest=1
 }
 
 // Inline-hook detour: do our per-frame work, then reproduce the stolen instruction and jump back.
