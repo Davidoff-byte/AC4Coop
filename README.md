@@ -38,10 +38,10 @@ py tools\verify_signatures.py
 It parses the on-disk exe, maps RVA→file offset correctly, re-derives every patched address from the
 pattern bases, and compares them against the literals baked into the plugin. **If it fails, the pattern
 is wrong — fix the pattern, never the expectation.** A previous port attempt is recorded in
-`docs/ops/JOURNAL-2026-11-04.md` §11 (22 of 101 sites resolved); that is the realistic scale.
+`docs/archive/ops/JOURNAL-2026-11-04.md` §11 (22 of 101 sites resolved); that is the realistic scale.
 
-**Start with [`README-REVIEW.md`](README-REVIEW.md)** — status, architecture, what is proven vs
-unproven, the known-wrong list, and where a reviewer should look first.
+**Start with [`docs/STATUS.md`](docs/STATUS.md)**: the current state, what is proven and what is not, and
+what comes next. Working rules for contributors and agents are in [`AGENTS.md`](AGENTS.md).
 
 ## What works
 
@@ -70,22 +70,24 @@ MSBuild AC4Coop.sln /nologo /v:m /p:Configuration=Release /p:Platform=x86 /p:Pla
 ```
 
 Reproducible: `/Brepro`, no PDB in Release. **Current pin `cddbc41`** — ASI 342,528 B, sha256
-`63c8ae7c…a9d4da1a8`, branch `fix/net-hardening-blendcount` (see `ops/PIN.json` in the working repo for
-the single source of truth).
+`63c8ae7c…a9d4da1a8`, merged to `main` in PR #1. `main` now also carries skel-attach and the F8 BoardableTest, neither
+live-tested on two machines.
 
 Deploy next to `AC4BFSP.exe`: `AC4Coop.asi`, `AC4Coop.ini`, `dinput8.dll`, `known_builds.txt`.
 
 ## Documentation
 
 ```
-docs/ops/      plans, decisions, claims ledger (C1–C25), journals, run sheets, tooling
+docs/STATUS.md the current state; supersedes everything in docs/archive/
+docs/ops/      live reference: co-op plan, decomp spine, lessons, claims, decisions, runbooks
+docs/archive/  old plans, journals, handoffs, the seat programme (historical, not instructions)
 docs/evidence/ PS3 debug-ELF extracts: enums, class index, name→address map, struct dumps
 docs/logs/     real two-machine logs used as evidence
 docs/kits/     release manifests
 ```
 
-Reading order for a newcomer: `docs/ops/JOURNAL-2026-10-30.md` →
-`docs/ops/JOURNAL-2026-11-04.md` → `docs/ops/CLAIMS.md` → `docs/ops/PLAN-PS3.md`.
+Reading order for a newcomer: `docs/STATUS.md` → `AGENTS.md` → `docs/ops/PLAN-COOP-V2.md` →
+`docs/ops/LESSONS.md` → `docs/ops/DECOMP-SPINE.md`.
 
 ## Rules this project runs on
 
@@ -142,6 +144,6 @@ Each tool prints usage and exits 2 rather than crashing when a required path is 
 - guard perception of the other player — `docs/ops/AI-T5-G10.md`
 - spawning an enemy the guest does not have — `docs/ops/PS3-SYMBOLS.md` §6
 - ship sync beyond identity
-- the second-build port — `docs/ops/JOURNAL-2026-11-04.md` §11: 22 of 101 sites resolved
+- the second-build port — `docs/archive/ops/JOURNAL-2026-11-04.md` §11: 22 of 101 sites resolved
 - no two-machine run since the last five commits, so everything after `5BC501A06101` is
   compile-and-reason only
