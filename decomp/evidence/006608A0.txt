@@ -1,0 +1,17 @@
+StrongHandleRegister @ 0x6608A0  (size 246)   -- probe receipt, no cl 16.00.40219.01 on this machine
+measured 2026-11-08 by ORCH against the pinned binary
+  AC4BFSP.exe sha256 bc11ad7924e1eca7363ee86aa3332c05386d0a05896c0b7370131daee9ab5150
+  candidate body: ac4-decomp\6608A0.c (submitted verbatim)
+
+claim
+    Registers an object in the strong-handle table: only when the object's
+    +0x880 word is <= 1; takes its handle, calls sub_15DFF10, drops the temporary
+    refcount, and (when sub_15DFF10 returned 0) re-takes the handle and calls
+    sub_1401BB0; then notifies every entry of the list at this+8 (u16 count +0xE)
+    through vtbl+0x54.
+
+cross-check / limit of this receipt
+    the +0x880 gate matches the 'observer phase gate' the project already tracks;
+    the list here is this+8, while the unregister below walks this+0x18 - two
+    different arrays, which is why register and unregister are not symmetric on
+    the same offset.

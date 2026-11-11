@@ -1,0 +1,15 @@
+{
+ "unit": "009F0B50",
+ "addr": "0x009F0B50",
+ "size": 16,
+ "name": "GetObjectID",
+ "submitted_at": "2026-11-08T12:12:54Z",
+ "original_sha": "583b44d48ae3918f0e8eecf2278a3e03c73331549e5302536f83afa0fa697a36",
+ "candidate_src_sha": "a3ca5969abe38f4d5ed203fa2d9b693b288995929b70eaf344b64a4cfa7cfe35",
+ "candidate_src": "009F0B50.cpp",
+ "arm": "probe",
+ "verdict": "UNVERIFIED-EVIDENCE",
+ "detail": "no object supplied: the pinned compiler (cl 16.00.40219.01) is not installed, so byte equality cannot be checked. Recorded as evidence only - never a match.",
+ "evidence": "009F0B50.txt",
+ "evidence_sha": "879cc72c89df3300d7592a92ab4afa610faa065fecba53559ce4846e9b36fcac"
+}

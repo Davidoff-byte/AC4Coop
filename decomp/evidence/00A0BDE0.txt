@@ -1,0 +1,15 @@
+HandleManagerFindOrCreate @ 0xA0BDE0  (size 108)   -- probe receipt, no cl 16.00.40219.01 on this machine
+measured 2026-11-08 by ORCH against the pinned binary
+  AC4BFSP.exe sha256 bc11ad7924e1eca7363ee86aa3332c05386d0a05896c0b7370131daee9ab5150
+  candidate body: ac4-decomp\A0BDE0.c (submitted verbatim)
+
+claim
+    find-or-create over the handle map: with a non-zero (lo,hi) it locks
+    this+0x7C, calls sub_A0BBF0(this,lo,hi), bumps the entry reference count and
+    unlocks; with (0,0) it bumps dword_4DD5F90 and returns &dword_4DD5F8C, the
+    shared empty handle.
+
+cross-check / limit of this receipt
+    the (0,0) branch explains the 'all-zero handle' the project sees for objects
+    that were never registered: it is a real singleton, not a null pointer, so a
+    test for == nullptr would miss it.

@@ -5,8 +5,13 @@
 build.bat
 HANDOFF.md
 /src/build_info.h
-decomp/receipts/*
-decomp/candidates/*
-decomp/objects/*
-decomp/evidence/*
 
+# The spine's receipts, candidates and evidence are versioned on purpose: a
+# receipt nobody can re-derive is paperwork. Objects stay ignored — they are
+# compiler output, reproducible from the candidate once the pinned toolchain
+# exists, and they are the only large/blobby part of the tree.
+decomp/objects/*
+
+# python bytecode (was accidentally tracked; regenerates on every run)
+__pycache__/
+*.pyc

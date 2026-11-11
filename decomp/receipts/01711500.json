@@ -1,0 +1,15 @@
+{
+ "unit": "01711500",
+ "addr": "0x01711500",
+ "size": 68,
+ "name": "AllyOrSame",
+ "submitted_at": "2026-11-08T12:57:23Z",
+ "original_sha": "cc8ef46afa19c18d518cc37030d631e01284e3d747d17e7abd042efa2ae94f22",
+ "candidate_src_sha": "defc4b747be151e42339e6e1022f5a2bd3926972d4c0f338e665aebf17a85082",
+ "candidate_src": "01711500.cpp",
+ "arm": "probe",
+ "verdict": "UNVERIFIED-EVIDENCE",
+ "detail": "no object supplied: the pinned compiler (cl 16.00.40219.01) is not installed, so byte equality cannot be checked. Recorded as evidence only - never a match.",
+ "evidence": "01711500.txt",
+ "evidence_sha": "d33d034726312504a3fcd0a0f2e8b84618813ec9d85ee56e9524920f99bdd7a2"
+}

@@ -23,12 +23,24 @@ namespace Net {
 
     // Session-lifecycle hardening (Feature #3, ini [Coop] NetStrictPeer):
     void     SetStrictPeer(bool strict); // accept datagrams only from the configured PeerIP (default true)
+    // X5: the local world id (World::GetObjectID()), set by phase1.cpp each frame. The entity encoder
+    // stamps it into the wire header; the decoder drops snapshots whose world differs from the local one.
+    void     SetLocalWorldId(uint64_t id);
     uint64_t LastRecvMs();               // GetTickCount64() of the last ACCEPTED packet (0 = none yet)
     uint32_t MillisSinceRecv();          // ms since the last accepted packet; 0xFFFFFFFF if none yet
 
     // Counters for the [Net] stats line. txBytes counts what sendto() was given (the full packet
     // struct), so the number is the real wire cost of this protocol, not an estimate.
-    struct Stats { uint32_t txPackets, txBytes, txEnts, rxPackets, rxBytes; };
+    // rejects = datagrams from the peer that were dropped without applying state; protoMismatch is
+    // the subset dropped because protoVer != NET_PROTO_VER. sizeMismatch is the player lane's
+    // anonymous case: the leading magic was ours but the datagram length was not
+    // sizeof(PlayerState), i.e. the peer runs a build with a different struct. That path is checked
+    // BEFORE the version gate, so it can never be counted as a protoMismatch (see net.cpp).
+    // All of them are 0 on a well-formed link. staleChunks is the entity lane's DEC_STALE: a late /
+    // reordered chunk of an already-superseded snapshot. Dropping it is correct, and it is NOT a
+    // reject (a benign reorder is normal on a well-formed link), so it is counted separately and
+    // excluded from `rejects` exactly as DEC_PENDING is.
+    struct Stats { uint32_t txPackets, txBytes, txEnts, rxPackets, rxBytes, rejects, protoMismatch, sizeMismatch, staleChunks; };
     void GetStats(Stats& out);
     void ResetStats();
 }

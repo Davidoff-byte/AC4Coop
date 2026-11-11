@@ -1,0 +1,15 @@
+{
+ "unit": "01038330",
+ "addr": "0x01038330",
+ "size": 338,
+ "name": "ComponentTargetFromEntity",
+ "submitted_at": "2026-11-08T16:48:59Z",
+ "original_sha": "395495253cbce412d050a9bf093782bc24e893b0587ffa13da1847edd44e99a6",
+ "candidate_src_sha": "cf381b33f84e5575726385c9dc28fdcbd6d7182cb5d6c8d2db5e1a091ae1c4b6",
+ "candidate_src": "01038330.cpp",
+ "arm": "probe",
+ "verdict": "UNVERIFIED-EVIDENCE",
+ "detail": "no object supplied: the pinned compiler (cl 16.00.40219.01) is not installed, so byte equality cannot be checked. Recorded as evidence only - never a match.",
+ "evidence": "01038330.txt",
+ "evidence_sha": "a5f09e8a0456383bd0920351c7cc006a131987f42824e4e65c4ea715dac4919c"
+}

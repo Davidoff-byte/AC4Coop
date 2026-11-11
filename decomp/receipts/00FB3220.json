@@ -1,0 +1,15 @@
+{
+ "unit": "00FB3220",
+ "addr": "0x00FB3220",
+ "size": 338,
+ "name": "SubAtVA_00FB3220",
+ "submitted_at": "2026-11-08T19:48:45Z",
+ "original_sha": "a5c85b00088f8efe10f72a4318ab172b50b8ffd11c1ec687ea96b17dfd59acbf",
+ "candidate_src_sha": "79fa3a49a0af59dc1a74036e4747a94c8f9af3c2470caf029e7fdb2ad5874576",
+ "candidate_src": "00FB3220.cpp",
+ "arm": "probe",
+ "verdict": "UNVERIFIED-EVIDENCE",
+ "detail": "no object supplied: the pinned compiler (cl 16.00.40219.01) is not installed, so byte equality cannot be checked. Recorded as evidence only - never a match.",
+ "evidence": "00FB3220.txt",
+ "evidence_sha": "08b0603c711be8b9a1c0ce253c43d3585dfdc326207558a9b15531b8cb6578b5"
+}

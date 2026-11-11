@@ -182,9 +182,16 @@ BYTE* BuildTrampoline(uintptr_t resume)
     if (!t) return nullptr;
 
     memcpy(t, kPrologue, STEAL_LEN);            // 66 8B 81 FC 00 00 00  mov ax,[ecx+0FCh]
-    t[7]  = 0xFF;                               // jmp dword ptr [imm32]
-    t[8]  = 0x25;
-    *reinterpret_cast<DWORD*>(t + 9) = (DWORD)resume;
+    // `68 imm32; C3` = push <resume>; ret -> an absolute jump that clobbers NOTHING.
+    //
+    // This used to be `FF 25 <resume>`. That encoding is `jmp dword ptr [imm32]`: it treats <resume>
+    // as the address of a POINTER and jumps to the dword stored there. The dword at 0x679227 is
+    // `66 83 E0 07` = 0x07E08366 - and 0x07E08366 is exactly where the 2026-11-08 run died with an
+    // execute AV. The detour's own return path was fine; only this continuation jump was wrong.
+    // (deref_guard.cpp:957 uses FF 25 correctly, with a pointer slot at t+15.)
+    t[7]  = 0x68;                               // push imm32
+    *reinterpret_cast<DWORD*>(t + 8) = (DWORD)resume;
+    t[12] = 0xC3;                               // ret
     FlushInstructionCache(GetCurrentProcess(), t, 13);
     return t;
 }

@@ -1,0 +1,15 @@
+{
+ "unit": "01406C70",
+ "addr": "0x01406C70",
+ "size": 457,
+ "name": "ActionRoleNames",
+ "submitted_at": "2026-11-08T12:43:51Z",
+ "original_sha": "acd0102ca9398b15198df54740037c7cdc917728e926fb69a6f22a0a5132451b",
+ "candidate_src_sha": "df07186538b640a92201e770ea1151bee62d64296246fc4d68c3784d7bb94fec",
+ "candidate_src": "01406C70.cpp",
+ "arm": "probe",
+ "verdict": "UNVERIFIED-EVIDENCE",
+ "detail": "no object supplied: the pinned compiler (cl 16.00.40219.01) is not installed, so byte equality cannot be checked. Recorded as evidence only - never a match.",
+ "evidence": "01406C70.txt",
+ "evidence_sha": "f3c99293e10c490211a8701e00bef9aabda31d73a6e6f62fc1b614af790bf092"
+}

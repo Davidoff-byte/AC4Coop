@@ -1,0 +1,15 @@
+{
+ "unit": "00636480",
+ "addr": "0x00636480",
+ "size": 421,
+ "name": "StateBitfieldSetter",
+ "submitted_at": "2026-11-08T15:31:22Z",
+ "original_sha": "5b653a955914695199054b25bce2cb70a277812c6fc7923afc0651b83ca993f3",
+ "candidate_src_sha": "f60b8f0fb62fd1e5122ad95c75d7318ed71e085442cca4c9406d7517794eb011",
+ "candidate_src": "00636480.cpp",
+ "arm": "probe",
+ "verdict": "UNVERIFIED-EVIDENCE",
+ "detail": "no object supplied: the pinned compiler (cl 16.00.40219.01) is not installed, so byte equality cannot be checked. Recorded as evidence only - never a match.",
+ "evidence": "00636480.txt",
+ "evidence_sha": "79586088ac0d9f0d9a3b64be7cd5f67086011834edb7f35eb9aa59dbc2afc633"
+}

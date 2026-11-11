@@ -1,0 +1,46 @@
+ShipEntityCtor @ 0x00503330  (size 322)   -- probe receipt, no cl 16.00.40219.01 here
+measured 2026-11-08 against the pinned binary
+  AC4BFSP.exe sha256 bc11ad7924e1eca7363ee86aa3332c05386d0a05896c0b7370131daee9ab5150
+  image base 0x400000   (PE header ImageBase; phase1.cpp:9189 notes the same)
+  unit bytes sha256 fc369a0baf90f2349c1bf26739bb48d8fd79b09847b59dbc99a04cb49ff4aa8e
+  size 322 = first 4-byte int3 run after the unit (function boundary)
+
+call site  phase1.cpp:1726
+    ((ShipCtorFn)(base() + 0x00103330))(buf);
+
+RVA arithmetic (the form the textual gate rules could not see)
+    base() is GetModuleHandle(NULL) = the image base 0x400000
+    0x400000 + 0x00103330 = 0x00503330   -> the VA this unit documents
+
+bytes (prologue / tail)
+    head 56 8b f1 e8 68 71 02 00 b8 01 00 00 00 c7 06 28
+    tail 01 00 00 66 c7 86 48 01 00 00 00 00 8b c6 5e c3
+
+disassembly (prologue and the instructions named in the candidate)
+    0x00503330  56                   push    esi
+    0x00503331  8bf1                 mov     esi, ecx
+    0x00503333  e868710200           call    0x52a4a0
+    0x00503338  b801000000           mov     eax, 1
+    0x0050333D  c70628a1e401         mov     dword ptr [esi], 0x1e4a128
+    0x00503343  8405e0e5ab02         test    byte ptr [0x2abe5e0], al
+    0x00503349  753e                 jne     0x503389
+    0x0050334B  0f28056090e401       movaps  xmm0, xmmword ptr [0x1e49060]
+    0x00503352  0905e0e5ab02         or      dword ptr [0x2abe5e0], eax
+    0x00503358  0f2905a0e5ab02       movaps  xmmword ptr [0x2abe5a0], xmm0
+    0x0050335F  0f28057090e401       movaps  xmm0, xmmword ptr [0x1e49070]
+    0x00503366  0f2905b0e5ab02       movaps  xmmword ptr [0x2abe5b0], xmm0
+    0x0050336D  0f28058090e401       movaps  xmm0, xmmword ptr [0x1e49080]
+    0x00503374  0f2905c0e5ab02       movaps  xmmword ptr [0x2abe5c0], xmm0
+    0x0050337B  0f28059090e401       movaps  xmm0, xmmword ptr [0x1e49090]
+    0x00503382  0f2905d0e5ab02       movaps  xmmword ptr [0x2abe5d0], xmm0
+    0x00503389  0f2805a0e5ab02       movaps  xmm0, xmmword ptr [0x2abe5a0]
+
+... tail:
+    0x0050345A  d0e5                 shl     ch, 1
+    0x0050345C  ab                   stosd   dword ptr es:[edi], eax
+    0x0050345D  020f                 add     cl, byte ptr [edi]
+    0x0050345F  298630010000         sub     dword ptr [esi + 0x130], eax
+    0x00503465  66c786480100000000   mov     word ptr [esi + 0x148], 0
+    0x0050346E  8bc6                 mov     eax, esi
+    0x00503470  5e                   pop     esi
+    0x00503471  c3                   ret     

@@ -1,0 +1,13 @@
+WorldGetPlayer @ 0x70E810  (size 14)   -- probe receipt, no cl 16.00.40219.01 on this machine
+measured 2026-11-08 by ORCH against the pinned binary
+  AC4BFSP.exe sha256 bc11ad7924e1eca7363ee86aa3332c05386d0a05896c0b7370131daee9ab5150
+  candidate body: ac4-decomp\70E810.c (submitted verbatim)
+
+claim
+    GetPlayer(world) = sub_736540(*(*(world+0x7F8)+4)). One load chain, no
+    null checks of its own.
+
+cross-check / limit of this receipt
+    fixes the exact path (world+0x7F8 -> +4 -> sub_736540) so a future probe can
+    validate it with three reads instead of a scan. sub_736540 is not decompiled
+    here, so what it does with the value stays open.

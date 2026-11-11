@@ -1,0 +1,14 @@
+GetUnusedPadID @ 0x744CF0  (size 192)   -- probe receipt, no cl 16.00.40219.01 on this machine
+measured 2026-11-08 by ORCH against the pinned binary
+  AC4BFSP.exe sha256 bc11ad7924e1eca7363ee86aa3332c05386d0a05896c0b7370131daee9ab5150
+  candidate body: ac4-decomp\744CF0.c (submitted verbatim)
+
+claim
+    Scans the pad-slot array for a free slot; on success writes the slot index to
+    *a2 and returns 1, otherwise returns 0. The array snapshot comes from
+    sub_A062A0/sub_A0A790 and is released through dword_2AC40F0's vtbl+0x14.
+
+cross-check / limit of this receipt
+    matches the live result already recorded (pad forced to an empty slot, player
+    pad kept). The receipt adds the return contract: 0 means 'no free slot', and
+    *a2 must be treated as untouched in that case.

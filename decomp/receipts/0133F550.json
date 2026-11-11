@@ -1,0 +1,15 @@
+{
+ "unit": "0133F550",
+ "addr": "0x0133F550",
+ "size": 70,
+ "name": "IsAliveByCrcService",
+ "submitted_at": "2026-11-08T15:31:23Z",
+ "original_sha": "c056a62873ad137a9efa0631b3d3b380bd5dc78bd8a1cb3ed0d606a14bad4228",
+ "candidate_src_sha": "38cb348b8904f030b6e7b15e1c8b06d29a97ba7c0120c560692ae02ddd9146dd",
+ "candidate_src": "0133F550.cpp",
+ "arm": "probe",
+ "verdict": "UNVERIFIED-EVIDENCE",
+ "detail": "no object supplied: the pinned compiler (cl 16.00.40219.01) is not installed, so byte equality cannot be checked. Recorded as evidence only - never a match.",
+ "evidence": "0133F550.txt",
+ "evidence_sha": "5791b06a5885ffa6d2c55c03e3c3117b23261762ba244522738f7fe43191f4a7"
+}

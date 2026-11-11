@@ -104,37 +104,76 @@ struct PlayerState {
     bool     shipValid;    // player is aboard a ship -> the fields below are meaningful
     float    shipPos[3];   // ship world position (x,y,z) = m_GlobalMatrix.M41/42/43
     float    shipQuat[4];  // ship rotation quaternion (x,y,z,w), from the 3x3 at +0x10
-    int32_t  shipHP;       // ship hull HP. SOURCE UNRESOLVED: [[ship+0x5C]+0x84] is disproved (it regenerates,
-                           // not health); a ShipHealthData class exists. Do not treat this field as verified.
+    float    shipHP;       // AUTHORITATIVE ship hull HP for the player lane: *(float*)(GcLShip+0xD0)
+                           // (max at GcLShip + 0xB4), read through the object's vtable slot 0x1B4 and
+                           // applied through slot 0x12C. Verified - see ops/evidence/hull-hp-found.md.
+                           // (The entity lane's legacy int copy, EntityState::hullHP, was removed at proto 11.)
+    float    shipMaxHP;    // peer's ship MAX hull HP: *(float*)(GcLShip+0xB4). Unlike shipHP this is a
+                           // class-level value (one writer, vtable slot 0x130), i.e. the ship's identity
+                           // fingerprint as far as damage behaviour goes. It rides the wire so the guest
+                           // can choose WHICH local ship to duplicate for the ghost (proxy route): the
+                           // selection keys on {maxHP, subEntityCount, flags} - see
+                           // ops/evidence/ghost-identity-implementation.md. 0.0f = unknown (not aboard,
+                           // or the GcLShip could not be resolved).
+    uint32_t shipClass;    // peer's ship CLASS index, read off the ship ENTITY (not GcLShip): exactly the
+                           // engine's sub_11AA850 -  f = *(u32*)(entity+0x9C);
+                           //   return ((f & 7)==3 && (f & 0x1F8)==0xE8) ? ((f>>9)&0x3F) : 0;
+                           // The tag/subtype gate is mandatory: without it +0x9C is arbitrary data
+                           // (ops/evidence/ship-type-entity-field.md). Mapping (sub_1045CD0,
+                           // ops/evidence/ship-class-index.md): 1 GunBoat 2 Schooner 3 Brig 4 Frigate
+                           // 6 ManOfWar 7 Jackdaw 8-11 SuperShip 12 Qar 13 Revenge 14 Begin
+                           // 15 NossoSenhor 16 Eldorado; 0 = gate failed / unknown. Lets the guest
+                           // proxy match the peer's class EXACTLY instead of by nearest hull tier.
 
     uint8_t  valid;                 // 1 = a live player was captured
 };
 #pragma pack(pop)
+// Machine-checked wire-layout guard: pack(1) caps natural alignment at 1, but the align(16) members
+// (Transform, Vector4) keep 16-byte alignment, so the struct alignment is 16. shipClass (u32) lands at
+// +560 inside what was 15 B of tail pad, so adding it does NOT grow the struct: still 576 B. The peer9
+// model and ops/tools/wire_model_test.py assert the same number; if any field here changes the size,
+// this fails the build and the peer/tools must move in lockstep.
+static_assert(sizeof(PlayerState) == 576, "PlayerState wire size changed - update peer9.py and wire_model_test.py");
 
 static const uint32_t NET_MAGIC = 0x43344341; // 'AC4C'
 // Wire/struct-layout version. PlayerState is #pragma pack(1): adding a field shifts every following
 // offset, so both peers MUST run the same build. Bump this whenever the layout changes.
-static const uint32_t NET_PROTO_VER = 9;   // 9: compact per-field entity wire (EntityField mask)
+static const uint32_t NET_PROTO_VER = 11;  // 11: entity chunking + worldId, hullHP removed, shipMaxHP
+                                           // (GcLShip+0xB4) + shipClass (entity+0x9C) added; 10: float shipHP (GcLShip+0xD0)
+// Why adding shipMaxHP (and now shipClass) to 11 needs NO further bump: 11 has never run on a second
+// machine (no released build speaks it), so there is no deployed proto-11 peer to stay compatible with.
+// The layout guard is already structural - the receive path requires n == sizeof(PlayerState), so a
+// stale build is rejected rather than mis-parsed; bumping again would only rename the number with
+// nothing on the other end.
 
 // ---- entity sync (host-authoritative "synced worlds") -------------------------------
-// One replicated entity's transform. `key` is the index in the host's enumeration; `kind`
-// selects which list that index is into (0 = World::m_CharacterList, 1 = ships filtered
-// from m_EntityManager.m_Entities by vtable 0x01E4A128). pos = m_GlobalMatrix.M41/M42/M43;
-// quat = the 3x3 rotation (HookMath::FromMatrix).
+// One replicated entity's transform. `key` is the index in the host's enumeration; `kind` (EntityKind
+// below) names the list that index is into: 1 = ship (filtered from m_EntityManager.m_Entities by
+// vtable 0x01E4A128), 2 = guard (soldier), 3 = one-shot kill event (not a list index).
+// pos = m_GlobalMatrix.M41/M42/M43; quat = the 3x3 rotation (HookMath::FromMatrix).
 static const uint32_t NET_ENTITY_MAGIC = 0x45344341; // 'AC4E'
 static const int      MAX_SYNC_ENTITIES = 128;
 
+// The entity kind carried by EntityState::kind and by the compact wire record. This is the ONLY
+// definition: 0 is reserved and no lane may publish it (net.cpp rejects it with DEC_KIND, as it does
+// any value above EK_KILL), so the receive side can never hand an unknown kind to the apply path.
+enum EntityKind : uint8_t {
+    EK_UNDEFINED = 0,   // reserved / undefined - rejected on receive, never sent
+    EK_SHIP      = 1,   // ship        -> phase1.cpp ApplyShips
+    EK_GUARD     = 2,   // guard NPC   -> phase1.cpp ApplyGuards
+    EK_KILL      = 3,   // one-shot death event -> ProcessKillEvents / Net::GetKillEntities
+};
+
 #pragma pack(push, 1)
 struct EntityState {
-    uint32_t key;          // index in the source list
-    uint8_t  kind;         // 2 = guard (soldier), 1 = ship
+    uint32_t key;          // index in the source list selected by `kind`
+    uint8_t  kind;         // EntityKind: 1 = ship, 2 = guard, 3 = kill. 0/reserved is NEVER valid here.
     uint8_t  dead;         // death state: 1 = dead (*(*(e+0xE8)+0x1C)+0xB8 & 0xC == 4)
     uint8_t  stage;        // HumanGroundStage (Fight=4 = aggro, Navigation=1 = calm)
     uint8_t  _pad;
     float    pos[3];       // world position (x,y,z)
     float    quat[4];      // world rotation (x,y,z,w)
     uint32_t actionAlias;  // current action clip (file alias); 0 = none (guards only)
-    int      hullHP;       // ship hull HP (ships only; 0 for guards) - host-authoritative damage
     uint64_t objId;        // host-assigned stable identity (HandleContainer::m_ObjectID); 0 = unknown
     uint16_t hp;           // host-authoritative Life (guards); 0xFFFF = dead
     uint16_t arch;         // archetype id at behaviour+0x14: lets the peer match class-to-class
@@ -152,31 +191,50 @@ struct EntityPacket {
 // ---- Phase 2: compact entity wire ------------------------------------------------------------
 // EntityPacket above remains the canonical DECODED form, so every consumer (ApplyShips/ApplyGuards/
 // ProcessKillEvents) is unchanged. On the wire each entity is:
-//     u32 key, u8 kind, u16 fieldMask, then only the fields whose bit is set (fixed order below).
-// A field is omitted when it equals the sender's shadow copy, so a static NPC costs 7 bytes instead
-// of 56. Every captured entity is still sent on every packet, so `count` keeps its old meaning.
-// Old (proto 8) peers are rejected by the protoVer check rather than mis-parsed.
+//     u32 key, u8 kind, u8 idKind, u16 fieldMask, u64 wireId,     <- 16-byte fixed part
+//     then only the fields whose bit is set (fixed order below).
+// `wireId` carries the entity's stable identity: the real objId when idKind == 0, otherwise a value
+// synthesised from kind+key. A field is omitted when it equals the sender's shadow copy, so an
+// UNCHANGED entity is omitted entirely (0 bytes) and a changed one costs at least 16 bytes - never
+// the 7 the old prose claimed (there is an idKind byte and an 8-byte wireId in the fixed part).
+// `count` keeps its old meaning: it is the number of element records the caller captured / the
+// number written on the wire, not the number of field groups.
+// Proto 11 (X15/X5): the header now also carries `worldId` (the sender's world; a mismatched snapshot
+// is dropped) and `chunkIndex`/`chunkTotal`, so a snapshot whose encoded records exceed 1400 B is split
+// into several UDP datagrams and reassembled on the receive side (a partial set is never applied).
+// Old (proto <= 10) peers are rejected by the protoVer check rather than mis-parsed (both lanes).
 enum EntityField : uint16_t {
     EF_POS    = 1u << 0,   // float pos[3]
     EF_QUAT   = 1u << 1,   // float quat[4]
     EF_ACTION = 1u << 2,   // u32 actionAlias
-    EF_HULLHP = 1u << 3,   // i32 hullHP
+    // bit 3 retired: EF_HULLHP (i32 hullHP) was captured+transmitted and never read (authority-model
+    // C3). Removed at proto 11; bit 3 is NEVER reused by a future field.
     EF_HP     = 1u << 4,   // u16 hp
     EF_ARCH   = 1u << 5,   // u16 arch
     EF_DEAD   = 1u << 6,   // u8  dead
     EF_STAGE  = 1u << 7,   // u8  stage
-    EF_OBJID  = 1u << 8,   // u64 objId
-    EF_ALL    = 0x01FFu,
+    EF_OBJID  = 1u << 8,   // u64 objId - declared only so the set is complete. NOT a legal mask bit:
+                           // objId rides the record's wireId (idKind == 0), and net.cpp rejects a
+                           // mask containing this bit.
+    EF_ALL    = 0x01F7u,   // every live bit (bit 3 retired). A LEGAL wire mask is
+                           // EF_ALL & ~EF_OBJID == 0x00F7; never send EF_ALL itself.
 };
 
 #pragma pack(push, 1)
 struct EntityWireHeader {
-    uint32_t magic;    // NET_ENTITY_MAGIC
-    uint32_t protoVer; // NET_PROTO_VER
-    uint32_t seq;
-    uint32_t epoch;    // shadow generation: both peers drop their delta base when this changes
-    uint32_t count;
+    uint32_t magic;       // NET_ENTITY_MAGIC
+    uint32_t protoVer;    // NET_PROTO_VER
+    uint32_t seq;         // sender frame counter; every chunk of one snapshot shares this seq
+    uint32_t epoch;       // shadow generation: both peers drop their delta base when this changes
+    uint32_t count;       // number of records in the FULL snapshot (all chunks together)
+    uint64_t worldId;     // sender's World::GetObjectID(); the receiver rejects a snapshot whose
+                          // world differs from the local one (world-transitions X5).
+    uint16_t chunkIndex;  // this chunk's 0-based index
+    uint16_t chunkTotal;  // chunks in this snapshot (1 = single-chunk, the common case)
 };
 #pragma pack(pop)
-static const int ENTITY_WIRE_HEADER_SIZE = 20;
-static const int ENTITY_WIRE_RECORD_MAX  = 16 + 50;  // key+kind+idKind+mask+id + every field (worst case)
+static const int ENTITY_WIRE_HEADER_SIZE = 32;
+// Fixed part (key+kind+idKind+mask+wireId = 16) + every optional field. The true worst case is
+// 16 + 38 = 54 (objId is the wireId inside the fixed part, not an extra field); 62 is deliberate
+// headroom - do not "correct" this constant below 54.
+static const int ENTITY_WIRE_RECORD_MAX  = 16 + 46;

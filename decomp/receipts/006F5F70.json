@@ -1,0 +1,15 @@
+{
+ "unit": "006F5F70",
+ "addr": "0x006F5F70",
+ "size": 29,
+ "name": "GetEntityAI",
+ "submitted_at": "2026-11-08T12:12:53Z",
+ "original_sha": "9d0db6564a9302a9270d929f29e94596dbc2041ff28e62c4540059971f75d360",
+ "candidate_src_sha": "6ce277a0c99fb916bd1958018c7eb32142b27aa07abada7b50e60a99888419ee",
+ "candidate_src": "006F5F70.cpp",
+ "arm": "probe",
+ "verdict": "UNVERIFIED-EVIDENCE",
+ "detail": "no object supplied: the pinned compiler (cl 16.00.40219.01) is not installed, so byte equality cannot be checked. Recorded as evidence only - never a match.",
+ "evidence": "006F5F70.txt",
+ "evidence_sha": "dbfeb1f4d369f0c7e317969e348e92956fec5711d454261f3ba031d34beb0773"
+}

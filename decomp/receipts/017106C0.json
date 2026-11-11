@@ -1,0 +1,15 @@
+{
+ "unit": "017106C0",
+ "addr": "0x017106C0",
+ "size": 104,
+ "name": "DamageFilter",
+ "submitted_at": "2026-11-08T12:12:51Z",
+ "original_sha": "2a34083b6d60b68417b0548b092dbe27592ca0591cd692fb6c38a0e8e5fc116c",
+ "candidate_src_sha": "b007269395c47141b35b5e4e3cc33bf95790dc3728409338ab681cf6862ff3cf",
+ "candidate_src": "017106C0.cpp",
+ "arm": "probe",
+ "verdict": "UNVERIFIED-EVIDENCE",
+ "detail": "no object supplied: the pinned compiler (cl 16.00.40219.01) is not installed, so byte equality cannot be checked. Recorded as evidence only - never a match.",
+ "evidence": "017106C0.txt",
+ "evidence_sha": "834f1f5a8de7b3f1ac2b902bfafd585a389155691fc70e2f68b24d2371aeecd8"
+}

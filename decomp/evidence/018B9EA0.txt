@@ -1,0 +1,14 @@
+DamageAmountCompute @ 0x18B9EA0  (size 56)   -- probe receipt, no cl 16.00.40219.01 on this machine
+measured 2026-11-08 by ORCH against the pinned binary
+  AC4BFSP.exe sha256 bc11ad7924e1eca7363ee86aa3332c05386d0a05896c0b7370131daee9ab5150
+  candidate body: ac4-decomp\18B9EA0.c (submitted verbatim)
+
+claim
+    Resolves a per-attack damage function: indexes dword_4E20544 by byte +0x35,
+    takes the virtual at (*(this+0x20) -> vtbl+0x30) + 4*index and calls it with
+    a2; returns 3 when any link is null.
+
+cross-check / limit of this receipt
+    confirms COMBAT-FIELDS' reading that DAT_04e20544[+0x35] selects the damage
+    function, and that 3 is the default/guard return. It does NOT give the table's
+    row layout - that stays unverified and must not be inferred from this body.

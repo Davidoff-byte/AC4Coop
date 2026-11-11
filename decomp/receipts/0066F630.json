@@ -1,0 +1,15 @@
+{
+ "unit": "0066F630",
+ "addr": "0x0066F630",
+ "size": 246,
+ "name": "ObserverListInsert",
+ "submitted_at": "2026-11-08T12:12:52Z",
+ "original_sha": "96c7829c3aef8c4d047f237b49645675378ad8b51c0c25def4eb906ae9a9da16",
+ "candidate_src_sha": "8ffb6d011330819939163e0e792aae2a440c3f48a2900e74a3b8bafb5dbcb44a",
+ "candidate_src": "0066F630.cpp",
+ "arm": "probe",
+ "verdict": "UNVERIFIED-EVIDENCE",
+ "detail": "no object supplied: the pinned compiler (cl 16.00.40219.01) is not installed, so byte equality cannot be checked. Recorded as evidence only - never a match.",
+ "evidence": "0066F630.txt",
+ "evidence_sha": "688fc84eebbe18c2d0836c96372daf70849df3a99a572b7d8b90e443fc4cb168"
+}

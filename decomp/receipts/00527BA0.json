@@ -1,0 +1,15 @@
+{
+ "unit": "00527BA0",
+ "addr": "0x00527BA0",
+ "size": 117,
+ "name": "ListNodeAcquireAndTag",
+ "submitted_at": "2026-11-08T19:48:39Z",
+ "original_sha": "c18be6f21839e8f63e899fc8f4d8f507a652c49fdff395455d426c2adf1b59c2",
+ "candidate_src_sha": "26d2fb32aed0e1589faa7a8d25e411fc26054e782f4ab9734f0b1e3eb81a4b4a",
+ "candidate_src": "00527BA0.cpp",
+ "arm": "probe",
+ "verdict": "UNVERIFIED-EVIDENCE",
+ "detail": "no object supplied: the pinned compiler (cl 16.00.40219.01) is not installed, so byte equality cannot be checked. Recorded as evidence only - never a match.",
+ "evidence": "00527BA0.txt",
+ "evidence_sha": "7b40b719011186f320fed460d9cea948156787c9cf25556ae37af421423cc365"
+}

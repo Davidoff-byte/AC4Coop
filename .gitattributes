@@ -1,2 +1,6 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# The spine's receipts hash the exact bytes of the candidate and evidence files.
+# Git's EOL conversion would rewrite those bytes on checkout and every receipt
+# would fail `decomp.py check` on a fresh clone, so these paths are byte-exact.
+decomp/candidates/** -text
+decomp/evidence/**  -text
+decomp/receipts/**  -text

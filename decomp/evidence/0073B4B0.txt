@@ -1,0 +1,18 @@
+IsSoldierPredicate @ 0x73B4B0  (size 31)   -- probe receipt, no cl 16.00.40219.01 on this machine
+measured 2026-11-08 by ORCH against the pinned binary
+  AC4BFSP.exe sha256 bc11ad7924e1eca7363ee86aa3332c05386d0a05896c0b7370131daee9ab5150
+  candidate body: ac4-decomp\73B4B0.c (submitted verbatim)
+
+claim
+sub_73B4B0 is the engine's soldier predicate: (word & 7) == 3 and (word & 0x1F8) == 8, i.e.
+kind 3 / role 1. It proves the +0x9C packing model used by EntityKindRole().
+
+cross-check (independent of the decompiler)
+PS3 ELF: EntityDescriptorNPCSubType DIE 0x2BAEC3 -> 1 = Templar, 2 = Peasant, 3 = Thief.
+0x1F8 >> 3 = 0x3F gives the 6-bit role field at bit 3, matching the mod's decode.
+Also: PS3 EntityKind (0 None/1 Spawned/2 Picked/3 Player) is NOT this field - recorded as
+a conflict in ops/PS3-P1-RESULTS.md.
+
+limits
+  probe arm only: this is UNVERIFIED-EVIDENCE, never a match. The byte arm needs the pinned
+  compiler; when it exists, re-submit with --obj and the receipt re-derives both sides.

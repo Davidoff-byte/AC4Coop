@@ -1,0 +1,78 @@
+SubAtVA_00FB3220 @ 0x00FB3220  (size 338)   -- probe receipt, no cl 16.00.40219.01 here
+measured 2026-11-08 against the pinned binary
+  AC4BFSP.exe sha256 bc11ad7924e1eca7363ee86aa3332c05386d0a05896c0b7370131daee9ab5150
+  image base 0x400000   (PE header ImageBase; phase1.cpp:9189 notes the same)
+  unit bytes sha256 a5c85b00088f8efe10f72a4318ab172b50b8ffd11c1ec687ea96b17dfd59acbf
+  size 338 = first 4-byte int3 run after the unit (function boundary)
+
+call site  phase1.cpp:7833
+    __try { sub = ((ShipSubFn_t)(base() + 0x00FB3220))(shipEnt, 0); }
+
+RVA arithmetic (the form the textual gate rules could not see)
+    base() is GetModuleHandle(NULL) = the image base 0x400000
+    0x400000 + 0x00FB3220 = 0x013B3220   -> NOT this unit: 0x013B3220 is not a
+                                            function entry (see BUG below)
+    this unit documents 0x00FB3220 - the address the call site's own comment
+    names (phase1.cpp:7826 "FUN_00fb3220"); its RVA is 0xBB3220
+
+bytes (prologue / tail)
+    head 55 8b ec 83 ec 10 56 8b 75 08 85 f6 75 07 33 c0
+    tail 50 8b 42 14 57 ff d0 5f 5b 8b c6 5e 8b e5 5d c3
+
+disassembly (prologue and the instructions named in the candidate)
+    0x00FB3220  55                   push    ebp
+    0x00FB3221  8bec                 mov     ebp, esp
+    0x00FB3223  83ec10               sub     esp, 0x10
+    0x00FB3226  56                   push    esi
+    0x00FB3227  8b7508               mov     esi, dword ptr [ebp + 8]
+    0x00FB322A  85f6                 test    esi, esi
+    0x00FB322C  7507                 jne     0xfb3235
+    0x00FB322E  33c0                 xor     eax, eax
+    0x00FB3230  5e                   pop     esi
+    0x00FB3231  8be5                 mov     esp, ebp
+    0x00FB3233  5d                   pop     ebp
+    0x00FB3234  c3                   ret     
+    0x00FB3235  6a01                 push    1
+    0x00FB3237  8d4df0               lea     ecx, [ebp - 0x10]
+    0x00FB323A  e86108ffff           call    0xfa3aa0
+    0x00FB323F  807d0c00             cmp     byte ptr [ebp + 0xc], 0
+    0x00FB3243  740f                 je      0xfb3254
+    0x00FB3245  8b06                 mov     eax, dword ptr [esi]
+    0x00FB3247  8b5068               mov     edx, dword ptr [eax + 0x68]
+    0x00FB324A  8d4df0               lea     ecx, [ebp - 0x10]
+    0x00FB324D  51                   push    ecx
+    0x00FB324E  8bce                 mov     ecx, esi
+    0x00FB3250  ffd2                 call    edx
+    0x00FB3252  eb11                 jmp     0xfb3265
+    0x00FB3254  8d45f0               lea     eax, [ebp - 0x10]
+    0x00FB3257  50                   push    eax
+    0x00FB3258  e883837eff           call    0x79b5e0
+    0x00FB325D  50                   push    eax
+    0x00FB325E  8bce                 mov     ecx, esi
+    0x00FB3260  e82b2357ff           call    0x525590
+    0x00FB3265  8b4df4               mov     ecx, dword ptr [ebp - 0xc]
+    0x00FB3268  53                   push    ebx
+    0x00FB3269  8b5df0               mov     ebx, dword ptr [ebp - 0x10]
+    0x00FB326C  c1e910               shr     ecx, 0x10
+    0x00FB326F  8d048b               lea     eax, [ebx + ecx*4]
+    0x00FB3272  57                   push    edi
+    0x00FB3273  894508               mov     dword ptr [ebp + 8], eax
+    0x00FB3276  3bd8                 cmp     ebx, eax
+    0x00FB3278  0f847f000000         je      0xfb32fd
+    0x00FB327E  8bff                 mov     edi, edi
+
+... tail:
+
+
+BUG - the call site's arithmetic, not this unit
+    phase1.cpp:7833 and :7838 call ((ShipSubFn_t)(base() + 0x00FB3220))(shipEnt, 0).
+    0x400000 + 0x00FB3220 = 0x013B3220. That address is NOT a function entry: it is
+    inside a function whose body ends
+        0x013B3271 pop edi / 0x013B3272 mov eax,esi / 0x013B3274 pop esi /
+        0x013B3275 pop ebx / 0x013B3276 pop ebp / 0x013B3277 ret 8
+    so it needs ebx/ebp for the enclosing frame and enters with a bare call. The
+    literal 0x00FB3220 is already a VA (the comment on phase1.cpp:7826 says
+    "FUN_00fb3220"), so base() is being added twice. Executing 0x013B3220 from a
+    call site is what the source reports as "sub=EXCEPTION/unreadable".
+    Logic is NOT changed here (dispatch forbids it); the gate carries this VA in
+    EXCEPTIONS and requires that the intended callee 0x00FB3220 has a unit.

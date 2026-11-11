@@ -1,0 +1,17 @@
+SpawningRequestSpawn @ 0x79B8D0  (size 74)   -- probe receipt, no cl 16.00.40219.01 on this machine
+measured 2026-11-08 by ORCH against the pinned binary
+  AC4BFSP.exe sha256 bc11ad7924e1eca7363ee86aa3332c05386d0a05896c0b7370131daee9ab5150
+  candidate body: ac4-decomp\79B8D0.c (submitted verbatim)
+
+claim
+    Spawn entry: gated on the object's own virtual predicate (*this)(), sets
+    this+0x24=1, +0x2C=0, +0x28=0, +0x20=1, calls sub_48A390(request), then
+    vtbl+0xC(this) and finally vtbl+0x88(that, this). Returns 0 if the predicate
+    refuses.
+
+cross-check / limit of this receipt
+    the prologue the hook-table patch expects (56 8B F1 8B 06 = push esi; mov esi,ecx;
+    mov eax,[esi]) is consistent with the __thiscall body, but the NAME is still
+    contested in the project (HOOK-TABLE says SpawningRequest::Spawn at RVA
+    0x39B8D0; SPAWN-RETHINK reports spawnreq at 0x5A8700). This receipt proves the
+    bytes and the body, not the name.

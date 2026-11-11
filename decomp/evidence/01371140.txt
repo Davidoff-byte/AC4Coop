@@ -1,0 +1,14 @@
+GetService_CSrvNPCHealth @ 0x1371140  (size 80)   -- probe receipt, no cl 16.00.40219.01 on this machine
+measured 2026-11-08 by ORCH against the pinned binary
+  AC4BFSP.exe sha256 bc11ad7924e1eca7363ee86aa3332c05386d0a05896c0b7370131daee9ab5150
+  candidate body: ac4-decomp\1371140.c (submitted verbatim)
+
+claim
+    Service lookup by class CRC. Returns a cached pointer from this+0x58 if set,
+    else walks the component array (this[3] + 0x70, u16 count at +0x76) and
+    compares sub_A1D0D0(entry) against 1475276487. Null when not found.
+
+cross-check / limit of this receipt
+    the 0x70/+0x76 pair is the same component container the project already
+    models (Entity+0x60/+0x64/+0x66 family); the CRC is the only class id used,
+    so the receipt fixes WHICH service this is, not the container layout.

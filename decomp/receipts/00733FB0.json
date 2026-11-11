@@ -1,0 +1,15 @@
+{
+ "unit": "00733FB0",
+ "addr": "0x00733FB0",
+ "size": 50,
+ "name": "NullReturnSubject",
+ "submitted_at": "2026-11-08T12:37:07Z",
+ "original_sha": "59c5d4f30e19428e73a6caf1dd6eddcb3ea6cedc5a7ac3fd69141e92e79ce692",
+ "candidate_src_sha": "a861de76fe21c5e44c78e3abc6dfc8c207ea9300f4bd7b474fe5db8537773a97",
+ "candidate_src": "00733FB0.cpp",
+ "arm": "probe",
+ "verdict": "UNVERIFIED-EVIDENCE",
+ "detail": "no object supplied: the pinned compiler (cl 16.00.40219.01) is not installed, so byte equality cannot be checked. Recorded as evidence only - never a match.",
+ "evidence": "00733FB0.txt",
+ "evidence_sha": "e5cfe47d9c97843b75a118bfb68dd740bf6b117b4639c2f7577444dc50f435c1"
+}

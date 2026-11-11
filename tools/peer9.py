@@ -430,6 +430,9 @@ def main(argv):
                     help="worldId to echo (hex accepted) - must match the game's")
     ap.add_argument("--scene", type=lambda s: int(s, 0), default=0,
                     help="sceneKey to echo (hex accepted) - the game's current localKey")
+    ap.add_argument("--ent", type=int, default=None, metavar="OBJID",
+                    help="also send a NON-kill entity record for this objId every tick "
+                         "(exercises the guest entity receive/bind path)")
     ap.add_argument("--kill", type=int, default=None, metavar="OBJID",
                     help="send a KIND_KILL entity record for this objId")
     ap.add_argument("--hp", type=int, default=0xFFFF,
@@ -561,6 +564,16 @@ def main(argv):
                         # KIND_KILL always carries dead=1 (a kill is a death); hp
                         # defaults to the 0xFFFF "dead" sentinel (--hp overrides).
                         rec = make_kill_record(args.kill, args.hp, True)
+                        sock.sendto(encode_entity_wire(seq, 1, [rec]), dest)
+                        tx += 1
+                    if args.ent is not None:
+                        # A NON-kill record: the game keeps kill-only packets out of the
+                        # snapshot slot on purpose, so this is the only way to exercise
+                        # the guest's entity receive/bind path. It MUST carry pos, or the
+                        # guest matches it against (0,0,0) and every candidate is "far".
+                        rec = {"key": 0, "kind": 2, "idKind": 0, "wireId": args.ent,
+                               "hp": args.hp, "dead": 0,
+                               "pos": (x, y, z)}
                         sock.sendto(encode_entity_wire(seq, 1, [rec]), dest)
                         tx += 1
                 interval = INTERVAL

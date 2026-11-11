@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <share.h>
+#include <process.h>      // _beginthreadex: RecvThread calls CRT (dbg -> printf/fputs); see dllmain.cpp "_beginthreadex, not CreateThread"
 #include "net.h"
 #include "paths.h"
 
@@ -38,7 +39,7 @@ namespace {
     // snapshot (and cannot be processed twice).
     #define NET_KILLQ 32
     #define NET_KILL_DROP_LOGS 8      // log only the first N ring overflows (a burst must not spam)
-    const uint8_t      NET_KIND_KILL = 3;     // phase1.cpp:2379 KIND_KILL (wire value, unchanged)
+    const uint8_t      NET_KIND_KILL = EK_KILL;   // phase1.cpp:2379 KIND_KILL; value declared in netstate.h
     EntityState        g_killRing[NET_KILLQ];
     int                g_killHead = 0;        // next write slot
     int                g_killCount = 0;       // filled entries; full -> the OLDEST is overwritten
@@ -86,6 +87,16 @@ namespace {
     }
 
     volatile LONG g_txPackets = 0, g_txBytes = 0, g_txEnts = 0, g_rxPackets = 0, g_rxBytes = 0;
+    // Rejects: datagrams from the peer that arrived but contributed NO state (version mismatch, a
+    // failed decode, or an illegal entity kind). They still count in rxPackets/rxBytes - they really
+    // were on the wire - but they do NOT refresh g_lastRecvMs (see the liveness note in RecvThread).
+    volatile LONG g_rxRejects = 0;        // dropped datagrams, EXCLUDING DEC_PENDING and DEC_STALE chunks
+    volatile LONG g_rxProtoMismatch = 0;  // subset of the above: protoVer != NET_PROTO_VER on either lane
+    volatile LONG g_rxSizeMismatch = 0;   // player lane only: magic matched but n != sizeof(PlayerState)
+    volatile LONG g_rxStaleChunks = 0;    // entity lane: DEC_STALE, a late chunk of a superseded snapshot.
+                                          // The drop is correct, but it is NOT a reject - a benign
+                                          // reorder is normal on a well-formed link - so it is excluded
+                                          // from g_rxRejects exactly like DEC_PENDING.
 
     // ---- Phase 2: compact entity wire ---------------------------------------------------------
     // A record carries a stable 64-bit identity. `key` is the entity-manager INDEX and is NOT stable
@@ -104,6 +115,59 @@ namespace {
                                                  // self-heal bound after a lost delta packet (~3 s)
     uint32_t   g_wireFullRecs = 0;               // instrumentation: records that carried every field
     uint32_t   g_wireRecs = 0;                   // instrumentation: records in the last packet
+
+    // ---- X15 (chunked transport) + X5 (world identity on the entity lane) ----------------------
+    // A snapshot whose encoded record region would exceed ENTITY_CHUNK_MAX (1400 B UDP payload) is
+    // split into chunkTotal datagrams, each <= 1400 B, so no chunk IP-fragments at MTU 1500 (one lost
+    // fragment no longer discards the whole snapshot). The header repeats in every chunk.
+    static const int ENTITY_CHUNK_MAX       = 1400;                              // UDP payload budget
+    static const int ENTITY_CHUNK_DATA      = ENTITY_CHUNK_MAX - ENTITY_WIRE_HEADER_SIZE; // 1368 B records/chunk
+    static const int ENTITY_CHUNK_MAX_TOTAL = 12;                                // = ceil((16384-32)/1368): the
+                                                                                 // receive buffer cannot hold more
+    static const uint64_t ENTITY_CHUNK_TIMEOUT_MS = 1000;   // drop an incomplete set after 1 s
+
+    // Local world id, set by phase1.cpp (World::GetObjectID()) and read by BOTH the encoder (main
+    // thread) and the decoder (recv thread). Interlocked 64-bit because this is an x86 build, where a
+    // plain u64 read can tear across its two 32-bit halves.
+    volatile LONGLONG g_localWorldId = 0;
+    inline uint64_t ReadLocalWorldId() {
+        return (uint64_t)InterlockedCompareExchange64(&g_localWorldId, 0, 0);
+    }
+
+    // X5 bootstrap allowance (m4), shared by the decoder (recv thread) and SetLocalWorldId (main
+    // thread). 1 = a non-zero world match has been seen since the last world change. Reset by
+    // SetLocalWorldId on an actual world change so the new world's worldId == 0 bootstrap frame is
+    // tolerated again instead of being DEC_WORLD forever.
+    volatile LONG g_worldConfirmed = 0;
+
+    // Receiver reassembly: one in-flight snapshot (seq is monotonic; a new seq discards the old one).
+    struct RxAssembly {
+        uint32_t seq;
+        uint32_t epoch;
+        uint16_t chunkTotal;
+        uint16_t receivedMask;   // bit i set once chunk i has arrived
+        uint32_t receivedBytes;  // record bytes buffered so far
+        uint64_t firstMs;        // first chunk arrival (bounded drop)
+        bool     active;
+        uint8_t  data[16384];    // header + record region (reassembled)
+    };
+    RxAssembly g_asm;
+
+    // M1 hardening: the mask has one bit per chunk, and the receive buffer must hold the largest set
+    // the encoder can ever emit. recordBytes <= sizeof(g_txBuf) - header = 16352, and
+    // ceil(16352/1368) = 12 chunks (the last one short): 11*1368 = 15048 < 16352, 15*1368 = 20520 does not.
+    static_assert(ENTITY_CHUNK_MAX_TOTAL <= 16,
+                  "receivedMask is uint16_t: one bit per chunk index");
+    static_assert((ENTITY_CHUNK_MAX_TOTAL - 1) * ENTITY_CHUNK_DATA
+                      < (int)sizeof(g_asm.data) - ENTITY_WIRE_HEADER_SIZE,
+                  "a full chunk set does not fit RxAssembly::data");
+    static_assert((int)((sizeof(g_txBuf) - ENTITY_WIRE_HEADER_SIZE + ENTITY_CHUNK_DATA - 1)
+                        / ENTITY_CHUNK_DATA) <= ENTITY_CHUNK_MAX_TOTAL,
+                  "encoder can emit more chunks than the validator accepts");
+
+    // RFC 1982 serial-number comparison on the uint32 seq counter: valid while |a-b| < 2^31, i.e. for
+    // any reordering distance a real link can produce.
+    static inline int32_t SeqDiff(uint32_t a, uint32_t b) { return (int32_t)(a - b); }
 
     inline uint64_t ShadowId(uint8_t kind, uint32_t key, uint64_t objId) {
         if (objId) return objId;
@@ -141,6 +205,7 @@ namespace {
         }
         EntityWireHeader h{};
         h.magic = p.magic; h.protoVer = p.protoVer; h.seq = p.seq; h.epoch = g_txEpoch;
+        h.worldId = ReadLocalWorldId();      // X5: sender's world id rides the header
         h.count = 0;                         // patched to the WRITTEN count after the loop
         std::memcpy(out, &h, sizeof(h));
         size_t o = sizeof(h);
@@ -165,10 +230,17 @@ namespace {
                 for (int q = 0; q < 4; ++q) { float d = e.quat[q] - sh->st.quat[q]; dq += (d < 0.0f ? -d : d); }
                 if (dq > 0.005f) mask |= EF_QUAT;
                 if (e.actionAlias != sh->st.actionAlias) mask |= EF_ACTION;
-                if (e.hullHP      != sh->st.hullHP)      mask |= EF_HULLHP;
                 if (e.hp          != sh->st.hp)          mask |= EF_HP;
                 if (e.arch        != sh->st.arch)        mask |= EF_ARCH;
-                if (e.dead        != sh->st.dead)        mask |= EF_DEAD;
+                // C2 §2.1: the dead bit is a LEVEL, not a delta. A corpse whose other fields have
+                // stopped changing would otherwise be omitted entirely (mask == 0) and its death
+                // would survive only through the epoch re-baseline. `|| e.dead != 0` re-sends the bit
+                // on every snapshot while dead; the `!=` term still fires 1 -> 0 on resurrection,
+                // which is the only way a body may come back.
+                // WIRE: this changes FREQUENCY, not layout - no new field, no new kind, no size
+                // change, NET_PROTO_VER stays 11. An unmodified peer decodes a repeated
+                // EF_DEAD = 1 and re-applies it idempotently.
+                if (e.dead != sh->st.dead || e.dead != 0u) mask |= EF_DEAD;
                 if (e.stage       != sh->st.stage)       mask |= EF_STAGE;
                 // objId is carried by the record identity, never by a field bit.
             }
@@ -185,7 +257,6 @@ namespace {
             if (mask & EF_POS)    need += 12;
             if (mask & EF_QUAT)   need += 16;
             if (mask & EF_ACTION) need += 4;
-            if (mask & EF_HULLHP) need += 4;
             if (mask & EF_HP)     need += 2;
             if (mask & EF_ARCH)   need += 2;
             if (mask & EF_DEAD)   need += 1;
@@ -199,7 +270,6 @@ namespace {
             if (mask & EF_POS)    { std::memcpy(out + o, e.pos, 12); o += 12; }
             if (mask & EF_QUAT)   { std::memcpy(out + o, e.quat, 16); o += 16; }
             if (mask & EF_ACTION) { std::memcpy(out + o, &e.actionAlias, 4); o += 4; }
-            if (mask & EF_HULLHP) { std::memcpy(out + o, &e.hullHP, 4); o += 4; }
             if (mask & EF_HP)     { std::memcpy(out + o, &e.hp, 2); o += 2; }
             if (mask & EF_ARCH)   { std::memcpy(out + o, &e.arch, 2); o += 2; }
             if (mask & EF_DEAD)   { out[o++] = e.dead; }
@@ -209,7 +279,6 @@ namespace {
                 if (mask & EF_POS)    std::memcpy(sh->st.pos,  e.pos,  sizeof(e.pos));
                 if (mask & EF_QUAT)   std::memcpy(sh->st.quat, e.quat, sizeof(e.quat));
                 if (mask & EF_ACTION) sh->st.actionAlias = e.actionAlias;
-                if (mask & EF_HULLHP) sh->st.hullHP = e.hullHP;
                 if (mask & EF_HP)     sh->st.hp = e.hp;
                 if (mask & EF_ARCH)   sh->st.arch = e.arch;
                 if (mask & EF_DEAD)   sh->st.dead = e.dead;
@@ -225,15 +294,32 @@ namespace {
         return o;
     }
 
+    // Why a datagram was dropped, so the recv thread can COUNT and LOG the reason instead of leaving
+    // a mis-versioned or malformed peer looking healthy (rxPackets used to climb for every drop).
+    enum DecodeReason : uint8_t {
+        DEC_OK = 0,    // decoded
+        DEC_SHORT,     // shorter than the wire header
+        DEC_MAGIC,     // wrong NET_ENTITY_MAGIC
+        DEC_PROTO,     // protoVer != NET_PROTO_VER
+        DEC_COUNT,     // count > MAX_SYNC_ENTITIES
+        DEC_TRUNC,     // a record, or one of its fields, runs past the datagram
+        DEC_MASK,      // a field bit outside the legal wire mask (EF_ALL & ~EF_OBJID)
+        DEC_KIND,      // entity kind not in {1 ship, 2 guard, 3 kill} (see EntityKind)
+        DEC_WORLD,     // header worldId != local world id (world-transitions X5)
+        DEC_PENDING,   // chunk buffered for reassembly; snapshot not complete yet (X15)
+        DEC_STALE,     // chunk for a snapshot OLDER than the one being reassembled: dropped (M1)
+    };
+
     // Oracle for the Phase 2 codec, run at startup on both peers:
-    bool DecodeEntityPacket(const uint8_t* in, size_t len, EntityPacket& out);   // fwd decl
+    bool DecodeEntityPacket(const uint8_t* in, size_t len, EntityPacket& out,
+                            DecodeReason* why = nullptr);   // fwd decl
 
     static bool SameEntity(const EntityState& a, const EntityState& b) {
         return a.key == b.key && a.kind == b.kind && a.dead == b.dead && a.stage == b.stage
             && a.pos[0] == b.pos[0] && a.pos[1] == b.pos[1] && a.pos[2] == b.pos[2]
             && a.quat[0] == b.quat[0] && a.quat[1] == b.quat[1]
             && a.quat[2] == b.quat[2] && a.quat[3] == b.quat[3]
-            && a.actionAlias == b.actionAlias && a.hullHP == b.hullHP
+            && a.actionAlias == b.actionAlias
             && a.objId == b.objId && a.hp == b.hp && a.arch == b.arch;
     }
 
@@ -245,8 +331,11 @@ namespace {
             e.key = (uint32_t)i; e.kind = 2; e.dead = (uint8_t)(i == 1); e.stage = (uint8_t)(i + 1);
             e.pos[0] = 10.5f + i; e.pos[1] = -3.25f * i; e.pos[2] = 7.0f;
             e.quat[0] = 0.1f; e.quat[1] = 0.2f; e.quat[2] = 0.3f; e.quat[3] = 0.9f;
-            e.actionAlias = 0x11223344u + i; e.hullHP = 100 + i;
-            e.objId = 0xAABBCCDD00000000ull + i; e.hp = (uint16_t)(50 + i); e.arch = (uint16_t)(0x35F7 + i);
+            e.actionAlias = 0x11223344u + i;
+            e.objId = 0xAABBCCDD00000000ull + i; e.arch = (uint16_t)(0x35F7 + i);
+            // C2 §4.1: `dead` and `hp` are one value. A dead body carries the 0xFFFF sentinel, so the
+            // fixture is what a cross-check-normalised sender emits: never dead=1 with a live hp.
+            e.hp = (i == 1) ? 0xFFFFu : (uint16_t)(50 + i);
         }
         std::memset(g_txShadow, 0, sizeof(g_txShadow));
         std::memset(g_rxShadow, 0, sizeof(g_rxShadow));
@@ -256,27 +345,80 @@ namespace {
         EntityPacket b{};
         bool ok = n1 > 0 && DecodeEntityPacket(buf, n1, b) && b.count == 3;
         if (ok) for (int i = 0; i < 3; ++i) ok = ok && SameEntity(a.ents[i], b.ents[i]);
-        // Second pass: nothing changed, so every entity must be omitted (header only).
+        // C2 §2.4 (2): second pass, nothing changed. The DEAD body must still be re-sent - the dead
+        // bit is a level, not a delta - while the two live bodies must still be omitted.
         const size_t n2 = EncodeEntityPacket(a, buf, sizeof(buf));
         EntityPacket c{};
-        bool ok2 = (n2 == sizeof(EntityWireHeader)) && DecodeEntityPacket(buf, n2, c) && c.count == 0;
+        bool ok2 = n2 > sizeof(EntityWireHeader) && DecodeEntityPacket(buf, n2, c)
+                   && c.count == 1 && c.ents[0].key == 1u && c.ents[0].dead == 1;
+        // C2 §2.4 (3): third pass, resurrection. `dead` falls back to 0 and hp must come back off the
+        // 0xFFFF sentinel with it, which is what the cross-check requires of a live body. Exactly one
+        // record, EF_DEAD set on the wire, decoded dead == 0.
+        a.ents[1].dead = 0; a.ents[1].hp = 40;
+        const size_t n3 = EncodeEntityPacket(a, buf, sizeof(buf));
+        EntityPacket d{};
+        bool ok3 = n3 > sizeof(EntityWireHeader) && DecodeEntityPacket(buf, n3, d)
+                   && d.count == 1 && d.ents[0].key == 1u && d.ents[0].dead == 0
+                   && d.ents[0].hp == 40;
+        // C2 §2.4 (1): the no-change omission assertion STAYS, for live entities. This is the only
+        // test protecting snapshot size; it is re-fixtured, never deleted, to make §2 pass.
+        const size_t n4 = EncodeEntityPacket(a, buf, sizeof(buf));
+        EntityPacket f{};
+        bool ok4 = (n4 == sizeof(EntityWireHeader)) && DecodeEntityPacket(buf, n4, f) && f.count == 0;
+        // C2-n1: a genuinely HALF-DEAD record - dead = 1 with a live hp (50). At HEAD the codec's own
+        // encoder does NOT normalise (net.cpp:272 writes e.hp verbatim); the dead=>sentinel step lives
+        // in the capture path (phase1.cpp EmitGuardEntity) and the DECODER is the backstop
+        // (net.cpp:444-445). So this shape can be emitted and must come back dead=1, hp=0xFFFF.
+        // Scratch packets are reused: sizeof(EntityPacket) is ~93 KB and five of them are already here.
+        EntityPacket& half = f;
+        EntityPacket& halfOut = d;
+        half = EntityPacket{};
+        half.magic = NET_ENTITY_MAGIC; half.protoVer = NET_PROTO_VER; half.seq = 2; half.count = 1;
+        half.ents[0].key = 7; half.ents[0].kind = 2; half.ents[0].dead = 1; half.ents[0].hp = 50;
+        half.ents[0].stage = 1; half.ents[0].arch = 0x35F7;
+        const size_t n5 = EncodeEntityPacket(half, buf, sizeof(buf));
+        bool ok5 = n5 > sizeof(EntityWireHeader) && DecodeEntityPacket(buf, n5, halfOut)
+                   && halfOut.count == 1 && halfOut.ents[0].key == 7u && halfOut.ents[0].dead == 1
+                   && halfOut.ents[0].hp == 0xFFFFu;
         // Both peers must start from an empty shadow.
         std::memset(g_txShadow, 0, sizeof(g_txShadow));
         std::memset(g_rxShadow, 0, sizeof(g_rxShadow));
         g_txEpoch = g_rxEpoch = 1; g_txSinceReset = 0;
-        char m[160];
-        wsprintfA(m, "[Net] wire codec selftest: roundtrip=%s nochange=%s (full=%u B, unchanged=%u B for 3 ents)\n",
-                  ok ? "PASS" : "FAIL", ok2 ? "PASS" : "FAIL", (unsigned)n1, (unsigned)n2);
+        char m[256];
+        wsprintfA(m, "[Net] wire codec selftest: roundtrip=%s nochange=%s deaddelta=%s resurrect=%s halfdead=%s"
+                     " (full=%u B, repeat=%u B, res=%u B, idle=%u B, half=%u B)\n",
+                  ok ? "PASS" : "FAIL", ok4 ? "PASS" : "FAIL", ok2 ? "PASS" : "FAIL",
+                  ok3 ? "PASS" : "FAIL", ok5 ? "PASS" : "FAIL",
+                  (unsigned)n1, (unsigned)n2, (unsigned)n3, (unsigned)n4, (unsigned)n5);
         dbg(m);
-        return ok && ok2;
+        return ok && ok2 && ok3 && ok4 && ok5;
     }
 
-    bool DecodeEntityPacket(const uint8_t* in, size_t len, EntityPacket& out) {
-        if (len < sizeof(EntityWireHeader)) return false;
+    bool DecodeEntityPacket(const uint8_t* in, size_t len, EntityPacket& out, DecodeReason* why) {
+        // Records the drop reason before every `return false`, so one call site can count + log it.
+        auto fail = [why](DecodeReason r) -> bool { if (why) *why = r; return false; };
+        if (why) *why = DEC_OK;
+        if (len < sizeof(EntityWireHeader)) return fail(DEC_SHORT);
         EntityWireHeader h{};
         std::memcpy(&h, in, sizeof(h));
-        if (h.magic != NET_ENTITY_MAGIC || h.protoVer != NET_PROTO_VER) return false;
-        if (h.count > (uint32_t)MAX_SYNC_ENTITIES) return false;
+        if (h.magic != NET_ENTITY_MAGIC) return fail(DEC_MAGIC);
+        if (h.protoVer != NET_PROTO_VER) return fail(DEC_PROTO);
+        if (h.count > (uint32_t)MAX_SYNC_ENTITIES) return fail(DEC_COUNT);
+        // X5: drop snapshots whose world differs from the local one. A worldId of 0 means "unknown
+        // yet" (first frame / world not loaded on the sender) and is tolerated ONLY while this
+        // session has never confirmed a world match - the bootstrap allowance. After the first
+        // successful resolution (sender and local agree on a non-zero world) a sender that still
+        // reports 0 cannot prove it is looking at the same world as us, so it is DEC_WORLD. m4.
+        {
+            const uint64_t localWorld = ReadLocalWorldId();
+            const bool worldConfirmed = (InterlockedCompareExchange(&g_worldConfirmed, 0, 0) != 0);
+            if (localWorld != 0 && h.worldId != 0 && h.worldId != localWorld) return fail(DEC_WORLD);
+            if (localWorld != 0 && h.worldId == 0 && worldConfirmed) return fail(DEC_WORLD);
+            if (!worldConfirmed && localWorld != 0 && h.worldId == localWorld) {
+                InterlockedExchange(&g_worldConfirmed, 1);   // one-shot: the bootstrap allowance ends here
+                dbg("[Net] X5 world rule: bootstrap allowance ended - sender worldId=0 is now DEC_WORLD\n");
+            }
+        }
         // Same epoch rule as the sender: a new epoch means the base is gone on both sides.
         if (h.epoch != g_rxEpoch) {
             std::memset(g_rxShadow, 0, sizeof(g_rxShadow));
@@ -285,33 +427,181 @@ namespace {
         out.magic = h.magic; out.protoVer = h.protoVer; out.seq = h.seq; out.count = 0;
         size_t o = sizeof(h);
         for (uint32_t i = 0; i < h.count; ++i) {
-            if (o + 16 > len) return false;
+            if (o + 16 > len) return fail(DEC_TRUNC);
             uint32_t key = 0; uint8_t kind = 0; uint8_t idKind = 0; uint16_t mask = 0; uint64_t wireId = 0;
             std::memcpy(&key, in + o, 4); o += 4;
             kind = in[o++];
             idKind = in[o++];
             std::memcpy(&mask, in + o, 2); o += 2;
             std::memcpy(&wireId, in + o, 8); o += 8;
-            if (mask & ~(uint16_t)(EF_ALL & ~EF_OBJID)) return false;
+            if (mask & ~(uint16_t)(EF_ALL & ~EF_OBJID)) return fail(DEC_MASK);
+            // Kind whitelist (X13): 0 is reserved and any value outside the enum is meaningless to
+            // ApplyShips/ApplyGuards/ProcessKillEvents. Publishing it only moves the failure
+            // downstream with the raw byte intact, so reject the datagram here and count it.
+            if (kind != EK_SHIP && kind != EK_GUARD && kind != EK_KILL) return fail(DEC_KIND);
             EntityState e{};
             e.key = key; e.kind = kind; e._pad = 0;
             e.objId = (idKind == 0) ? wireId : 0;
             ShadowSlot* sh = ShadowFind(g_rxShadow, ShadowId(kind, key, e.objId), true);
             if (sh) e = sh->st, e.key = key, e.kind = kind, e._pad = 0, e.objId = (idKind == 0) ? wireId : 0;
-            if (mask & EF_POS)    { if (o + 12 > len) return false; std::memcpy(e.pos, in + o, 12); o += 12; }
-            if (mask & EF_QUAT)   { if (o + 16 > len) return false; std::memcpy(e.quat, in + o, 16); o += 16; }
-            if (mask & EF_ACTION) { if (o + 4 > len) return false; std::memcpy(&e.actionAlias, in + o, 4); o += 4; }
-            if (mask & EF_HULLHP) { if (o + 4 > len) return false; std::memcpy(&e.hullHP, in + o, 4); o += 4; }
-            if (mask & EF_HP)     { if (o + 2 > len) return false; std::memcpy(&e.hp, in + o, 2); o += 2; }
-            if (mask & EF_ARCH)   { if (o + 2 > len) return false; std::memcpy(&e.arch, in + o, 2); o += 2; }
-            if (mask & EF_DEAD)   { if (o + 1 > len) return false; e.dead = in[o++]; }
-            if (mask & EF_STAGE)  { if (o + 1 > len) return false; e.stage = in[o++]; }
+            if (mask & EF_POS)    { if (o + 12 > len) return fail(DEC_TRUNC); std::memcpy(e.pos, in + o, 12); o += 12; }
+            if (mask & EF_QUAT)   { if (o + 16 > len) return fail(DEC_TRUNC); std::memcpy(e.quat, in + o, 16); o += 16; }
+            if (mask & EF_ACTION) { if (o + 4 > len) return fail(DEC_TRUNC); std::memcpy(&e.actionAlias, in + o, 4); o += 4; }
+            if (mask & EF_HP)     { if (o + 2 > len) return fail(DEC_TRUNC); std::memcpy(&e.hp, in + o, 2); o += 2; }
+            if (mask & EF_ARCH)   { if (o + 2 > len) return fail(DEC_TRUNC); std::memcpy(&e.arch, in + o, 2); o += 2; }
+            if (mask & EF_DEAD)   { if (o + 1 > len) return fail(DEC_TRUNC); e.dead = in[o++]; }
+            if (mask & EF_STAGE)  { if (o + 1 > len) return fail(DEC_TRUNC); e.stage = in[o++]; }
+            // C2 §4.2 cross-check: one record may not present two answers for one fact. Only a
+            // record that actually carried one of the two death fields is normalised - an untouched
+            // shadow value must not ratchet, or a shadow of dead=1 would be re-derived as dead for
+            // ever and a delta that legitimately omits `dead` could never be trusted. Kill-lane
+            // records are exempt: hp is their payload and dead is unused (I1: kind 3 && hp == 0xFFFF,
+            // one entry per packet), so the rule is gated on kind not being a kill kind.
+            if (kind != EK_KILL && (mask & (EF_DEAD | EF_HP)) && (e.dead || e.hp == 0xFFFFu)) {
+                e.dead = 1; e.hp = 0xFFFFu;
+            }
+            // The writeback below stores the normalised value, so the receiver's shadow agrees with
+            // what the apply path will see and a sender-side inconsistency is not re-amplified into
+            // every later delta.
             if (sh) sh->st = e;
             out.ents[out.count++] = e;
         }
         return true;
     }
 
+    // X15: consume one entity datagram (a chunk). Returns:
+    //   DEC_OK      - a complete snapshot was decoded into `out` (single chunk, or the final chunk).
+    //   DEC_PENDING - the chunk was buffered; the snapshot is not complete yet (never applied).
+    //   any other   - the datagram was rejected (malformed / wrong version / wrong world / bad kind).
+    DecodeReason DecodeEntityChunk(const uint8_t* in, size_t len, EntityPacket& out, DecodeReason* why) {
+        auto fail = [why](DecodeReason r) -> DecodeReason { if (why) *why = r; return r; };
+        if (why) *why = DEC_OK;
+        if (len < sizeof(EntityWireHeader)) return fail(DEC_SHORT);
+        EntityWireHeader h{};
+        std::memcpy(&h, in, sizeof(h));
+        if (h.magic != NET_ENTITY_MAGIC) return fail(DEC_MAGIC);
+        if (h.protoVer != NET_PROTO_VER) return fail(DEC_PROTO);
+        if (h.chunkTotal == 0 || h.chunkTotal > ENTITY_CHUNK_MAX_TOTAL) return fail(DEC_MASK);
+        if (h.chunkIndex >= h.chunkTotal) return fail(DEC_MASK);
+        if (h.count > (uint32_t)MAX_SYNC_ENTITIES) return fail(DEC_COUNT);
+
+        const size_t hdr = sizeof(h);
+        const size_t chunkBytes = len - hdr;
+
+        // Fast path: a single-chunk snapshot (the common case) decodes straight out of the datagram.
+        if (h.chunkTotal == 1) {
+            if (!DecodeEntityPacket(in, len, out, why)) return *why;   // reason already set
+            return DEC_OK;
+        }
+
+        // Multi-chunk: reassemble. A chunk belonging to a NEWER snapshot, or a set that has aged out,
+        // discards the old. A chunk belonging to an OLDER snapshot (late / reordered) is DROPPED so it
+        // cannot destroy an in-progress newer set: with no retransmit, losing one already-arrived chunk
+        // makes a snapshot unreassemblable forever (M1). seq is a uint32 counter, so direction is a
+        // signed difference - (int32_t)(a - b) > 0 is "a newer than b" and is correct across the 2^32
+        // wrap (RFC 1982 serial-number comparison; valid for any |a-b| < 2^31).
+        const uint64_t now = GetTickCount64();
+        if (g_asm.active) {
+            const int32_t dseq = SeqDiff(h.seq, g_asm.seq);
+            if (dseq < 0) return fail(DEC_STALE);           // late chunk of a superseded snapshot
+            if (dseq > 0 || (now - g_asm.firstMs) > ENTITY_CHUNK_TIMEOUT_MS) {
+                std::memset(&g_asm, 0, sizeof(g_asm));
+            }
+        }
+        if (!g_asm.active) {
+            g_asm.active = true;
+            g_asm.seq = h.seq;
+            g_asm.epoch = h.epoch;
+            g_asm.chunkTotal = h.chunkTotal;
+            g_asm.receivedMask = 0;
+            g_asm.receivedBytes = 0;
+            g_asm.firstMs = now;
+            std::memcpy(g_asm.data, in, hdr);   // chunk 0's header is the canonical one
+        } else if (h.epoch != g_asm.epoch || h.chunkTotal != g_asm.chunkTotal) {
+            // Same seq but an inconsistent split: malformed. Drop the whole set rather than keeping a
+            // partially-filled assembly that would otherwise survive until the 1 s timeout (M1 review).
+            std::memset(&g_asm, 0, sizeof(g_asm));
+            return fail(DEC_MASK);              // same seq but inconsistent split -> malformed
+        }
+        // Place this chunk's record bytes (chunks are fixed-size except the last); a duplicate chunk
+        // is ignored so the byte count is never double-counted.
+        if (!(g_asm.receivedMask & (uint16_t)(1u << h.chunkIndex))) {
+            const size_t off = (size_t)h.chunkIndex * ENTITY_CHUNK_DATA;
+            if (off + chunkBytes > sizeof(g_asm.data) - hdr) return fail(DEC_TRUNC);
+            std::memcpy(g_asm.data + hdr + off, in + hdr, chunkBytes);
+            g_asm.receivedMask |= (uint16_t)(1u << h.chunkIndex);
+            g_asm.receivedBytes += (uint32_t)chunkBytes;
+        }
+
+        if (g_asm.receivedMask == (uint16_t)((1u << h.chunkTotal) - 1)) {
+            // Complete: decode the reassembled snapshot, then consume the assembler.
+            const size_t total = hdr + g_asm.receivedBytes;
+            const bool ok = DecodeEntityPacket(g_asm.data, total, out, why);
+            std::memset(&g_asm, 0, sizeof(g_asm));
+            if (!ok) return *why;
+            return DEC_OK;
+        }
+        return DEC_PENDING;
+    }
+
+    // ---- reject observability (X4/X18) -----------------------------------------------------------
+    // A version mismatch or a malformed packet used to be dropped with no trace: rxPackets climbed,
+    // so a mis-versioned peer looked alive while every one of its snapshots was discarded. One line
+    // per process per lane - a mismatched peer sends at SnapshotHz, so per-packet logging would flood
+    // net_log.txt - plus counters (g_rxRejects / g_rxProtoMismatch) that Net::GetStats exposes.
+    void LogProtoMismatch(const char* lane, uint32_t got) {
+        static bool s_player = false, s_entity = false;
+        bool& logged = (lane[0] == 'p') ? s_player : s_entity;
+        if (logged) return;
+        logged = true;
+        char m[160];
+        wsprintfA(m, "[Net] %s packet REJECTED protoVer=%u expected=%u (both peers must run the same build)\n",
+                  lane, (unsigned)got, (unsigned)NET_PROTO_VER);
+        dbg(m);
+        { char e[96]; wsprintfA(e, "[E] ev=proto-mismatch lane=%s got=%u expected=%u\n", lane, (unsigned)got, (unsigned)NET_PROTO_VER); dbg(e); }
+    }
+    // Player lane, anonymous-vs-named: a peer built against a different PlayerState sends a datagram
+    // whose leading magic is OUR magic but whose length is not sizeof(PlayerState). playerPkt is
+    // false for it, so the version branch below never runs - the datagram used to vanish without a
+    // single line in net_log.txt AND without touching g_rxRejects (the outer gate only lets
+    // playerPkt / entityPkt in). Name the cause once per process per lane; protoVer sits in the
+    // shared prefix at +4 and is only printed when the datagram is long enough to hold it.
+    void LogSizeMismatch(int n, bool haveProto, uint32_t got) {
+        static bool s_logged = false;
+        if (s_logged) return;
+        s_logged = true;
+        char m[160];
+        if (haveProto)
+            wsprintfA(m, "[Net] player packet SIZE MISMATCH n=%d expected=%d (peer build differs; protoVer=%u)\n",
+                      n, (int)sizeof(PlayerState), (unsigned)got);
+        else
+            wsprintfA(m, "[Net] player packet SIZE MISMATCH n=%d expected=%d (peer build differs; protoVer=?)\n",
+                      n, (int)sizeof(PlayerState));
+        dbg(m);
+        { char e[96]; wsprintfA(e, "[E] ev=size-mismatch n=%d expected=%d\n", n, (int)sizeof(PlayerState)); dbg(e); }
+    }
+    void LogKindRejected() {
+        static bool s_logged = false;
+        if (s_logged) return;
+        s_logged = true;
+        dbg("[Net] entity packet REJECTED: kind outside {1 ship, 2 guard, 3 kill} (netstate.h EntityKind)\n");
+        dbg("[E] ev=reject lane=entity reason=kind\n");
+    }
+    void LogWorldMismatch() {
+        static bool s_logged = false;
+        if (s_logged) return;
+        s_logged = true;
+        dbg("[Net] entity packet REJECTED: header worldId != local world (world change in progress?)\n");
+        dbg("[E] ev=reject lane=entity reason=world-mismatch\n");
+    }
+    void LogRejectSummary(LONG rejects) {
+        char m[224];
+        wsprintfA(m, "[Net] rx rejects=%ld protoMismatch=%ld sizeMismatch=%ld stale=%ld (datagrams dropped without applying state)\n",
+                  rejects, (LONG)InterlockedCompareExchange(&g_rxProtoMismatch, 0, 0),
+                  (LONG)InterlockedCompareExchange(&g_rxSizeMismatch, 0, 0),
+                  (LONG)InterlockedCompareExchange(&g_rxStaleChunks, 0, 0));
+        dbg(m);
+    }
 
     DWORD WINAPI RecvThread(LPVOID) {
         // Read into a buffer sized for the LARGEST packet type (EntityPacket), then dispatch on the
@@ -322,6 +612,20 @@ namespace {
             int n = recvfrom(g_sock, buf, sizeof(buf), 0, (sockaddr*)&from, &flen);
             if (n >= 4) {
                 uint32_t magic = *(uint32_t*)buf;
+                // X4b: player SIZE mismatch, named instead of anonymous. A peer on a different build
+                // (older/newer struct) sends our player magic with a foreign length, so playerPkt is
+                // false and `if (playerPkt && !playerOk)` below never runs: no protoMismatch line, no
+                // reject line, no evidence at all. Detect it from the magic alone (before the length
+                // gate decides anything), count it, and log once per process. Same source filtering
+                // as the strict-peer gate so foreign traffic cannot trip the one-shot log.
+                if (magic == NET_MAGIC && n != (int)sizeof(PlayerState) &&
+                    (!g_strictPeer || from.sin_addr.s_addr == g_peer.sin_addr.s_addr)) {
+                    uint32_t peerProto = 0;
+                    const bool haveProto = (n >= 8);            // protoVer is the second u32
+                    if (haveProto) std::memcpy(&peerProto, buf + 4, sizeof(peerProto));
+                    InterlockedIncrement(&g_rxSizeMismatch);
+                    LogSizeMismatch(n, haveProto, peerProto);
+                }
                 bool playerPkt = (magic == NET_MAGIC        && n == (int)sizeof(PlayerState));
                 bool entityPkt = (magic == NET_ENTITY_MAGIC && n >= ENTITY_WIRE_HEADER_SIZE);
                 if (playerPkt || entityPkt) {
@@ -340,18 +644,58 @@ namespace {
                     } else {
                         EntityPacket decoded{};
                         int killDrops = 0;   // kill-ring entries overwritten by this datagram
-                        const bool entityOk = !entityPkt ||
-                            DecodeEntityPacket((const uint8_t*)buf, (size_t)n, decoded);
+                        // Both packet types put magic first and protoVer second, so the version is
+                        // readable before the type-specific decode (a player datagram is exactly
+                        // sizeof(PlayerState) = 576 B, an entity one >= ENTITY_WIRE_HEADER_SIZE, so
+                        // bytes 4..8 are always inside it).
+                        uint32_t peerProto = NET_PROTO_VER;
+                        std::memcpy(&peerProto, buf + 4, sizeof(peerProto));
+                        // Player lane (X4): magic+length alone let a PROTO-9 peer through. 9 -> 10
+                        // turned shipHP from int32 to float WITHOUT changing sizeof(PlayerState), so
+                        // the length check cannot see it and an int hull reads back as a denormal.
+                        const bool playerOk = playerPkt && peerProto == NET_PROTO_VER;
+                        // Entity lane (X18/X15/X5): the chunk decoder reports WHY it dropped or deferred.
+                        DecodeReason why = DEC_OK;
+                        const bool entityOk = entityPkt &&
+                            (DecodeEntityChunk((const uint8_t*)buf, (size_t)n, decoded, &why) == DEC_OK);
+                        const bool entityPending = entityPkt && !entityOk && why == DEC_PENDING;
+                        // DEC_STALE: a late/reordered chunk of a superseded snapshot. Correct to drop,
+                        // but benign on a well-formed link -> its own counter, never a reject.
+                        const bool entityStale   = entityPkt && !entityOk && why == DEC_STALE;
+                        const bool accepted = playerPkt ? playerOk : entityOk;
+                        if (playerPkt && !playerOk) {
+                            InterlockedIncrement(&g_rxProtoMismatch);
+                            LogProtoMismatch("player", peerProto);            // one line per process
+                        } else if (entityPkt && !entityOk) {
+                            if (why == DEC_PROTO) {
+                                InterlockedIncrement(&g_rxProtoMismatch);
+                                LogProtoMismatch("entity", peerProto);        // one line per process
+                            } else if (why == DEC_KIND) {
+                                LogKindRejected();
+                            } else if (why == DEC_WORLD) {
+                                LogWorldMismatch();
+                            }
+                            // DEC_PENDING: a chunk buffered for reassembly - neither accepted nor rejected.
+                            // DEC_STALE: a superseded chunk - dropped, and counted as stale, not as a reject.
+                        }
+                        if (entityStale) InterlockedIncrement(&g_rxStaleChunks);
+                        if (!accepted && !entityPending && !entityStale) {
+                            const LONG rejects = InterlockedIncrement(&g_rxRejects);
+                            if (rejects == 1 || (rejects % 256) == 0) LogRejectSummary(rejects);
+                        }
                         EnterCriticalSection(&g_lock);
-                        if (playerPkt) {
-                            g_remote = *(PlayerState*)buf; g_haveRemote = true;
+                        if (playerOk) {
+                            std::memcpy(&g_remote, buf, sizeof(g_remote));   // not *(PlayerState*)buf: buf is not 16-byte aligned
+                            // blendCount indexes blendFactors[BLEND_MAX] in lerpState/apply; a wire value above it is an OOB write.
+                            if (g_remote.blendCount > BLEND_MAX) g_remote.blendCount = BLEND_MAX;
+                            g_haveRemote = true;
                             // Queue it too (overwrites the OLDEST when the ring is full), so a frame
                             // that drains several packets feeds the interpolator all of them.
                             g_rxq[g_rxqHead] = g_remote;
                             g_rxqHead = (g_rxqHead + 1) % NET_RXQ;
                             if (g_rxqCount < NET_RXQ) ++g_rxqCount;
                         }
-                        else if (entityOk) {
+                        else if (entityPkt && entityOk) {
                             // B-4: pull the death entries out into their own ring first. A packet made
                             // only of them (the dedicated one-entry death push) does not touch the
                             // snapshot slot at all, so it can neither be overwritten before the frame
@@ -375,8 +719,13 @@ namespace {
                         }
                         // A header-only entity packet carries no state at all: it is a heartbeat, not
                         // evidence that the peer is alive, so it must NOT refresh the presence timer.
-                        const bool heartbeatOnly = entityPkt && entityOk && decoded.count == 0;
-                        if (!heartbeatOnly) g_lastRecvMs = GetTickCount64();   // liveness for the presence check
+                        // A REJECTED datagram refreshes nothing either (X18): it used to bump
+                        // g_lastRecvMs, so a peer whose every snapshot failed to decode looked alive.
+                        // rxPackets/rxBytes still count it - it did arrive on the wire - and
+                        // g_rxRejects is the subset that produced no state, EXCLUDING the chunks that
+                        // were merely deferred (DEC_PENDING) or superseded (DEC_STALE).
+                        const bool heartbeatOnly = accepted && entityPkt && decoded.count == 0;
+                        if (accepted && !heartbeatOnly) g_lastRecvMs = GetTickCount64();
                         InterlockedIncrement(&g_rxPackets);
                         InterlockedAdd(&g_rxBytes, (LONG)n);
                         LeaveCriticalSection(&g_lock);
@@ -455,11 +804,11 @@ bool Init() {
     inet_pton(AF_INET, peerIp, &g_peer.sin_addr);
 
     InitializeCriticalSection(&g_lock);
-    CreateThread(nullptr, 0, RecvThread, nullptr, 0, nullptr);
 
     g_enabled = true;
     g_lastRecvMs = 0;   // no packet accepted yet
     SelfTestWire();     // [Phase 2] prove the compact codec round-trips before any traffic
+    _beginthreadex(nullptr, 0, (unsigned (__stdcall*)(void*))RecvThread, nullptr, 0, nullptr);   // after the self-test (it resets the rx shadow)
     char m[128]; wsprintfA(m, "[Net] up: bound:%d -> %s:%d\n", bindPort, peerIp, sendPort); dbg(m);
     return true;
 }
@@ -502,17 +851,35 @@ int DrainRemote(PlayerState* out, int max) {
 
 void SendEntities(const EntityPacket& p) {
     if (!g_enabled) return;
-    const size_t n = EncodeEntityPacket(p, g_txBuf, sizeof(g_txBuf));
+    const size_t n = EncodeEntityPacket(p, g_txBuf, sizeof(g_txBuf));   // [header][records]
     if (n == 0) return;
-    sendto(g_sock, (const char*)g_txBuf, (int)n, 0, (sockaddr*)&g_peer, sizeof(g_peer));
-    InterlockedIncrement(&g_txPackets);
-    InterlockedAdd(&g_txBytes, (LONG)n);          // actual encoded size, not sizeof(EntityPacket)
+    const size_t hdr = sizeof(EntityWireHeader);
+    const size_t recordBytes = n - hdr;
+    // X15: chunk the record region so every UDP payload stays <= ENTITY_CHUNK_MAX. A header-only
+    // snapshot (recordBytes == 0) still sends one chunk so the peer sees the heartbeat.
+    const uint16_t total = (recordBytes == 0) ? 1u
+                            : (uint16_t)((recordBytes + ENTITY_CHUNK_DATA - 1) / ENTITY_CHUNK_DATA);
+    uint8_t chunk[ENTITY_CHUNK_MAX];
+    for (uint16_t i = 0; i < total; ++i) {
+        const size_t off = (size_t)i * ENTITY_CHUNK_DATA;
+        size_t len = recordBytes - off;
+        if (len > (size_t)ENTITY_CHUNK_DATA) len = (size_t)ENTITY_CHUNK_DATA;
+        EntityWireHeader h{};
+        std::memcpy(&h, g_txBuf, sizeof(h));   // magic/proto/seq/epoch/count/worldId already set
+        h.chunkIndex = i;
+        h.chunkTotal = total;
+        std::memcpy(chunk, &h, sizeof(h));
+        std::memcpy(chunk + hdr, g_txBuf + hdr + off, len);
+        sendto(g_sock, (const char*)chunk, (int)(hdr + len), 0, (sockaddr*)&g_peer, sizeof(g_peer));
+        InterlockedIncrement(&g_txPackets);
+        InterlockedAdd(&g_txBytes, (LONG)(hdr + len));   // actual bytes on the wire (per chunk)
+    }
     InterlockedAdd(&g_txEnts, (LONG)g_wireRecs);
     static uint32_t s_logCounter = 0;
     if ((++s_logCounter % 60) == 0) {
         char m[160];
-        wsprintfA(m, "[Net] entwire pkt=%u B sent=%u/%u full=%u/%u\n",
-                  (unsigned)n, (unsigned)g_wireRecs, (unsigned)p.count,
+        wsprintfA(m, "[Net] entwire pkt=%u B chunks=%u sent=%u/%u full=%u/%u\n",
+                  (unsigned)n, (unsigned)total, (unsigned)g_wireRecs, (unsigned)p.count,
                   (unsigned)g_wireFullRecs, (unsigned)g_wireRecs);
         dbg(m);
     }
@@ -568,6 +935,19 @@ uint32_t GetKillEntities(EntityPacket& out, uint32_t max) {
 // ---- session-lifecycle hardening (Feature #3) --------------------------------------
 void SetStrictPeer(bool strict) { g_strictPeer = strict; }
 
+// X5: the local world id (World::GetObjectID()). The entity encoder stamps it into the wire header;
+// the decoder drops snapshots whose world differs from the local one. Interlocked 64-bit write so the
+// recv thread's read (ReadLocalWorldId) never tears on this x86 build.
+void SetLocalWorldId(uint64_t id) {
+    // X5: a world CHANGE re-arms the bootstrap allowance. Without this the "confirmed" flag stayed
+    // latched for the life of the process, so the first legitimate worldId == 0 frame of a NEW world
+    // was DEC_WORLD forever. Only an actual change resets it - phase1 calls this every frame with the
+    // same id. Interlocked because the decoder reads it on the recv thread.
+    if ((uint64_t)InterlockedCompareExchange64(&g_localWorldId, 0, 0) != id)
+        InterlockedExchange(&g_worldConfirmed, 0);
+    InterlockedExchange64(&g_localWorldId, (LONGLONG)id);
+}
+
 uint64_t LastRecvMs() {
     if (!g_enabled) return 0;
     EnterCriticalSection(&g_lock);
@@ -592,6 +972,10 @@ void GetStats(Stats& out) {
     out.txEnts    = (uint32_t)InterlockedCompareExchange(&g_txEnts,    0, 0);
     out.rxPackets = (uint32_t)InterlockedCompareExchange(&g_rxPackets, 0, 0);
     out.rxBytes   = (uint32_t)InterlockedCompareExchange(&g_rxBytes,   0, 0);
+    out.rejects       = (uint32_t)InterlockedCompareExchange(&g_rxRejects,       0, 0);
+    out.protoMismatch = (uint32_t)InterlockedCompareExchange(&g_rxProtoMismatch, 0, 0);
+    out.sizeMismatch  = (uint32_t)InterlockedCompareExchange(&g_rxSizeMismatch,  0, 0);
+    out.staleChunks   = (uint32_t)InterlockedCompareExchange(&g_rxStaleChunks,   0, 0);
 }
 
 void ResetStats() {
@@ -600,6 +984,10 @@ void ResetStats() {
     InterlockedExchange(&g_txEnts,    0);
     InterlockedExchange(&g_rxPackets, 0);
     InterlockedExchange(&g_rxBytes,   0);
+    InterlockedExchange(&g_rxRejects,       0);
+    InterlockedExchange(&g_rxProtoMismatch, 0);
+    InterlockedExchange(&g_rxSizeMismatch,  0);
+    InterlockedExchange(&g_rxStaleChunks,   0);
 }
 
 } // namespace Net

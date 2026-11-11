@@ -1,0 +1,12 @@
+WorldAddEntity @ 0x70E860  (size 27)   -- probe receipt, no cl 16.00.40219.01 on this machine
+measured 2026-11-08 by ORCH against the pinned binary
+  AC4BFSP.exe sha256 bc11ad7924e1eca7363ee86aa3332c05386d0a05896c0b7370131daee9ab5150
+  candidate body: ac4-decomp\70E860.c (submitted verbatim)
+
+claim
+    AddEntity(world, e) = sub_5A8A80(world, e, 0xFFFF, 0).
+
+cross-check / limit of this receipt
+    the same sub_5A8A80 the domino spawn op calls with (0xFFFF, 1); the trailing
+    flag is 0 on the plain add and 1 on the domino route. That one-bit difference
+    is the only distinction the bodies show.

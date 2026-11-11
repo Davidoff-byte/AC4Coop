@@ -1,0 +1,15 @@
+{
+ "unit": "006609A0",
+ "addr": "0x006609A0",
+ "size": 173,
+ "name": "StrongHandleUnregister",
+ "submitted_at": "2026-11-08T12:37:09Z",
+ "original_sha": "4e4d62aaac27b2d5531dc40030007d5290d5850bd8f630ebebf22ad4df206d7f",
+ "candidate_src_sha": "935f81e6e2fc0f659b7de8439bcf20b8e8bc4cb2291ee78033efaf6d5f951f68",
+ "candidate_src": "006609A0.cpp",
+ "arm": "probe",
+ "verdict": "UNVERIFIED-EVIDENCE",
+ "detail": "no object supplied: the pinned compiler (cl 16.00.40219.01) is not installed, so byte equality cannot be checked. Recorded as evidence only - never a match.",
+ "evidence": "006609A0.txt",
+ "evidence_sha": "9e4d77adacdc1f3a39f4ac27bbfcdd965fc742be70469245ac70cee6f7aa82e8"
+}

@@ -1,0 +1,11 @@
+#!/bin/sh
+# The decompilation spine is a gate, not a suggestion: a receipt that no longer
+# re-derives, or an engine call with no unit, blocks the commit.
+cd "$(dirname "$0")/.." || exit 1
+py -3.14 tools/spine_gate.py || {
+  echo ""
+  echo "COMMIT BLOCKED: spine gate failed (see above)."
+  echo "  - a receipt must re-derive from the pinned exe (tools/decomp.py check)"
+  echo "  - every direct engine call needs a unit in decomp/units.json"
+  exit 1
+}

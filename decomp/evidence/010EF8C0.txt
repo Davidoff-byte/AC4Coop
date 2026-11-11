@@ -1,0 +1,17 @@
+GetComponentByCrc1588608236 @ 0x10EF8C0  (size 72)   -- probe receipt, no cl 16.00.40219.01 on this machine
+measured 2026-11-08 by ORCH against the pinned binary
+  AC4BFSP.exe sha256 bc11ad7924e1eca7363ee86aa3332c05386d0a05896c0b7370131daee9ab5150
+  candidate body: ac4-decomp\10EF8C0.c (submitted verbatim)
+
+claim
+    __cdecl(int entity) -> void*: get the AI pointer (sub_6F5F70), walk its
+    component list at +0x5C (92) with the u16 count at +0x62 (98), and return the
+    first component whose class id (sub_A1D0D0) equals 1588608236. Null when the
+    AI pointer or the component is missing.
+
+cross-check / limit of this receipt
+    1588608236 is one of the 13 CRCs of the health-service block - it is the
+    getter at 0x1370E20 (ops/evidence/health-service-crcs.md). So this helper is
+    the entity -> service lookup for that type, which is exactly the shape the
+    ship hull-HP hunt needs: find the CRC on a ship and this is how the service
+    is reached.

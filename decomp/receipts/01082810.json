@@ -1,0 +1,15 @@
+{
+ "unit": "01082810",
+ "addr": "0x01082810",
+ "size": 155,
+ "name": "SpawnRequestAlloc",
+ "submitted_at": "2026-11-08T19:48:44Z",
+ "original_sha": "9199457db51d8bcf92e3aaa2fc8349995d3ac0266adb6f29cabd2f09ecc89db5",
+ "candidate_src_sha": "f908ec8a2e124f459f2c68e8d67c6a6e93851347154852f82cf9b0feab054355",
+ "candidate_src": "01082810.cpp",
+ "arm": "probe",
+ "verdict": "UNVERIFIED-EVIDENCE",
+ "detail": "no object supplied: the pinned compiler (cl 16.00.40219.01) is not installed, so byte equality cannot be checked. Recorded as evidence only - never a match.",
+ "evidence": "01082810.txt",
+ "evidence_sha": "9945f891f88acdfb52580e125ba0580d66ce750d451697e8bd73a29ac64f7386"
+}

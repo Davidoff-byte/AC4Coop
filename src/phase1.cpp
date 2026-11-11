@@ -4,6 +4,7 @@
 #include "paths.h"
 #include "net.h"
 #include "Hook.h"
+#include "build_info.h"
 #include <windows.h>
 #include <cstdint>
 #include <cstdio>
@@ -467,6 +468,65 @@ static void FinishPadProbe() {    World* world = World::GetCurrentWorld();
     L("[VPad] verdict: whichever moved owns the pad-1 input\n");
 }
 
+// ---- F2: give the built puppet a skeleton so it animates instead of gliding ([Coop] SkelAttach, default 0) ----
+// Recipe: ops/evidence/skeleton-attach-recipe-2026-11-10.md (all four calls verified in IDA, AC4BFSP md5 2058342866…):
+//   M1 create  sub_A38120(SkeletonComponent class-info 0x02749420, 0)  __cdecl; allocs desc+0x18 = 0x340 B, ctor desc+0x30
+//   M4 attach  sub_527CC0(entity, comp)  __thiscall, retn 4 (edi=ecx, comp from [ebx+8]); appends to entity+0x60,
+//              re-sorts, bumps the generation, calls comp->OnAttach (sets comp+8 = owner), world attach if entity+0x5C
+//   M2 model   sub_45ABB0(comp, &model)  __thiscall; stores model at comp+0x20 (+1 ref) and, if !(comp+0x335 & 4),
+//   M3 build   runs sub_45A830(comp): +0x124 = owner, +0x128 = bone-name map, pose buffers.
+// ORDER MATTERS: M3 dereferences comp+8 (owner), which only M4 sets. Model source: the player's own skeleton (+0x20),
+// so the puppet wears Edward's rig. Every step is guarded; nothing runs unless SkelAttach=1.
+static const uint32_t VT_SKELETON_COMPONENT = 0x01E41E58;   // class-info-map.tsv
+static void* FindComponentByVtable(Entity* e, uint32_t vt) {
+    if (!readable(e, 0x68)) return nullptr;
+    uint16_t n = *(uint16_t*)((uint8_t*)e + 0x66);            // authoritative count (CLAIMS C1)
+    void** arr = *(void***)((uint8_t*)e + 0x60);
+    if (n == 0 || n > 96 || !readable(arr, 4u * n)) return nullptr;
+    for (uint16_t i = 0; i < n; ++i)
+        if (readable(arr[i], 4) && *(uint32_t*)arr[i] == vt) return arr[i];
+    return nullptr;
+}
+static void LogSkel(const char* who, const void* s) {
+    if (!readable(s, 0x340)) { L("[Skel] %s skel=%p (unreadable)\n", who, s); return; }
+    const uint8_t* b = (const uint8_t*)s;
+    L("[Skel] %s skel=%p owner(+8)=%08X model(+0x20)=%08X +0x124=%08X +0x128=%08X +0x134=%08X flags(+0x335)=%02X\n",
+      who, s, *(uint32_t*)(b + 0x8), *(uint32_t*)(b + 0x20), *(uint32_t*)(b + 0x124), *(uint32_t*)(b + 0x128),
+      *(uint32_t*)(b + 0x134), b[0x335]);
+}
+static void PuppetSkelAttach(Entity* puppet, Entity* player) {
+    static int s_on = -1;
+    if (s_on < 0) s_on = GetPrivateProfileIntA("Coop", "SkelAttach", 0, Paths::Ini()) != 0 ? 1 : 0;
+    if (!s_on || !puppet || !player) return;
+    __try {
+        void* existing = FindComponentByVtable(puppet, VT_SKELETON_COMPONENT);
+        if (existing) { L("[Skel] puppet already has a SkeletonComponent - nothing to do\n"); LogSkel("ghost", existing); return; }
+        void* pskel = FindComponentByVtable(player, VT_SKELETON_COMPONENT);
+        if (!pskel || !readable(pskel, 0x340)) { L("[Skel] player SkeletonComponent not found - skipped\n"); return; }
+        void* model = *(void**)((uint8_t*)pskel + 0x20);
+        if (!readable(model, 0x10)) { L("[Skel] player model (+0x20) unreadable - skipped\n"); return; }
+        LogSkel("player", pskel);                                           // G-GLIDE-2 positive control
+
+        void* skel = ((void* (__cdecl*)(void*, int))0x00A38120)((void*)0x02749420, 0);                 // M1
+        if (!readable(skel, 0x340) || *(uint32_t*)skel != VT_SKELETON_COMPONENT) {
+            L("[Skel] M1 create failed skel=%p\n", skel); return;
+        }
+        ((void (__thiscall*)(void*, void*))0x00527CC0)(puppet, skel);                                    // M4
+        if (*(void**)((uint8_t*)skel + 0x8) != (void*)puppet) {
+            L("[Skel] M4 attach did not set owner (+8=%08X) - M2 NOT run (would fault in M3)\n",
+              *(uint32_t*)((uint8_t*)skel + 0x8));
+            return;
+        }
+        ((void (__thiscall*)(void*, void**))0x0045ABB0)(skel, &model);                                    // M2 (=> M3)
+        L("[Skel] attached: puppet=%p skel=%p comps=%u\n", puppet, skel, (unsigned)*(uint16_t*)((uint8_t*)puppet + 0x66));
+        LogSkel("ghost", skel);                                              // G-GLIDE-1
+        L("[E] ev=skel-attach ok=1\n");
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        L("[Skel] EXCEPTION during attach (code=0x%08X)\n", GetExceptionCode());
+        L("[E] ev=skel-attach ok=0\n");
+    }
+}
+
 void* Phase1::TrySpawnPuppet() {
     Entity* newEntity = nullptr;
     __try {
@@ -581,6 +641,12 @@ void* Phase1::TrySpawnPuppet() {
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         L("[Phase1] EXCEPTION during integrate (code=0x%08X)\n", GetExceptionCode());
+    }
+    // F2: after AddEntity was issued (deferred to next frame) but before the world processes it, so the new
+    // component is in the array when the entity joins the world, like a normally built body's skeleton.
+    if (g_puppet == newEntity) {
+        World* w = World::GetCurrentWorld();
+        PuppetSkelAttach(newEntity, w ? w->GetPlayer() : nullptr);
     }
     return newEntity;
 }
@@ -968,9 +1034,290 @@ static uint32_t worldLastLoadCellId(World* world) {
 // Ghost ship sync state: the spawned second ship entity + the peer's ship position to drive it to
 // (via the SetGlobalMatrixInternal render override). g_ghostShip is set when m_Duplicate succeeds.
 static void*   g_ghostShip = nullptr;        // the spawned ghost ship entity
+static uint64_t g_ghostObjId = 0;            // its stable object id (0 = unknown) - liveness probe
 static float   g_ghostSyncPos[3] = {0,0,0};  // peer's ship world position (x,y,z)
 static float   g_ghostSyncQuat[4] = {0,0,0,1}; // peer's ship rotation quaternion (x,y,z,w)
+static float   g_ghostSyncHP = 0.0f;        // [ShipHPSync] peer's ship hull HP (GcLShip+0xD0)
+static float   g_ghostAppliedHP = -1.0f;    // hull HP last written to the ghost (-1 = not applied yet)
+static float   g_ghostPeerMaxHP = 0.0f;     // [GhostProxy] peer's ship MAX hull HP (GcLShip+0xB4); 0 = unknown
+static uint32_t g_ghostPeerClass = 0;       // [GhostProxy] peer's ship CLASS (entity+0x9C, see ReadShipClass); 0 = unknown
+// Assign the ghost and record its id, so the drive path can prove the clone still exists through the
+// engine registry (ResolveEntityById). Before this, g_ghostShip was only cleared by F11 or a drive
+// exception: a clone the engine had freed left a dangling ref that blocked the auto-respawn forever.
+static void GhostTrack(void* ent) {
+    g_ghostShip = ent;
+    g_ghostObjId = 0;
+    if (!ent) return;
+    __try { g_ghostObjId = ((ManagedObject*)ent)->GetObjectID(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { g_ghostObjId = 0; }
+}
+// ---- [Coop] ShipHPSync (default OFF) ---------------------------------------------------------
+// Hull HP lives at GcLShip+0xD0 (max at GcLShip+0xB4). A ship entity reaches its GcLShip through the
+// engine call at 0x01038330 (decomp unit "01038330"); null when the ship has no such object.
+// READ through the object's vtable slot 0x1B4 (float getter). Do NOT call slot 0x1B8: it takes an extra
+// argument and the wrong arity unbalances the stack.
+// WRITE through slot 0x12C, the __stdcall thunk to sub_1225A10 (a damage-aware setter: clamps, fires the
+// zero event, republishes the HUD fraction). __stdcall is the thunk's own convention (this on the stack),
+// which is also how the engine's virtual call site passes it.
+// Evidence: ops/evidence/hull-hp-found.md.
+// Read once, cached (same idiom as PuppetPhysicsMode below).
+static int s_shipHPSync = -1;
+static inline int ShipHPSyncEnabled() {
+    if (s_shipHPSync < 0)
+        s_shipHPSync = GetPrivateProfileIntA("Coop", "ShipHPSync", 0, Paths::Ini()) != 0 ? 1 : 0;
+    return s_shipHPSync;
+}
+// GcLShip* for a ship entity, or null. Every step is guarded: the entity, the engine call's result and the
+// HP/dword we are about to read are all validated with readable().
+static void* ShipGcLObj(void* shipEnt) {
+    if (!shipEnt || !readable(shipEnt, 4)) return nullptr;
+    void* hobj = ((void* (__cdecl*)(void*, char))0x01038330)(shipEnt, 0);
+    return (hobj && readable(hobj, 0xD4)) ? hobj : nullptr;   // +0xD0 HP and the vtable pointer
+}
+// Current hull HP through slot 0x1B4. False (and *out untouched) when unreachable or not a sane value.
+static bool ReadShipHullHP(void* shipEnt, float* out) {
+    void* hobj = ShipGcLObj(shipEnt);
+    if (!hobj || !out) return false;
+    __try {
+        void** vt = *(void***)hobj;
+        if (!readable((void*)vt, 0x1B8)) return false;
+        float v = ((float (__thiscall*)(void*))vt[0x1B4 / 4])(hobj);
+        if (!(v >= 0.0f) || !(v <= 1.0e7f)) return false;   // NaN / absurd -> treat as unknown
+        *out = v;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+// Max hull HP for the same ship: a plain field at GcLShip+0xB4 (a class-level value with a single
+// writer, vtable slot 0x130 - not a per-damage value), NOT behind a getter. It is the fingerprint the
+// ghost's proxy selection matches on ({maxHP, subEntityCount, flags}), so it rides the player lane.
+// False (and *out untouched) when the GcLShip is unreachable or the value is insane.
+static bool ReadShipHullMax(void* shipEnt, float* out) {
+    void* hobj = ShipGcLObj(shipEnt);          // validates readable(hobj, 0xD4), which covers +0xB4
+    if (!hobj || !out) return false;
+    __try {
+        float v = *(float*)((char*)hobj + 0xB4);
+        if (!(v > 0.0f) || !(v <= 1.0e7f)) return false;   // 0 / NaN / absurd -> treat as unknown
+        *out = v;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+// Ship class index off the ship ENTITY: *(u32*)(entity+0x9C) is a packed word {tag:3 @ bits0-2,
+// subtype @ bits3-8, class:6 @ bits9-14}. Byte-for-byte the engine's sub_11AA850
+// (ops/evidence/ship-type-entity-field.md); the gate (tag==3 && subtype==0xE8) is mandatory - without
+// it +0x9C is arbitrary data. Mapping (sub_1045CD0, ops/evidence/ship-class-index.md):
+// 1 GunBoat 2 Schooner 3 Brig 4 Frigate 6 ManOfWar 7 Jackdaw 8-11 SuperShip 12 Qar 13 Revenge
+// 14 Begin 15 NossoSenhor 16 Eldorado; 0 = gate failed / not a ship entity. Reads the entity itself,
+// never the GcLShip (the ship subsystem reads this off the object it holds at S+0xD4 - the entity,
+// not the component-derived GcLShip - ship-type-entity-field.md §2.1).
+static uint32_t ReadShipClass(Entity* ent) {
+    if (!ent || !readable((const char*)ent + 0x9C, 4)) return 0;
+    __try {
+        uint32_t f = *(uint32_t*)((const char*)ent + 0x9C);
+        if ((f & 7u) == 3u && (f & 0x1F8u) == 0xE8u) return (f >> 9) & 0x3Fu;
+        return 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+// Write a hull HP onto a ship through slot 0x12C. False when unreachable or rejected as insane.
+// The slot holds thunk 0x12279B0, whose body is `movss xmm0,[ebp+8]; push ecx; movss [esp],xmm0;
+// call sub_1225A10; retn 4` - i.e. `this` arrives in ECX and the float on the stack, so the call is
+// __thiscall. Calling it as __stdcall would put `this` on the stack and leave ECX garbage.
+static bool WriteShipHullHP(void* shipEnt, float hp) {
+    void* hobj = ShipGcLObj(shipEnt);
+    if (!hobj) return false;
+    // negative is legal: the engine's own damage path leaves hulls below zero (observed -40) before
+    // the zero-health event fires, and the sink test relies on being able to drive it there.
+    if (!(hp >= -1.0e6f) || !(hp <= 1.0e7f)) return false;
+    __try {
+        void** vt = *(void***)hobj;
+        if (!readable((void*)vt, 0x130)) return false;
+        ((void (__thiscall*)(void*, float))vt[0x12C / 4])(hobj, hp);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+// Direct field write, for DUPLICATE ships only. The setter (slot 0x12C -> sub_1225A10) faults on a
+// cloned GcLShip: it dereferences this+1092 -> [+0x58] and re-enters sub_1220B60, and on a duplicate
+// those sub-objects are not initialised, so every call raises and the apply never takes. A raw write
+// sets the value the ghost carries without firing events or republishing the HUD fraction - which is
+// all a render-only duplicate needs. NEVER use this on a real ship: use the setter there, so clamps,
+// the invulnerability bit and the zero-health event still behave.
+static bool WriteShipHullHPRaw(void* shipEnt, float hp) {
+    void* hobj = ShipGcLObj(shipEnt);
+    if (!hobj) return false;
+    if (!(hp >= -1.0e6f) || !(hp <= 1.0e7f)) return false;
+    if (!readable((char*)hobj + 0xD0, 4)) return false;
+    __try {
+        *(float*)((char*)hobj + 0xD0) = hp;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+// GcLShip max-hull setter (vtable slot 0x130 = sub_121F2F0): `*(this+0xB4) = max(a2, 1.0f)`. A pure
+// field write with no sub_1220B60 / threshold re-entry, so it is safe on a duplicate GcLShip - unlike
+// the current setter (slot 0x12C -> sub_1225A10), which faults on clones (see WriteShipHullHPRaw).
+static bool WriteShipHullMax(void* shipEnt, float maxHp) {
+    void* hobj = ShipGcLObj(shipEnt);          // validates readable(hobj, 0xD4), covering +0xB4
+    if (!hobj) return false;
+    if (!(maxHp > 0.0f) || !(maxHp <= 1.0e7f)) return false;
+    __try {
+        void** vt = *(void***)hobj;
+        if (!readable((void*)vt, 0x134)) return false;
+        ((void (__thiscall*)(void*, float))vt[0x130 / 4])(hobj, maxHp);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+// -------------------------------------------------------------------------------------------
+// Ghost proxy source selection (Coop:GhostProxy, default 0).
+//
+// When the peer's ship MAX hull HP (GcLShip+0xB4) is known, duplicate a LOCAL ship whose class
+// fingerprint matches it (exact match preferred, else the nearest tier) instead of the local
+// Jackdaw, so the ghost wears the peer's hull class. The duplicate does not copy +0xB4/+0xD0,
+// so after the duplicate the ghost's hull is re-established (max then current).
+// Tie-break: farthest from the camera (approximated by distance to the local ship, the camera's
+// focus in naval view), then lowest object id. A source is remembered as an id pair and excluded
+// while its duplicate lives; the ring is oldest-overwrite, so a source can become selectable again
+// after an eviction - bounded, never a permanent blacklist. There is no supported hide seam
+// (ops/evidence/entity-hide-seams.md), so a source stays visible either way.
+// -------------------------------------------------------------------------------------------
+static int s_ghostProxy = -1;
+static inline int GhostProxyEnabled() {
+    if (s_ghostProxy < 0)
+        s_ghostProxy = GetPrivateProfileIntA("Coop", "GhostProxy", 0, Paths::Ini()) != 0 ? 1 : 0;
+    return s_ghostProxy;
+}
+// ---- Proxy source set (ids, not pointers) --------------------------------------------------
+// A pair records "this exact duplicate was made from this exact source object":
+//   srcId   = id of the ship we duplicated   (excluded from future selection)
+//   ghostId = id of the duplicate we created (excluded as a candidate; also the prune key)
+// Ids, not pointers, because the pointer form bought nothing: an entry was only ever compared by
+// identity, so a stale value could not "fail" a read - it silently blacklisted whatever later
+// occupied that address (the engine's allocator recycles freed entity blocks). The id is minted per
+// object instance: it survives a list reorder and dies with the object, which is exactly the
+// lifetime a pair has. Nothing here ever dereferences a stored id.
+// Oldest-overwrite ring: insertion never fails, and exclusion is always a finite set of <= 8 pairs,
+// so no code path can leave selection impossible. An eviction only lets the evicted source be
+// duplicated once more - bounded, never a disablement.
+struct ProxySrcPair { uint32_t srcId; uint32_t ghostId; };
+static ProxySrcPair g_proxySrcRing[8];
+static int g_proxySrcCount = 0;    // live pairs, <= 8 - diagnostic only, never gates selection
+static int g_proxySrcNext  = 0;    // next write slot
+// Every duplicate id we have ever created. DespawnGhostShip hides a ghost instead of destroying it
+// (SHIP-RE C11), so its id can stay live forever; this keeps such a ghost out of the candidate set.
+static uint32_t g_proxyGhostIds[8];
+static int      g_proxyGhostCount = 0, g_proxyGhostNext = 0;
+
+// What the selector reports. A pure-query result: the selector records nothing.
+struct ProxyPick { uint32_t srcId; int idx; float srcMax; float tierDelta; uint32_t hint; uint32_t cls; int classMiss; const char* camSrc; };
+
+static Entity* ResolveEntityById(uint64_t id);   // engine registry, defined with the ApplyGuards
+static void ProxySrcClearAll();
+
+static void ProxySrcRemember(uint32_t srcId, uint32_t ghostId) {
+    g_proxySrcRing[g_proxySrcNext].srcId   = srcId;
+    g_proxySrcRing[g_proxySrcNext].ghostId = ghostId;
+    g_proxySrcNext = (g_proxySrcNext + 1) % 8;
+    // The two tables are written in one place so they can never disagree.
+    g_proxyGhostIds[g_proxyGhostNext] = ghostId;
+    g_proxyGhostNext = (g_proxyGhostNext + 1) % 8;
+    if (g_proxySrcCount   < 8) ++g_proxySrcCount;
+    if (g_proxyGhostCount < 8) ++g_proxyGhostCount;
+}
+static bool ProxySrcUsed(uint32_t srcId) {
+    if (!srcId) return false;
+    for (int k = 0; k < 8; ++k) if (g_proxySrcRing[k].srcId == srcId) return true;
+    return false;
+}
+static bool ProxyGhostIdKnown(uint32_t ghostId) {
+    if (!ghostId) return false;
+    for (int k = 0; k < 8; ++k) if (g_proxyGhostIds[k] == ghostId) return true;
+    return false;
+}
+static void ProxySrcClearAll() {
+    for (int k = 0; k < 8; ++k) {
+        g_proxySrcRing[k].srcId = 0; g_proxySrcRing[k].ghostId = 0;
+        g_proxyGhostIds[k] = 0;
+    }
+    g_proxySrcCount = g_proxySrcNext = 0;
+    g_proxyGhostCount = g_proxyGhostNext = 0;
+}
+// Drop a pair whose duplicate no longer exists. A null from ResolveEntityById is the only evidence
+// accepted here ("that duplicate is gone"); a non-null answer keeps the pair, because a ghost moved
+// far away is still ours and the resolver is not trusted to distinguish it by identity.
+static void ProxySrcPrune() {
+    int live = 0;
+    for (int k = 0; k < 8; ++k) {
+        if (!g_proxySrcRing[k].ghostId) continue;
+        if (ResolveEntityById(g_proxySrcRing[k].ghostId)) { ++live; continue; }
+        g_proxySrcRing[k].srcId = 0;
+        g_proxySrcRing[k].ghostId = 0;
+    }
+    g_proxySrcCount = live;   // diagnostic only
+}
+// World change: every entity in the old world is dead or unmoored, so every pair is meaningless.
+// This is the reset the review found missing; it runs on the selection path so it cannot be skipped.
+static uint64_t s_proxyWorldId = 0;
+static void ProxySrcWorldCheck() {
+    __try {
+        World* w = World::GetCurrentWorld();
+        if (!w) return;
+        const uint64_t wid = w->GetObjectID();
+        if (wid == s_proxyWorldId) return;
+        s_proxyWorldId = wid;
+        if (g_proxySrcCount || g_proxyGhostCount)
+            L("[GhostProxy] world change -> source set cleared (pairs=%d ghosts=%d)\n",
+              g_proxySrcCount, g_proxyGhostCount);
+        ProxySrcClearAll();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+// Re-establish a freshly-duplicated ghost's hull identity. Order is load-bearing:
+//   max (slot 0x130, a pure field write) -> clamp current <= max -> current (raw write) -> read-back.
+// The clone does not copy +0xB4/+0xD0, so its max may be 0 - and +0x1B8 (max) is the divisor
+// ShipHealthCondition::Evaluate uses, so the max write is CHECKED. Returning false means the caller
+// must not register the clone.
+// current is clamped to [1.0, peerMax]: >= 1.0 so the write can never fire the zero-health destroy
+// (hull-hp-found.md P4), <= peerMax so it can never exceed the max we just set. The read-back is
+// one-shot, never a retry loop: a refusal is for a human reading the line.
+static bool GhostSetHullIdentity(void* ghost, float peerMax) {
+    if (!ghost || !(peerMax > 0.0f)) return false;
+    float preMax = 0.0f;
+    const bool havePre = ReadShipHullMax(ghost, &preMax);   // probe: the clone's +0xB4 before our write
+    const bool maxOk   = WriteShipHullMax(ghost, peerMax);
+    float cur = peerMax;
+    if (ShipHPSyncEnabled() && g_ghostSyncHP > 0.0f) cur = g_ghostSyncHP;
+    if (cur > peerMax) cur = peerMax;
+    if (cur < 1.0f)    cur = 1.0f;
+    L("[GhostProxy] hull-prewrite max=%.0f cur=%.0f\n", havePre ? preMax : 0.0f, cur);
+    if (!maxOk) {
+        L("[GhostProxy] hull-readback FAIL want=%.1f/%.1f got=unwritten (max setter refused)\n", peerMax, cur);
+        return false;
+    }
+    WriteShipHullHPRaw(ghost, cur);   // a refusal only logs - the max is already correct
+    float maxBack = 0.0f, curBack = 0.0f;
+    const bool rbMax = ReadShipHullMax(ghost, &maxBack);
+    const bool rbCur = ReadShipHullHP(ghost, &curBack);
+    float dMax = 1.0e9f;
+    if (rbMax) dMax = (maxBack > peerMax) ? (maxBack - peerMax) : (peerMax - maxBack);
+    if (!rbMax || !(dMax <= 0.5f) || !rbCur || !(curBack > 0.0f) || !(curBack <= peerMax + 0.5f))
+        L("[GhostProxy] hull-readback FAIL want=%.1f/%.1f got=%.1f/%.1f\n",
+          peerMax, cur, rbMax ? maxBack : -1.0f, rbCur ? curBack : -1.0f);
+    return true;   // the max is what matters; a refused current or a failed read-back only logs
+}
+// T39: live ship-test harness. The 20 Hz poll thread in dllmain.cpp sets the request (ScrollLock =
+// damage, Pause = sink); CaptureShips consumes it, because this is where the naval manager and the
+// local ship are resolved. Mode 1 damages every ship within ShipTestRadiusM by ShipTestFracPct of
+// its OWN max; mode 2 drives the hull to -1 so the engine fires its zero-health event and sinks.
+static volatile long g_shipTestReq = 0;
+void Phase1::RequestShipTest(int mode) { if (mode) g_shipTestReq = mode; }
 static volatile long g_ghostHasSync = 0;     // 1 = we have a peer ship position to drive to
+// Liveness stamp for the latch above. g_ghostHasSync used to be cleared only by a *later*
+// ApplyRemoteState, so once the peer stopped talking it froze at 1 (auto-spawn + drive kept running
+// with no peer, at a stale position, through world changes). ApplyRemoteState stamps the time and the
+// world id here; EntitySyncTick clears the latch when either no longer matches (see kPeerLiveMs).
+static uint64_t g_ghostSyncMs = 0;           // GetTickCount64() of the last ship-state apply
+static uint64_t g_ghostSyncWorldId = 0;      // world id carried by that apply (0 = unknown)
+static bool    g_ghostPeerNoShip = false;    // 1 = that apply said "peer not aboard" (explicit disembark)
+// Peer liveness window (ms), shared by the puppet gate below and the ghost latch so the two lanes can
+// never disagree about what "the peer is still here" means. Same 2 s convention as the receive timer.
+static const uint64_t kPeerLiveMs = 2000;
 static bool    g_ghostAuto = false;          // 1 = spawned by the net path (despawn on disembark); 0 = manual F12
 static float   g_localShipZ = 0.0f;          // the LOCAL ship's current Z (water height, bobs with waves)
 // A1 ([Coop] ActionDeathLog): the local player's current action alias, mirrored here by
@@ -988,6 +1335,7 @@ bool Phase1::CaptureLocalState(PlayerState& s) {
             return false;
 
         s.worldId = world->GetObjectID();
+        Net::SetLocalWorldId(s.worldId);   // X5: the entity lane stamps/checks this id
         s.protoVer = NET_PROTO_VER;
 
         Entity* player = world->GetPlayer();
@@ -1151,7 +1499,9 @@ bool Phase1::CaptureLocalState(PlayerState& s) {
         s.shipValid = false;
         s.shipPos[0] = s.shipPos[1] = s.shipPos[2] = 0.0f;
         s.shipQuat[0] = s.shipQuat[1] = s.shipQuat[2] = 0.0f; s.shipQuat[3] = 1.0f;
-        s.shipHP = 0;
+        s.shipHP = 0.0f;
+        s.shipMaxHP = 0.0f;   // 0 = unknown (no ship aboard / GcLShip unreachable)
+        s.shipClass = 0;      // 0 = unknown (not aboard, or the ship entity's class tag failed)
         void* ship = handleResolve(h->m_IsOnShipEntity);
         if (!ship) ship = handleResolve(h->m_Data.m_Vehicle);
         if (ship && readable(ship, sizeof(HookMath::Transform))) {
@@ -1161,8 +1511,22 @@ bool Phase1::CaptureLocalState(PlayerState& s) {
             HookMath::Quaternion q;
             HookMath::FromMatrix(sm, &q);
             s.shipQuat[0] = q.x; s.shipQuat[1] = q.y; s.shipQuat[2] = q.z; s.shipQuat[3] = q.w;
-            void* stat = readable((char*)ship + 0x5C, 4) ? *(void**)((char*)ship + 0x5C) : nullptr;
-            s.shipHP = (stat && readable((char*)stat + 0x84, 4)) ? *(int*)((char*)stat + 0x84) : 0;
+            // Hull HP from GcLShip+0xD0 (verified; [[ship+0x5C]+0x84] was disproved - it regenerates).
+            // Behind ShipHPSync: with the flag off nothing is read and the field stays 0.0f.
+            if (ShipHPSyncEnabled()) {
+                float hp = 0.0f;
+                if (ReadShipHullHP(ship, &hp)) s.shipHP = hp;
+            }
+            // Max hull HP is deliberately NOT behind ShipHPSync: it is identity, not a value applied to
+            // the ghost. The proxy selection needs it to choose WHICH local ship to duplicate, and that
+            // path runs with HP sync off (the default). Same guarded GcLShip lookup as shipHP above.
+            {
+                float maxHp = 0.0f;
+                if (ReadShipHullMax(ship, &maxHp)) s.shipMaxHP = maxHp;
+            }
+            // Ship class, straight off the ship ENTITY (not the GcLShip). Like shipMaxHP it is identity
+            // for the proxy selector, so it is not behind ShipHPSync (which is off by default).
+            s.shipClass = ReadShipClass((Entity*)ship);
             s.shipValid = true;
         }
 
@@ -1210,8 +1574,69 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
         g_ghostSyncQuat[2] = s.shipQuat[2];
         g_ghostSyncQuat[3] = s.shipQuat[3];
         g_ghostHasSync = 1;
+        g_ghostSyncMs = GetTickCount64();   // liveness stamp: EntitySyncTick clears the latch when stale
+        g_ghostSyncWorldId = s.worldId;     // ...or when the clone's world stops matching the current one
+        g_ghostPeerNoShip = false;
+        // PX-m3: the peer's copy of GcLShip+0xB4 arrives raw over the wire; only the LOCAL read is
+        // bounded (ReadShipHullMax). 0 already means "unknown" downstream (the proxy gate is
+        // > 0.0f), so an out-of-band value must become 0 -- no proxy -- and never a number the
+        // selector believes. Band top = the measured live maximum (350..52000: hull-hp-found.md,
+        // ghost-identity-by-proxy.md); the bit test is used instead of
+        // "raw != raw" because an operand-comparison NaN test can be folded under /fp:fast.
+        {
+            float raw = s.shipMaxHP;
+            const uint32_t bits = *(uint32_t*)&raw;                  // same cast pattern as the timer read
+            const bool isNan = ((bits & 0x7F800000u) == 0x7F800000u) && ((bits & 0x007FFFFFu) != 0);
+            float clean = raw;
+            const char* why = nullptr;
+            if (isNan)                   { clean = 0.0f; why = "nan"; }
+            else if (!(raw > 0.0f))      { clean = 0.0f; why = "non-positive"; }   // also -inf / negative
+            else if (!(raw <= 52000.0f)) { clean = 0.0f; why = "above-band"; }     // also +inf
+            if (why) {
+                static bool s_peerMaxHpClampLogged = false;   // once per process: an out-of-band wire
+                if (!s_peerMaxHpClampLogged) {                // value is a smell, not a 20 Hz event
+                    s_peerMaxHpClampLogged = true;
+                    L("[GhostProxy] shipMaxHP out of band raw=%g -> %g reason=%s\n", raw, clean, why);
+                }
+            }
+            g_ghostPeerMaxHP = clean;   // [GhostProxy] peer's class fingerprint (GcLShip+0xB4; 0 = unknown)
+        }
+        g_ghostPeerClass = s.shipClass;   // [GhostProxy] peer's ship class (entity+0x9C; 0 = unknown)
+        // [Coop] ShipHPSync (default OFF): carry the peer's hull HP to the ghost. Change-guarded, so the
+        // damage-aware setter (clamp + zero event + HUD republish) is not hammered once per packet.
+        if (ShipHPSyncEnabled()) {
+            // PX-m2: g_ghostSyncHP is taken raw off the wire and written by WriteShipHullHPRaw at two
+            // sites, so a peer sending NaN / 0 / a garbage negative would write it into GcLShip+0xD0.
+            // Clamp here at the assignment (both write sites inherit it): NaN and <= 0 -> 0 (the same
+            // bit-test pattern as the shipMaxHP clamp above, so /fp:fast cannot fold the NaN test; a
+            // sinking hull may sit slightly below 0, but a non-positive raw write is the
+            // zero-health-destroy hazard); > 1e7 -> clamped to 1e7 (the band ReadShipHullHP uses).
+            float raw = s.shipHP;
+            const uint32_t bits = *(uint32_t*)&raw;
+            const bool isNan = ((bits & 0x7F800000u) == 0x7F800000u) && ((bits & 0x007FFFFFu) != 0);
+            float clean = raw;
+            const char* why = nullptr;
+            if (isNan)                  { clean = 0.0f; why = "nan"; }
+            else if (!(raw > 0.0f))     { clean = 0.0f; why = "non-positive"; }   // 0 / negative / -inf
+            else if (!(raw <= 1e7f))    { clean = 1e7f; why = "above-band"; }     // +inf / absurd
+            if (why) {
+                static bool s_shipHpClampLogged = false;
+                if (!s_shipHpClampLogged) {
+                    s_shipHpClampLogged = true;
+                    L("[GhostProxy] shipHP out of band raw=%g -> %g reason=%s\n", raw, clean, why);
+                }
+            }
+            if (clean == 0.0f) g_ghostAppliedHP = -1.0f;   // PX-m2: a cleaned (no-hull) value re-applies the next valid one
+            g_ghostSyncHP = clean;
+            if (g_ghostShip && g_ghostSyncHP != g_ghostAppliedHP) {
+                if (WriteShipHullHPRaw(g_ghostShip, g_ghostSyncHP)) g_ghostAppliedHP = g_ghostSyncHP;
+            }
+        }
     } else {
         g_ghostHasSync = 0;
+        g_ghostPeerNoShip = true;   // explicit "peer not aboard" -> this MAY hide the auto ghost (as before)
+        g_ghostPeerMaxHP = 0.0f;   // peer not aboard -> no class fingerprint
+        g_ghostPeerClass = 0;      // peer not aboard -> no ship class
     }
     if (!g_puppet || !s.valid) return;
     __try {
@@ -1527,6 +1952,7 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
                 // Full array, bounded by BOTH the peer's slot count and the puppet's own controller size
                 // (sized per action; the engine drops writes past it anyway).
                 int n = s.blendCount;
+                if (n > BLEND_MAX) n = BLEND_MAX;
                 int pn = ac->GetBlendFactorCount(0, ACTLAYER_PRIMARY);
                 if (pn < n) n = pn;
                 for (int i = 0; i < n; ++i) {
@@ -1717,6 +2143,156 @@ static void* ConstructGhostBody(void* sourceBody, const HookMath::Transform& tm)
     return body;
 }
 
+// -------------------------------------------------------------------------------------------
+// Ghost player-marker suppression (Coop:GhostMarkerSuppress, default 1).
+//
+// The duplicate inherits the ship's marker component, and its activate path re-sends
+// PLAYER_MARKER_ADD for the clone, so the minimap holds two "player ship" icons that thrash.
+//
+// Quoted from AC4BFSP.exe.i64 (IDA 9.3, idalib), all three facts verified this session:
+//
+//   sub_1223790 — the ONLY PLAYER_MARKER_ADD emitter (its one and only data reference in the
+//   image is the vtable slot at 0x26A2770, so the *class vtable slot* is the identity):
+//        v12[0] = this + 72;                          // +0x48 = subject key
+//        result = sub_7FE9A0(&off_26A37A8 /* L"PLAYER_MARKER_ADD" */, 2, v12);
+//        if ( a3 ) { *(this + 68) |= 1u; ... *((_DWORD *)this + 12) = v8(this); }   // +0x44, +0x30
+//   NOTE: sub_1223790 never reads +0x26. Only the base MARKER_ADD emitter (sub_117D1D0) and the
+//   faction emitter (sub_1223620) branch on that byte, so no +0x26 value "decides" the player
+//   marker — the vtable slot does. We therefore identify the component by its slots, not by kind.
+//
+//   sub_114CC30 — the deactivate virtual (slot 3 = byte 0x0C of BOTH vtables of that family:
+//   0x26A270C and 0x26A277C both hold it):
+//        sub_7FA170(this + 60);                       // frees *(this+0x3C), nulls it
+//        v6 = this + 72;                              // SAME subject key as the add
+//        result = sub_7FE9A0(L"MARKER_REMOVE", 2, &v6);
+//        if ( a3 ) *(_BYTE *)(this + 68) &= ~1u;      // clear +0x44 bit 0
+//
+// The subject key is the address of the component's own +0x48 field, so a remove issued on the
+// ghost's clone can only ever name the clone — the player's own marker is a different object.
+// sub_114CC30 frees (+0x3C) before it emits; nothing on any add path writes +0x3C, so on a fresh
+// clone it is normally NULL (free is a no-op). If it is NOT null we refuse to run the engine
+// teardown on a possibly shared sub-object and only clear the local registration fields.
+static const uint32_t VA_PLAYER_MARKER_ADD = 0x1223790u;   // vtable slot 0 (or 0x70) of the class
+static const uint32_t VA_MARKER_DEACTIVATE = 0x114CC30u;   // vtable slot 3 (0x0C) of the class
+
+static int s_ghostMarkerSuppress = -1;
+static inline int GhostMarkerSuppressEnabled() {
+    if (s_ghostMarkerSuppress < 0)
+        s_ghostMarkerSuppress = GetPrivateProfileIntA("Coop", "GhostMarkerSuppress", 1, Paths::Ini()) != 0 ? 1 : 0;
+    return s_ghostMarkerSuppress;
+}
+
+// 1 if `obj` carries the player-marker class vtable (PLAYER_MARKER_ADD emitter present AND the
+// MARKER_REMOVE deactivate at slot 3). Fills kind (+0x26) and handle (+0x30) for the log line.
+static int GhostMarkerProbe(void* obj, int* kindOut, uint32_t* handleOut)
+{
+    if (!obj || !readable(obj, 0x78)) return 0;
+    uint32_t vt = *(uint32_t*)obj;
+    if (!vt) return 0;
+    if (!readable((void*)(uintptr_t)(vt + 0x0C), 4)) return 0;
+    if (*(uint32_t*)(uintptr_t)(vt + 0x0C) != VA_MARKER_DEACTIVATE) return 0;
+    // The family has two sibling vtables; the emitter sits at slot 0 of one and at +0x70 of the
+    // other, so accept either — but only one of the two may hold it.
+    uint32_t add0 = 0, add70 = 0;
+    if (readable((void*)(uintptr_t)(vt + 0x00), 4)) add0 = *(uint32_t*)(uintptr_t)(vt + 0x00);
+    if (readable((void*)(uintptr_t)(vt + 0x70), 4)) add70 = *(uint32_t*)(uintptr_t)(vt + 0x70);
+    if (add0 != VA_PLAYER_MARKER_ADD && add70 != VA_PLAYER_MARKER_ADD) return 0;
+    *kindOut = (int)*(uint8_t*)((char*)obj + 0x26);
+    *handleOut = *(uint32_t*)((char*)obj + 0x30);
+    return 1;
+}
+
+// Run the class's own deactivate virtual (a3 = 1). Returns 1 if the marker is neutralised (engine
+// teardown ran, or the shared-sub-object fallback cleared the registration), 0 if it was refused.
+static int GhostMarkerDeactivate(void* comp, int* kindOut, uint32_t* handleOut)
+{
+    if (!GhostMarkerProbe(comp, kindOut, handleOut)) return 0;
+    uint32_t vt = *(uint32_t*)comp;
+    uint32_t shared = *(uint32_t*)((char*)comp + 0x3C);
+    typedef int (__thiscall *MarkerDeactivateFn)(void*, void*, void*);
+    MarkerDeactivateFn fn = *(MarkerDeactivateFn*)(uintptr_t)(vt + 0x0C);
+    if (!fn) return 0;
+    if (shared) {
+        // m3 (outcome b, 2026-11-09): the engine teardown (`fn`) is NOT run. `fn` is sub_114CC30 and it
+        // frees *(this+0x3C) (sub_7FA170) before emitting MARKER_REMOVE. Whether that sub-object is
+        // private to the clone is NOT proved anywhere in the tree - the duplicate path's treatment of
+        // +0x3C has never been decompiled, so emitting the remove risks a double free of the player's
+        // own marker sub-object.
+        // SETTLING FACT: decompile the duplicate/clone routine the ghost spawn uses and check whether it
+        // deep-copies +0x3C (a fresh allocation) or leaves it NULL on the clone. Deep copy => the remove
+        // is safe here; a shared pointer => the fallback below is correct as written.
+        //
+        // Residual, logged once per process so the omission is never silent: MARKER_REMOVE and the free
+        // of +0x3C are skipped; the local registration is still cleared - bit 0 of +0x44, the handle at
+        // +0x30 and the marker kind byte at +0x26 (0 is not one of the player kinds {1,2,3,31,32,38,39,
+        // 42,43}) - and the marker is reported handled, so no caller needs a second attempt.
+        static int s_markerSharedLogged = 0;
+        if (s_markerSharedLogged < 1) {
+            ++s_markerSharedLogged;
+            L("[GhostMarker] skip MARKER_REMOVE reason=shared-subobject +0x3C=%08X skipped=MARKER_REMOVE,free(+0x3C) (registration cleared)\n",
+              shared);
+        }
+        *(uint8_t*)((char*)comp + 0x44) &= (uint8_t)~1u;
+        *(uint32_t*)((char*)comp + 0x30) = 0;
+        *(uint8_t*)((char*)comp + 0x26) = 0;
+        return 1;
+    }
+    __try {
+        fn(comp, nullptr, (void*)1);            // -> MARKER_REMOVE + clear +0x44 bit 0
+        return 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        L("[GhostMarker] deactivate EXCEPTION 0x%08X\n", GetExceptionCode());
+        return 0;
+    }
+}
+
+// Scan one pointer array of the ghost; `depth` allows one level down into a child entity's own
+// component array. Returns the number of markers deactivated.
+static int GhostMarkerScanArray(void* base, int count, int depth, int* kindOut, uint32_t* handleOut)
+{
+    if (!base || count <= 0 || count > 512) return 0;
+    if (!readable(base, count * 4)) return 0;
+    int n = 0;
+    for (int i = 0; i < count; ++i) {
+        void* p = *(void**)((char*)base + i * 4);
+        if (!p || !readable(p, 4)) continue;
+        int k = 0; uint32_t h = 0;
+        if (GhostMarkerProbe(p, &k, &h)) {
+            *kindOut = k; *handleOut = h;
+            if (GhostMarkerDeactivate(p, &k, &h)) ++n;
+            continue;
+        }
+        if (depth > 0 && readable((char*)p + 0x68, 2)) {
+            void* cbase = *(void**)((char*)p + 0x60);         // component array
+            int   ccount = *(uint16_t*)((char*)p + 0x66);     // u16 count
+            n += GhostMarkerScanArray(cbase, ccount, depth - 1, kindOut, handleOut);
+        }
+    }
+    return n;
+}
+
+// Suppress the player marker on the ghost ONLY. Walks the clone's component array (+0x60 / u16
+// +0x66) and the child array copied by FUN_00503600 (+0x140 / u16 +0x146), plus one level of
+// child components. Never touches the source ship or the local player. Logs once per spawn.
+static void GhostSuppressPlayerMarker(void* ghost)
+{
+    if (!ghost || !GhostMarkerSuppressEnabled()) return;
+    if (!readable(ghost, 0x150)) return;
+    int suppressed = 0, kind = -1;
+    uint32_t handle = 0;
+    __try {
+        void* cbase = *(void**)((char*)ghost + 0x60);          // m_Components data
+        int   ccount = *(uint16_t*)((char*)ghost + 0x66);
+        suppressed += GhostMarkerScanArray(cbase, ccount, 1, &kind, &handle);
+        void* kbase = *(void**)((char*)ghost + 0x140);         // child (sub-entity) array
+        int   kcount = *(uint16_t*)((char*)ghost + 0x146);
+        suppressed += GhostMarkerScanArray(kbase, kcount, 1, &kind, &handle);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        L("[GhostMarker] walk EXCEPTION 0x%08X\n", GetExceptionCode());
+    }
+    L("[GhostMarker] suppressed=%d kind=%d handle=%08X\n", suppressed, kind, handle);
+}
+
 // Spawn a ghost ship = a FULL clone of the LOCAL ship (EntityGroup vtable[3] deep-copy + the 3 direct
 // component fields + physics disabled). Returns the ghost EntityGroup, or nullptr on failure.
 // Runs on the main thread (the frame hook). This is the ship-spawn primitive proven via F12.
@@ -1792,6 +2368,7 @@ static void* DuplicateShip(void* shipEnt) {
             HookMath::Vector4 gpos;
             gpos.x = sm->M41; gpos.y = sm->M42; gpos.z = sm->M43; gpos.w = 0.0f;
             ((Entity*)dup)->SetPosition(gpos);
+            GhostSuppressPlayerMarker(dup);   // Coop:GhostMarkerSuppress — kill the 2nd player icon
             return dup;
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             return nullptr;
@@ -1801,7 +2378,14 @@ static void* DuplicateShip(void* shipEnt) {
     }
 }
 
-// Spawn the peer's ship ghost from the LOCAL player's ship (the Jackdaw).
+// Forward declaration for the ghost-proxy route (defined after the naval-list helpers below).
+// Pure query: it returns the best candidate and reports it in *out; it records NOTHING.
+static Entity* SelectProxySource(float peerMax, uint32_t peerClass, ProxyPick* out);
+
+// Spawn the peer's ship ghost. With GhostProxy=1 and a known peer max, duplicate the local ship
+// whose class matches the peer's instead of the local Jackdaw; else (or on any failure) fall back
+// to the local ship exactly as today. With GhostProxy=0 (default) nothing in this block runs: one
+// int test on the cached flag, then the same DuplicateShip(shipEnt) call as before the proxy route.
 static void* SpawnGhostShip() {
     __try {
         World* world = World::GetCurrentWorld();
@@ -1810,6 +2394,88 @@ static void* SpawnGhostShip() {
         if (!h) return nullptr;
         void* shipEnt = handleResolve(h->m_IsOnShipEntity);
         if (!shipEnt) shipEnt = handleResolve(h->m_Data.m_Vehicle);
+
+        if (GhostProxyEnabled()) {
+            // Backoff after a failed duplicate/hull write. Advisory only: it shapes WHEN we retry,
+            // and no counter here can ever gate SelectProxySource.
+            static uint64_t s_proxyDupFailUntil = 0;
+            static unsigned s_proxyDupFails     = 0;   // saturated at 8: only the shift (clamped to 4)
+                                                       // and the [GhostProxy] log field consume it
+            static uint64_t s_proxyLogLast      = 0;   // wall-clock throttle, 1 s
+            static uint32_t s_pickLastSrcId     = 0;   // PX-m5: last pick line's source id
+            static int      s_pickSpawn         = 0;   // PX-m5: pick count (first spawn always logs)
+            const uint64_t nowMs = GetTickCount64();
+            ProxySrcWorldCheck();
+            if (nowMs < s_proxyDupFailUntil) {
+                // Backing off: the proxy path does not run this frame. The Jackdaw fallback below
+                // still does, so the ghost appears - degraded, exactly as before the proxy route.
+            } else if (g_ghostPeerMaxHP > 0.0f) {
+                ProxySrcPrune();   // once per selection pass, never per frame
+                ProxyPick pick;
+                Entity* chosen = SelectProxySource(g_ghostPeerMaxHP, g_ghostPeerClass, &pick);
+                if (chosen) {
+                    // PX-m5: throttle the pick line (1 s wall-clock, shared with the fallback lines);
+                    // a first spawn or a source change always logs, so a live test still sees the
+                    // source identity it cares about.
+                    const bool firstSpawn = (s_pickSpawn == 0);
+                    const bool srcChanged = (pick.srcId != s_pickLastSrcId);
+                    if (firstSpawn || srcChanged || (nowMs - s_proxyLogLast >= 1000)) {
+                        s_proxyLogLast = nowMs;
+                        s_pickLastSrcId = pick.srcId;
+                        L("[GhostProxy] pick src=%08X id=%u cls=%u peerCls=%u delta=%.0f idx=%d retry=%u classMiss=%d camSrc=%s\n",
+                          (unsigned)chosen, (unsigned)pick.srcId, (unsigned)pick.cls, (unsigned)g_ghostPeerClass,
+                          pick.srcMax, pick.idx, s_proxyDupFails, pick.classMiss, pick.camSrc ? pick.camSrc : "?");
+                        L("[E] ev=proxy-pick src=%08X id=%u cls=%u peerCls=%u idx=%d\n",
+                          (unsigned)chosen, (unsigned)pick.srcId, (unsigned)pick.cls, (unsigned)g_ghostPeerClass, pick.idx);
+                    }
+                    ++s_pickSpawn;
+                    void* dup = DuplicateShip(chosen);
+                    if (dup) {
+                        uint32_t ghostId = 0;
+                        __try { ghostId = (uint32_t)((ManagedObject*)dup)->GetObjectID(); }
+                        __except (EXCEPTION_EXECUTE_HANDLER) { ghostId = 0; }
+                        if (GhostSetHullIdentity(dup, g_ghostPeerMaxHP)) {
+                            // The pair is recorded only now - after the duplicate exists. On any
+                            // failure no slot is consumed, so the next frame may retry the source.
+                            ProxySrcRemember(pick.srcId, ghostId);
+                            s_proxyDupFails = 0; s_proxyDupFailUntil = 0;
+                            return dup;
+                        }
+                        // The clone's max could not be established. Registering it would leave a
+                        // ghost whose max may be 0 - the divisor ShipHealthCondition::Evaluate uses
+                        // - so retire the clone the way DespawnGhostShip does (move it far away;
+                        // never World::RemoveEntity, SHIP-RE C11 erase crash) and record no pair, so
+                        // it can never be chosen as a ghost and never blacklists a source.
+                        __try {
+                            HookMath::Transform hide;
+                            hide.M41 = 0.0f; hide.M42 = -100000.0f; hide.M43 = 0.0f;
+                            ((Entity*)dup)->SetGlobalMatrixInternal(&hide, false);
+                        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+                        if (s_proxyDupFails < 8) ++s_proxyDupFails;   // saturate: log field + shift are bounded
+                        { unsigned sh = s_proxyDupFails < 4 ? s_proxyDupFails : 4;
+                          s_proxyDupFailUntil = nowMs + (250ULL << (sh - 1)); }   // 250/500/1000/2000 ms
+                        if (nowMs - s_proxyLogLast >= 1000) {
+                            s_proxyLogLast = nowMs;
+                            L("[GhostProxy] fallback reason=hull-write-failed\n");
+                        }
+                    } else {
+                        if (s_proxyDupFails < 8) ++s_proxyDupFails;   // saturate: log field + shift are bounded
+                        { unsigned sh = s_proxyDupFails < 4 ? s_proxyDupFails : 4;
+                          s_proxyDupFailUntil = nowMs + (250ULL << (sh - 1)); }
+                        if (nowMs - s_proxyLogLast >= 1000) {
+                            s_proxyLogLast = nowMs;
+                            L("[GhostProxy] fallback reason=dup-failed\n");
+                        }
+                    }
+                } else if (nowMs - s_proxyLogLast >= 1000) {
+                    s_proxyLogLast = nowMs;
+                    L("[GhostProxy] fallback reason=no-candidate\n");
+                }
+            } else if (nowMs - s_proxyLogLast >= 1000) {
+                s_proxyLogLast = nowMs;
+                L("[GhostProxy] fallback reason=no-peer-max\n");
+            }
+        }
         return DuplicateShip(shipEnt);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return nullptr;
@@ -2060,7 +2726,7 @@ void Phase1::TryShipDupProbe() {
     }
     void* dup = SpawnGhostShip();
     if (dup) {
-        g_ghostShip = dup;
+        GhostTrack(dup);
         g_ghostAuto = false;   // manual F12 spawn: persists until F11 removes it (no auto-despawn)
         L("[ShipDup] spawned ghost ship %p vt=%08X (manual, will track peer)\n", dup, *(uint32_t*)dup);
     } else {
@@ -2076,6 +2742,8 @@ void Phase1::DespawnGhostShip() {
     if (!g_ghostShip) return;
     Entity* dead = (Entity*)g_ghostShip;
     g_ghostShip = nullptr;
+    g_ghostObjId = 0;           // the liveness probe must not resolve a hidden ghost
+    g_ghostAppliedHP = -1.0f;   // ShipHPSync: re-apply the peer's HP to the next ghost
     g_ghostAuto = false;
     __try {
         HookMath::Transform hideTransform;   // identity rotation, position far away
@@ -2165,6 +2833,221 @@ static Entity* GetLocalShip() {
     } __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
 }
 
+// ---- F8 live test: [Coop] BoardableTest (default 0) -----------------------------------------------------
+// ops/evidence/boarding-enable-2026-11-10.md (IDA, instructions quoted): the script action ActionShipBoardable does
+//   obj = sub_122BA20(entity)            __cdecl, 1 arg (= sub_FB3220(entity, 0)): per-ship entity object
+//   sub_1207960(obj, u8 value)           __thiscall, retn 4: writes obj+0x3A9 and obj+0x540, posts an event
+// and the mission condition BoardingCondition reads obj->vtbl[+408]() && obj->vtbl[+368]() (u8 predicates).
+// This test does exactly the action's call on the NEAREST non-local AI ship within 200 m, once, and logs the byte
+// and both predicates before and after. Question answered live: does the flag alone make the ship boardable?
+static void BoardableTestTick() {
+    static int s_on = -1, s_done = 0; static DWORD s_next = 0;
+    if (s_on < 0) s_on = GetPrivateProfileIntA("Coop", "BoardableTest", 0, Paths::Ini()) != 0 ? 1 : 0;
+    if (!s_on || s_done) return;
+    const DWORD now = GetTickCount();
+    if (now < s_next) return;
+    s_next = now + 2000;                                       // look every 2 s until one ship qualifies
+    __try {
+        World* world = World::GetCurrentWorld();
+        Entity* player = world ? world->GetPlayer() : nullptr;
+        void* mgr = GetNavalManager();
+        if (!player || !mgr || !readable((char*)mgr + 0x3E8, 8)) return;
+        const unsigned short n = *(unsigned short*)((char*)mgr + 0x3EE);
+        Entity* local = GetLocalShip();
+        Entity* best = nullptr; float bestD2 = 200.0f * 200.0f;
+        const float px = player->m_GlobalMatrix.M41, py = player->m_GlobalMatrix.M42;
+        for (int i = 0; i < (int)n && i < 128; ++i) {
+            Entity* se = GetShipEntity(mgr, i);
+            if (!se || !readable(se, 0x50) || *(uint32_t*)se != 0x01E4A128u || se == local) continue;
+            if (se == (Entity*)g_ghostShip) continue;
+            const float dx = se->m_GlobalMatrix.M41 - px, dy = se->m_GlobalMatrix.M42 - py;
+            if (dx * dx + dy * dy < bestD2) { bestD2 = dx * dx + dy * dy; best = se; }
+        }
+        if (!best) return;
+        void* obj = ((void* (__cdecl*)(void*))0x0122BA20)((void*)best);
+        if (!readable(obj, 0x548) || !readable(*(void**)obj, 0x1A0)) { L("[Board] ship=%p obj=%p unreadable - skipped\n", best, obj); s_done = 1; return; }
+        typedef unsigned char (__thiscall* Pred)(void*);
+        void** vt = *(void***)obj;
+        const unsigned char b0 = *((unsigned char*)obj + 0x3A9), m0 = *((unsigned char*)obj + 0x540);
+        const unsigned char p408a = ((Pred)vt[408 / 4])(obj), p368a = ((Pred)vt[368 / 4])(obj);
+        L("[Board] BEFORE ship=%p obj=%p dist=%.1f +0x3A9=%u +0x540=%u pred408=%u pred368=%u\n",
+          best, obj, sqrtf(bestD2), b0, m0, p408a, p368a);
+        ((void (__thiscall*)(void*, unsigned char))0x01207960)(obj, 1);                  // SetBoardable(obj, 1)
+        const unsigned char b1 = *((unsigned char*)obj + 0x3A9), m1 = *((unsigned char*)obj + 0x540);
+        const unsigned char p408b = ((Pred)vt[408 / 4])(obj), p368b = ((Pred)vt[368 / 4])(obj);
+        L("[Board] AFTER  ship=%p +0x3A9=%u +0x540=%u pred408=%u pred368=%u\n", best, b1, m1, p408b, p368b);
+        L("[E] ev=boardable-set ok=%d\n", (b1 == 1) ? 1 : 0);
+        s_done = 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        L("[Board] EXCEPTION code=0x%08X\n", GetExceptionCode());
+        s_done = 1;
+    }
+}
+
+// Choose a naval-list ship to duplicate as the peer's class. Walks [mgr+0x3E8] (handle containers,
+// stride 0xD0, count u16 @ +0x3EE).
+//
+// PURE QUERY: it records nothing. The pair is inserted by the caller, after DuplicateShip returns -
+// otherwise a failed duplicate burns a source slot and eight failures disable the feature.
+//
+// Matching, in the light of ops/evidence/ship-max-upgrades.md: GcLShip+0xB4 is PER-INSTANCE state
+// (the ctor writes 1000.0f, the live Jackdaw holds 12000, a duplicate reads 1000 again), so exact
+// float equality is not a class test - and a duplicate always reads 1000, which also makes it
+// self-matching. Ranking therefore is:
+//   1. ship CLASS (when peerClass != 0, the peer's class read from its own ship entity): candidates
+//      whose ReadShipClass(se) equals peerClass are preferred over any that do not - the exact-class
+//      match the wire now provides. If none matches, this tier is vacuous (every candidate ties) and
+//      rules 2-4 still apply; classMiss is reported so the fallback is observable;
+//   2. nearest log-ratio hull tier, |log(candMax / peerMax)| - never equality;
+//   3. structural class hint, the ship's sub-entity count (u16 @ GcLShip+0x146). The peer's hint is
+//      not on the wire, so it cannot be the target today; among equally-tiered candidates the one
+//      that carries a readable hint wins, then the structurally simpler hull (fewer sub-entities -
+//      the duplicate deep-copies that array, and burning/wreck children come along with it);
+//   4. farther from the camera (approximated by distance to the local ship - the only F1 mitigation
+//      available, no hide seam exists), then lowest object id.
+// cls, peerCls, classMiss, hint and tierDelta are all reported so the rule is observable.
+static Entity* SelectProxySource(float peerMax, uint32_t peerClass, ProxyPick* out) {
+    if (out) { out->srcId = 0; out->idx = -1; out->srcMax = 0.0f; out->tierDelta = 0.0f; out->hint = 0; out->cls = 0; out->classMiss = 0; out->camSrc = nullptr; }
+    if (!(peerMax > 0.0f)) return nullptr;
+    __try {
+        void* mgr = GetNavalManager();
+        if (!mgr || !readable((char*)mgr + 0x3E8, 8)) return nullptr;
+        const unsigned short n = *(unsigned short*)((char*)mgr + 0x3EE);
+        // PX-m6: the 128-ship selection window is silent when clamped - log once per distinct n so a
+        // worse source chosen silently is at least visible in the capture.
+        if (n > 128) {
+            static unsigned short s_clampLoggedN = 0;
+            if (s_clampLoggedN != n) {
+                s_clampLoggedN = n;
+                L("[GhostProxy] selection window clamped=128 of n=%u\n", (unsigned)n);
+            }
+        }
+        Entity* localShip = GetLocalShip();
+        const uint32_t curGhostId = (uint32_t)g_ghostObjId;
+
+        // Camera-focus proxy: the local ship's position (the naval camera orbits it). When the local
+        // ship cannot be read the tie-break silently degrades to "distance from world origin", so the
+        // source is reported for the pick log (camSrc=ship|origin).
+        const bool camFromShip = localShip && readable(localShip, sizeof(HookMath::Transform));
+        if (out) out->camSrc = camFromShip ? "ship" : "origin";
+        float camX = 0.0f, camZ = 0.0f;
+        if (camFromShip) {
+            camX = localShip->m_GlobalMatrix.M41;
+            camZ = localShip->m_GlobalMatrix.M43;
+        }
+
+        Entity* best = nullptr;
+        float bestTier = 0.0f, bestDist = -1.0f, bestMax = 0.0f;
+        float bestTieDelta = 0.0f;
+        uint32_t bestId = 0;
+        int bestIdx = -1, bestHint = 0;
+        bool bestHintOk = false;
+        uint32_t bestCls = 0;
+        bool bestClsMatch = false;
+        bool ghostInList = false;
+        float lastSkippedHp = 0.0f;
+        int   skippedDead = 0;
+        for (int i = 0; i < (int)n && i < 128; ++i) {
+            Entity* se = GetShipEntity(mgr, i);
+            if (!se || !readable(se, 4) || *(uint32_t*)se != 0x01E4A128u) continue;
+            if (se == localShip) continue;
+            // M3: after GhostSetHullIdentity the proxy ghost is a perfect fingerprint match, so it
+            // must be excluded by identity - never by its hull value.
+            if (se == (Entity*)g_ghostShip) { ghostInList = true; continue; }
+            void* hc = GetShipHandle(mgr, i);
+            if (!hc || !readable(hc, 0x14)) continue;
+            uint32_t candId = 0;
+            __try { candId = (uint32_t)(*(uint64_t*)((char*)hc + 0x0C)); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { candId = 0; }
+            if (!candId) continue;                        // no identity -> cannot be tracked/pruned
+            if (candId == curGhostId) { ghostInList = true; continue; }
+            if (ProxyGhostIdKnown(candId)) continue;      // a duplicate we created earlier
+            if (ProxySrcUsed(candId)) continue;           // id-keyed: a recycled address cannot match
+            // The object's own id must agree with the handle's cached id. A recycled entity block
+            // carries a different id, so address reuse can never blacklist a live ship.
+            uint32_t objId = 0;
+            __try { objId = (uint32_t)((ManagedObject*)se)->GetObjectID(); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { objId = 0; }
+            if (!objId || objId != candId) continue;
+            // Advisory only: a null here with a matching self-id above is logged once and the
+            // candidate is ACCEPTED. Minted ids are documented as absent from the reverse map, so a
+            // hard gate would silently empty the candidate set (a new M1-class bug).
+            {
+                static bool s_resolveMissLogged = false;
+                if (!ResolveEntityById(candId) && !s_resolveMissLogged) {
+                    s_resolveMissLogged = true;
+                    L("[GhostProxy] proxy-resolve-miss id=%u (accepted; resolver is advisory)\n", (unsigned)candId);
+                }
+            }
+            float maxV = 0.0f;
+            if (!ReadShipHullMax(se, &maxV)) continue;
+            float curHp = 0.0f;
+            if (!ReadShipHullHP(se, &curHp) || !(curHp > 1.0f)) {
+                // M4: a sinking/wreck source would deep-copy a wreck's sub-entity state into a ghost
+                // we then teleport to the peer and drive. <= 1.0 is the boundary because every write
+                // this project makes is clamped to >= 1.0.
+                ++skippedDead; lastSkippedHp = curHp;
+                continue;
+            }
+            float tier = logf(maxV / peerMax);
+            if (tier < 0.0f) tier = -tier;     // log ratio: symmetric, never float equality
+            // Ship class off the candidate's own entity (never the GcLShip); 0 = unreadable/not a ship.
+            uint32_t cls = ReadShipClass(se);
+            const bool clsMatch = (peerClass != 0u) && (cls == peerClass);
+            // Structural hint: sub-entity count, best-effort. An unavailable hint is NOT a failure.
+            int hint = 0; bool hintOk = false;
+            void* ho = ShipGcLObj(se);
+            if (ho && readable((char*)ho + 0x140, 0x0A)) {
+                __try { hint = (int)*(uint16_t*)((char*)ho + 0x146); hintOk = true; }
+                __except (EXCEPTION_EXECUTE_HANDLER) { hint = 0; hintOk = false; }
+            }
+            float dist = 0.0f;
+            if (readable(se, sizeof(HookMath::Transform))) {
+                float dx = se->m_GlobalMatrix.M41 - camX, dz = se->m_GlobalMatrix.M43 - camZ;
+                dist = dx * dx + dz * dz;
+            }
+            bool better = false;
+            if (!best) better = true;
+            else if (peerClass != 0u && clsMatch != bestClsMatch) better = clsMatch;  // class match wins
+            else if (tier < bestTier - 1.0e-5f) better = true;
+            else if (tier <= bestTier + 1.0e-5f) {
+                if (hintOk != bestHintOk) better = hintOk;
+                else if (hintOk && hint != bestHint) better = hint < bestHint;
+                else if (dist > bestDist) better = true;
+                else if (dist == bestDist && candId < bestId) better = true;
+            }
+            if (better) {
+                best = se; bestTier = tier; bestDist = dist; bestMax = maxV;
+                bestTieDelta = tier; bestIdx = i; bestId = candId;
+                bestHint = hint; bestHintOk = hintOk;
+                bestCls = cls; bestClsMatch = clsMatch;
+            }
+        }
+        // One line closing the review's open premise: does the ghost ever appear in [mgr+0x3E8]?
+        {
+            static bool s_ghostInListLogged = false;
+            if (g_ghostShip && !s_ghostInListLogged) {
+                s_ghostInListLogged = true;
+                L("[GhostProxy] ghostInList=%d n=%d g_ghostShip=%p g_ghostObjId=%u\n",
+                  ghostInList ? 1 : 0, (int)n, g_ghostShip, (unsigned)curGhostId);
+            }
+        }
+        if (skippedDead)
+            L("[GhostProxy] filter dead=%d lastCur=%.1f (skipped)\n", skippedDead, lastSkippedHp);
+        if (!best) return nullptr;
+        if (out) {
+            out->srcId     = bestId;
+            out->idx       = bestIdx;
+            out->srcMax    = bestMax;
+            out->tierDelta = bestTieDelta;
+            out->hint      = (uint32_t)bestHint;
+            out->cls       = bestCls;
+            out->classMiss = (peerClass != 0u && !bestClsMatch) ? 1 : 0;
+        }
+        return best;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+}
+
 static void fillShipState(EntityState& es, Entity* ent, uint32_t key, uint64_t objId) {
     es.key = key; es.kind = 1;
     // Real identity, from the same HandleContainer accessor the guard lane uses (phase1.cpp:3217).
@@ -2174,14 +3057,16 @@ static void fillShipState(EntityState& es, Entity* ent, uint32_t key, uint64_t o
     es.pos[0] = m->M41; es.pos[1] = m->M42; es.pos[2] = m->M43;
     HookMath::Quaternion q; HookMath::FromMatrix(m, &q);
     es.quat[0] = q.x; es.quat[1] = q.y; es.quat[2] = q.z; es.quat[3] = q.w;
-    // Hull HP (host-authoritative ship damage): *(ship+0x5C) -> +0x84.
-    es.hullHP = 0;
-    void* stat = readable((char*)ent + 0x5C, 4) ? *(void**)((char*)ent + 0x5C) : nullptr;
-    if (stat && readable((char*)stat + 0x84, 4)) es.hullHP = *(int*)((char*)stat + 0x84);
 }
 
 static void CaptureShips(EntityPacket& pkt) {
     pkt.magic = NET_ENTITY_MAGIC; pkt.protoVer = NET_PROTO_VER; pkt.count = 0;
+    // X5: stamp the entity lane with the CURRENT world id so a world change is reflected in the very
+    // next snapshot (the host sends entities before CaptureLocalState updates the id in the same frame).
+    {
+        World* w = World::GetCurrentWorld();
+        if (w) Net::SetLocalWorldId(w->GetObjectID());
+    }
     // [Coop] ShipSync=0 -> the header above still has to be written (CaptureGuards appends after us),
     // but no ship entry and no packet is produced.
     if (!ShipSyncEnabled()) return;
@@ -2189,12 +3074,256 @@ static void CaptureShips(EntityPacket& pkt) {
     if (!mgr || !readable((char*)mgr + 0x3E8, 8)) return;
     unsigned short n = *(unsigned short*)((char*)mgr + 0x3EE);
     Entity* localShip = GetLocalShip();
+    // T39: consume a ship-test request (ScrollLock = damage, Pause = sink). The request is latched by
+    // the 20 Hz poll thread, so a slow frame here cannot lose the keypress.
+    {
+        static int s_shipTest = -1;
+        if (s_shipTest < 0) s_shipTest = GetPrivateProfileIntA("Coop", "ShipTest", 0, Paths::Ini());
+        if (s_shipTest && g_shipTestReq) {
+            const int mode = (int)g_shipTestReq;
+            g_shipTestReq = 0;
+            const int fracPct = GetPrivateProfileIntA("Coop", "ShipTestFracPct", 45, Paths::Ini());
+            const int radiusM = GetPrivateProfileIntA("Coop", "ShipTestRadiusM", 250, Paths::Ini());
+            const float px = localShip ? localShip->m_GlobalMatrix.M41 : 0.0f;
+            const float pz = localShip ? localShip->m_GlobalMatrix.M43 : 0.0f;
+            int hits = 0;
+            for (int si = 0; si < (int)n && si < 64; ++si) {
+                Entity* se = GetShipEntity(mgr, si);
+                if (!se || *(uint32_t*)se != 0x01E4A128u) continue;
+                // The naval list includes the player's own ship (the Jackdaw). Sinking yourself with a
+                // test key is not a test, so the local ship is always skipped - distance alone cannot
+                // exclude it, since the local ship is at distance 0.
+                if (se == localShip) continue;
+                const float dx = se->m_GlobalMatrix.M41 - px, dz = se->m_GlobalMatrix.M43 - pz;
+                if (radiusM > 0 && (dx * dx + dz * dz) > (float)(radiusM * radiusM)) continue;
+                void* ho = ShipGcLObj(se);
+                if (!ho || !readable((char*)ho + 0xB4, 4)) continue;
+                const float mx = *(float*)((char*)ho + 0xB4);
+                float hp = 0.0f;
+                if (!ReadShipHullHP(se, &hp)) continue;
+                const float want = (mode == 2) ? -1.0f : hp - mx * ((float)fracPct / 100.0f);
+                if (WriteShipHullHP(se, want)) {
+                    L("[ShipTest] mode=%d ship=%d obj=%08X max=%.1f hp=%.1f -> %.1f\n",
+                      mode, si, (unsigned)ho, mx, hp, want);
+                    ++hits;
+                }
+            }
+            L("[ShipTest] mode=%d ships_hit=%d radius=%dm frac=%d%%\n", mode, hits, radiusM, fracPct);
+        }
+    }
+    // T30: [Coop] ShipDump=1 prints every ship's component class IDs (the same CRC the health-service
+    // getters compare against), so the real hull-HP service can be found by matching
+    // ops/evidence/health-service-crcs.md instead of guessing a field. sub_A1D0D0 is __thiscall.
+    static int s_shipDump = -1;
+    if (s_shipDump < 0) s_shipDump = GetPrivateProfileIntA("Coop", "ShipDump", 0, Paths::Ini());
+    // T31: floats of the component whose class id is WatercraftAttributes (crc32("WatercraftAttributes")).
+    // Dumped once a second so a single cannonball shows up as a step change in the log.
+    static int s_dumpFloats = -1;
+    if (s_dumpFloats < 0) s_dumpFloats = GetPrivateProfileIntA("Coop", "ShipDumpFloats", 0, Paths::Ini());
+    // T32/T33: change-detector. Polling snapshots at 1 Hz misses the instant of a hit (and the game
+    // pauses when unfocused, so the window is short). Instead remember each watched block and log the
+    // exact dword deltas when they change - the damage step is captured whenever it happens.
+    //
+    // T33 widens it to the object's REAL size instead of a guessed 0x100. Sizes are not guesses: the
+    // engine class descriptor is [name ptr][base id][class id][object size], so class_size.py reads the
+    // size straight out of .data (ops/evidence/class-descriptor-sizes.md). WatercraftAttributes is 0xC4
+    // (fully covered and it never changed - not hull HP); ShipPhysicComponent is 0x8C0, so the earlier
+    // 0x100 window only saw 11% of it.
+    struct CompSize { uint32_t crc; uint32_t size; };
+    static const CompSize kCompSize[] = {
+        {2036133539u, 0x8C0}, {91423769u, 0xC4},    {3118473014u, 0x34},  {1804543191u, 0x2D0},
+        {3780995325u, 0xA0},  {1364444245u, 0xA0},   {2357895581u, 0x210}, {870870259u, 0xE0},
+        {3893575776u, 0x140}, {3669238175u, 0x28},   {715225515u, 0x1C},   {2918307302u, 0xB8},
+        {3683139299u, 0x130}, {1303865978u, 0x20},   {476739111u, 0x1C},   {1139133171u, 0x18},
+        {2299661283u, 0x42C}, {3374079800u, 0x14},   {3417066870u, 0x58},  {2455389939u, 0x540},
+        {3195084550u, 0x128}, {492202595u, 0x80},    {3144731556u, 0x78},
+    };
+    const unsigned kMaxBlock = 0x1000;
+    const int      kSlots    = 320;
+    const int      kPerOff   = 3;   // log an offset at most this many times (physics churn otherwise drowns the log)
+    struct Watch { void* p; uint32_t n; uint32_t crc; int ship; };
+    static Watch         s_watch[kSlots];
+    static unsigned char s_prev[kSlots][0x1000];
+    static unsigned char s_hits[kSlots][0x1000 / 4];
+    static int           s_watchN = 0;
+    // Slot lookup is open addressing keyed on the watched pointer (linear probing, 4-byte key) instead
+    // of a linear scan of all 320 slots: at saturation the scan cost ~26 x 320 compares per ship per
+    // capture (~1 M/s). kHashCap is a power of two > 2 x kSlots so the probe sequence always
+    // terminates; entries are never removed (s_watch is append-only), so a miss still allocates the
+    // next slot exactly as before.
+    const int kHashCap = 512;
+    static int s_hash[kHashCap];              // slot index + 1; 0 = empty
+    auto hashOf = [](void* p) -> unsigned {
+        unsigned h = (unsigned)((uintptr_t)p >> 4);
+        h ^= h >> 13; h *= 2654435761u; h ^= h >> 11;
+        return h & 511u;                      // kHashCap - 1
+    };
+    auto watchBlock = [&](void* p, uint32_t bytes, uint32_t crc, int ship) {
+        if (!p || bytes < 4 || bytes > kMaxBlock) return;
+        if (!readable(p, bytes)) return;
+        int slot = -1;
+        const unsigned h0 = hashOf(p);
+        for (int probe = 0; probe < kHashCap; ++probe) {
+            const int e = s_hash[(h0 + (unsigned)probe) & (unsigned)(kHashCap - 1)];
+            if (!e) break;                                    // empty: not watched yet
+            if (s_watch[e - 1].p == p) { slot = e - 1; break; }
+        }
+        if (slot < 0) {
+            if (s_watchN >= kSlots) return;
+            slot = s_watchN++;
+            s_watch[slot].p = p;
+            s_watch[slot].n = bytes;
+            s_watch[slot].crc = crc;
+            s_watch[slot].ship = ship;
+            for (int probe = 0; probe < kHashCap; ++probe) {   // the miss above proved a free entry
+                int& e = s_hash[(h0 + (unsigned)probe) & (unsigned)(kHashCap - 1)];
+                if (!e) { e = slot + 1; break; }
+            }
+            memcpy(s_prev[slot], p, bytes);
+            return;
+        }
+        Watch& w = s_watch[slot];
+        if (w.n != bytes) { w.n = bytes; memcpy(s_prev[slot], p, bytes); return; }
+        unsigned char* cur = (unsigned char*)p;
+        if (memcmp(s_prev[slot], cur, bytes) == 0) return;
+        const uint64_t now = GetTickCount64();
+        for (unsigned o = 0; o + 4 <= bytes; o += 4) {
+            DWORD a = *(DWORD*)(s_prev[slot] + o), b = *(DWORD*)(cur + o);
+            if (a == b) continue;
+            unsigned& h = *(unsigned*)&s_hits[slot][o >> 2];
+            if (h >= (unsigned)kPerOff) continue;
+            ++h;
+            L("[ShipDelta] t=%llu ship=%d crc=%u p=%08X off=0x%03X 0x%08X -> 0x%08X (i %d -> %d, f %.3f -> %.3f)\n",
+              (unsigned long long)now, w.ship, w.crc, (unsigned)p, o, a, b, (int)a, (int)b,
+              *(float*)&a, *(float*)&b);
+        }
+        memcpy(s_prev[slot], cur, bytes);
+    };
+    auto compBytes = [](uint32_t crc) -> uint32_t {
+        for (unsigned i = 0; i < sizeof(kCompSize) / sizeof(kCompSize[0]); ++i)
+            if (kCompSize[i].crc == crc) return kCompSize[i].size;
+        return 0;   // unknown class: skip rather than guess a window
+    };
+    static uint64_t s_dumpNextMs = 0;
+    const uint64_t dumpNow = GetTickCount64();
+    const bool dumpThisTick = s_shipDump && dumpNow >= s_dumpNextMs;
+    if (dumpThisTick) s_dumpNextMs = dumpNow + 1000;
     uint32_t count = 0;
     uint32_t withId = 0;
     __try {
         for (int i = 0; i < (int)n && count < (uint32_t)MAX_SYNC_ENTITIES; ++i) {
             Entity* ent = GetShipEntity(mgr, i);
             if (!ent || *(uint32_t*)ent != 0x01E4A128u) continue;
+            // T32/T33: watch every tick (not just on the 1 Hz dump) so a hit is caught the frame it lands.
+            if (s_dumpFloats) {
+                watchBlock(ent, 0x1000, 0x01E4A128u, i);
+                const unsigned short cw = *(unsigned short*)((char*)ent + 0x66);
+                Component** cwdata = *(Component***)((char*)ent + 0x60);
+                if (cwdata && readable(cwdata, 4)) {
+                    for (int kw = 0; kw < (int)cw && kw < 96; ++kw) {
+                        Component* cc = cwdata[kw];
+                        if (!cc || !readable(cc, 4)) continue;
+                        int crcw = -1;
+                        __try { crcw = ((int(__thiscall*)(void*))0x00A1D0D0)(cc); }
+                        __except (EXCEPTION_EXECUTE_HANDLER) { crcw = -1; }
+                        if (crcw < 0) continue;
+                        const uint32_t cb = compBytes((uint32_t)crcw);
+                        if (cb) watchBlock(cc, cb, (uint32_t)crcw, i);
+                    }
+                }
+                // T34: follow the naval health bar's own read path to the per-ship health object.
+                // Verified chain (ops/evidence/naval-healthbar.md, from sub_12B4720 / sub_193D8F0):
+                //   H   = *(entity + 0x8F4)
+                //   sp  = *(H + 0xC8)            // smart handle { ptr@+0, state@+8 }
+                //   obj = *(sp + 0x00)           // taken when *(int32*)(sp+8) < 0
+                // The bar then reads obj+0x55C and obj+0x560. Watch the whole neighbourhood of both
+                // owners instead of guessing which field is the hull value.
+                if (readable((char*)ent + 0x8F4, 4)) {
+                    void* H = *(void**)((char*)ent + 0x8F4);
+                    if (H && readable(H, 4)) {
+                        watchBlock(H, 0x400, 0x00008F40u, i);
+                        if (readable((char*)H + 0xC8, 4)) {
+                            void* sp = *(void**)((char*)H + 0xC8);
+                            if (sp && readable(sp, 12)) {
+                                void* obj = *(void**)((char*)sp);
+                                if (obj && readable(obj, 0x700)) {
+                                    watchBlock(obj, 0x700, 0x000000C0u, i);
+                                    if (dumpThisTick) {
+                                        char line[420]; int o = 0;
+                                        for (int f = 0x540 / 4; f < 0x5A0 / 4; ++f)
+                                            o += _snprintf_s(line + o, sizeof(line) - o, _TRUNCATE,
+                                                            " %X:%.4f", 4 * f, *(float*)((char*)obj + 4 * f));
+                                        L("[HBar] ship=%d ent=%08X H=%08X obj=%08X%s\n",
+                                          i, (unsigned)ent, (unsigned)H, (unsigned)obj, line);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if (dumpThisTick) {
+                // T36: hull health through the engine's own getter, not through a guessed offset.
+                // Verified chain (decomp/evidence/1038330.txt, receipt decomp/receipts/01038330.json):
+                //   sub_1913100 case 3:  obj = sub_1038330(entity, 0);
+                //                        float v = ((float(__thiscall*)(void*))(*obj)[0x1B4/4])(obj);
+                //   case 4 also reads slot 0x1B8 (max).  Both are __thiscall, float in st(0).
+                {
+                    void*  hobj = nullptr;
+                    float  hp = -1.0f;
+                    uint32_t hvt = 0;
+                    float  fD0 = -1.0f, fB4 = -1.0f;
+                    // Only slot 0x1B4 is called. Case 3 of sub_1913100 calls it as
+                    // (__thiscall)(obj) with no other argument; case 4 calls slot 0x1B8 as
+                    // (__thiscall)(obj, arg) - a different signature - so calling 0x1B8 without
+                    // knowing whether it ends in `ret` or `ret 4` risks a stack imbalance. Not called.
+                    __try {
+                        hobj = ((void* (__cdecl*)(void*, char))0x01038330)(ent, 0);
+                        if (hobj && readable(hobj, 4)) {
+                            void** vt = *(void***)hobj;
+                            hvt = (uint32_t)vt;
+                            if (vt && readable(vt, 4 * (0x1B4 / 4 + 1)))
+                                hp = ((float (__thiscall*)(void*))vt[0x1B4 / 4])(hobj);
+                            // The identified class is GcLShip (ops/evidence/hull-hp-found.md):
+                            // current at +0xD0, max at +0xB4, both read by 7-byte `fld; ret` getters.
+                            if (readable((char*)hobj + 0xD0, 4)) fD0 = *(float*)((char*)hobj + 0xD0);
+                            if (readable((char*)hobj + 0xB4, 4)) fB4 = *(float*)((char*)hobj + 0xB4);
+                        }
+                    } __except (EXCEPTION_EXECUTE_HANDLER) { hobj = nullptr; hp = -2.0f; }
+                    L("[ShipHP] ship=%d ent=%08X obj=%08X vt=%08X hp=%.3f d0=%.3f b4=%.3f local=%d\n",
+                      i, (unsigned)ent, (unsigned)hobj, hvt, hp, fD0, fB4, ent == localShip ? 1 : 0);
+                }
+                const unsigned short cn = *(unsigned short*)((char*)ent + 0x66);
+                Component** cdata = *(Component***)((char*)ent + 0x60);
+                L("[ShipDump] idx=%d ent=%08X vt=%08X comps=%u local=%d\n",
+                  i, (unsigned)ent, *(uint32_t*)ent, (unsigned)cn, ent == localShip ? 1 : 0);
+                if (cdata && readable(cdata, 4)) {
+                    for (int k = 0; k < (int)cn && k < 96; ++k) {
+                        Component* c = cdata[k];
+                        if (!c || !readable(c, 4)) continue;
+                        uint32_t vt = *(uint32_t*)c;
+                        int crc = 0;
+                        __try { crc = ((int(__thiscall*)(void*))0x00A1D0D0)(c); }
+                        __except (EXCEPTION_EXECUTE_HANDLER) { crc = -1; }
+                        L("[ShipDump]   c[%d] ptr=%08X vt=%08X crc=%d d0C=%08X d64=%08X\n", k, (unsigned)c, vt, crc,
+                          readable((char*)c + 0x0C, 4) ? *(uint32_t*)((char*)c + 0x0C) : 0u,
+                          readable((char*)c + 0x64, 4) ? *(uint32_t*)((char*)c + 0x64) : 0u);
+                        // WatercraftAttributes = 91423769: print the first 32 dwords as floats, which is
+                        // where max/current hull values would live. Read-only; nothing is written.
+                        if (s_dumpFloats && (crc == 91423769 || crc == 2036133539) && readable(c, 0x80)) {
+                            char line[512]; int o = 0;
+                            for (int f = 0; f < 32; ++f) {
+                                DWORD bits = *(DWORD*)((char*)c + 4 * f);
+                                float fv = *(float*)((char*)c + 4 * f);
+                                o += _snprintf_s(line + o, sizeof(line) - o, _TRUNCATE,
+                                                 " %d:%.3f", f, fv);
+                                if (o > 400) break;
+                            }
+                            L("[ShipFloat] idx=%d ent=%08X c=%08X%s\n", i, (unsigned)ent, (unsigned)c, line);
+                        }
+                    }
+                }
+            }
             if (ent == localShip) continue;   // skip the Jackdaw (synced via g_ghostShip)
             // [Relevance] Same combined rule as the guards, but with the (wider) ship radius.
             if (!IsRelevantToPeer(ent->m_GlobalMatrix.M41, ent->m_GlobalMatrix.M42, ent->m_GlobalMatrix.M43,
@@ -2711,6 +3840,48 @@ static inline bool IsFighterBody(const KindRole& kr) {
 }
 static inline bool IsCivilianBody(const KindRole& kr) { return kr.ok && kr.kind == 2 && kr.role == 2; }
 
+// ---- T26: faction hostility (RE 2026-11-08) ------------------------------------------------------
+// The engine's own player-relative test, found by call-graph (no PS3 name survives on PC):
+//   sub_1719FF0(entity) = faction(entity) is in faction(ownerOf(entity))+0x14   (the ENEMY array)
+//   sub_171A040(entity) = same faction or in +0x0C                              (the ALLY array)
+// Both are __cdecl, one entity pointer, and return false when either faction is null
+// (sub_133A4C0 resolves entity -> faction). Polarity is proven by the debug handler sub_13C1040:
+// it kills when sub_1719FF0 is true for "Nuke Enemies" and false for "Nuke Allies".
+// Receipts: 17114C0 / 1711500 / 1719FF0 / 171A040 / 133A4C0. Default 0: the list layout is
+// verified, but calling into it has never run in a game, so it stays opt-in until a live run.
+static int HostileOnly() {
+    static int s = -1;
+    if (s < 0) s = GetPrivateProfileIntA("Coop", "HostileOnly", 0, Paths::Ini());
+    return s;
+}
+// A28 (RE 2026-11-08): the correct question is "is this body hostile to the LOCAL PLAYER", not
+// "is the entity's owner an enemy of the entity's own faction" (0x1719FF0, which is ~always false
+// for an ordinary NPC).  0x17114C0(A,B) == "faction(B) in enemies(faction(A))", i.e. B is an enemy
+// of A: the SUBJECT is arg0, the CANDIDATE is arg1.  __cdecl, two stack args, bare `ret`, BOOL out.
+// 0x133A4C0 is entity -> faction pointer, __cdecl, one stack arg, 0 == unresolvable.
+// Direction must not be swapped: never (e, player).
+// HOST_UNKNOWN == 0 so zero-initialised storage can never be read as HOST_NO (fail-safe).
+enum Hostility {
+    HOST_UNKNOWN = 0,   // unresolvable faction / null entity -- NOT "friendly"
+    HOST_NO      = 1,
+    HOST_YES     = 2
+};
+static Hostility HostilityToPlayer(const void* player, const void* e) {
+    if (!player || !e) return HOST_UNKNOWN;
+    __try {
+        // Fast path: 0x17114C0 returns 1 only when it resolved BOTH factions itself, so a 1 here
+        // is YES with no extra engine calls.  Subject first: (player, e).
+        if (((BOOL(__cdecl*)(void*, void*))0x017114C0)((void*)player, (void*)e)) return HOST_YES;
+        // Slow path: 0 is ambiguous ("not enemy" vs "could not resolve"); resolve to separate them.
+        // These are the only reason the two extra calls exist -- the predicate resolves both anyway.
+        if (!((int(__cdecl*)(void*))0x0133A4C0)((void*)player)) return HOST_UNKNOWN;
+        if (!((int(__cdecl*)(void*))0x0133A4C0)((void*)e))      return HOST_UNKNOWN;
+        return HOST_NO;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return HOST_UNKNOWN;
+    }
+}
+
 // ---- sync scope (TASK: proximity to the PEER) ------------------------------------------------
 // History: the capture used to accept EVERY Skeleton + BhvGenericNPC + health-service entity, i.e.
 // the whole civilian crowd. The first attempt to narrow it was [Coop] SyncEnemiesOnly, which keyed
@@ -2731,9 +3902,18 @@ static inline bool IsCivilianBody(const KindRole& kr) { return kr.ok && kr.kind 
 // Read once (lazy, -1 = not read yet) from the ini, like the other [Coop] flags.
 static int      s_syncEnemiesOnly = -1;
 static unsigned s_scopeCand     = 0;  // characters that passed skeleton+bhv+health (+ T13 soldier filter)
-static unsigned s_scopeEnemies  = 0;  // of those, the ones carrying the (dead) weapon/icon ids
+// HO-3: no `enemies=` counter here. It was `weapon || guardIcon`, two component ids this file
+// itself documents as never attached to a live body, so it printed a hostile-looking number from a
+// dead discriminator beside the real one. One fact, one channel: `hostile=`/`unknown=` (A28) are
+// the only hostile reporting on this line.
 static unsigned s_scopeInRadius = 0;  // of those, the ones inside SyncRadiusM of the peer
 static unsigned s_scopeSent     = 0;  // character states actually packed into a snapshot
+// A28: counted per candidate BEFORE the HostileOnly gate, so the filter is observable even when the
+// gate is off (the default).  s_scopeCand is likewise pre-gate now -- see the note at the counter.
+static unsigned s_scopeHostile  = 0;  // of candidates, HostilityToPlayer == HOST_YES
+static unsigned s_scopeUnknown  = 0;  // of candidates, faction unresolvable (NOT "friendly")
+static unsigned s_scopeCaps     = 0;  // CaptureGuards ATTEMPTS in this window (sentPerCap denominator;
+                                      // counted at entry, so a capture with no world is included)
 // T13 oracle, same 5 s window: every character candidate the walk reached BEFORE the soldier filter,
 // split by entity+0x9C. soldier+civilian+other == n, so the line proves the classifier in one run.
 static unsigned s_krN        = 0;
@@ -2781,6 +3961,18 @@ static void KrRejectAdd(const KindRole& kr) {
 // large max is one badly bound body; a large mean everywhere is a systematic binding error.
 static unsigned s_bindSent      = 0;
 static unsigned s_bindBound     = 0;
+// T28 (2026-11-08): why a guest record binds nothing. Counted per window and logged only when
+// [Coop] BindDiag=1, so the coop_report.py bind-line format is untouched.
+static unsigned s_bindScanN     = 0;
+static unsigned s_bindRejSelf   = 0;
+static unsigned s_bindRejSkel   = 0;
+static unsigned s_bindRejBhv    = 0;
+static unsigned s_bindRejAi     = 0;
+static unsigned s_bindRejHp     = 0;
+static unsigned s_bindRejArch   = 0;
+static unsigned s_bindRejTaken  = 0;
+static unsigned s_bindRejComps  = 0;
+static float    s_bindMinD      = 1e9f;   // nearest candidate distance seen this window (m²)
 static unsigned s_bindUnmatched = 0;
 static double   s_bindErrSum    = 0.0;
 static float    s_bindErrMax    = 0.0f;
@@ -2842,11 +4034,12 @@ static inline bool ScopeLess(const ScopeSel& a, const ScopeSel& b) {
     if (a.objId != b.objId) return a.objId < b.objId;   // stable, machine-independent tie-break
     return a.idx < b.idx;                          // last resort: the capture's own order
 }
-// ---- component histogram (diagnostic for the enemies-only filter) -----------------------------
-// `enemies=0` over thousands of candidates is either "no armed NPCs here" or "one/both vtable ids
-// are wrong for this build". One run has to tell those apart, so every CANDIDATE's component array
-// is tallied into a small fixed histogram of component vtable ids, and each of the two ids the
-// filter trusts gets its own candidate count. The ids are collected on the component walk the
+// ---- component histogram (diagnostic for the soldier filter) ----------------------------------
+// The OLD `enemies=` counter read 0 over thousands of candidates while standing among soldiers -
+// either "no armed NPCs here" or "one/both vtable ids are wrong for this build". That counter is
+// retired (HO-3); this histogram answers the same question directly. One run tells the two apart,
+// so every CANDIDATE's component array is tallied into a small fixed histogram of component vtable
+// ids, and each of the two ids the soldier filter trusts gets its own candidate count. The ids are collected on the component walk the
 // capture already performs (:2708) and flushed into the histogram only once the entity passes the
 // candidate gate, so no second array walk and no change to what is captured.
 #define COMP_HIST_CAP 32          // component vtable ids per window (was 16; the discriminator is in the tail)
@@ -2975,6 +4168,25 @@ static inline int SyncEnemiesOnly() {
     return s_syncEnemiesOnly;
 }
 
+// Diagnostic keys - both default 0, so a shipping build prints neither:
+//   [Coop] Diag=1  - HIGH-VOLUME lane only: the [Sync] comps / ai / sample histograms (per-candidate
+//                    sampling at the walk plus the 5 s formatting). This is all Diag still owns.
+//   [Coop] Probe=1 - LOW-VOLUME probe lane: the one-shot per-world [Ident] entity walk. Diag=1 also
+//                    enables it, so a session already configured with Diag=1 prints what it printed
+//                    before m2. The [Sync] scope line is not gated by either key.
+static inline int DiagEnabled() {
+    static int v = -1;
+    if (v < 0) v = GetPrivateProfileIntA("Coop", "Diag", 0, Paths::Ini());
+    return v;
+}
+
+// [Coop] Probe (default 0): the one-shot probe lane that must not be silenced by Diag=0.
+static inline int ProbeEnabled() {
+    static int v = -1;
+    if (v < 0) v = GetPrivateProfileIntA("Coop", "Probe", 0, Paths::Ini());
+    return v;
+}
+
 // [Coop] SyncRadiusM (default 60): the proximity scope that replaced the class filter. 0 = no cutoff.
 static inline int SyncRadiusM() {
     static int v = -1;
@@ -3050,6 +4262,89 @@ static void StageLogEmit(const EntityState& es, float gx, float gy, float gz,
     s.used = true; s.objId = es.objId; s.stage = es.stage; s.alias = es.actionAlias; s.ms = nowMs;
 }
 
+// ---- C2-m3: corpse budget (a PACKING decision only) -------------------------------------------
+// A corpse's record is never omitted by the encoder - net.cpp forces EF_DEAD for any dead entity
+// (`if (e.dead != sh->st.dead || e.dead != 0u) mask |= EF_DEAD;`) - so every corpse is a permanent
+// resident of every snapshot. A chunk holds ENTITY_CHUNK_DATA / 52 = 26 records, and reassembly is
+// all-or-nothing (losing one chunk loses the whole snapshot), so the corpse share of a snapshot is
+// kept below one chunk:
+//   * age a corpse out of the PACKET after [Coop] CorpseKeepSec seconds (default 30, floor 0 =
+//     never age), and
+//   * cap corpse records per snapshot at CORPSE_BUDGET_MAX (24 < 26), oldest-first,
+// whichever binds first.  Ageing out means "stop including it in the packet" - the entity is not
+// deleted, es.dead is not touched, and the death lanes/tombstone/life-watch above all still run.
+// A corpse that is not packed keeps its first-seen stamp, so it cannot flap back in on the next
+// capture; the table is bounded and recycles the oldest entry when full.
+#define CORPSE_AGE_CAP    256          // tracked corpses (>= CORPSE_BUDGET_MAX with room to spare)
+#define CORPSE_BUDGET_MAX 24           // corpse records per snapshot, strictly below the 26/chunk
+
+struct CorpseAge { void* ent; uint64_t objId; uint64_t firstMs; };
+static CorpseAge s_corpseAge[CORPSE_AGE_CAP];
+static int      s_corpseAgeN     = 0;
+static int      s_corpseKeepSec  = -1;    // lazy, -1 = not read yet (like the other [Coop] keys)
+static unsigned s_corpseKept     = 0;     // corpse records packed in the CURRENT capture
+static unsigned s_corpseDropAge  = 0;     // ... dropped by age in the current capture
+static unsigned s_corpseDropCap  = 0;     // ... dropped by the count cap in the current capture
+static int      s_corpseBound    = 0;     // last reported binder: 0 none, 1 age, 2 count
+
+static int CorpseKeepSec() {
+    if (s_corpseKeepSec < 0) {
+        int v = GetPrivateProfileIntA("Coop", "CorpseKeepSec", 30, Paths::Ini());
+        if (v < 0) v = 0;                  // floor 0 = never age out
+        s_corpseKeepSec = v;
+    }
+    return s_corpseKeepSec;
+}
+static void CorpseBudgetBeginCapture() { s_corpseKept = 0; s_corpseDropAge = 0; s_corpseDropCap = 0; }
+static void CorpseAgeForget(void* ent, uint64_t objId) {
+    for (int i = 0; i < s_corpseAgeN; ++i) {
+        if (s_corpseAge[i].ent == ent || (objId && s_corpseAge[i].objId == objId)) {
+            s_corpseAge[i] = s_corpseAge[--s_corpseAgeN];   // order is irrelevant
+            return;
+        }
+    }
+}
+// true = pack the corpse this capture. Never mutates the entity, es, or any death state.
+static bool CorpseBudgetKeep(void* ent, uint64_t objId, uint64_t nowMs) {
+    int at = -1;
+    for (int i = 0; i < s_corpseAgeN; ++i) {
+        if (s_corpseAge[i].ent == ent || (objId && s_corpseAge[i].objId == objId)) { at = i; break; }
+    }
+    if (at < 0) {
+        if (s_corpseAgeN < CORPSE_AGE_CAP) {
+            at = s_corpseAgeN++;
+        } else {
+            at = 0;                        // full: recycle the oldest first-seen entry
+            for (int i = 1; i < s_corpseAgeN; ++i)
+                if (s_corpseAge[i].firstMs < s_corpseAge[at].firstMs) at = i;
+        }
+        s_corpseAge[at].ent = ent;
+        s_corpseAge[at].objId = objId;
+        s_corpseAge[at].firstMs = nowMs;
+    } else if (objId && s_corpseAge[at].objId != objId) {
+        s_corpseAge[at].objId = objId;     // identity refreshed, the age is kept
+    }
+    const int keepSec = CorpseKeepSec();
+    if (keepSec > 0 && nowMs - s_corpseAge[at].firstMs >= (uint64_t)keepSec * 1000u) {
+        ++s_corpseDropAge;
+        return false;
+    }
+    if (s_corpseKept >= CORPSE_BUDGET_MAX) { ++s_corpseDropCap; return false; }
+    ++s_corpseKept;
+    return true;
+}
+// Once per BIND CHANGE (age/count), not once per capture: a steady scene logs one line.
+static void CorpseBudgetReport() {
+    const int bound = s_corpseDropAge ? 1 : (s_corpseDropCap ? 2 : 0);
+    if (bound == s_corpseBound) return;
+    s_corpseBound = bound;
+    if (!bound) return;                    // nothing bound this capture: the next bind logs again
+    L("[Cap] corpse budget bound=%s kept=%u dropped=%u\n",
+      bound == 1 ? "age" : "count", s_corpseKept, s_corpseDropAge + s_corpseDropCap);
+    L("[E] ev=corpse-budget bound=%s kept=%u dropped=%u\n",
+      bound == 1 ? "age" : "count", s_corpseKept, s_corpseDropAge + s_corpseDropCap);
+}
+
 // ---- one synced guard: pack its wire record ---------------------------------------------------
 // Extracted from CaptureGuards so the capture can select a set FIRST (nearest to the peer) and only
 // then serialise it. Callers run it inside CaptureGuards' __try, so the same readable() discipline
@@ -3080,6 +4375,9 @@ static void EmitGuardEntity(EntityPacket& pkt, uint32_t& count, int idx, Entity*
     AbstractEntityAI* ai = AIEntityHelper::GetEntityAI(e);
     // P0: identity + health that survive the AI being torn down after death.
     unsigned int hpSvc = FindHealthInAI((unsigned int)ai);
+    // C2-n3: which predicate set es.dead - 1 = health dead flag (+0x60), 2 = combat is-alive,
+    // 3 = no health service (is-alive only), 0 = alive. Named on the [Cap] dead=1 line.
+    unsigned int deadVia = 0;
     bool hpSvcOk = HostHpSvcValid(hpSvc);          // D-016(1): validate before caching or reading
     if (hpSvcOk) RememberEntityHealth((unsigned int)e, hpSvc);
     else { hpSvc = CachedHealthForEntity((unsigned int)e); hpSvcOk = HostHpSvcValid(hpSvc); }
@@ -3093,10 +4391,15 @@ static void EmitGuardEntity(EntityPacket& pkt, uint32_t& count, int idx, Entity*
         // real death); secondary: combat is-alive. Do NOT use ai+0x8C here - that is a different
         // (AI-side) predicate, not the combat one.
         bool flagsDead = (*(unsigned int*)(hpSvc + 0x60) & 0x01000000u) != 0;
-        es.dead = (flagsDead || !EngineIsAlive((unsigned int)e)) ? 1 : 0;
+        const bool combatAlive = EngineIsAlive((unsigned int)e);
+        es.dead = (flagsDead || !combatAlive) ? 1 : 0;
+        // C2-n3: remember WHICH of the two predicates decided, so the [Cap] dead=1 line can name it.
+        // The branch above is the only place es.dead is produced on the capture path (:4174).
+        deadVia = flagsDead ? 1u : (combatAlive ? 0u : 2u);
     } else {
         es.hp = 0;
         es.dead = EngineIsAlive((unsigned int)e) ? 0 : 1;
+        deadVia = es.dead ? 3u : 0u;      // no health service: the combat predicate alone decided
     }
     ObjMapAdd(es.objId, (unsigned int)e, hpSvc);
     // Host -> guest death lane. D-016(3/4): a death is a TRANSITION - the same objId must have been
@@ -3178,6 +4481,47 @@ static void EmitGuardEntity(EntityPacket& pkt, uint32_t& count, int idx, Entity*
             }
         }
     }
+    // C2 4.1 encode-side cross-check - the mirror of the decode gate. `dead` and hp==0xFFFF are one
+    // fact (the engine sets Life=0xFFFF and the dead flag together, "[KF] after ... life=65535
+    // flags=01000004"), so the sender must never put a flag-dead record on the wire with a live hp.
+    // ONLY the dead->sentinel direction is kept: a body the engine calls dead carries Life==0xFFFF.
+    // The reverse (sentinel->dead) is REMOVED - a raw 0xFFFF Life is NOT evidence of a death (a body
+    // first seen at 0xFFFF, i.e. a recycled/borrowed health service, is what the life-watch above
+    // refuses to count as a death TRANSITION). The decoder's cross-check remains the only place that
+    // reconciles the other direction. Normalise here - AFTER the life-watch block above, which must
+    // keep reading the raw
+    // engine values exactly as before, and BEFORE the record is packed - so the peer's gate never
+    // has to invent a value. Wire layout, struct and NET_PROTO_VER are untouched: only the values
+    // already in this record are made consistent.
+    {
+        const unsigned short rawHp = es.hp;
+        const uint8_t rawDead = es.dead;
+        if (es.dead) es.hp = 0xFFFFu;
+        if (es.hp != rawHp) {
+            // Hot path (per snapshot, per body): dedupe on (entity, new dead, raw hp), same style
+            // and same 64-slot budget as the [Cap] dead line below.
+            static void*          s_normEnt[64];
+            static uint8_t        s_normDead[64];
+            static unsigned short s_normHp[64];
+            static int            s_normN = 0;
+            bool seen = false;
+            for (int nq = 0; nq < s_normN; ++nq)
+                if (s_normEnt[nq] == e && s_normDead[nq] == es.dead && s_normHp[nq] == rawHp) { seen = true; break; }
+            if (!seen && s_normN < 64) {
+                s_normEnt[s_normN] = e; s_normDead[s_normN] = es.dead; s_normHp[s_normN] = rawHp; ++s_normN;
+                L("[Cap] death-cross-check ent=%08X dead=%d hp=%u -> dead=%d hp=%u\n",
+                  (unsigned)e, (int)rawDead, (unsigned)rawHp, (int)es.dead, (unsigned)es.hp);
+            }
+        }
+    }
+    // C2-m3: corpse budget decision (see CorpseBudgetKeep above). PACKING ONLY, and deliberately
+    // taken BEFORE the one-shot [Cap] dead line so a corpse that is aged or capped out of this
+    // packet still produces its dead=1 evidence (P7). Nothing here deletes the entity, marks it
+    // dead again, or touches es.dead - a dropped record simply does not reach `++count`, and the
+    // death push below still runs.
+    bool corpsePack = true;
+    if (es.dead) corpsePack = CorpseBudgetKeep(e, es.objId, nowMs);
+    else         CorpseAgeForget(e, es.objId);   // alive (or a recycled objId): drop the age entry
     if (es.dead) {
         static void* s_capDead[64];
         static int   s_capDeadN = 0;
@@ -3185,8 +4529,18 @@ static void EmitGuardEntity(EntityPacket& pkt, uint32_t& count, int idx, Entity*
         for (int cq = 0; cq < s_capDeadN; ++cq) if (s_capDead[cq] == e) { seen = true; break; }
         if (!seen && s_capDeadN < 64) {
             s_capDead[s_capDeadN++] = e;
-            L("[Cap] ent=%08X dead=1 ai=%08X (captured into the snapshot)\n", e, ai);
+            // C2-n3: `dead=1` alone cannot tell a flag-driven death from an is-alive one any more, so
+            // the deciding predicate is printed. 1 = health dead flag (+0x60 & 0x01000000),
+            // 2 = combat is-alive (EngineIsAlive) said dead, 3 = no health service, is-alive alone.
+            const char* via = (deadVia == 1) ? "engine-flag"
+                            : (deadVia == 2) ? "engine-alive"
+                            : (deadVia == 3) ? "no-health-service" : "none";
+            L("[Cap] ent=%08X dead=1 via=%s ai=%08X (captured into the snapshot)\n", e, via, ai);
         }
+    }
+    if (!corpsePack) {
+        if (deathId) PushHostDeath(deathId, (unsigned int)e, deathPos);
+        return;                            // not packed this snapshot; the entity is untouched
     }
     ++count;
     ++s_scopeSent;
@@ -3195,6 +4549,11 @@ static void EmitGuardEntity(EntityPacket& pkt, uint32_t& count, int idx, Entity*
 
 static void CaptureGuards(EntityPacket& pkt) {
     if (s_adLog < 0) s_adLog = GetPrivateProfileIntA("Coop", "ActionDeathLog", 0, Paths::Ini());
+    // A28: one increment per CAPTURE ATTEMPT, counted at entry so a capture that bails out early
+    // (no world loaded yet) is still in the denominator - otherwise sentPerCap is biased high by
+    // dividing a window's sends by only the captures that happened to run with a world present.
+    ++s_scopeCaps;
+    CorpseBudgetBeginCapture();          // C2-m3: per-snapshot corpse budget counters
     ObjMapReset();                       // rebuild the objId table for this capture
     World* world = World::GetCurrentWorld();
     if (!world) return;
@@ -3332,20 +4691,32 @@ static void CaptureGuards(EntityPacket& pkt) {
                   (bhvC && readable(bhvC, 4)) ? *(uint32_t*)bhvC : 0u, skel ? 1u : 0u, (unsigned)n);
             }
             if (SyncEnemiesOnly() && !IsFighterBody(kr)) { KrRejectAdd(kr); continue; }
+            // A28: ONE classification per candidate, before the gate, so the counters describe the
+            // population and not just the survivors.  Counted hostile -> unknown -> candidate.
+            // Default-off gate means nothing is rejected (identical to before) but it is measured.
+            const int hostile = (int)HostilityToPlayer(player, e);
+            if (hostile == HOST_YES)     ++s_scopeHostile;
+            if (hostile == HOST_UNKNOWN) ++s_scopeUnknown;
+            ++s_scopeCand;
+            // Selection filter only: drop NO and UNKNOWN alike when the gate is on.  No health write,
+            // no es.dead change, no packing change -- the wire is untouched with the gate at its default.
+            if (HostileOnly() && hostile != HOST_YES) { KrRejectAdd(kr); continue; }
             // ---- scope counters ----
             // Candidates = every body that survived skeleton + BhvGenericNPC + the health service and
             // the T13 soldier filter above (so with SyncEnemiesOnly=1 this counts soldiers only; the
-            // pre-filter population is what [Sync] kindrole reports). Enemies = the subset carrying
-            // WeaponComponent or MapIconBehaviorGuard. Counted before the relevance test on purpose: the
-            // numbers must describe the SCOPE, not the radius, so `sent` can be read against `enemies`.
-            const bool isEnemy = weapon || guardIcon;
-            ++s_scopeCand;
-            if (isEnemy) ++s_scopeEnemies;
+            // pre-filter population is what [Sync] kindrole reports), counted PRE-hostility-gate, so
+            // `candidates` is the population and not the survivor count.  Hostile/unknown are the
+            // only enemy counts (A28): the old `enemies=` counter was `weapon || guardIcon`, a pair
+            // of vtable ids this file documents as dead, and it was retired rather than renamed so
+            // that "one fact, one channel" holds on the [Sync] scope line (HO-3).  Counted before
+            // the relevance test on purpose: the numbers must describe the SCOPE, not the radius.
             // Diagnostic only: fold this candidate's component ids (already collected on the walk
             // above) into the window histogram, plus its AI object vtable from the pointer the gate
             // above already obtained. Counted before any `continue`, so both tables describe the same
-            // population as candidates/enemies. Position is kept per id as a cluster hint.
-            {
+            // population as candidates. Position is kept per id as a cluster hint.
+            // [Coop] Diag (default 0): the whole comps/ai histogram lane (per-candidate sampling here,
+            // formatting in the 5 s block) is quiet unless the key is on.
+            if (DiagEnabled()) {
                 const float hx = e->m_GlobalMatrix.M41;
                 const float hy = e->m_GlobalMatrix.M42;
                 const float hz = e->m_GlobalMatrix.M43;
@@ -3417,8 +4788,11 @@ static void CaptureGuards(EntityPacket& pkt) {
             EmitGuardEntity(pkt, count, i, e, bhvC, hc, px, py, pz, nowMs);
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    // TASK 2: release slots the capture has not seen for 10 s. Runs AFTER the capture, so everything
-    // this capture handled carries a fresh stamp; only entities that left the world can be released.
+    // C2-m3: one line per bind change (age|count), not per capture - a steady scene stays quiet.
+    CorpseBudgetReport();
+    // A28: the per-capture increment now happens at function entry (see the note there), before the
+    // `if (!world) return;` early exit, so the denominator counts every attempt. SyncSlotSweep below
+    // still only runs when a world exists.
     SyncSlotSweep(nowMs);
 
     // Anything we tracked last capture but did not see now either walked out of range or died. D-016(5):
@@ -3511,7 +4885,7 @@ static unsigned int FindHealthInAI(unsigned int ai);     // defined further belo
 // P0/P1: peer -> host health event. objId is the host-assigned identity; position is a fallback only.
 static void ApplyPeerHealth(uint64_t objId, unsigned short life, float x, float y, float z);  // below
 static bool SelfTestModeActive();                        // defined below
-static void KillGuardEntity(Entity* e);                  // defined below
+static bool KillGuardEntity(Entity* e);                  // defined below
 static void MirrorVisualDeath(Entity* e);                // defined below
 
 // Re-entrancy guard shared by both event lanes (self-test loopback must not ping-pong).
@@ -3594,6 +4968,91 @@ static int GktMarkPushed(uint64_t objId, unsigned int ent) {
     s_gktPushed[slot].objId = objId;
     s_gktPushed[slot].ent   = ent;
     return slot;
+}
+
+// ---- C2 §3.4: per-claim retry counter for the snapshot death lane ------------------------------
+// The tombstone is now written only once a death is SETTLED (engine killed it, or the engine's own
+// predicate already said dead). An unsettled claim keeps no tombstone and is retried on the next
+// snapshot, which is what makes `applied=0` a retry instead of a permanent dead-on-paper latch. The
+// counter bounds the retry (and therefore the log), it never clears the claim.
+static const unsigned int CLAIM_MAX_ATTEMPTS   = 20;   // ≈1-2 s at the snapshot tick rate
+static const unsigned int CLAIM_EPOCH_SNAPSHOTS = 64;  // EPOCH_PACKETS (net.cpp:109) - the retry
+                                                       // fallback cadence only; not a wire constant
+// C2-m1: why a mirror kill refused to settle. GuestKillMirrorEntity / KillGuardEntityInner already
+// compute this on every early return; it used to be thrown away, so the escalation line could only say
+// "terminal-drop". Carried on the claim slot so the 20th attempt names the refusal that kept failing.
+enum KillRefusal {
+    KILL_OK = 0,               // not refused: killed, or the engine already says dead (settled)
+    KILL_REFUSED_DISABLED,     // GuestKillMirror=0 - the escape hatch ran and touched nothing
+    KILL_REFUSED_NO_ID,        // ent == 0, or the entity is not the guest mirror bound to objId
+    KILL_REFUSED_NO_HEALTH,    // no valid health service -> no proven Life predicate
+    KILL_REFUSED_AI_UNREADABLE,// the AI pointer fails readable() in KillGuardEntityInner
+    KILL_REFUSED_NO_BEHAVIOUR, // behaviour component unreachable -> kill refused, not attempted
+    KILL_REFUSED_ENGINE_ALIVE, // the kill writes ran, the engine still reports Life != 0xFFFF
+    KILL_REFUSED_EXCEPTION,    // the kill path faulted
+};
+static const char* KillRefusalName(KillRefusal r) {
+    switch (r) {
+    case KILL_REFUSED_DISABLED:       return "kill-disabled";
+    case KILL_REFUSED_NO_ID:          return "id-mismatch";
+    case KILL_REFUSED_NO_HEALTH:      return "no-health-service";
+    case KILL_REFUSED_AI_UNREADABLE:  return "ai-unreadable";
+    case KILL_REFUSED_NO_BEHAVIOUR:   return "no-behaviour-component";
+    case KILL_REFUSED_ENGINE_ALIVE:   return "engine-said-alive";
+    case KILL_REFUSED_EXCEPTION:      return "kill-exception";
+    default:                          return "none";
+    }
+}
+
+// C2-m1: global per-process cap on the per-attempt claim lines. The per-body counter bounds each
+// claim to CLAIM_MAX_ATTEMPTS, but not the product: 24 unsettled bodies produced ~480 lines. After
+// CLAIM_LOG_MAX the per-attempt lines go silent for the rest of the process. `applied=1` lines are
+// one per body and are deliberately NOT routed through here.
+static const int CLAIM_LOG_MAX = 200;
+static int s_claimLogs = 0;
+static inline bool ClaimLogAllowed() { return s_claimLogs < CLAIM_LOG_MAX ? (++s_claimLogs, true) : false; }
+
+struct GktAttempt { uint64_t objId; unsigned int ent; unsigned int n; unsigned int skip; int escalated;
+                    KillRefusal lastRefusal; };
+static GktAttempt s_gktAttempt[256];
+static int        s_gktAttemptN = 0;
+static int        s_gktAttemptNext = 0;               // overwrite cursor once full (evict, never refuse)
+
+static GktAttempt& GktAttemptSlot(uint64_t objId, unsigned int ent) {
+    for (int i = 0; i < s_gktAttemptN; ++i) {
+        if (objId) { if (s_gktAttempt[i].objId == objId) return s_gktAttempt[i]; }
+        else       { if (s_gktAttempt[i].objId == 0 && s_gktAttempt[i].ent == ent) return s_gktAttempt[i]; }
+    }
+    int slot;
+    if (s_gktAttemptN < 256) {
+        slot = s_gktAttemptN++;
+    } else {
+        slot = s_gktAttemptNext % 256;
+        ++s_gktAttemptNext;
+    }
+    s_gktAttempt[slot].objId     = objId;
+    s_gktAttempt[slot].ent       = ent;
+    s_gktAttempt[slot].n           = 0;
+    s_gktAttempt[slot].skip        = 0;
+    s_gktAttempt[slot].escalated   = 0;
+    s_gktAttempt[slot].lastRefusal = KILL_OK;
+    return s_gktAttempt[slot];
+}
+
+// Settlement resets the counters in place (the slot stays allocated and keyed, at zero): dropping the
+// key would let a rebind to a different body inherit nothing anyway, and re-creating it costs a scan.
+static void GktAttemptClear(uint64_t objId, unsigned int ent) {
+    for (int i = 0; i < s_gktAttemptN; ++i) {
+        if (objId ? (s_gktAttempt[i].objId == objId)
+                  : (s_gktAttempt[i].objId == 0 && s_gktAttempt[i].ent == ent)) {
+            s_gktAttempt[i].n = 0;
+            s_gktAttempt[i].skip = 0;
+            s_gktAttempt[i].escalated = 0;
+            s_gktAttempt[i].lastRefusal = KILL_OK;
+            return;
+        }
+    }
+    (void)ent;
 }
 
 // objId == 0 is legal: a guard the host never described (locally spawned) has no host id, and
@@ -3828,14 +5287,14 @@ static bool MirrorAliasShouldApply(void* e, unsigned int alias) {
 static unsigned int s_covMatched = 0, s_covNoBody = 0, s_covStolen = 0;   // coverage counters, reset with stats
 
 // ---- [IdRes] engine-resolver entity identity (additive; the scan below stays the fallback) --------
-// The engine keeps an object registry at VA 0x004DD9824: table pointer at +0x10, uint16 count at +0x16,
+// The engine keeps an object registry at VA 0x04DD9824: table pointer at +0x10, uint16 count at +0x16,
 // stride 16, entry {id_lo, id_hi, owner, extra}. 0x00A1F160 is
 // `void* __thiscall (registry, uint32_t id_lo, uint32_t id_hi)` (retn 8) and returns entry->owner, or 0
 // for (0,0), for unknown ids, and when byte_27F4AC6 == 0.
 //
 // It has NO generation check, so an id that was destroyed and re-issued can hand back a dangling
 // pointer. Every hit is therefore verified against the object's own id before it is used. The resolver
-// also dereferences the registry critical section at *0x004DD601C unconditionally, so that pointer is
+// also dereferences the registry critical section at *0x04DD601C unconditionally, so that pointer is
 // checked first (it is null before the registry comes up and after a teardown).
 static bool g_idResolver = true;
 static int  s_idResHit  = 0;
@@ -3844,9 +5303,9 @@ static int  s_idResMiss = 0;
 static void* ResolveEntityByIdRaw(uint64_t id) {
     if (!id) return nullptr;
     __try {
-        if (*(void**)0x004DD601C == nullptr) return nullptr;   // registry lock/service not up
+        if (*(void**)0x04DD601C == nullptr) return nullptr;   // registry lock/service not up
         return Hook::CallClassMethod<void*, void*, uint32_t, uint32_t>(
-            0x00A1F160, (void*)0x004DD9824, (uint32_t)id, (uint32_t)(id >> 32));
+            0x00A1F160, (void*)0x04DD9824, (uint32_t)id, (uint32_t)(id >> 32));
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return nullptr;
     }
@@ -3858,10 +5317,32 @@ static bool IdResLogNow(int* counter) {
     return *counter <= 20 || (*counter % 500) == 0;
 }
 
+static int  s_idResRetry = 0;   // RES-1 retry throttle (bounded source-3 retry in ResolveEntityById)
+
 // The entity that currently owns `id`, or nullptr. The return value is only ever a pointer whose own id
 // reads back as `id`, so a stale-past-destroy hit degrades to a miss (and the caller falls back).
 static Entity* ResolveEntityById(uint64_t id) {
     void* obj = ResolveEntityByIdRaw(id);
+    if (!obj) {
+        // RES-1 bounded retry (ops/evidence/register-re-closures-4.md): 0xA1F160's owner-first
+        // scan short-circuits on a slot whose entry+8 == 0 and returns null before reaching its
+        // own sources 2/3. One direct source-3 call (0x00A1DC00, the two-level id->object lookup)
+        // restores those ids. Never re-call 0xA1F160 - it recurses into the same broken match.
+        // Id halves are the same split ResolveEntityByIdRaw passes to 0xA1F160:
+        //   lo = (uint32_t)id,  hi = (uint32_t)(id >> 32).
+        __try {
+            if (*(void**)0x04DD601C != nullptr) {   // registry lock/service up, as in ResolveEntityByIdRaw
+                int ent = Hook::CallClassMethod<int, void*, uint32_t, uint32_t>(
+                    0x00A1DC00, (void*)0x04DD9824, (uint32_t)id, (uint32_t)(id >> 32));
+                if (IdResLogNow(&s_idResRetry))
+                    L("[Mirror] resolver retry id=%llu hit=%d\n",
+                      (unsigned long long)id, ent ? 1 : 0);
+                obj = (void*)ent;   // 0 on miss: the null path stays exactly as it is today
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            obj = nullptr;
+        }
+    }
     if (!obj) return nullptr;
     __try {
         if (!readable(obj, 8)) return nullptr;
@@ -3921,16 +5402,93 @@ static unsigned int GuestObjFindResolve(uint64_t objId) {
         return 0;
     }
     GuestObjAdd(objId, ent);
-    L("[Mirror] objId=%llu rebound via resolver ent=%08X\n", (unsigned long long)objId, ent);
+    uint64_t resId = 0;
+    __try { resId = ((ManagedObject*)ent)->GetObjectID(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { resId = 0; }
+    const unsigned int reqBand = (objId >= 0xF0000000ull && objId < 0xF8000000ull) ? 1u : 0u;
+    const unsigned int resBand = (resId >= 0xF0000000ull && resId < 0xF8000000ull) ? 1u : 0u;
+    L("[Mirror] objId=%llu rebound via resolver ent=%08X reqBand=%s resId=%llu resBand=%s\n",
+      (unsigned long long)objId, ent, reqBand ? "minted" : "authored",
+      (unsigned long long)resId, resBand ? "minted" : "authored");
     return ent;
 }
 
 // Defined next to ApplyPeerHealth (:5191): the proven-mirror engine kill. ApplyGuards needs it for the
 // snapshot death path below, which runs long before the definition.
-static bool GuestKillMirrorEntity(uint64_t objId, unsigned int ent, bool viaGuestObj);
+// C2 §3.3: the bool alone cannot separate "refused" from "already dead" (both return false - see the
+// already-dead skip, no-behaviour-component skip and the hp-not-ok tail). `alreadyDead` is the
+// out-param that carries the settled case, so the caller can tombstone on "engine says dead" without
+// inferring it. It is only set true on the explicit already-dead branch.
+static bool GuestKillMirrorEntity(uint64_t objId, unsigned int ent, bool viaGuestObj,
+                                  bool* alreadyDead = nullptr, KillRefusal* why = nullptr);
 // Defined beside GuestKillMirrorEntity (:5390): fires the deferred corpse re-disable. Driven from
 // GuestDeathScan's own per-tick generation counter (s_gktGen) - no threads, no timers.
 static void CorpseLatchTick();
+
+// ---- guest-side damage relay (C1 + X9) ---------------------------------------------------------
+// The snapshot's `hp` is the host's own Life, the int16 at CSrvNPCHealth+0x5C (class id 0x57EEEEC7,
+// setter 0x19FB4C0 = vtable off_2712F60 slot +0x40). Applying it on the guest obeys the guard proved in
+// ops/evidence/character-health-setter.md §4:
+//   * liveness is the SIGN of the int16 - a body already below 0 is a corpse. The setter accepts a
+//     negative -> positive transition, so writing there would REVIVE it; we never write at all.
+//   * the value is clamped to the LOCAL Max (+0x5E): the two worlds do not agree on a guard's max
+//     (host 36 vs guest 30 in the live logs), so the host's absolute value is only a target, not a truth.
+//   * on the wire 0xFFFF means the int16 -1, i.e. a KILL. It is routed through the same proven mirror
+//     kill the snapshot death path uses, never written as "life 0".
+//   * 0 is NOT applied: a record whose HP field was omitted by the delta encoder decodes to 0
+//     (net.cpp:174/332; g_remoteEntities is replaced, not merged), so 0 is indistinguishable from
+//     "unchanged" and treating it as damage would kill every guard on the first quiet snapshot.
+// Everything is behind [Coop] DamageRelay (default 0). With the key off this is one static int test per
+// matched entity and no engine access at all, so the build behaves exactly as before it existed.
+static int DamageRelayEnabled() {
+    static int s = -1;
+    if (s < 0) s = GetPrivateProfileIntA("Coop", "DamageRelay", 0, Paths::Ini()) != 0 ? 1 : 0;
+    return s;
+}
+
+static void ApplyRelayedHealth(uint64_t objId, Entity* e, const EntityState& es) {
+    if (!DamageRelayEnabled()) return;
+    if (!e || es.dead) return;                    // the host's death lane owns this body (below)
+    if (MirrorKilledLocally(e)) return;           // already a corpse locally
+    const int relayed = (int)(int16_t)es.hp;      // 0xFFFF -> -1 = kill
+    if (relayed == 0) return;                     // absent/unchanged, never "life 0"
+    const unsigned int ent = (unsigned int)e;
+    if (relayed < 0) {
+        // Death: the exact sequence the snapshot path runs (:4473), so the body dies through the proven
+        // mirror kill instead of a bare health write. GuestKillMirrorEntity re-checks the body is dead
+        // on both engine predicates before it touches the engine (double SetLife(-1) is the crash path).
+        if (GktAlreadyPushed(objId, ent) || DeathAppliedRecently(ent)) return;
+        __try {
+            GktMarkPushed(objId, ent);
+            MarkMirrorKilledLocally(e);
+            MarkDeathApplied(ent);
+            MirrorVisualDeath(e);
+            GuestKillMirrorEntity(objId, ent, true);
+            static int s_hpRelayDeaths = 0;
+            if (s_hpRelayDeaths < 10) { ++s_hpRelayDeaths;
+                L("[Mirror] hp relay death objId=%llu ent=%08X\n", (unsigned long long)objId, ent); }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        return;
+    }
+    __try {
+        unsigned int svc = CachedHealthForEntity(ent);
+        if (!HostHpSvcValid(svc))
+            svc = FindHealthInAI((unsigned int)AIEntityHelper::GetEntityAI(e));
+        if (!HostHpSvcValid(svc)) return;                    // vtable + plausible Max, nothing else may read it
+        const int cur = (int)*(int16_t*)(svc + 0x5C);         // signed: negative = dead
+        if (cur < 0) return;                                  // never revive a corpse
+        if ((*(unsigned int*)(svc + 0x60) & 0x01000000u) != 0) return;   // engine dead flag
+        const int maxLife = (int)*(int16_t*)(svc + 0x5E);     // HostHpSvcValid proved 1..2000
+        int want = relayed;
+        if (want > maxLife) want = maxLife;                   // already at/over max: no write
+        if (want <= 0 || want == cur) return;                 // idempotent: one write per real change
+        ((int (__thiscall*)(void*, int))0x19FB4C0)((void*)svc, want);   // CSrvNPCHealth::SetLife
+        static int s_hpRelayLines = 0;
+        if (s_hpRelayLines < 20) { ++s_hpRelayLines;
+            L("[Mirror] hp relay objId=%llu ent=%08X life %d -> %d (host %d, local max %d)\n",
+              (unsigned long long)objId, ent, cur, want, relayed, maxLife); }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
 
 static void ApplyGuards(const EntityPacket& pkt) {
     World* world = World::GetCurrentWorld();
@@ -3994,13 +5552,14 @@ static void ApplyGuards(const EntityPacket& pkt) {
                 }
             }
             const int scanN = best ? 0 : nobj;               // a resolver hit skips the legacy scan
+            s_bindScanN += (unsigned)scanN;
             for (int j = 0; j < scanN; ++j) {
                 Reference* ref = ents.GetElement(j);
                 if (!ref || !readable(ref, 4)) break;
                 HandleContainer* hc = ref->m_HandleContainer;
-                if (!hc || !readable(hc, 4)) continue;
+                if (!hc || !readable(hc, 4)) { ++s_bindRejComps; continue; }
                 Entity* e = (Entity*)hc->m_Object;
-                if (!e || !readable(e, 4) || e == player) continue;
+                if (!e || !readable(e, 4) || e == player) { ++s_bindRejSelf; continue; }
                 uint16_t n = *(uint16_t*)((uint8_t*)e + 0x66);   // authoritative count @ +0x66 (never +0x64)
                 if (n < 1 || n > 96) n = 0;   // clamp: 1..96 safety net
                 Component** data = *(Component***)((uint8_t*)e + 0x60);   // re-read live: a grow frees the old block
@@ -4012,21 +5571,22 @@ static void ApplyGuards(const EntityPacket& pkt) {
                     if (vt == 0x01E41E58) skel = true;
                     if (vt == 0x026E34D8) bhvC = c;   // BhvGenericNPC only
                 }
-                if (!skel || !bhvC) continue;
+                if (!skel || !bhvC) { if (!skel) ++s_bindRejSkel; else ++s_bindRejBhv; continue; }
                 {
                     // Same predicate as the capture side: any human NPC with a health service.
                     AbstractEntityAI* aiPre = AIEntityHelper::GetEntityAI(e);
                     unsigned int hpPre = FindHealthInAI((unsigned int)aiPre);
-                    if (!aiPre || !hpPre || !readable(aiPre, 0xC0)) continue;
+                    if (!aiPre) { ++s_bindRejAi; continue; }
+                    if (!hpPre || !readable(aiPre, 0xC0)) { ++s_bindRejHp; continue; }
                 }
                 // Class-aware matching: if the host told us the archetype, only consider bodies of that
                 // class. Without this a heavy could be played by a civilian standing nearby.
-                if (es.arch && (uint16_t)(*(uint32_t*)((char*)bhvC + 0x14) & 0xFFFF) != es.arch) continue;
+                if (es.arch && (uint16_t)(*(uint32_t*)((char*)bhvC + 0x14) & 0xFFFF) != es.arch) { ++s_bindRejArch; continue; }
                 // One body per host entity per snapshot: skip anything already claimed this packet.
                 {
                     bool taken = false;
                     for (int u = 0; u < usedN; ++u) if (usedEnt[u] == (unsigned int)e) { taken = true; break; }
-                    if (taken) continue;
+                    if (taken) { ++s_bindRejTaken; continue; }
                 }
                 // Stable binding: once an objId is tied to a local entity, keep that body - but only while
                 // the body is plausibly still the same one. If it sits far from where the host says the
@@ -4050,6 +5610,7 @@ static void ApplyGuards(const EntityPacket& pkt) {
                 float dy = e->m_GlobalMatrix.M42 - es.pos[1];
                 float dz = e->m_GlobalMatrix.M43 - es.pos[2];
                 float d = dx*dx + dy*dy + dz*dz;
+                if (d < s_bindMinD) s_bindMinD = d;
                 if (d < bestD) { bestD = d; best = e; bestBhv = bhvC; }
             }
             if (!best) { ++s_covNoBody; ++s_bindUnmatched; continue; }
@@ -4104,6 +5665,8 @@ static void ApplyGuards(const EntityPacket& pkt) {
                     gs.used = 1; gs.ent = (unsigned int)best; gs.objId = es.objId;
                     L("[Slot] bind slot=%u objId=%llu -> ent=%08X via=%s\n",
                       slotIdx, (unsigned long long)es.objId, (unsigned int)best, via);
+                    L("[E] ev=bind slot=%u objId=%llu ent=%08X via=%s\n",
+                      slotIdx, (unsigned long long)es.objId, (unsigned int)best, via);
                 }
                 gs.lastPktMs = nowMs;
             }
@@ -4111,6 +5674,9 @@ static void ApplyGuards(const EntityPacket& pkt) {
             // the real guard). Skipped when the death came from the host snapshot, so it can't echo.
             GuestObjAdd(es.objId, (unsigned int)best);   // objId -> local mirror, for inbound events
             TrackMirrorDeathForRelay(best, es);
+            // C1 + X9: relayed damage. After the relay tracker (so a host-sourced death is never echoed
+            // back as a guest kill) and before the local death lane below, which owns es.dead.
+            ApplyRelayedHealth(es.objId, best, es);
             // B-4 (TASK 4): the SNAPSHOT is the reliable death channel. `es.dead` is the host's own
             // engine predicate, evaluated on every capture (:2632), delta-encoded and repeated at
             // SnapshotHz - and the live logs show it already reaching the guest. The one-shot KIND_KILL
@@ -4121,21 +5687,65 @@ static void ApplyGuards(const EntityPacket& pkt) {
             // and evicting the oldest instead of refusing), so one kill per body per session.
             // Ordering: GuestKillMirrorEntity's own "already 0xFFFF / engine dead flag" skip runs before
             // any engine write, so a body that is already dead is refused there and never killed twice.
-            if (es.dead && !GktAlreadyPushed(es.objId, (unsigned int)best)) {
-                GktMarkPushed(es.objId, (unsigned int)best);
-                MarkMirrorKilledLocally(best);             // stop driving the corpse, stop the echo
-                bool applied = false;
-                if (!DeathAppliedRecently((unsigned int)best)) {
-                    MarkDeathApplied((unsigned int)best);
-                    MirrorVisualDeath(best);               // visual death first, as on the packet path
-                    GuestKillMirrorEntity(es.objId, (unsigned int)best, true);
-                    applied = true;
-                }
-                static int s_snapDeathLines = 0;
-                if (s_snapDeathLines < 10) {
-                    ++s_snapDeathLines;
-                    L("[Mirror] snapshot death objId=%llu ent=%08X applied=%d\n",
-                      (unsigned long long)es.objId, (unsigned int)best, applied ? 1 : 0);
+            // C2 BLOCKER-1 fix: skip the claim entirely for an id-less record. objId == 0 is legal (a
+            // guard the host never described has no host id - GuestObjAdd refuses id 0, so
+            // GuestObjFind(0) can never return the slot binding). Without this guard the id-less body
+            // would take the latch path below (MarkMirrorKilledLocally) while GuestKillMirrorEntity can
+            // never prove its identity and returns false without setting alreadyDead - the body is then
+            // "latched dead but alive" and retried for ever. The only identity available to an id-less
+            // record is the entity pointer from the position match, which the file's own policy treats as
+            // too weak for an irreversible engine kill. So the id-less claim is refused before the latch:
+            // the body is left untouched (driven/disabled as a normal mirror) and never enters the latch.
+            if (es.dead && es.objId && !GktAlreadyPushed(es.objId, (unsigned int)best)) {
+                const unsigned int dent = (unsigned int)best;
+                // Tombstone is written only once the death is SETTLED (killed, or already dead by the
+                // engine). A failed attempt keeps the claim: no tombstone, so the next snapshot retries.
+                GktAttempt& at = GktAttemptSlot(es.objId, dent);
+                // MAJOR-2 terminal state: once the attempt budget is exhausted without settling, STOP
+                // touching the body. No MarkMirrorKilledLocally, no SetEnabled/DriveEntity, no SetLife,
+                // no CorpseLatchArm - the 1/64 cadence below becomes observation only (one escalation
+                // log, then nothing). This replaces the old "bounded rate, unbounded count" behaviour
+                // that re-ran the whole engine-kill sequence every epoch for the rest of the session.
+                const bool terminal = (at.n >= CLAIM_MAX_ATTEMPTS);
+                const bool dueNow = terminal ? (++at.skip >= CLAIM_EPOCH_SNAPSHOTS) : true;
+                if (dueNow) {
+                    at.skip = 0;
+                    if (terminal) {
+                        if (!at.escalated) {
+                            at.escalated = 1;
+                            L("[Death] unresolved objId=%llu ent=%08X attempts=%u reason=terminal-drop lastRefusal=%s\n",
+                              (unsigned long long)es.objId, dent, at.n, KillRefusalName(at.lastRefusal));
+                            L("[E] ev=death-unsettled objId=%llu ent=%08X attempts=%u reason=terminal-drop lastRefusal=%s\n",
+                              (unsigned long long)es.objId, dent, at.n, KillRefusalName(at.lastRefusal));
+                        }
+                        // Terminal: the body is no longer touched and no tombstone is written. The
+                        // claim re-enters each snapshot but immediately lands on this branch.
+                    } else {
+                        MarkMirrorKilledLocally(best);         // stop driving the corpse, stop the echo
+                        if (!DeathAppliedRecently(dent)) {
+                            MarkDeathApplied(dent);
+                            MirrorVisualDeath(best);           // visual death first, as on the packet path
+                        }
+                        bool alreadyDead = false;
+                        KillRefusal why = KILL_OK;      // C2-m1: the refusal the kill already computed
+                        const bool killed = GuestKillMirrorEntity(es.objId, dent, true, &alreadyDead, &why);
+                        const bool settled = killed || alreadyDead;
+                        at.lastRefusal = why;           // last attempt decides what escalated
+                        ++at.n;
+                        if (settled) {
+                            GktMarkPushed(es.objId, dent);     // ONLY now
+                            L("[Mirror] snapshot death objId=%llu ent=%08X applied=1 retry=0 attempts=%u\n",
+                              (unsigned long long)es.objId, dent, at.n);
+                            L("[E] ev=death-applied objId=%llu ent=%08X attempts=%u\n",
+                              (unsigned long long)es.objId, dent, at.n);
+                            GktAttemptClear(es.objId, dent);
+                        } else if (at.n <= CLAIM_MAX_ATTEMPTS && ClaimLogAllowed()) {
+                            L("[Mirror] snapshot death objId=%llu ent=%08X applied=0 retry=1 attempts=%u lastRefusal=%s\n",
+                              (unsigned long long)es.objId, dent, at.n, KillRefusalName(why));
+                            L("[E] ev=death-unsettled objId=%llu ent=%08X attempts=%u lastRefusal=%s\n",
+                              (unsigned long long)es.objId, dent, at.n, KillRefusalName(why));
+                        }
+                    }
                 }
             }
             // Visibility: log each guard the first time it becomes a playback dummy, so a live test can
@@ -4406,10 +6016,12 @@ static void EntitySyncTick() {
     World* gateWorld = World::GetCurrentWorld();
     if (!gateWorld || gateWorld->m_CharacterList.GetSize() < 2) return;
 
-    // [Ident] One-shot identity probe (per world). Dumps every human's m_ObjectID + spawn position +
-    // archetype so two sessions (or two machines) can be compared: if the same NPC at the same place
-    // carries the same objId, the id is content-derived and can replace position matching entirely.
-    {
+    // [Ident] One-shot identity probe (per world) - gated on [Coop] Probe (or Diag), never on Diag
+    // alone: it is one line-set per world, so a probe job must be able to get it without turning on the
+    // high-volume [Sync] histograms. Dumps every human's m_ObjectID + spawn position + archetype so two
+    // sessions (or two machines) can be compared: if the same NPC at the same place carries the same
+    // objId, the id is content-derived and can replace position matching entirely.
+    if (DiagEnabled() || ProbeEnabled()) {
         static void*    s_identWorld = nullptr;
         static uint64_t s_identWorldId = 0;
         uint64_t wid = gateWorld->GetObjectID();
@@ -4466,7 +6078,20 @@ static void EntitySyncTick() {
     // Poll incoming packets BEFORE the self-test branch (D-019). The old order returned early with
     // EntitySelfTest=1, so every incoming entity and kill packet was dropped.
     EntityPacket in;
-    const bool haveIn = Net::GetEntities(in) && in.protoVer == NET_PROTO_VER;
+    const bool gotPacket = Net::GetEntities(in);
+    const bool haveIn = gotPacket && in.protoVer == NET_PROTO_VER;
+    // T27: one join line per process. Until now the only evidence that a peer had ever been heard was
+    // the absence of failures; a version mismatch was silent. Values are what the packet itself said.
+    {
+        static bool s_joinLogged = false;
+        if (gotPacket && !s_joinLogged) {
+            s_joinLogged = true;
+            L("[Join] first entity packet: protoVer=%u expected=%u accepted=%d count=%u\n",
+              (unsigned)in.protoVer, (unsigned)NET_PROTO_VER, haveIn ? 1 : 0, (unsigned)in.count);
+            L("[E] ev=peer-first-packet protoVer=%u expected=%u accepted=%d count=%u\n",
+              (unsigned)in.protoVer, (unsigned)NET_PROTO_VER, haveIn ? 1 : 0, (unsigned)in.count);
+        }
+    }
     // B-4: drain the death entries the recv thread queued. A one-entry KIND_KILL packet is no longer
     // inside `in` at all (it cannot clobber the snapshot slot, net.cpp) and could not be relied on being
     // there even before, because the snapshot slot is last-writer-wins. This is the queue that guarantees
@@ -5961,25 +7586,35 @@ static void MirrorVisualDeathInner(Entity* e) {
 // notifyPeer=false is the guest variant (KillGuardEntityQuiet below): the mirror carries a LOCAL objId,
 // so pushing it back would reach the host as an unknown id and resolve by POSITION onto whichever guard
 // stands there. Every pre-existing call site goes through KillGuardEntity(Entity*) and still notifies.
-static void KillGuardEntityInner(Entity* e, bool notifyPeer);     // wrapped below
-static void KillGuardEntity(Entity* e) {
-    if (!e || !readable(e, 4)) return;
-    __try { KillGuardEntityInner(e, true); }
+// C2-M1: the return value is "the ENGINE says this body is dead after this call", never "the function
+// reached its end". notifyPeer selects only the peer push; the verdict means the same on both paths.
+static bool KillGuardEntityInner(Entity* e, bool notifyPeer, KillRefusal* why);     // wrapped below
+static bool KillGuardEntity(Entity* e) {
+    if (!e || !readable(e, 4)) return false;
+    bool dead = false;
+    __try { dead = KillGuardEntityInner(e, true, nullptr); }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         L("[KF] EXCEPTION 0x%08X (ent=%08X) - kill aborted\n", GetExceptionCode(), e);
+        dead = false;
     }
+    return dead;
 }
 
-static void KillGuardEntityQuiet(Entity* e) {
-    if (!e || !readable(e, 4)) return;
-    __try { KillGuardEntityInner(e, false); }
+static bool KillGuardEntityQuiet(Entity* e, KillRefusal* why) {
+    if (why) *why = KILL_OK;
+    if (!e || !readable(e, 4)) { if (why) *why = KILL_REFUSED_NO_ID; return false; }
+    bool dead = false;
+    __try { dead = KillGuardEntityInner(e, false, why); }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         L("[KF] EXCEPTION 0x%08X (ent=%08X) - kill aborted\n", GetExceptionCode(), e);
+        dead = false;
+        if (why) *why = KILL_REFUSED_EXCEPTION;
     }
+    return dead;
 }
 
-static void KillGuardEntityInner(Entity* e, bool notifyPeer) {
-    if (!e) return;
+static bool KillGuardEntityInner(Entity* e, bool notifyPeer, KillRefusal* why) {
+    if (!e) { if (why) *why = KILL_REFUSED_NO_ID; return false; }   // no body: engine says nothing
 
     unsigned int ai = (unsigned int)AIEntityHelper::GetEntityAI(e);
     unsigned int hp = FindHealthInAI(ai);
@@ -5988,8 +7623,10 @@ static void KillGuardEntityInner(Entity* e, bool notifyPeer) {
     // No health service means this is not a killable NPC (stale/duplicated entity, or a junk AI pointer).
     // Everything below walks the AI, so stop here - a tester crash came from exactly this: ai=10251025
     // passed the readable() test and EngineIsAlive() faulted on it.
-    if (!hp) { L("[KF] no health service (ai=%08X) -> skip\n", ai); return; }
-    if (!ai || !readable((void*)ai, 0xC0)) { L("[KF] ai unreadable\n"); return; }
+    if (!hp) { if (why) *why = KILL_REFUSED_NO_HEALTH;
+               L("[KF] no health service (ai=%08X) -> skip\n", ai); return false; }   // nothing was killed
+    if (!ai || !readable((void*)ai, 0xC0)) { if (why) *why = KILL_REFUSED_AI_UNREADABLE;
+                                             L("[KF] ai unreadable\n"); return false; }
 
     L("[KF] before: alive=%d  health life=%u/%u flags=%08X\n", (int)EngineIsAlive((unsigned int)e),
       hp ? *(unsigned short*)(hp + 0x5C) : 0, hp ? *(unsigned short*)(hp + 0x5E) : 0,
@@ -6055,6 +7692,19 @@ static void KillGuardEntityInner(Entity* e, bool notifyPeer) {
     if (notifyPeer)
         SendHealthEvent(ObjIdForEntity((unsigned int)e), 0xFFFFu,
                         e->m_GlobalMatrix.M41, e->m_GlobalMatrix.M42, e->m_GlobalMatrix.M43);
+
+    // C2-M1 verdict: read the engine back instead of assuming. Life (+0x5C) is the independent
+    // predicate -- this function writes the +0x60 death flag ITSELF above, so that flag can only
+    // corroborate its own write and must not be the sole evidence of a kill. SetLife(-1) is refused
+    // on an already-dead body (live log quoted above: "rc=-1 life 65535 -> 65535"), and in
+    // exactly that case the body IS dead, so Life == 0xFFFF is the right answer for both.
+    bool engineDead = false;
+    if (readable((void*)(hp + 0x60), 4))
+        engineDead = (*(unsigned short*)(hp + 0x5C) == 0xFFFFu);
+    if (!engineDead && why) *why = KILL_REFUSED_ENGINE_ALIVE;
+    L("[KF] verdict ent=%08X life=%u engineDead=%d\n", e,
+      readable((void*)(hp + 0x5C), 2) ? (unsigned)*(unsigned short*)(hp + 0x5C) : 0, (int)engineDead);
+    return engineDead;
 }
 
 // ini [Coop] GuestKillMirror (default 1): let the guest run the real engine kill on a mirrored guard.
@@ -6140,12 +7790,25 @@ static void CorpseLatchTick() {
 //      (src/phase1.cpp:2197). SetLife on a recycled service is exactly the fault this guards against.
 // Anything else touches no entity at all and only logs. A proximity kill here would be far worse than a
 // corpse that keeps standing, so the default for an unprovable target is "do nothing".
-static bool GuestKillMirrorEntity(uint64_t objId, unsigned int ent, bool viaGuestObj) {
+static bool GuestKillMirrorEntity(uint64_t objId, unsigned int ent, bool viaGuestObj,
+                                  bool* alreadyDead /* = nullptr in the declaration */,
+                                  KillRefusal* why /* = nullptr in the declaration */) {
+    if (alreadyDead) *alreadyDead = false;   // C2 §3.3: only the already-dead branch below sets it
+    if (why) *why = KILL_OK;
     const int flag = GuestKillMirrorEnabled();
     // GuestKillMirror=0 is the escape hatch: nothing below runs at all - no health read, no
     // re-enable, no engine call - so the crash path is unreachable with the flag off.
     if (!flag) {
-        L("[Mirror] dead ent=%08X -> KillGuardEntity applied=0 (GuestKillMirror=%d)\n", ent, flag);
+        // C2-m4: a disabled kill used to return false with no claim bookkeeping, so the snapshot death
+        // caller never settled (no GktMarkPushed, no GktAttemptClear) and the claim lived for ever while
+        // MirrorVisualDeath had already shown the corpse. Retire the claim here: clear the attempt slot
+        // and count the disabled path (bounded) - a disabled mirror is "handled", not retried.
+        static int s_gktKillDisabled = 0;
+        if (s_gktKillDisabled < 10) ++s_gktKillDisabled;
+        GktAttemptClear(objId, ent);
+        if (why) *why = KILL_REFUSED_DISABLED;   // C2-m1: the escalation line reports this
+        if (ClaimLogAllowed())
+            L("[Mirror] dead ent=%08X -> KillGuardEntity applied=0 killDisabled=1 (GuestKillMirror=%d)\n", ent, flag);
         return false;
     }
     bool hpOk = false;
@@ -6163,12 +7826,17 @@ static bool GuestKillMirrorEntity(uint64_t objId, unsigned int ent, bool viaGues
                 deadFlag = (*(unsigned int*)(hpSvc + 0x60) & 0x01000000u) != 0;   // engine dead flag
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) { hpOk = false; }
+    } else if (why) {
+        // C2-m1: the identity gate refused before any health read. ent==0 and a mirror-table mismatch
+        // are the same refusal from the caller's point of view (unprovable identity).
+        *why = KILL_REFUSED_NO_ID;
     }
     // D: SetLife(-1) on an ALREADY dead body is refused by the engine (live log: "rc=-1
     // life 65535 -> 65535") but still walks the health-event path that drives the action/blend
     // dispatcher - the state in which this->[0x114] is null (crash at 0x67B2EA, 0xC0000005).
     // A body that is dead on any of the two proven predicates is never killed a second time.
     if (hpOk && (life == 0xFFFFu || deadFlag)) {
+        if (alreadyDead) *alreadyDead = true;   // settled: the engine predicate already says dead
         L("[Mirror] dead ent=%08X skipped reason=already-dead life=%u\n", ent, (unsigned)life);
         return false;
     }
@@ -6199,10 +7867,22 @@ static bool GuestKillMirrorEntity(uint64_t objId, unsigned int ent, bool viaGues
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) { prepared = false; }
         if (!prepared) {
-            L("[Mirror] dead ent=%08X skipped reason=no-behaviour-component\n", ent);
+            if (why) *why = KILL_REFUSED_NO_BEHAVIOUR;
+            if (ClaimLogAllowed())
+                L("[Mirror] dead ent=%08X skipped reason=no-behaviour-component\n", ent);
             return false;
         }
-        KillGuardEntityQuiet((Entity*)ent);   // own __try/__except
+        const bool engineDead = KillGuardEntityQuiet((Entity*)ent, why);   // own __try/__except; real verdict
+        if (!engineDead) {
+            // C2-M1: no SetLife, or the engine refused it. Do NOT arm the latch here -- CorpseLatchTick
+            // does SetEnabled(false) + m_DriveEntity = false, which would freeze a body that is still
+            // alive. Report unsettled so the claim retries (settled = killed || alreadyDead).
+            // C2-m1: `why` already carries the inner refusal (no-health / ai-unreadable / engine-alive).
+            if (ClaimLogAllowed())
+                L("[Mirror] dead ent=%08X -> KillGuardEntity applied=0 reason=engine-not-dead inner=%s (GuestKillMirror=%d)\n",
+                  ent, KillRefusalName(why ? *why : KILL_REFUSED_ENGINE_ALIVE), flag);
+            return false;
+        }
         // The enable above only buys the engine the samples it needs to start the death transition.
         // Hand the body to the latch so the tick's disable/drive-clear are re-applied a few ticks
         // later and the statechart cannot talk the corpse back to life.
@@ -6210,7 +7890,9 @@ static bool GuestKillMirrorEntity(uint64_t objId, unsigned int ent, bool viaGues
         L("[Mirror] dead ent=%08X -> KillGuardEntity applied=1 (GuestKillMirror=%d)\n", ent, flag);
         return true;
     }
-    L("[Mirror] dead ent=%08X -> KillGuardEntity applied=0 (GuestKillMirror=%d)\n", ent, flag);
+    if (why && *why == KILL_OK) *why = KILL_REFUSED_NO_HEALTH;   // C2-m1: no valid service -> nothing attempted
+    if (ClaimLogAllowed())
+        L("[Mirror] dead ent=%08X -> KillGuardEntity applied=0 reason=no-health-service (GuestKillMirror=%d)\n", ent, flag);
     return false;
 }
 
@@ -6293,12 +7975,11 @@ static void ApplyPeerHealth(uint64_t objId, unsigned short life, float x, float 
             // GuestKillMirrorEntity); MirrorVisualDeath stays first so the "[Mirror] dead ..." line is
             // still emitted exactly as before.
             bool applied = false;
-            if (g_entHost) { KillGuardEntity((Entity*)ent); applied = true; }
+            if (g_entHost) { applied = KillGuardEntity((Entity*)ent); }
             else if (!DeathAppliedRecently(ent)) {
                 MarkDeathApplied(ent);
                 MirrorVisualDeath((Entity*)ent);
-                GuestKillMirrorEntity(objId, ent, viaGuestObj);
-                applied = true;
+                applied = GuestKillMirrorEntity(objId, ent, viaGuestObj);
             }
             if (KtOn(KT_RECV))
                 L("[KT] death recv objId=%llu -> ent=%08X ok=1 applied=%d\n",
@@ -6914,6 +8595,28 @@ static void lerpState(const PlayerState& a, const PlayerState& b, float t, Playe
     o.curSpeed  = lerpf(a.curSpeed,  b.curSpeed,  t);
     o.destSpeed = lerpf(a.destSpeed, b.destSpeed, t);
 
+    // Ghost ship (authority-model C4): X/Y are sender-authoritative and continuous, so lerp them; Z is
+    // derived-local at the drive site (the local water height at the peer's XZ), so it is carried as-is.
+    // Orientation is a nlerp in the same wire quaternion space, shortest-arc (dot<0 -> negate b), then
+    // renormalised; a degenerate pair keeps b's rotation (copied by o = b above).
+    if (a.shipValid && b.shipValid) {
+        o.shipPos[0] = lerpf(a.shipPos[0], b.shipPos[0], t);
+        o.shipPos[1] = lerpf(a.shipPos[1], b.shipPos[1], t);
+        o.shipPos[2] = b.shipPos[2];
+        float qw = b.shipQuat[3];
+        float qs = (a.shipQuat[0]*b.shipQuat[0] + a.shipQuat[1]*b.shipQuat[1] +
+                    a.shipQuat[2]*b.shipQuat[2] + a.shipQuat[3]*b.shipQuat[3]) < 0.0f ? -1.0f : 1.0f;
+        float qx = lerpf(a.shipQuat[0]*qs, b.shipQuat[0], t);
+        float qy = lerpf(a.shipQuat[1]*qs, b.shipQuat[1], t);
+        float qz = lerpf(a.shipQuat[2]*qs, b.shipQuat[2], t);
+        float qn = lerpf(a.shipQuat[3]*qs, qw, t);
+        const float len = sqrtf(qx*qx + qy*qy + qz*qz + qn*qn);
+        if (len > 1e-6f) {
+            o.shipQuat[0] = qx / len; o.shipQuat[1] = qy / len;
+            o.shipQuat[2] = qz / len; o.shipQuat[3] = qn / len;
+        }
+    }
+
     // Heading is a direction: component-lerp xyz then renormalize (keeps .w from the newer snapshot).
     o.heading.x = lerpf(a.heading.x, b.heading.x, t);
     o.heading.y = lerpf(a.heading.y, b.heading.y, t);
@@ -6924,7 +8627,7 @@ static void lerpState(const PlayerState& a, const PlayerState& b, float t, Playe
     // (they index that action's clips). Same action -> lerp for a smooth speed ramp; different action ->
     // keep b's (the alias we're switching to, copied by o = b) so we don't cross-blend unrelated clips.
     if (a.actionAlias == b.actionAlias && a.actionChannel == b.actionChannel && a.blendCount == b.blendCount) {
-        for (int i = 0; i < b.blendCount; ++i) o.blendFactors[i] = lerpf(a.blendFactors[i], b.blendFactors[i], t);
+        for (int i = 0; i < b.blendCount && i < BLEND_MAX; ++i) o.blendFactors[i] = lerpf(a.blendFactors[i], b.blendFactors[i], t);
         o.timeScale = lerpf(a.timeScale, b.timeScale, t);   // clip speed is continuous too
         // Phase: lerp unless the clip looped between snapshots (b < a), then keep b's (o = b) — never
         // interpolate backwards across the wrap.
@@ -7195,38 +8898,15 @@ void Phase1::TryShipProbe() {
             L("[Ship] pos=unavailable\n");
         }
 
-        // Ship gameplay sub-object: FUN_00fb3220(ship, 0). Try __thiscall first (flag on stack),
-        // then __fastcall (flag in DL) — convention was ambiguous; log whichever succeeds.
-        {
-            typedef int (__thiscall *ShipSubFn_t)(void* ship, char flag);
-            typedef int (__fastcall *ShipSubFn_f)(void* ship, char flag);
-            int   sub = 0;
-            DWORD exc = 0;
-            __try { sub = ((ShipSubFn_t)(base() + 0x00FB3220))(shipEnt, 0); }
-            __except (EXCEPTION_EXECUTE_HANDLER) { exc = GetExceptionCode(); }
-            if (exc || !readable((void*)(uintptr_t)sub, 8)) {
-                L("[Ship] sub thiscall: exc=0x%08X sub=%p (falling back to fastcall)\n", exc, (void*)(uintptr_t)sub);
-                exc = 0;
-                __try { sub = ((ShipSubFn_f)(base() + 0x00FB3220))(shipEnt, 0); }
-                __except (EXCEPTION_EXECUTE_HANDLER) { exc = GetExceptionCode(); }
-            }
-            void* subp = (void*)(uintptr_t)sub;
-            if (exc || !readable(subp, 8)) {
-                L("[Ship] sub=EXCEPTION/unreadable (exc=0x%08X)\n", exc);
-            } else {
-                uint32_t subVt = *(uint32_t*)subp;
-                L("[Ship] sub=%p subVt=%08X\n", subp, subVt);
-                for (int row = 0; row < 8; ++row) {   // sub+0x00..0x80, 4 u32 per line
-                    uint32_t v[4];
-                    for (int i = 0; i < 4; ++i) {
-                        uintptr_t off = (uintptr_t)(row * 0x10 + i * 4);
-                        v[i] = readable((char*)subp + off, 4) ? *(uint32_t*)((char*)subp + off) : 0;
-                    }
-                    L("[Ship] sub+0x%02X: %08X %08X %08X %08X\n",
-                      (unsigned)(row * 0x10), v[0], v[1], v[2], v[3]);
-                }
-            }
-        }
+        // DBA-1: the FUN_00FB3220 probe was removed here (ops/evidence/double-base-add.md §5).
+        // It called base() + 0x00FB3220 -- the VA pasted where an RVA belongs (0x400000 + 0xFB3220
+        // = 0x013B3220, mid-function), a double base-add. Corrected, the call is still unsafe:
+        // the callee is int __cdecl a1,a2 (args at [ebp+8]/[ebp+0xC], bare ret at 0x00FB3234), and
+        // with a2 == 0 it runs sub_525590(a1, ...) + a container walk, so a1 must be a collection
+        // manager -- whether a ship Entity* is legal was never proven. The warm-up "flag on stack"
+        // __thiscall attempt also puts a1 = 0, which is why the log always fell through.
+        // Nothing is lost: RequestShipProbe (phase1.cpp:6088) has no caller at HEAD, so g_shipReq
+        // (:6066) can never be set and this function is unreachable.
 
         // Walk the ship entity's first 0x200 bytes for pointers to objects with a .rdata vtable
         // (its components). The ship HP (ShipHealthData / GcLNavalHealth) is behind one of these.
@@ -7267,6 +8947,9 @@ static void ProbeIdentityOnce() {
     static void* s_lastWorld = nullptr;
     if (w == s_lastWorld) return;
     s_lastWorld = w;
+    // [GhostProxy] world change: every entity of the old world is dead or unmoored, so every
+    // source/ghost pair is meaningless. Reset there, not in a new poller.
+    ProxySrcWorldCheck();
 
     __try {
         BaseBigArray<Reference>& ents = w->m_EntityManager.m_Entities;
@@ -7766,6 +9449,79 @@ static void __cdecl OnFrame(Human* updatedHuman) {
     }
 }
 
+// ---- Config dump + RUN provenance --------------------------------------------------------
+// One line per key the code actually reads, once per process, BEFORE the net lane opens. The
+// RESOLVED value (post-default) is printed, so an absent key shows the default the code chose.
+// GetPrivateProfile* is a deterministic disk read of an ini that is not rewritten at runtime, so
+// re-reading here yields exactly the value each call site uses later (same section/key/default).
+// Absence is detected with a sentinel: GetPrivateProfileStringA returns lpDefault only when the
+// key is missing, so a sentinel hit == "absent" and is annotated "(default)".
+static void DumpConfigOnce()
+{
+    static bool s_done = false;
+    if (s_done) return;
+    s_done = true;
+
+    char mod[MAX_PATH] = "?";
+    HMODULE self = nullptr;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)&L, &self) && self)
+        GetModuleFileNameA(self, mod, MAX_PATH);
+
+    L("[AC4Coop] RUN build=%s tree=%s proto=%u ini=%s pid=%u exe=%s\n",
+      BUILD_GIT_COMMIT, BUILD_GIT_TREE, (unsigned)NET_PROTO_VER, Paths::Ini(),
+      (unsigned)GetCurrentProcessId(), mod);
+
+    struct K { const char* s; const char* k; int d; };
+    static const K keys[] = {
+        { "Coop", "ActionDeathLog", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "CombatObserve", 0 },
+        { "Coop", "CombatTest", 0 }, { "Coop", "CorpseKeepSec", 30 }, { "Coop", "CrowdProbeIntegrate", 1 },
+        { "Coop", "CrowdProbeLiveKeys", 1 }, { "Coop", "DamageRelay", 0 }, { "Coop", "Diag", 0 },
+        { "Coop", "DisableCrowd", 0 }, { "Coop", "DisablePuppetAI", 1 }, { "Coop", "DisableSpawns", 0 },
+        { "Coop", "DriveActions", 1 }, { "Coop", "DriveContext", 0 }, { "Coop", "DriveLocomotion", 0 },
+        { "Coop", "EntityHost", 0 }, { "Coop", "EntitySelfTest", 0 }, { "Coop", "EntitySelfTestMax", 1 },
+        { "Coop", "EntitySelfTestOffset", 0 }, { "Coop", "EntitySync", 0 }, { "Coop", "FixNullReturn", 1 },
+        { "Coop", "ForceUnknownBuild", 0 }, { "Coop", "GhostMarkerSuppress", 1 }, { "Coop", "GhostProxy", 0 },
+        { "Coop", "GuardNullActionTarget", 0 }, { "Coop", "GuardNullTarget", 1 }, { "Coop", "GuardStaleTarget", 1 },
+        { "Coop", "GuestKillMirror", 1 }, { "Coop", "HookSgm", 1 }, { "Coop", "HostileOnly", 0 },
+        { "Coop", "HybridLoco", 1 }, { "Coop", "IdentityBand", 0 }, { "Coop", "IdResolver", 1 },
+        { "Coop", "InstallHooks", 1 }, { "Coop", "IntegratePuppet", 0 }, { "Coop", "KillTrace", 1 },
+        { "Coop", "KrLog", 0 }, { "Coop", "LegacyPadIdHook", 1 }, { "Coop", "MinBlendInMs", 100 },
+        { "Coop", "NetStrictPeer", 1 }, { "Coop", "NullReturnObserver", 1 }, { "Coop", "Probe", 0 },
+        { "Coop", "PuppetParkX", 0 }, { "Coop", "PuppetPhysics", 0 }, { "Coop", "RegisterPad1", 0 },
+        { "Coop", "RelevanceRadiusM", 250 }, { "Coop", "ReloadBuilder", 1 }, { "Coop", "SceneAware", 1 },
+        { "Coop", "SeekOnSwitch", 1 }, { "Coop", "SkelAttach", 0 }, { "Coop", "ShipDump", 0 }, { "Coop", "ShipDumpFloats", 0 },
+        { "Coop", "ShipGhost", 0 }, { "Coop", "ShipGhostSelfTest", 0 }, { "Coop", "ShipHPSync", 0 },
+        { "Coop", "ShipPassenger", 0 }, { "Coop", "ShipRelevanceRadiusM", 1000 }, { "Coop", "ShipSync", 1 },
+        { "Coop", "ShipTest", 0 }, { "Coop", "ShipTestFracPct", 45 }, { "Coop", "ShipTestRadiusM", 250 },
+        { "Coop", "StageLog", 0 }, { "Coop", "SyncEnemiesOnly", 1 }, { "Coop", "SyncMaxEntities", 32 },
+        { "Coop", "SyncRadiusM", 60 }, { "Coop", "TransformProbe", 0 }, { "Coop", "VPadEnable", 0 },
+        { "Coop", "VPadTest", 0 }, { "Coop", "WatchDeadBit", 0 }, { "Coop", "WatchTarget", 0 },
+        { "Coop", "HookFrame", 1 }, { "Coop", "HookPad", 1 }, { "Coop", "HookWindowed", 1 },
+        { "Coop", "HookMultiInstance", 1 },
+        { "Display", "Borderless", 0 }, { "Display", "ForceWindowedMs", 5000 }, { "Display", "Fullscreen", 0 },
+        { "Net", "Enabled", 0 }, { "Net", "InterpDelayMs", 100 }, { "Net", "InterpMaxExtrapMs", 100 },
+        { "Net", "Interpolation", 1 }, { "Net", "LocalPort", 47801 }, { "Net", "PeerPort", 47801 },
+        { "Net", "SnapshotHz", 20 },
+    };
+
+    const char sent[] = "\x1A\x1B absent";
+    char sv[64];
+    const size_t n = sizeof(keys) / sizeof(keys[0]);
+    for (size_t i = 0; i < n; ++i) {
+        GetPrivateProfileStringA(keys[i].s, keys[i].k, sent, sv, sizeof(sv), Paths::Ini());
+        const bool absent = (strcmp(sv, sent) == 0);
+        const int v = GetPrivateProfileIntA(keys[i].s, keys[i].k, keys[i].d, Paths::Ini());
+        L("[AC4Coop] CFG %s.%s=%d%s\n", keys[i].s, keys[i].k, v, absent ? " (default)" : "");
+    }
+
+    char str[128];
+    GetPrivateProfileStringA("Net", "PeerIP", "127.0.0.1", str, sizeof(str), Paths::Ini());
+    L("[AC4Coop] CFG Net.PeerIP=%s\n", str);
+    GetPrivateProfileStringA("Coop", "DriveContextMask", "", str, sizeof(str), Paths::Ini());
+    L("[AC4Coop] CFG Coop.DriveContextMask=%s%s\n", str[0] ? str : "(empty)", str[0] ? "" : " (default)");
+}
+
 static void OnFrameInner(Human* updatedHuman) {
     if (!isPlayerUpdate(base(), updatedHuman)) return;
 
@@ -7802,6 +9558,7 @@ static void OnFrameInner(Human* updatedHuman) {
         s_shipPassenger = GetPrivateProfileIntA("Coop", "ShipPassenger", 0, Paths::Ini());
         s_shipGhost     = GetPrivateProfileIntA("Coop", "ShipGhost",     0, Paths::Ini());
         s_ghostSelfTest = GetPrivateProfileIntA("Coop", "ShipGhostSelfTest", 0, Paths::Ini());
+        s_shipHPSync    = GetPrivateProfileIntA("Coop", "ShipHPSync",    0, Paths::Ini());
         s_transformProbe = GetPrivateProfileIntA("Coop", "TransformProbe", 0, Paths::Ini());
         g_identityBand   = GetPrivateProfileIntA("Coop", "IdentityBand",   0, Paths::Ini());
         g_combatTest     = GetPrivateProfileIntA("Coop", "CombatTest",     0, Paths::Ini());
@@ -7813,6 +9570,7 @@ static void OnFrameInner(Human* updatedHuman) {
         g_watchDeadBit   = GetPrivateProfileIntA("Coop", "WatchDeadBit",   0, Paths::Ini());
         if (g_watchTarget  > 0) L("[TD] WatchTarget=1 hotkey=Ctrl+Alt+J (address dump only)\n");
         if (g_watchDeadBit > 0) L("[WB] WatchDeadBit=1 hotkey=Ctrl+Alt+L (PAGE_GUARD on svc+4, cap %d)\n", WB_MAX_EXC);
+        DumpConfigOnce();   // RUN + full CFG dump, once, before the link opens
         Net::SetStrictPeer(s_netStrictPeer != 0);   // before Init: the recv thread filters from the start
         bool netOk = Net::Init();
         L("[Net] init=%d  (bound/peer line goes to OutputDebugString)\n", netOk ? 1 : 0);
@@ -7873,20 +9631,34 @@ static void OnFrameInner(Human* updatedHuman) {
             }
             Net::Stats st; Net::GetStats(st);
             double secs = (stNow - s_statsLast) / 1000.0;
-            L("[Net] stats tx=%u pkt, %u B, %u ent  rx=%u pkt, %u B  |  %.1f kB/s up, %.1f kB/s down  |  mirror ok=%u nobod=%u steal=%u\n",
+            L("[Net] stats tx=%u pkt, %u B, %u recs  rx=%u pkt, %u B  |  %.1f kB/s up, %.1f kB/s down  |  mirror ok=%u nobod=%u steal=%u rejects=%u protoMismatch=%u\n",
               st.txPackets, st.txBytes, st.txEnts, st.rxPackets, st.rxBytes,
               (st.txBytes / 1024.0) / secs, (st.rxBytes / 1024.0) / secs,
-              s_covMatched, s_covNoBody, s_covStolen);
+              s_covMatched, s_covNoBody, s_covStolen, st.rejects, st.protoMismatch);
             // Scope line, same 5 s window as the wire stats above. It exists so one run PROVES the
-            // filter: candidates minus enemies is the civilian mass that used to be shipped, sent is
-            // what actually went out (it also includes ships, which are packed before the characters).
-            // The guest never runs CaptureGuards, so candidates/enemies/sent stay 0 there by design.
+            // filter: `hostile`/`unknown` are the hostile population (A28), `sent` is what actually
+            // went out (it also includes ships, which are packed before the characters).
+            // The guest never runs CaptureGuards, so candidates/hostile/sent stay 0 there by design.
+            // HO-3: `enemies=` was removed on purpose - it counted `weapon || guardIcon`, two ids
+            // this file documents as never attached to a live body, and sat beside the real
+            // `hostile=`. One fact, one channel; no scraper reads `enemies=` (checked: the only
+            // other occurrences are a sample line in tools/coop_report.py's selftest fixture and
+            // historical captures kept in ops/).
             // Scope (TASK 1): candidates that passed the validity gate, how many of them are inside
             // SyncRadiusM of the peer, and how many were actually emitted (nearest-first, capped by
             // SyncMaxEntities; `sent` also includes ships, packed before the characters).
-            L("[Sync] scope candidates=%u inRadius=%u enemies=%u sent=%u (SyncEnemiesOnly=%d, SyncRadiusM=%d, SyncMaxEntities=%d)\n",
-              s_scopeCand, s_scopeInRadius, s_scopeEnemies, s_scopeSent,
-              SyncEnemiesOnly(), SyncRadiusM(), SyncMaxEntities());
+            // A28: HostileOnly is printed here for the first time (it was invisible in every capture),
+            // and `captures`/`sentPerCap` are added because `sent` is a WINDOW SUM, not a per-snapshot
+            // figure -- only sentPerCap is bounded by SyncMaxEntities.  L() formats into char buf[1024]
+            // (see the definition above), so the shortened line cannot truncate.
+            // HO-3: `enemies=%u` is gone. It was fed by `weapon || guardIcon`, not by hostility, and
+            // a reader of the runbook would take it as the hostile count. `hostile=`/`unknown=` are
+            // the only hostile reporting now; older captures in ops/ still show the field as history.
+            L("[Sync] scope candidates=%u inRadius=%u hostile=%u unknown=%u sent=%u captures=%u sentPerCap=%.2f (SyncEnemiesOnly=%d, SyncRadiusM=%d, SyncMaxEntities=%d, HostileOnly=%d)\n",
+              s_scopeCand, s_scopeInRadius, s_scopeHostile, s_scopeUnknown, s_scopeSent,
+              s_scopeCaps,
+              s_scopeCaps ? (double)s_scopeSent / (double)s_scopeCaps : 0.0,
+              SyncEnemiesOnly(), SyncRadiusM(), SyncMaxEntities(), HostileOnly());
             // T13/T21 oracle: the discriminator over every character candidate the walk reached in
             // this window, BEFORE the SyncEnemiesOnly filter (so the numbers do not collapse to zero
             // when the filter is on). soldier = kind 3 with a fighter role from the T21 set;
@@ -7919,7 +9691,7 @@ static void OnFrameInner(Human* updatedHuman) {
                     if (w < 0) break;
                     off += w;
                 }
-                L("[Sync] krreject total=%u%s%s\n", s_krRejTotal, rej, s_krRejOverflow ? " (+overflow)" : "");
+                L("[Sync] krreject total=%u %s%s\n", s_krRejTotal, rej, s_krRejOverflow ? " (+overflow)" : "");
             }
             // G7 oracle (TASK 3), guest side: did every character record get a body, and how far is
             // that body from where the host says it is at APPLY time? sent == bound + unmatched.
@@ -7928,11 +9700,22 @@ static void OnFrameInner(Human* updatedHuman) {
                 L("[Sync] bind sent=%u bound=%u unmatched=%u meanErr=%.2f maxErr=%.2f\n",
                   s_bindSent, s_bindBound, s_bindUnmatched, meanErr, (double)s_bindErrMax);
             }
-            // Component histogram, same window. ALL non-zero distinct component vtable ids by
-            // descending count (32 slots), then the two ids the enemies-only filter trusts, each as
-            // "candidates carrying it". If enemies=0 while weapon_A8/icon_D0 are non-zero, the scope
-            // gate is broken; if both stay 0 across a populated scene, those ids are absent here.
+            // T28: WHY the guest bound nothing. Separate line, [Coop] BindDiag=1, so the oracle's
+            // [Sync] bind format above stays exactly as coop_report.py expects it.
             {
+                static int s_diag = -1;
+                if (s_diag < 0) s_diag = GetPrivateProfileIntA("Coop", "BindDiag", 0, Paths::Ini());
+                if (s_diag)
+                    L("[BindDiag] recs=%u scan=%u rej(self=%u comps=%u skel=%u bhv=%u ai=%u hp=%u arch=%u taken=%u) noBody=%u minD=%.2f\n",
+                      s_bindSent, s_bindScanN, s_bindRejSelf, s_bindRejComps, s_bindRejSkel,
+                      s_bindRejBhv, s_bindRejAi, s_bindRejHp, s_bindRejArch, s_bindRejTaken,
+                      s_bindUnmatched, (s_bindMinD < 1e8f) ? sqrtf(s_bindMinD) : -1.0f);
+            }
+            // Component histogram, same window. ALL non-zero distinct component vtable ids by
+            // descending count (32 slots), then the two ids the soldier filter trusts, each as
+            // "candidates carrying it". If weapon_A8/icon_D0 stay 0 across a populated scene, those
+            // ids are absent here (the retired `enemies=` counter said nothing either way).
+            if (DiagEnabled()) {
                 char hist[1024]; hist[0] = 0;
                 HistFormatTop(hist, sizeof(hist), s_compVt, s_compCnt, s_compDistinct, COMP_HIST_CAP);
                 L("[Sync] comps n=%u%s  weapon_A8=%u icon_D0=%u  distinct=%d%s\n",
@@ -7942,7 +9725,7 @@ static void OnFrameInner(Human* updatedHuman) {
             // AI object vtable histogram: top 12 by descending count. If a single AI vtable dominates
             // the candidate population while comps shows no single dominant id, this is the real
             // discriminator for "soldier" in this scene.
-            {
+            if (DiagEnabled()) {
                 char hist[1024]; hist[0] = 0;
                 HistFormatTop(hist, sizeof(hist), s_aiVt, s_aiCnt, s_aiDistinct, 12);
                 L("[Sync] ai n=%u%s  distinct=%d%s\n",
@@ -7950,7 +9733,7 @@ static void OnFrameInner(Human* updatedHuman) {
             }
             // One example position per table for the highest-count id, so a guard cluster can be
             // located on the map. 0x00000000 with count 0 means "no data this window".
-            {
+            if (DiagEnabled()) {
                 int ci = HistBestIndex(s_compCnt, s_compDistinct);
                 if (ci >= 0)
                     L("[Sync] sample comp vt=%08X pos=(%.1f,%.1f,%.1f)\n",
@@ -7962,12 +9745,17 @@ static void OnFrameInner(Human* updatedHuman) {
             }
             CompHistReset();
             AiHistReset();
-            s_scopeCand = 0; s_scopeEnemies = 0; s_scopeInRadius = 0; s_scopeSent = 0;
+            s_scopeCand = 0; s_scopeInRadius = 0; s_scopeSent = 0;
+            s_scopeHostile = 0; s_scopeUnknown = 0; s_scopeCaps = 0;   // A28: same window boundary
             s_krN = 0; s_krSoldier = 0; s_krCivilian = 0; s_krOther = 0;
             s_krWinLines = 0;   // T17: the per-window [KR] budget refills with the other counters
             s_krRejN = 0; s_krRejTotal = 0; s_krRejOverflow = 0;   // T21: rejection histogram
             // TASK 3 oracle counters, same window.
             s_bindSent = 0; s_bindBound = 0; s_bindUnmatched = 0;
+            s_bindScanN = 0; s_bindRejSelf = 0; s_bindRejComps = 0; s_bindRejSkel = 0;
+            s_bindRejBhv = 0; s_bindRejAi = 0; s_bindRejHp = 0; s_bindRejArch = 0;
+            s_bindRejTaken = 0;
+            s_bindMinD = 1e9f;
             s_bindErrSum = 0.0; s_bindErrMax = 0.0f;
             // One-shot receive watchdog: counters reset every poll, so 2 polls with tx and no rx
             // means ~10 s of transmitting into the void. Say so once - silence is the failure mode
@@ -8039,6 +9827,22 @@ static void OnFrameInner(Human* updatedHuman) {
             hm->M41 = g_holdPos[0]; hm->M42 = g_holdPos[1]; hm->M43 = g_holdPos[2];
         }
     }
+    // Heartbeat: an unconditional line every 30 s, before any net/world gate. Without it, "the frame
+    // hook died" and "the hook is idle" look identical in the log - which cost the 2026-11-08 evening
+    // three blind runs (the log simply stopped at 17:30 and nothing said so).
+    {
+        static uint64_t s_hbNext = 0;
+        uint64_t hbNow = GetTickCount64();
+        if (hbNow >= s_hbNext) {
+            s_hbNext = hbNow + 30000;
+            L("[HB] tick=%llu net=%d entSync=%d host=%d world=%p\n",
+              (unsigned long long)hbNow, Net::Enabled() ? 1 : 0, g_entSync, g_entHost,
+              (void*)World::GetCurrentWorld());
+        }
+    }
+    // F8 live test (no-op unless [Coop] BoardableTest=1). Must sit ABOVE the Net::Enabled() block: that block always
+    // returns, so anything after it never runs in a networked session (first placement, 19788a1, never fired).
+    BoardableTestTick();
     if (Net::Enabled()) {
         EntitySyncTick();   // host broadcasts entity transforms; peer mirrors them (synced worlds)
         // Capture only succeeds in a real playable world (not title/whiteroom). Require it to be
@@ -8100,8 +9904,52 @@ static void OnFrameInner(Human* updatedHuman) {
         // timer — covers world change, disconnect, silence and unexpected-source drops, where GetRemote
         // keeps returning a stale last packet forever. With NetStrictPeer=0 the timer arm is inert, so
         // the condition reduces exactly to today's.
-        bool timerOk = (s_netStrictPeer == 0) || (Net::MillisSinceRecv() < 2000);
-        bool peerPresent = rawSameWorld && (now - lastFreshMs) < 2000 && timerOk;
+        bool timerOk = (s_netStrictPeer == 0) || (Net::MillisSinceRecv() < kPeerLiveMs);
+        bool peerPresent = rawSameWorld && (now - lastFreshMs) < kPeerLiveMs && timerOk;
+        // [E] link-up / link-down: edge-triggered, one line per transition (never per frame).
+        {
+            static bool s_peerWasPresent = false;
+            if (peerPresent && !s_peerWasPresent) {
+                L("[E] ev=link-up peerMs=%u world=%08X scene=%08X\n",
+                  Net::MillisSinceRecv(),
+                  localOk ? (unsigned)local.worldId : 0u,
+                  localOk ? (unsigned)local.sceneKey : 0u);
+            } else if (!peerPresent && s_peerWasPresent) {
+                L("[E] ev=link-down peerMs=%u world=%08X scene=%08X\n",
+                  Net::MillisSinceRecv(),
+                  localOk ? (unsigned)local.worldId : 0u,
+                  localOk ? (unsigned)local.sceneKey : 0u);
+            }
+            s_peerWasPresent = peerPresent;
+        }
+
+        // X21: ONE line every ~10 s that says what every lane is doing and why it dropped work, so a
+        // session is diagnosed from one format instead of six ([Net]/[Sync]/[ShipSync]/[Net] scene ...).
+        // Telemetry only: no engine calls beyond the attribute reads this tick already performs, no
+        // allocation (fixed buffer + _snprintf_s), bounded length, and every value comes from a counter
+        // that already exists. bind/dmg values are the most recent 5 s window, because that is the
+        // window the [Net] stats block resets them at. `recs(recv=?)`: no received-record counter
+        // exists, so it is printed as ? rather than inventing one.
+        static uint64_t s_healthLast = 0;                        // X21: 10 s window, block-scope only
+        if (s_healthLast == 0) s_healthLast = now;
+        if (now - s_healthLast >= 10000) {
+            s_healthLast = now;
+            Net::Stats hs; Net::GetStats(hs);                    // cheap struct copy, same as the 5 s line
+            const double hErr = s_bindBound ? (s_bindErrSum / (double)s_bindBound) : 0.0;
+            char hb[384];
+            _snprintf_s(hb, sizeof(hb), _TRUNCATE,
+                        "[Health] net=%d peerMs=%u proto=%u bind(sent=%u bound=%u unmatched=%u err=%.2f) "
+                        "recs(sent=%u recv=?) ships(ghost=%d hpWant=%.1f hpApplied=%.1f cls=%u) "
+                        "dmgRelay=%d rejects=%u protoMismatch=%u sizeMismatch=%u stale=%u world=%08X scene=%08X hostile=%u unknown=%u",
+                        Net::Enabled() ? 1 : 0, Net::MillisSinceRecv(), (unsigned)NET_PROTO_VER,
+                        s_bindSent, s_bindBound, s_bindUnmatched, hErr,
+                        hs.txEnts, g_ghostShip ? 1 : 0, (double)g_ghostSyncHP, (double)g_ghostAppliedHP,
+                        (unsigned)g_ghostPeerClass,
+                        DamageRelayEnabled(), hs.rejects, hs.protoMismatch, hs.sizeMismatch, hs.staleChunks,
+                        localOk ? (unsigned)local.worldId : 0u, localOk ? (unsigned)local.sceneKey : 0u,
+                        s_scopeHostile, s_scopeUnknown);
+            L("%s\n", hb);
+        }
 
         // Observability: log each scene transition once so the gating is visible in the log.
         // D-017: only an OBSERVED key may count as a change. Packets arrive at SnapshotHz (~20) while this
@@ -8112,6 +9960,8 @@ static void OnFrameInner(Human* updatedHuman) {
         {
             static uint32_t lastLocalKey = 0, lastPeerKey = 0;
             static bool     lastLocalValid = false, lastPkValid = false;
+            static uint32_t lastWorldId = 0;       // previous world id (world-change vs scene-change)
+            static bool     haveWorldId  = false;
             const bool     localValid = localOk;
             const uint32_t lk = localOk ? local.sceneKey : 0u;
             const uint32_t pk = gotRaw  ? raw.sceneKey   : 0u;
@@ -8136,6 +9986,16 @@ static void OnFrameInner(Human* updatedHuman) {
                     const bool shown = (s_sceneAware == 0) || !localValid || !gotRaw || (pk == lk);
                     L("[Net] scene change: localKey=%08X peerKey=%08X%s -> puppet %s\n",
                       localShow, peerShow, gotRaw ? "" : " (last)", shown ? "shown" : "hidden");
+                    const uint32_t curWorld = localOk ? (unsigned)local.worldId : 0u;
+                    if (haveWorldId && curWorld != lastWorldId) {
+                        L("[E] ev=world-change world=%08X->%08X localKey=%08X\n",
+                          lastWorldId, curWorld, localShow);
+                    } else {
+                        L("[E] ev=scene-change localKey=%08X world=%08X\n",
+                          localShow, curWorld);
+                    }
+                    lastWorldId = curWorld;
+                    haveWorldId = true;
                 }
                 if (localValid) { lastLocalKey = lk; lastLocalValid = true; }
                 if (gotRaw)     { lastPeerKey  = pk; lastPkValid  = true; }
@@ -8153,6 +10013,13 @@ static void OnFrameInner(Human* updatedHuman) {
             __try { puppetAlive = readable(g_puppet, 8) && (*(void**)g_puppet == g_puppetVtbl); }
             __except (EXCEPTION_EXECUTE_HANDLER) { puppetAlive = false; }
         }
+        // World-change gate (D3): g_puppetWorldId is recorded at spawn and was never compared. A puppet
+        // built in another world cannot be valid here. Evaluated only in a live local world (localOk is
+        // false while paused/loading, and a paused world reads as a different real world), so this does
+        // not reproduce the pause mis-drop the vtable test above exists to avoid.
+        bool puppetSameWorld = true;
+        if (g_puppet && puppetAlive && localOk && g_puppetWorldId && local.worldId)
+            puppetSameWorld = (local.worldId == g_puppetWorldId);
         if (g_puppet) {
             if (!puppetAlive) {                          // entity was freed (world change / teardown)
                 L("[Net] puppet entity gone -> drop ref\n");
@@ -8162,6 +10029,15 @@ static void OnFrameInner(Human* updatedHuman) {
                 g_bhvState = -1; g_switchCd = 0;
                 g_casActivated = false;
                 g_spawnTries = 0; g_spawnCd = 180;       // let the new world's builder settle before respawn
+                g_snapCount = 0; g_snapHead = 0; g_haveSnapSeq = false;
+                despawnGrace = 0;
+            } else if (!puppetSameWorld) {               // puppet belongs to a world we have left
+                L("[Net] puppet world changed (%08X%08X -> %08X%08X) -> despawn\n",
+                  (uint32_t)(g_puppetWorldId >> 32), (uint32_t)g_puppetWorldId,
+                  (uint32_t)(local.worldId >> 32), (uint32_t)local.worldId);
+                Phase1::DespawnPuppet();                 // the existing despawn path, never RemoveEntity here
+                g_puppetWorldId = 0; g_puppetVtbl = nullptr;
+                g_spawnTries = 0; g_spawnCd = 180;
                 g_snapCount = 0; g_snapHead = 0; g_haveSnapSeq = false;
                 despawnGrace = 0;
             } else if (!localOk) {
@@ -8273,11 +10149,56 @@ static void OnFrameInner(Human* updatedHuman) {
         }
         // Auto-spawn the ghost ship when the peer is aboard (and none exists yet). The render override
         // (LogSetGlobalMatrix) then drives it to the peer's position/rotation every frame.
+        // Ghost liveness: the engine/streamer can free the clone on a world change. g_ghostShip alone
+        // would then dangle and block the auto-respawn below, so re-resolve the id recorded at spawn
+        // and drop the ref when it no longer names the same entity. Id 0 = unknown (capture failed):
+        // probe nothing rather than null a live ghost.
+        if (g_ghostShip && g_ghostObjId) {
+            __try {
+                if (ResolveEntityById(g_ghostObjId) != (Entity*)g_ghostShip) {
+                    L("[ShipSync] ghost entity gone (id=%016llX) -> drop ref\n",
+                      (unsigned long long)g_ghostObjId);
+                    g_ghostShip = nullptr; g_ghostObjId = 0; g_ghostAuto = false; g_ghostAppliedHP = -1.0f;
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                L("[ShipSync] ghost liveness EXCEPTION code=0x%08X\n", GetExceptionCode());
+                // m1: this is a clear path like the drop above - without the HP reset the next ghost
+                // would match the stale g_ghostAppliedHP and skip its initial hull apply.
+                g_ghostShip = nullptr; g_ghostObjId = 0; g_ghostAuto = false; g_ghostAppliedHP = -1.0f;
+            }
+        }
+        // Ghost-sync latch liveness. ApplyRemoteState can only run inside the world-gated puppet block
+        // above, so clearing the latch there (peer disembark) never fires when the peer simply stops,
+        // leaves the world, or we change world: g_ghostHasSync then stayed 1 forever, and the
+        // auto-spawn + drive below kept running with no peer at a stale g_ghostSyncPos. Re-evaluate it
+        // here, OUTSIDE that gate: live == the last ship-state apply is inside kPeerLiveMs AND it came
+        // from the world we are in now. Clear the latch, but deliberately do NOT despawn/remove the
+        // clone in the same step - a frozen ghost in place beats a vanishing one; DespawnGhostShip
+        // (explicit disembark) and F11 still remove it.
+        if (g_ghostHasSync) {
+            bool fresh     = g_ghostSyncMs && (now - g_ghostSyncMs) < kPeerLiveMs;
+            bool sameWorld = true;
+            if (g_ghostSyncWorldId && localOk && local.worldId)
+                sameWorld = (local.worldId == g_ghostSyncWorldId);
+            if (!fresh || !sameWorld) {
+                const char* why = fresh ? "world" : "stale";
+                int ageMs = g_ghostSyncMs ? (int)(now - g_ghostSyncMs) : -1;
+                L("[ShipSync] ghost sync latch cleared reason=%s (peer=%d world=%d)\n",
+                  why, ageMs, sameWorld ? 1 : 0);
+                L("[E] ev=ghost-latch-clear reason=%s peer=%d world=%d\n",
+                  why, ageMs, sameWorld ? 1 : 0);
+                g_ghostHasSync = 0;   // re-set by the next ApplyRemoteState that carries a live ship state
+            }
+        }
         if (s_shipGhost && g_ghostHasSync && !g_ghostShip) {
-            g_ghostShip = SpawnGhostShip();
-            if (g_ghostShip) { g_ghostAuto = true; L("[ShipSync] auto-spawned ghost ship %p\n", g_ghostShip); }
-        } else if (!g_ghostHasSync && g_ghostAuto && g_ghostShip) {
-            Phase1::DespawnGhostShip();   // peer disembarked -> hide the auto ghost
+            GhostTrack(SpawnGhostShip());
+            if (g_ghostShip) { g_ghostAuto = true; L("[ShipSync] auto-spawned ghost ship %p\n", g_ghostShip);
+                               L("[E] ev=ghost-spawn ent=%p auto=1\n", g_ghostShip); }
+        } else if (!g_ghostHasSync && g_ghostPeerNoShip && g_ghostAuto && g_ghostShip) {
+            // Only an explicit "peer not aboard" hides the auto ghost. A latch cleared for staleness /
+            // world change leaves the clone standing where it was (see above).
+            L("[E] ev=ghost-despawn reason=peer-not-aboard\n");
+            Phase1::DespawnGhostShip();
         }
         // Direct drive (F12 manual ghost + auto ghost): the ghost's RigidBody/AI components are disabled,
         // so the engine never writes its transform and the SetGlobalMatrixInternal hook can't fire for it.
@@ -8287,14 +10208,30 @@ static void OnFrameInner(Human* updatedHuman) {
             q.x = g_ghostSyncQuat[0]; q.y = g_ghostSyncQuat[1]; q.z = g_ghostSyncQuat[2]; q.w = g_ghostSyncQuat[3];
             HookMath::Transform m;
             HookMath::ToMatrix(&q, &m);
+            // Authority (C4, decided in ops/evidence/authority-model.md): Z stays DERIVED-LOCAL.
+            // X/Y and the quaternion are sender-authoritative, but m.M43 must use this machine's water
+            // height at the peer's XZ - taking the peer's hull Z would make vertical lead horizontal by
+            // the ~100 ms render delay. The solo F12 self-test below also uses the local Z.
             m.M41 = g_ghostSyncPos[0]; m.M42 = g_ghostSyncPos[1]; m.M43 = g_localShipZ;
+            // [Coop] ShipHPSync: apply a pending hull HP; a fresh ghost is normally spawned after the packet
+            // that carried the value, so this cannot live only on the receive path.
+            if (ShipHPSyncEnabled() && g_ghostShip && g_ghostSyncHP != g_ghostAppliedHP) {
+                // Diagnostic: a failed apply is silent otherwise. Logs at 2 Hz only while the target
+                // value has not been reached, so it cannot spam once it works.
+                { static int hpdbg = 0; if ((hpdbg++ % 30) == 0)
+                    L("[ShipHPSync] want=%.1f applied=%.1f ghost=%08X gcL=%08X\n",
+                      g_ghostSyncHP, g_ghostAppliedHP, (unsigned)g_ghostShip,
+                      (unsigned)ShipGcLObj(g_ghostShip)); }
+                if (WriteShipHullHPRaw(g_ghostShip, g_ghostSyncHP)) g_ghostAppliedHP = g_ghostSyncHP;
+            }
             __try {
                 ((Entity*)g_ghostShip)->SetGlobalMatrixInternal(&m, true);
                 { static int n = 0; if ((n++ & 0x3F) == 0)
                     L("[ShipSync] driving ghost to (%.1f, %.1f, %.1f)\n", m.M41, m.M42, m.M43); }
             } __except (EXCEPTION_EXECUTE_HANDLER) {
                 L("[ShipSync] drive EXCEPTION code=0x%08X\n", GetExceptionCode());
-                g_ghostShip = nullptr;
+                // m1: the ref is dropped here too, so the next ghost must re-apply the peer's hull HP.
+                g_ghostShip = nullptr; g_ghostAppliedHP = -1.0f;
             }
         } else if (g_ghostShip && s_ghostSelfTest) {
             // Solo self-test: drive the ghost to the LOCAL ship's transform + an X offset, so the user
@@ -8689,7 +10626,7 @@ void Phase1::InstallFrameHook() {
 
     // SetGlobalMatrixInternal (VA 0x00528200, RVA 0x128200) __thiscall: ECX=this, [EBP+8]=matrix*, [EBP+0xC]=updatePhysics.
     // Steal 6 bytes (55 8B EC 8B 45 08); trace the caller when the ship's transform is written.
-    {
+    if (GetPrivateProfileIntA("Coop", "HookSgm", 1, Paths::Ini()) != 0) {
         uint8_t* sgm = (uint8_t*)(b + 0x128200);
         g_sgmJmpBack = (uint32_t)(b + 0x128200 + 6);
         VirtualProtect(sgm, 6, PAGE_EXECUTE_READWRITE, &old);

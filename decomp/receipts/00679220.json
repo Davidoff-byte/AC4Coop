@@ -1,0 +1,15 @@
+{
+ "unit": "00679220",
+ "addr": "0x00679220",
+ "size": 84,
+ "name": "ActionGate",
+ "submitted_at": "2026-11-08T12:06:27Z",
+ "original_sha": "3cdd448d2a9a19e5e80716dd17d226c70140560fce4b2d8131a952f266a3f439",
+ "candidate_src_sha": "59c00b9676b6fa63abd9e4389d6f5d5151c6d5ecd7477e2bf91b8a8eff5035c5",
+ "candidate_src": "00679220.cpp",
+ "arm": "probe",
+ "verdict": "UNVERIFIED-EVIDENCE",
+ "detail": "no object supplied: the pinned compiler (cl 16.00.40219.01) is not installed, so byte equality cannot be checked. Recorded as evidence only - never a match.",
+ "evidence": "00679220.txt",
+ "evidence_sha": "e8d07d0cb3bbc0ca695ff4af6ee87bfa234d1e5567a07f13d1cb7314d34cfd1b"
+}

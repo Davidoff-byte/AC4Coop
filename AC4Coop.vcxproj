@@ -4,7 +4,8 @@
        bin\AC4Coop.asi. Build with:
          MSBuild AC4Coop.sln /p:Configuration=Release /p:Platform=x86 /p:PlatformToolset=v143
 
-       src\ship_sync.cpp is a reference implementation and is deliberately not listed here. -->
+       (src\ship_sync.cpp was a reference implementation, never compiled; it was deleted in D5 - its
+       hull-HP claim was disproved by ops/evidence/hull-hp-found.md.) -->
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Debug|Win32">
       <Configuration>Debug</Configuration>

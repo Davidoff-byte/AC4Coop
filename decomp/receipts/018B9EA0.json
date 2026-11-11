@@ -1,0 +1,15 @@
+{
+ "unit": "018B9EA0",
+ "addr": "0x018B9EA0",
+ "size": 56,
+ "name": "DamageAmountCompute",
+ "submitted_at": "2026-11-08T12:12:52Z",
+ "original_sha": "45038b76b08bdb3eeab86d58ca99055f8ba45d4665e6a6bba4e0e0dfe56d4f03",
+ "candidate_src_sha": "5ddd4f53ed47af029827ab149d025cd2391cd85c72c6692b0bb93c12f632bff2",
+ "candidate_src": "018B9EA0.cpp",
+ "arm": "probe",
+ "verdict": "UNVERIFIED-EVIDENCE",
+ "detail": "no object supplied: the pinned compiler (cl 16.00.40219.01) is not installed, so byte equality cannot be checked. Recorded as evidence only - never a match.",
+ "evidence": "018B9EA0.txt",
+ "evidence_sha": "a3b1714c3acd21d90e9f39e0fdc5864c64f84aa68ddc7b9b227257bfe19bbbae"
+}

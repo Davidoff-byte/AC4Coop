@@ -1,0 +1,15 @@
+{
+ "unit": "00528200",
+ "addr": "0x00528200",
+ "size": 139,
+ "name": "SetGlobalMatrixInternal",
+ "submitted_at": "2026-11-08T12:37:06Z",
+ "original_sha": "fe65a672f8adf71b1661c7633cca1457ec5f89b8284ffc8b10ba270631bac6bc",
+ "candidate_src_sha": "dd19b1727390bf864e95925bd98c6fee1044ca0824251a85efeb326ce83a0b76",
+ "candidate_src": "00528200.cpp",
+ "arm": "probe",
+ "verdict": "UNVERIFIED-EVIDENCE",
+ "detail": "no object supplied: the pinned compiler (cl 16.00.40219.01) is not installed, so byte equality cannot be checked. Recorded as evidence only - never a match.",
+ "evidence": "00528200.txt",
+ "evidence_sha": "b55c2c78eb71cecab5908ee1e894d0240aac6a443f6b25464e57e654276ea1a6"
+}

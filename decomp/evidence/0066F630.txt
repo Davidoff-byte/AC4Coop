@@ -1,0 +1,15 @@
+ObserverListInsert @ 0x66F630  (size 246)   -- probe receipt, no cl 16.00.40219.01 on this machine
+measured 2026-11-08 by ORCH against the pinned binary
+  AC4BFSP.exe sha256 bc11ad7924e1eca7363ee86aa3332c05386d0a05896c0b7370131daee9ab5150
+  candidate body: ac4-decomp\66F630.c (submitted verbatim)
+
+claim
+    Appends an observer to the list at this+8 (u16 count at +0xE, capacity
+    (this+0xC)&0x3FFF, growth via sub_A09AB0 with a 4-byte element), refcounts it,
+    then notifies every existing entry through vtbl+0x54 and finally checks
+    sub_45BED0 before calling vtbl+0x48.
+
+cross-check / limit of this receipt
+    this is the only insertion into Universe+0x08 the project found (WP8). The
+    receipt proves the list mechanics and the two notification slots; it does not
+    prove that registering a mod-created object is safe, which still needs a probe.

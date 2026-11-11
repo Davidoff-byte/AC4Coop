@@ -62,6 +62,37 @@ else — index, ownership, receipts, tamper detection — works and is exercised
 compiler is installed, `--obj` starts producing real `MATCH` receipts and the corpus begins to mean
 something.
 
+**Versioning (changed 2026-11-08).** `decomp/receipts/`, `decomp/candidates/` and `decomp/evidence/`
+are committed, not ignored: `check` re-hashes the candidate source and the evidence, so a receipt
+without them cannot be re-derived and a clone could not run `check` at all. `decomp/objects/` remains
+ignored — compiler output, reproducible from the candidate once the pinned toolchain exists.
+
+## Enforcement (hard, since 2026-11-08)
+
+The method is not a convention any more; two rules are machine-checked and block work:
+
+**`tools/spine_gate.py`** — exit 0 only when both hold:
+
+1. **Receipts re-derive.** It runs `tools/decomp.py check`; a drifted candidate, a missing evidence file or a
+   hand-edited verdict fails.
+2. **No undocumented engine call.** It scans `src/*.cpp|*.h` for the direct-call form
+   `))0xADDR)(…`, extracts every address, and requires a unit in `decomp/units.json` for each. If we call an
+   engine function, it gets a unit and a receipt.
+
+It is wired in three places:
+
+| where | what it does |
+|---|---|
+| `tools/spine_gate.py` | the check itself; `--json` for machines |
+| `.githooks/pre-commit` (`core.hooksPath=.githooks`) | blocks any commit whose spine is broken; verified by committing with it active |
+| `audit/tools/run_audit.py` → facts `spine.receipts_ok`, `spine.calls_without_unit` → claims **A-08**, **A-09** | the same two rules inside the project's audit, so `STATUS.md` shows them |
+
+First run of the gate on the existing tree found **4 engine calls with no unit** — `0x636480`, `0x00A1D0D0`,
+`0x010EF8C0`, `0x0133F550`. All four are now filed with receipts; two of them turned out to matter:
+`0xA1D0D0` is the component class-ID accessor the whole health-service CRC family keys on, and
+`0x10EF8C0` is the entity→service lookup for CRC **1588608236** (the getter at `0x1370E20`), i.e. exactly the
+shape the ship hull-HP hunt needs. That is the gate earning its keep on day one.
+
 Seeded units (the load-bearing functions, not the 128 k):
 
 | address | size | what |
