@@ -43,4 +43,7 @@ journal and handoff in `docs/archive/`. Update it in the same PR as any change t
 
 ## Plan of record
 `docs/ops/PLAN-COOP-V2.md` (outcome-sync architecture, gates P0–P8), with `docs/ops/SOLO-PLAN.md` for what one
-machine can prove. The next slice is being chosen; record it here when it is.
+machine can prove.
+
+Next slice: lobby codes (host shows a code, guest enters it), serverless, one guest. Design and PR stack in
+`docs/design/lobby-code.md`.

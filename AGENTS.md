@@ -34,7 +34,8 @@ py tools\verify_signatures.py
 If it fails, the pattern is wrong. Fix the pattern, never the expectation.
 
 ## Testing in the game
-Single-player and offline only. No anti-cheat, DRM or online-service work.
+No work on Ubisoft online services, anti-cheat or DRM. Our own peer link is in scope, including the UPnP/STUN
+lookups of lobby mode (`docs/design/lobby-code.md`).
 New behaviour ships behind an `AC4Coop.ini` flag that defaults to `0` until it has been verified live.
 Record the ASI sha256 and the commit with every log you use as evidence (`[Build] asi=` is logged at load).
 A clean build is not a tested build: state which of them each claim rests on.
