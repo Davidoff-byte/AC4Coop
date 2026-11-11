@@ -39,7 +39,7 @@ New behaviour ships behind an `AC4Coop.ini` flag that defaults to `0` until it h
 Record the ASI sha256 and the commit with every log you use as evidence (`[Build] asi=` is logged at load).
 A clean build is not a tested build: state which of them each claim rests on.
 Solo testing uses `tools/peer9.py` (a Python peer that speaks the real protocol) and the phases in
-`docs/archive/ops/SOLO-PLAN.md`. Two-machine runs follow `docs/archive/ops/TWO-MACHINE-RUNBOOK.md`.
+`docs/ops/SOLO-PLAN.md`. Two-machine runs follow `docs/ops/TWO-MACHINE-RUNBOOK.md`.
 
 ## Ground truth
 The game's bytes and bounded disassembly are ground truth. PS3 DWARF names, the decompiler's prose and

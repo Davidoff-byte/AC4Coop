@@ -15,3 +15,5 @@ decomp/objects/*
 # python bytecode (was accidentally tracked; regenerates on every run)
 __pycache__/
 *.pyc
+docs/ops/bus/
+local/
