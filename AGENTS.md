@@ -22,6 +22,8 @@ MSBuild AC4Coop.sln /nologo /v:m /p:Configuration=Release /p:Platform=x86 /p:Pla
 Release is reproducible in size (`/Brepro`, no PDB). The hash still depends on the checkout path, so
 "same hash" only means "same build from the same directory".
 Set the paths first (`AC4_GAME_DIR`, `AC4_KNOWN_EXE`; see README), then check them with `py tools\paths.py`.
+On the owner's machine they are set as user environment variables pointing at
+`G:\Games\Assassins Creed IV Black Flag`, the test install where the mod is deployed.
 Run after every change that touches `src/` or `decomp/`:
 ```text
 py tools\spine_gate.py
@@ -95,7 +97,6 @@ put it in `tools/oneoff/` with a line saying what it produced.
 Current state: `docs/STATUS.md`. Design notes for new work: `docs/design/`. Reviewed evidence:
 `docs/evidence/`. Old plans, journals and handoffs: `docs/archive/`.
 
-## Open questions
-`DECOMP-SPINE.md` describes a `.githooks/pre-commit` gate that this repository does not contain;
-the gate is currently manual.
-There is no CI. Nothing is enforced server-side; do not claim it is.
+## No CI, by choice
+There is no CI and no commit hook, and none is wanted. The two checks above are run locally before a PR.
+`DECOMP-SPINE.md` mentions a `.githooks/pre-commit` gate; that is historical and does not exist here.

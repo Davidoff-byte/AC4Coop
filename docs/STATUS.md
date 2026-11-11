@@ -39,7 +39,6 @@ journal and handoff in `docs/archive/`. Update it in the same PR as any change t
 - Connection setup is manual: both machines edit `[Net] PeerIP/LocalPort/PeerPort` in `AC4Coop.ini`, and
   internet play has needed a VPN.
 - The spine's byte arm needs the pinned compiler `cl 16.00.40219.01`; until then no unit can reach `matched`.
-- No CI, and no committed pre-commit hook; `tools/spine_gate.py` is run by hand.
 
 ## Plan of record
 `docs/ops/PLAN-COOP-V2.md` (outcome-sync architecture, gates P0–P8), with `docs/ops/SOLO-PLAN.md` for what one
