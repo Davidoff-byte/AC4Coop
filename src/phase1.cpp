@@ -5631,6 +5631,113 @@ static bool MirrorActionsEnabled() {
 }
 static unsigned s_mirrorActionCalls = 0;   // SetTargetAction calls issued on mirrored guards (5 s window)
 
+// ---- [Coop] MirrorActionsDeferred (default 0; re-read every 2 s) ------------------------------------------------
+// ROOT CAUSE this addresses (three crashes, 2026-11-12, builds 949810E4 / CBCF01BA / B00EA69B):
+//   * every crash is a call through the ActionEvaluator a body's CURRENT evaluator blends from (evaluator+0x1F4,
+//     i.e. m_BlendInEvaluator+0x114), after that previous evaluator was destroyed;
+//   * every crash stack runs through the body's own Human update, sub_16FA7D0 -> `call sub_52DF80` @0x016FA857
+//     (return address 0x016FA85C on all three stacks) -> the Human's statechart -> ActionComponent. In the first
+//     crash that statechart was itself inside SetTargetAction (0x006625F9 -> sub_65DCB0 -> sub_651C20 ->
+//     sub_4C6980 -> AnimNode_Reset);
+//   * the recorder file of the third crash (AC4Coop_crashctx_20096.txt) names the entity, 0x359DB1F0, and the last
+//     plugin log line before it is `[MirrorAct] ent=359DB1F0`, our own SetTargetAction on that body;
+//   * with MirrorActions=0 the same session ran 3.5 min through two loop points without a crash.
+// So the body's action stack has two writers: its own Human statechart (which keeps running although BhvGenericNPC
+// is disabled) and ApplyGuards, which runs inside the PLAYER's Human update (OnFrameInner returns for every other
+// Human). Our call therefore lands at an arbitrary point relative to the body's own update.
+// FIX: do not call SetTargetAction from the player's update. Queue (Human*, alias) and issue it from the frame hook
+// when it fires for THAT Human. The hook site 0x016FAACD sits at the end of sub_16FA7D0, after the statechart call
+// at 0x016FA857 has returned (IDA disassembly: one `retn` at 0x016FAAF2, every path reaches 0x016FAACD), so the
+// call is made on the body's own update, after its own writer is done for the frame.
+// UNVERIFIED until a guest run with the flag on survives where the direct call crashed.
+static bool MirrorActionsDeferred() {
+    static int s_v = 0; static uint64_t s_next = 0;
+    const uint64_t now = GetTickCount64();
+    if (now >= s_next) {
+        s_next = now + 2000;
+        const int v = GetPrivateProfileIntA("Coop", "MirrorActionsDeferred", 0, Paths::Ini()) != 0 ? 1 : 0;
+        if (v != s_v) L("[Mirror] MirrorActionsDeferred=%d (was %d)\n", v, s_v);
+        s_v = v;
+    }
+    return s_v != 0;
+}
+
+struct MirrorActReq { volatile LONG human; uint32_t alias; unsigned int ent; uint64_t objId; uint64_t ms; };
+static MirrorActReq  s_maq[64];
+static volatile LONG s_maqCount = 0;          // published requests; the drain's early-out
+static volatile LONG s_maqApplied = 0, s_maqExpired = 0;
+static unsigned      s_maqQueued = 0, s_maqNoSlot = 0;
+
+// Player-update thread only (ApplyGuards). One request per Human: a newer alias replaces an unapplied older one.
+static void MirrorActQueue(Human* h, uint32_t alias, unsigned int ent, uint64_t objId) {
+    const LONG key = (LONG)(uintptr_t)h;
+    const uint64_t now = GetTickCount64();
+    int freeSlot = -1;
+    for (int i = 0; i < 64; ++i) {
+        const LONG cur = s_maq[i].human;
+        if (cur == key) {
+            if (InterlockedCompareExchange(&s_maq[i].human, 0, key) == key) InterlockedDecrement(&s_maqCount);
+            if (freeSlot < 0) freeSlot = i;
+        } else if (cur == 0) {
+            if (freeSlot < 0) freeSlot = i;
+        } else if (now - s_maq[i].ms > 2000) {
+            // never drained: that Human stopped updating (despawned). Take the request back.
+            if (InterlockedCompareExchange(&s_maq[i].human, 0, cur) == cur) {
+                InterlockedDecrement(&s_maqCount); InterlockedIncrement(&s_maqExpired);
+                if (freeSlot < 0) freeSlot = i;
+            }
+        }
+    }
+    if (freeSlot < 0) { ++s_maqNoSlot; return; }
+    MirrorActReq& r = s_maq[freeSlot];
+    r.alias = alias; r.ent = ent; r.objId = objId; r.ms = now;      // fields first ...
+    InterlockedExchange(&r.human, key);                              // ... then publish
+    InterlockedIncrement(&s_maqCount);
+    ++s_maqQueued;
+}
+
+// Frame hook, ANY Human's update (whatever thread the engine runs it on): issue the request queued for this Human.
+static void MirrorActDrain(Human* h) {
+    if (!s_maqCount) return;
+    const LONG key = (LONG)(uintptr_t)h;
+    for (int i = 0; i < 64; ++i) {
+        if (s_maq[i].human != key) continue;
+        if (InterlockedCompareExchange(&s_maq[i].human, 0, key) != key) continue;   // taken back by the writer
+        InterlockedDecrement(&s_maqCount);
+        const uint32_t alias = s_maq[i].alias;
+        const unsigned int ent = s_maq[i].ent; const uint64_t objId = s_maq[i].objId;
+        if (GetTickCount64() - s_maq[i].ms > 1000) { InterlockedIncrement(&s_maqExpired); return; }
+        if (!readable(h, 4)) return;
+        ActionComponent* ac = h->GetActionComponent();
+        if (!ac || !readable(ac, 0x40)) return;
+        ac->SetTargetAction((int)alias, 0, 0, 0xFFFF, ACTLAYER_PRIMARY);
+        const LONG n = InterlockedIncrement(&s_maqApplied);
+        if (n <= 3000)
+            L("[MirrorAct] deferred ent=%08X objId=%016llX alias=%u tid=%lu\n", ent, (unsigned long long)objId,
+              (unsigned)alias, GetCurrentThreadId());
+        return;
+    }
+}
+
+// Which threads run Human updates? One line per new thread id, separately for the player's update and the others.
+// Answers whether ApplyGuards (player's update) can run concurrently with another body's update.
+static void HumanUpdateThreadProbe(bool player) {
+    static volatile LONG s_tids[2][16];
+    const LONG tid = (LONG)GetCurrentThreadId();
+    volatile LONG* t = s_tids[player ? 1 : 0];
+    for (int i = 0; i < 16; ++i) {
+        if (t[i] == tid) return;
+        if (t[i] == 0) {
+            if (InterlockedCompareExchange(&t[i], tid, 0) == 0) {
+                L("[Thread] %s Human update runs on tid=%ld (distinct thread #%d for this kind)\n",
+                  player ? "PLAYER" : "other", tid, i + 1);
+                return;
+            }
+            if (t[i] == tid) return;
+        }
+    }
+}
+
 static void ApplyGuards(const EntityPacket& pkt) {
     World* world = World::GetCurrentWorld();
     if (!world) return;
@@ -5967,7 +6074,9 @@ static void ApplyGuards(const EntityPacket& pkt) {
                 if (es.actionAlias && MirrorActionsEnabled() && MirrorAliasShouldApply(best, es.actionAlias)) {
                     if (bh && readable(bh, 4)) {
                         ActionComponent* ac = bh->GetActionComponent();
-                        if (ac && readable(ac, 0x40)) {
+                        if (ac && readable(ac, 0x40) && MirrorActionsDeferred()) {
+                            MirrorActQueue(bh, es.actionAlias, (unsigned int)best, es.objId);   // issued on its own update
+                        } else if (ac && readable(ac, 0x40)) {
                             ac->SetTargetAction((int)es.actionAlias, 0, 0, 0xFFFF, ACTLAYER_PRIMARY);
                             ++s_mirrorActionCalls;
                             // One line per call, capped: the last lines before a crash name the bodies whose
@@ -9623,6 +9732,11 @@ static void OnFrameInner(Human* updatedHuman);
 // the process down. Crashes that follow from engine state we already corrupted will still happen, but a
 // bad pointer in our own code no longer kills the game - and the log names the frame instead of ending.
 static void __cdecl OnFrame(Human* updatedHuman) {
+    __try { MirrorActDrain(updatedHuman); }      // no-op unless a request is queued for this Human
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        static int s_dn = 0;
+        if (s_dn < 20) { ++s_dn; L("[Frame] EXCEPTION 0x%08X in deferred mirror action (skipped)\n", GetExceptionCode()); }
+    }
     __try { OnFrameInner(updatedHuman); }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         static int s_n = 0;
@@ -9667,7 +9781,7 @@ static void DumpConfigOnce()
         { "Coop", "GuestKillMirror", 1 }, { "Coop", "HookSgm", 1 }, { "Coop", "HostileOnly", 0 },
         { "Coop", "HybridLoco", 1 }, { "Coop", "IdentityBand", 0 }, { "Coop", "IdResolver", 1 },
         { "Coop", "InstallHooks", 1 }, { "Coop", "IntegratePuppet", 0 }, { "Coop", "KillTrace", 1 },
-        { "Coop", "KrLog", 0 }, { "Coop", "LegacyPadIdHook", 1 }, { "Coop", "MirrorActions", 1 }, { "Coop", "MinBlendInMs", 100 },
+        { "Coop", "KrLog", 0 }, { "Coop", "LegacyPadIdHook", 1 }, { "Coop", "MirrorActions", 1 }, { "Coop", "MirrorActionsDeferred", 0 }, { "Coop", "MinBlendInMs", 100 },
         { "Coop", "NetStrictPeer", 1 }, { "Coop", "NullReturnObserver", 1 }, { "Coop", "Probe", 0 },
         { "Coop", "PuppetParkX", 0 }, { "Coop", "PuppetPhysics", 0 }, { "Coop", "RegisterPad1", 0 },
         { "Coop", "RelevanceRadiusM", 250 }, { "Coop", "ReloadBuilder", 1 }, { "Coop", "SceneAwareExact", 0 },
@@ -9704,7 +9818,8 @@ static void DumpConfigOnce()
 }
 
 static void OnFrameInner(Human* updatedHuman) {
-    if (!isPlayerUpdate(base(), updatedHuman)) return;
+    if (!isPlayerUpdate(base(), updatedHuman)) { HumanUpdateThreadProbe(false); return; }
+    HumanUpdateThreadProbe(true);
 
     ProbeIdentityOnce();
 
@@ -9903,8 +10018,10 @@ static void OnFrameInner(Human* updatedHuman) {
                       s_bindRejBhv, s_bindRejAi, s_bindRejHp, s_bindRejArch, s_bindRejTaken,
                       s_bindUnmatched, (s_bindMinD < 1e8f) ? sqrtf(s_bindMinD) : -1.0f);
                 WideBindReport();
-                L("[Mirror] actions on=%d calls=%u\n", MirrorActionsEnabled() ? 1 : 0, s_mirrorActionCalls);
-                s_mirrorActionCalls = 0;
+                L("[Mirror] actions on=%d calls=%u deferred=%d queued=%u applied=%ld expired=%ld noSlot=%u\n",
+                  MirrorActionsEnabled() ? 1 : 0, s_mirrorActionCalls, MirrorActionsDeferred() ? 1 : 0, s_maqQueued,
+                  InterlockedExchange(&s_maqApplied, 0), InterlockedExchange(&s_maqExpired, 0), s_maqNoSlot);
+                s_mirrorActionCalls = 0; s_maqQueued = 0; s_maqNoSlot = 0;
             }
             // Component histogram, same window. ALL non-zero distinct component vtable ids by
             // descending count (32 slots), then the two ids the soldier filter trusts, each as
