@@ -23,6 +23,7 @@
 #include "lobby_ui.h"
 #include "ui_probe.h"
 #include "video_hook.h"
+#include "menu_probe.h"
 #include "action_guard.h"
 #include "deref_guard.h"
 #include "combat_observe.h"
@@ -569,6 +570,10 @@ BOOL APIENTRY DllMain(HMODULE hMod, DWORD reason, LPVOID)
         // ([Coop] CombatObserve=0) -- with the flag at 0 this is one GetPrivateProfileIntA and one
         // int test: no log file, no allocation, no VirtualProtect, no detour, no thread.
         CombatObserve::Init();
+
+        // Menu probe (boot straight into the world, part B): observation-only hooks on the title-menu save path.
+        // [Coop] MenuProbe, default 0 -> one GetPrivateProfileIntA, nothing patched.
+        MenuProbe::Init();
 
         // Front B (peer-to-peer UDP link) is started on the first in-world frame instead of at
         // DLL attach. The game's launch chain (Steam -> Ubisoft -> DRM -> real game) starts more
