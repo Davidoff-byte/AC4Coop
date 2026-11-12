@@ -28,6 +28,20 @@ namespace {
     bool               g_strictPeer = true;   // reject datagrams from any source but the configured peer
     uint64_t           g_lastRecvMs = 0;      // GetTickCount64() of the last ACCEPTED packet (0 = none yet)
 
+    // ---- lobby mode (slice 3, docs/design/lobby-code.md) -------------------------------------------
+    // Manual mode: g_peer comes from PeerIP and g_peerReady is 1 from the start (today's behaviour).
+    // Host: g_peer is unknown until the first HELLO; join: g_peer comes from the code but the link is
+    // not up until WELCOME. While g_peerReady is 0, Send/SendEntities send nothing and RecvThread
+    // accepts only lobby packets. In lobby mode g_peer can be rewritten by the recv thread (host
+    // re-lock) while the game thread sends, so every read and write of it goes through g_peerLock.
+    enum LobbyMode { LM_MANUAL = 0, LM_HOST = 1, LM_JOIN = 2 };
+    LobbyMode          g_mode = LM_MANUAL;
+    SRWLOCK            g_peerLock = SRWLOCK_INIT;
+    volatile LONG      g_peerReady = 1;
+    uint32_t           g_joinNonce = 0;       // join: this attempt's nonce (WELCOME must echo it)
+    uint32_t           g_joinCheck = 0;       // join: check of the typed code (sent in HELLO, logged by the host)
+    volatile LONG      g_joinState = 0;       // join: 0 idle, 1 sending HELLO, 2 welcomed, 3 rejected, 4 timed out
+
     // ---- received DEATH ring (B-4: a one-shot death packet must not be lost to the snapshot slot) --
     // g_remoteEntities is last-writer-wins: `g_remoteEntities = decoded` below overwrites whatever the
     // previous datagram carried. The snapshot stream runs at SnapshotHz, so a one-entry KIND_KILL packet
@@ -604,6 +618,167 @@ namespace {
         dbg(m);
     }
 
+    // ---- lobby helpers (slice 3) ------------------------------------------------------------------
+    sockaddr_in PeerCopy() {
+        AcquireSRWLockShared(&g_peerLock);
+        sockaddr_in p = g_peer;
+        ReleaseSRWLockShared(&g_peerLock);
+        return p;
+    }
+    void PeerSet(const sockaddr_in& p) {
+        AcquireSRWLockExclusive(&g_peerLock);
+        g_peer = p;
+        ReleaseSRWLockExclusive(&g_peerLock);
+    }
+    bool SameAddr(const sockaddr_in& a, const sockaddr_in& b) {
+        return a.sin_addr.s_addr == b.sin_addr.s_addr && a.sin_port == b.sin_port;
+    }
+    void FmtAddr(const sockaddr_in& a, char* out, size_t n) {
+        char ip[32] = {0};
+        inet_ntop(AF_INET, (void*)&a.sin_addr, ip, sizeof(ip));
+        _snprintf(out, n, "%s:%u", ip, (unsigned)ntohs(a.sin_port));
+        out[n - 1] = 0;
+    }
+    void SendLobby(uint32_t type, uint32_t nonce, uint32_t check, const sockaddr_in& to) {
+        LobbyPacket p{ NET_LOBBY_MAGIC, NET_PROTO_VER, type, nonce, check };
+        sendto(g_sock, (const char*)&p, sizeof(p), 0, (const sockaddr*)&to, sizeof(to));
+    }
+    // This PC's LAN IPv4 (host order): the source address the OS would use for the default route.
+    // A connected UDP socket sends nothing; getsockname just reports the route's local address.
+    bool LanIPv4(uint32_t* out) {
+        SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (s == INVALID_SOCKET) return false;
+        sockaddr_in dst{}; dst.sin_family = AF_INET; dst.sin_port = htons(53);
+        inet_pton(AF_INET, "8.8.8.8", &dst.sin_addr);
+        bool ok = false;
+        if (connect(s, (sockaddr*)&dst, sizeof(dst)) == 0) {
+            sockaddr_in me{}; int ml = sizeof(me);
+            if (getsockname(s, (sockaddr*)&me, &ml) == 0 && me.sin_addr.s_addr != 0) {
+                *out = ntohl(me.sin_addr.s_addr); ok = true;
+            }
+        }
+        closesocket(s);
+        return ok;
+    }
+
+    // The 12-bit check of the code for ip:port (the same CRC the code itself carries).
+    uint32_t CodeCheckOf(uint32_t ipHost, uint16_t port) {
+        const uint8_t b[6] = { (uint8_t)(ipHost >> 24), (uint8_t)(ipHost >> 16), (uint8_t)(ipHost >> 8),
+                               (uint8_t)ipHost, (uint8_t)(port >> 8), (uint8_t)port };
+        return LobbyCode::Crc16CcittFalse(b, 6) & 0x0FFFu;
+    }
+
+    // One lobby datagram (exactly sizeof(LobbyPacket), magic already checked). Recv thread only.
+    void HandleLobby(const LobbyPacket& p, const sockaddr_in& from) {
+        char fa[48]; FmtAddr(from, fa, sizeof(fa));
+        char m[192];
+        if (g_mode == LM_HOST && p.type == LOBBY_HELLO) {
+            if (p.protoVer != NET_PROTO_VER) {
+                SendLobby(LOBBY_REJECT, p.nonce, 0, from);
+                static int s_logs = 0;
+                if (s_logs++ < 4) {
+                    _snprintf(m, sizeof(m), "[Lobby] HELLO from %s refused: guest proto=%u, host proto=%u\n",
+                              fa, (unsigned)p.protoVer, (unsigned)NET_PROTO_VER);
+                    m[sizeof(m) - 1] = 0; dbg(m);
+                }
+                return;
+            }
+            const sockaddr_in cur = PeerCopy();
+            const bool ready = InterlockedCompareExchange(&g_peerReady, 0, 0) != 0;
+            if (ready && SameAddr(cur, from)) {   // a retry that crossed our WELCOME: answer again, no log
+                SendLobby(LOBBY_WELCOME, p.nonce, 0, from);
+                return;
+            }
+            // Re-lock rule: the guest slot is taken by the first HELLO. A different source may take it
+            // over only if it is the same machine (same IP, new NAT port after a guest restart) or the
+            // current guest has been silent for 10 s.
+            const uint64_t now = GetTickCount64();
+            const bool silent = g_lastRecvMs == 0 || now - g_lastRecvMs > 10000;
+            if (ready && cur.sin_addr.s_addr != from.sin_addr.s_addr && !silent) {
+                static int s_full = 0;
+                if (s_full++ < 4) {
+                    char ca[48]; FmtAddr(cur, ca, sizeof(ca));
+                    _snprintf(m, sizeof(m), "[Lobby] HELLO from %s ignored: guest slot held by %s\n", fa, ca);
+                    m[sizeof(m) - 1] = 0; dbg(m);
+                }
+                return;
+            }
+            InterlockedExchange(&g_peerReady, 0);
+            PeerSet(from);
+            g_lastRecvMs = 0;
+            InterlockedExchange(&g_peerReady, 1);
+            SendLobby(LOBBY_WELCOME, p.nonce, 0, from);
+            _snprintf(m, sizeof(m), "[Lobby] guest joined %s (nonce=%08x codeCheck=%03x%s)\n", fa,
+                      (unsigned)p.nonce, (unsigned)(p.codeCheck & 0xFFF), ready ? " re-lock" : "");
+            m[sizeof(m) - 1] = 0; dbg(m);
+            { char e[160]; _snprintf(e, sizeof(e), "[E] ev=lobby-join peer=%s\n", fa); e[sizeof(e) - 1] = 0; dbg(e); }
+            return;
+        }
+        if (g_mode == LM_JOIN && (p.type == LOBBY_WELCOME || p.type == LOBBY_REJECT)) {
+            const sockaddr_in cur = PeerCopy();
+            if (!SameAddr(cur, from) || p.nonce != g_joinNonce) return;   // not our host / not this attempt
+            if (InterlockedCompareExchange(&g_joinState, 0, 0) != 1) return;   // already decided
+            if (p.type == LOBBY_WELCOME) {
+                if (InterlockedCompareExchange(&g_joinState, 2, 1) != 1) return;
+                InterlockedExchange(&g_peerReady, 1);
+                _snprintf(m, sizeof(m), "[Lobby] joined host %s\n", fa);
+                m[sizeof(m) - 1] = 0; dbg(m);
+                { char e[160]; _snprintf(e, sizeof(e), "[E] ev=lobby-joined host=%s\n", fa); e[sizeof(e) - 1] = 0; dbg(e); }
+            } else {
+                if (InterlockedCompareExchange(&g_joinState, 3, 1) != 1) return;
+                _snprintf(m, sizeof(m), "[Lobby] join refused by %s: host proto=%u, ours=%u (different builds)\n",
+                          fa, (unsigned)p.protoVer, (unsigned)NET_PROTO_VER);
+                m[sizeof(m) - 1] = 0; dbg(m);
+            }
+        }
+    }
+
+    // Join mode: HELLO every 250 ms for the first 15 s (the design's window), then every 2 s for up to
+    // 10 min, because in practice the host is often still loading when the guest reaches the world.
+    // Deviation from lobby-code.md (15 s then stop) - the 15 s line is still logged as the design's verdict.
+    unsigned __stdcall JoinThread(void*) {
+        const uint64_t t0 = GetTickCount64();
+        int sent = 0;
+        bool slowLogged = false;
+        char pa[48]; FmtAddr(PeerCopy(), pa, sizeof(pa));
+        char m[256];
+        while (InterlockedCompareExchange(&g_joinState, 0, 0) == 1) {
+            const uint64_t el = GetTickCount64() - t0;
+            if (el > 600000) {
+                if (InterlockedCompareExchange(&g_joinState, 4, 1) == 1) {
+                    _snprintf(m, sizeof(m), "[Lobby] join gave up: no answer from %s after %d HELLOs in 10 min\n", pa, sent);
+                    m[sizeof(m) - 1] = 0; dbg(m);
+                }
+                break;
+            }
+            if (el > 15000 && !slowLogged) {
+                slowLogged = true;
+                _snprintf(m, sizeof(m), "[Lobby] no answer from %s after %d HELLOs in 15 s (host not in Mode=host yet, "
+                          "or its router does not let the packet in) - still trying every 2 s for 10 min\n", pa, sent);
+                m[sizeof(m) - 1] = 0; dbg(m);
+            }
+            SendLobby(LOBBY_HELLO, g_joinNonce, g_joinCheck, PeerCopy());
+            ++sent;
+            Sleep(el > 15000 ? 2000 : 250);
+        }
+        return 0;
+    }
+
+    // Lobby handshake selftest: the frozen 20-byte layout and the constants the Python twin pins.
+    void SelfTestLobby() {
+        LobbyPacket p{ NET_LOBBY_MAGIC, NET_PROTO_VER, LOBBY_HELLO, 0x01020304u, 0x0ABCu };
+        uint8_t raw[sizeof(p)];
+        std::memcpy(raw, &p, sizeof(p));
+        // Little-endian on the wire: 'A','C','4','L' then the version.
+        const bool ok = sizeof(LobbyPacket) == 20 && raw[0] == 'A' && raw[1] == 'C' && raw[2] == '4' && raw[3] == 'L' &&
+                        raw[4] == (uint8_t)NET_PROTO_VER && raw[8] == 1 && raw[12] == 0x04 && raw[15] == 0x01 &&
+                        // 0x5E7 = the low 12 bits of SC07-21XT-Q5F7 ('5'&3, 'F', '7'), the vector for 203.0.113.7:47801
+                        CodeCheckOf(0xCB007107u, 47801) == 0x5E7u;
+        char m[128];
+        _snprintf(m, sizeof(m), "[Lobby] handshake selftest: %s proto=%u\n", ok ? "PASS" : "FAIL", (unsigned)NET_PROTO_VER);
+        m[sizeof(m) - 1] = 0; dbg(m);
+    }
+
     DWORD WINAPI RecvThread(LPVOID) {
         // Read into a buffer sized for the LARGEST packet type (EntityPacket), then dispatch on the
         // leading magic. Both PlayerState and EntityPacket share the one UDP socket.
@@ -613,6 +788,18 @@ namespace {
             int n = recvfrom(g_sock, buf, sizeof(buf), 0, (sockaddr*)&from, &flen);
             if (n >= 4) {
                 uint32_t magic = *(uint32_t*)buf;
+                // Lobby lane (slice 3): handled first and never counted as game traffic. Manual mode
+                // ignores lobby packets entirely.
+                if (magic == NET_LOBBY_MAGIC) {
+                    if (g_mode != LM_MANUAL && n == (int)sizeof(LobbyPacket)) {
+                        LobbyPacket lp; std::memcpy(&lp, buf, sizeof(lp));
+                        HandleLobby(lp, from);
+                    }
+                    continue;
+                }
+                // Before the handshake there is no peer: drop game packets unseen (lobby modes only).
+                if (InterlockedCompareExchange(&g_peerReady, 0, 0) == 0) continue;
+                const sockaddr_in peer = PeerCopy();   // one consistent copy per datagram (g_peerLock)
                 // X4b: player SIZE mismatch, named instead of anonymous. A peer on a different build
                 // (older/newer struct) sends our player magic with a foreign length, so playerPkt is
                 // false and `if (playerPkt && !playerOk)` below never runs: no protoMismatch line, no
@@ -620,7 +807,7 @@ namespace {
                 // gate decides anything), count it, and log once per process. Same source filtering
                 // as the strict-peer gate so foreign traffic cannot trip the one-shot log.
                 if (magic == NET_MAGIC && n != (int)sizeof(PlayerState) &&
-                    (!g_strictPeer || from.sin_addr.s_addr == g_peer.sin_addr.s_addr)) {
+                    (!g_strictPeer || from.sin_addr.s_addr == peer.sin_addr.s_addr)) {
                     uint32_t peerProto = 0;
                     const bool haveProto = (n >= 8);            // protoVer is the second u32
                     if (haveProto) std::memcpy(&peerProto, buf + 4, sizeof(peerProto));
@@ -631,13 +818,13 @@ namespace {
                 bool entityPkt = (magic == NET_ENTITY_MAGIC && n >= ENTITY_WIRE_HEADER_SIZE);
                 if (playerPkt || entityPkt) {
                     // Strict peer (Feature #3): accept only datagrams from the configured PeerIP.
-                    if (g_strictPeer && from.sin_addr.s_addr != g_peer.sin_addr.s_addr) {
+                    if (g_strictPeer && from.sin_addr.s_addr != peer.sin_addr.s_addr) {
                         static bool warned = false;
                         if (!warned) {
                             warned = true;
                             char got[32] = {0}, exp[32] = {0};
                             inet_ntop(AF_INET, &from.sin_addr, got, sizeof(got));
-                            inet_ntop(AF_INET, &g_peer.sin_addr, exp, sizeof(exp));
+                            inet_ntop(AF_INET, &peer.sin_addr, exp, sizeof(exp));
                             char m[160];
                             wsprintfA(m, "[Net] dropped packet from unexpected source %s (expected %s)\n", got, exp);
                             dbg(m);
@@ -762,6 +949,23 @@ bool Init() {
     char peerIp[64] = {0};
     GetPrivateProfileStringA("Net", "PeerIP", "127.0.0.1", peerIp, sizeof(peerIp), Paths::Ini());
 
+    // [Net] Mode=manual|host|join (default manual = everything below behaves exactly as before).
+    char modeStr[16] = {0}, joinCode[64] = {0};
+    GetPrivateProfileStringA("Net", "Mode", "manual", modeStr, sizeof(modeStr), Paths::Ini());
+    GetPrivateProfileStringA("Net", "JoinCode", "", joinCode, sizeof(joinCode), Paths::Ini());
+    g_mode = LM_MANUAL;
+    if (_stricmp(modeStr, "host") == 0) g_mode = LM_HOST;
+    else if (_stricmp(modeStr, "join") == 0) g_mode = LM_JOIN;
+    else if (_stricmp(modeStr, "manual") != 0) {
+        char m[96]; _snprintf(m, sizeof(m), "[Lobby] unknown [Net] Mode=%s, using manual\n", modeStr); m[sizeof(m) - 1] = 0; dbg(m);
+    }
+    uint32_t joinIp = 0; uint16_t joinPort = 0;
+    if (g_mode == LM_JOIN && !LobbyCode::Decode(joinCode, &joinIp, &joinPort)) {
+        char m[160]; _snprintf(m, sizeof(m), "[Lobby] JoinCode \"%s\" is invalid (typo?) - nothing sent, link off\n", joinCode);
+        m[sizeof(m) - 1] = 0; dbg(m);
+        return false;
+    }
+
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) { dbg("[Net] WSAStartup failed\n"); return false; }
 
@@ -784,6 +988,10 @@ bool Init() {
     // is kept only as a SECONDARY signal (it can still fire for other reasons).
     int bindPort = g_secondInstance ? peerPort  : localPort;
     int sendPort = g_secondInstance ? localPort : peerPort;
+    // Join mode: the guest needs no fixed port (its own NAT mapping carries the replies). A same-PC
+    // second instance binds an ephemeral port so it cannot steal the host's LocalPort datagrams
+    // (SO_REUSEADDR below: the last binder of a shared port receives).
+    if (g_mode == LM_JOIN && g_secondInstance) bindPort = 0;
     sockaddr_in local{};
     local.sin_family = AF_INET;
     local.sin_addr.s_addr = INADDR_ANY;
@@ -800,9 +1008,28 @@ bool Init() {
     }
     { char m[96]; wsprintfA(m, "[Net] instance slot=%d bind=%d peer=%d\n", g_secondInstance ? 2 : 1, bindPort, sendPort); dbg(m); }
 
-    g_peer.sin_family = AF_INET;
-    g_peer.sin_port = htons((u_short)sendPort);
-    inet_pton(AF_INET, peerIp, &g_peer.sin_addr);
+    if (bindPort == 0) {   // ephemeral: log the port the OS picked
+        sockaddr_in got{}; int gl = sizeof(got);
+        if (getsockname(g_sock, (sockaddr*)&got, &gl) == 0) bindPort = ntohs(got.sin_port);
+    }
+
+    sockaddr_in peer{};
+    peer.sin_family = AF_INET;
+    if (g_mode == LM_MANUAL) {
+        peer.sin_port = htons((u_short)sendPort);
+        inet_pton(AF_INET, peerIp, &peer.sin_addr);
+        g_peerReady = 1;
+    } else if (g_mode == LM_JOIN) {
+        peer.sin_port = htons(joinPort);
+        peer.sin_addr.s_addr = htonl(joinIp);
+        g_peerReady = 0;
+        LARGE_INTEGER qpc; QueryPerformanceCounter(&qpc);
+        g_joinNonce = (uint32_t)qpc.LowPart ^ (GetCurrentProcessId() << 16) ^ (uint32_t)GetTickCount64();
+        g_joinCheck = CodeCheckOf(joinIp, joinPort);
+    } else {   // host: no peer until the first HELLO
+        g_peerReady = 0;
+    }
+    PeerSet(peer);
 
     InitializeCriticalSection(&g_lock);
 
@@ -810,8 +1037,33 @@ bool Init() {
     g_lastRecvMs = 0;   // no packet accepted yet
     SelfTestWire();     // [Phase 2] prove the compact codec round-trips before any traffic
     { char lm[192]; LobbyCode::SelfTest(lm, sizeof(lm)); dbg(lm); }   // lobby-code format (slice 2): log only, no behaviour
+    if (g_mode != LM_MANUAL) SelfTestLobby();
     _beginthreadex(nullptr, 0, (unsigned (__stdcall*)(void*))RecvThread, nullptr, 0, nullptr);   // after the self-test (it resets the rx shadow)
-    char m[128]; wsprintfA(m, "[Net] up: bound:%d -> %s:%d\n", bindPort, peerIp, sendPort); dbg(m);
+    char m[192];
+    if (g_mode == LM_MANUAL) {
+        wsprintfA(m, "[Net] up: bound:%d -> %s:%d\n", bindPort, peerIp, sendPort); dbg(m);
+    } else if (g_mode == LM_HOST) {
+        wsprintfA(m, "[Net] up: bound:%d mode=host (waiting for a guest)\n", bindPort); dbg(m);
+        uint32_t lan = 0;
+        if (LanIPv4(&lan)) {
+            char code[15] = {0}; LobbyCode::Encode(lan, (uint16_t)bindPort, code);
+            _snprintf(m, sizeof(m), "[Lobby] host LAN code %s (%u.%u.%u.%u:%d) - same network only\n", code,
+                      lan >> 24, (lan >> 16) & 0xFF, (lan >> 8) & 0xFF, lan & 0xFF, bindPort);
+            m[sizeof(m) - 1] = 0; dbg(m);
+        } else {
+            dbg("[Lobby] host LAN address not found (no IPv4 route) - no LAN code\n");
+        }
+        char loop[15] = {0}; LobbyCode::Encode(0x7F000001u, (uint16_t)bindPort, loop);
+        _snprintf(m, sizeof(m), "[Lobby] host same-PC code %s (127.0.0.1:%d)\n", loop, bindPort);
+        m[sizeof(m) - 1] = 0; dbg(m);
+    } else {
+        char pa[48]; FmtAddr(peer, pa, sizeof(pa));
+        _snprintf(m, sizeof(m), "[Net] up: bound:%d mode=join code=%s -> host %s (nonce=%08x)\n",
+                  bindPort, joinCode, pa, (unsigned)g_joinNonce);
+        m[sizeof(m) - 1] = 0; dbg(m);
+        InterlockedExchange(&g_joinState, 1);
+        _beginthreadex(nullptr, 0, JoinThread, nullptr, 0, nullptr);
+    }
     return true;
 }
 
@@ -820,8 +1072,9 @@ bool Enabled() { return g_enabled; }
 bool IsSecondInstance() { return g_secondInstance; }
 
 void Send(const PlayerState& s) {
-    if (!g_enabled) return;
-    sendto(g_sock, (const char*)&s, sizeof(s), 0, (sockaddr*)&g_peer, sizeof(g_peer));
+    if (!g_enabled || InterlockedCompareExchange(&g_peerReady, 0, 0) == 0) return;   // lobby: no peer yet
+    const sockaddr_in peer = PeerCopy();
+    sendto(g_sock, (const char*)&s, sizeof(s), 0, (const sockaddr*)&peer, sizeof(peer));
     InterlockedIncrement(&g_txPackets);
     InterlockedAdd(&g_txBytes, (LONG)sizeof(s));
 }
@@ -852,7 +1105,9 @@ int DrainRemote(PlayerState* out, int max) {
 }
 
 void SendEntities(const EntityPacket& p) {
-    if (!g_enabled) return;
+    // Lobby: no peer yet -> send nothing, and do not encode either (the encoder advances the delta shadow).
+    if (!g_enabled || InterlockedCompareExchange(&g_peerReady, 0, 0) == 0) return;
+    const sockaddr_in peer = PeerCopy();
     const size_t n = EncodeEntityPacket(p, g_txBuf, sizeof(g_txBuf));   // [header][records]
     if (n == 0) return;
     const size_t hdr = sizeof(EntityWireHeader);
@@ -872,7 +1127,7 @@ void SendEntities(const EntityPacket& p) {
         h.chunkTotal = total;
         std::memcpy(chunk, &h, sizeof(h));
         std::memcpy(chunk + hdr, g_txBuf + hdr + off, len);
-        sendto(g_sock, (const char*)chunk, (int)(hdr + len), 0, (sockaddr*)&g_peer, sizeof(g_peer));
+        sendto(g_sock, (const char*)chunk, (int)(hdr + len), 0, (const sockaddr*)&peer, sizeof(peer));
         InterlockedIncrement(&g_txPackets);
         InterlockedAdd(&g_txBytes, (LONG)(hdr + len));   // actual bytes on the wire (per chunk)
     }

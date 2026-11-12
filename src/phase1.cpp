@@ -9578,14 +9578,18 @@ static void OnFrameInner(Human* updatedHuman) {
         // this log alone (the bind/peer line only reaches net_log.txt + OutputDebugString, which are often
         // missing from the game folder). Same keys/defaults as net.cpp.
         {
-            char cfgPeer[64] = {0};
+            char cfgPeer[64] = {0}, cfgMode[16] = {0}, cfgJoin[64] = {0};
             GetPrivateProfileStringA("Net", "PeerIP", "127.0.0.1", cfgPeer, sizeof(cfgPeer), Paths::Ini());
-            L("[Net] cfg enabled=%d peer=%s local=%d peerPort=%d strictPeer=%d\n",
+            GetPrivateProfileStringA("Net", "Mode", "manual", cfgMode, sizeof(cfgMode), Paths::Ini());   // lobby slice 3
+            GetPrivateProfileStringA("Net", "JoinCode", "", cfgJoin, sizeof(cfgJoin), Paths::Ini());
+            // mode/joinCode go LAST: tools/solo_run.py and gate_parse.py match "cfg enabled=N peer=X".
+            L("[Net] cfg enabled=%d peer=%s local=%d peerPort=%d strictPeer=%d mode=%s joinCode=%s\n",
               GetPrivateProfileIntA("Net", "Enabled",   0, Paths::Ini()),
               cfgPeer,
               GetPrivateProfileIntA("Net", "LocalPort", 47801, Paths::Ini()),
               GetPrivateProfileIntA("Net", "PeerPort",  47801, Paths::Ini()),
-              s_netStrictPeer);
+              s_netStrictPeer,
+              cfgMode, cfgJoin[0] ? cfgJoin : "-");
             if (!netOk)
                 L("[Net] init=FALSE -> link disabled ([Net] Enabled=0, or bind/socket failure; details in net_log.txt)\n");
         }

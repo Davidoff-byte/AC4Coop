@@ -138,8 +138,33 @@ static_assert(sizeof(PlayerState) == 576, "PlayerState wire size changed - updat
 static const uint32_t NET_MAGIC = 0x43344341; // 'AC4C'
 // Wire/struct-layout version. PlayerState is #pragma pack(1): adding a field shifts every following
 // offset, so both peers MUST run the same build. Bump this whenever the layout changes.
-static const uint32_t NET_PROTO_VER = 11;  // 11: entity chunking + worldId, hullHP removed, shipMaxHP
+static const uint32_t NET_PROTO_VER = 12;  // 12: lobby handshake (LobbyPacket below); PlayerState/entity layouts unchanged
+                                           // 11: entity chunking + worldId, hullHP removed, shipMaxHP
                                            // (GcLShip+0xB4) + shipClass (entity+0x9C) added; 10: float shipHP (GcLShip+0xD0)
+
+// ---- lobby handshake (docs/design/lobby-code.md, slice 3) ---------------------------------------
+// [Net] Mode=host|join only. The guest sends HELLO to the address in its lobby code until WELCOME;
+// the host locks g_peer to the first HELLO's source (IP AND port, the guest's NAT mapping) and
+// replies WELCOME. A HELLO with a foreign protoVer gets REJECT carrying the host's version.
+// This 20-byte layout is FROZEN across protocol versions: it is how two different builds find out
+// they differ, so it must parse on both. Never add a field; use a new magic instead.
+static const uint32_t NET_LOBBY_MAGIC = 0x4C344341; // 'AC4L'
+enum LobbyType : uint32_t {
+    LOBBY_HELLO   = 1,   // guest -> host, every 250 ms until WELCOME/REJECT or 15 s
+    LOBBY_WELCOME = 2,   // host -> guest, echoes the guest's nonce
+    LOBBY_REJECT  = 3,   // host -> guest, protoVer mismatch (protoVer field = the host's version)
+};
+#pragma pack(push, 1)
+struct LobbyPacket {
+    uint32_t magic;       // NET_LOBBY_MAGIC
+    uint32_t protoVer;    // sender's NET_PROTO_VER
+    uint32_t type;        // LobbyType
+    uint32_t nonce;       // chosen by the guest per join attempt; WELCOME/REJECT echo it
+    uint32_t codeCheck;   // HELLO: low 12 bits = the check of the code the guest typed. Logged, not
+                          // enforced: the code carries no secret (lobby-code.md "The code").
+};
+#pragma pack(pop)
+static_assert(sizeof(LobbyPacket) == 20, "LobbyPacket is a frozen wire layout");
 // Why adding shipMaxHP (and now shipClass) to 11 needs NO further bump: 11 has never run on a second
 // machine (no released build speaks it), so there is no deployed proto-11 peer to stay compatible with.
 // The layout guard is already structural - the receive path requires n == sizeof(PlayerState), so a
