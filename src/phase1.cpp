@@ -5770,6 +5770,35 @@ static int OwnFlag(const char* key, int* cache, uint64_t* next) {
 static int s_ownG = 0, s_ownP = 0; static uint64_t s_ownGNext = 0, s_ownPNext = 0;
 static bool OwnGuardsOn() { return OwnFlag("OwnUpdateGuards", &s_ownG, &s_ownGNext) != 0; }
 static bool OwnPuppetOn() { return OwnFlag("OwnUpdatePuppet", &s_ownP, &s_ownPNext) != 0; }
+// [Coop] OwnPhysicsMs (default 0 = render-only writes, physics only on placement / >5 m jumps): in own-update
+// mode, also move the body's physics (SetGlobalMatrixInternal updatePhysics=true) at most every N ms; 1 = every
+// frame. A/B for "mirrored guards float" (2026-11-12): host heights were measured clean, so the question is
+// whether a body whose capsule stays behind decides it is in the air (context 6). Re-read every 2 s.
+static int s_ownPhysMs = 0; static uint64_t s_ownPhysNext = 0;
+static int OwnPhysMs() {
+    const uint64_t now = GetTickCount64();
+    if (now >= s_ownPhysNext) {
+        s_ownPhysNext = now + 2000;
+        int v = GetPrivateProfileIntA("Coop", "OwnPhysicsMs", 0, Paths::Ini());
+        if (v < 0) v = 0;
+        if (v != s_ownPhysMs) L("[Own] OwnPhysicsMs=%d (was %d)\n", v, s_ownPhysMs);
+        s_ownPhysMs = v;
+    }
+    return s_ownPhysMs;
+}
+// Probe counters (guards, own-update hook): AI context of the body, and moving frames vs the action it plays.
+static volatile LONG s_cxFrames = 0, s_cxGround = 0, s_cxAir = 0, s_cxOther = 0, s_cxOtherId = 0;
+static volatile LONG s_mvFrames = 0, s_mvActMatch = 0, s_mvActMis = 0, s_physWrites = 0;
+struct OwnPair { uint32_t body, host; LONG n; };
+static OwnPair s_mvPairs[12]; static SRWLOCK s_mvPairLock = SRWLOCK_INIT;
+static void OwnNotePair(uint32_t body, uint32_t host) {
+    AcquireSRWLockExclusive(&s_mvPairLock);
+    int k = 0;
+    for (; k < 12; ++k) if (s_mvPairs[k].n && s_mvPairs[k].body == body && s_mvPairs[k].host == host) break;
+    if (k == 12) for (k = 0; k < 12; ++k) if (!s_mvPairs[k].n) break;
+    if (k < 12) { s_mvPairs[k].body = body; s_mvPairs[k].host = host; ++s_mvPairs[k].n; }
+    ReleaseSRWLockExclusive(&s_mvPairLock);
+}
 
 static inline uint64_t OwnNowUs() {
     static LARGE_INTEGER f = {};
@@ -5785,7 +5814,7 @@ static void OwnAtomicMax(volatile LONG* t, LONG v) {
 struct OwnBody {
     unsigned int human, ent;
     float fromPos[3], fromQuat[4], toPos[3], toQuat[4];
-    uint64_t t0Us, durUs, lastPubUs, lastWriteUs, aliasSinceUs, createdUs;
+    uint64_t t0Us, durUs, lastPubUs, lastWriteUs, aliasSinceUs, createdUs, lastPhysUs;
     float lastWrite[3]; bool haveWrite, snap;
     uint32_t alias;
 };
@@ -5955,31 +5984,56 @@ static void OwnDrain(Human* h) {
         const float d = sqrtf(dx * dx + dy * dy + dz * dz);
         if (d > 0.02f) OwnNoteMove(true, d);
     }
-    // action probe: what is this body playing, against what the host says (once the host alias is 500 ms old)
-    if (o.alias && now - o.aliasSinceUs > 500000) {
+    // context probe: 2 = ground (default), 6 = in air (phase1.cpp:98, DriveContextMask)
+    {
+        const int cx = h->GetCurrentContextID(MAIN_AI_TRACK);
+        InterlockedIncrement(&s_cxFrames);
+        if (cx == 2) InterlockedIncrement(&s_cxGround);
+        else if (cx == 6) InterlockedIncrement(&s_cxAir);
+        else { InterlockedIncrement(&s_cxOther); InterlockedExchange(&s_cxOtherId, cx); }
+    }
+    // what is this body playing (needed by both probes below)
+    uint32_t curAlias = 0; bool haveCur = false;
+    {
         ActionComponent* ac = h->GetActionComponent();
         if (ac && readable(ac, 0x40)) {
             unsigned char mir = 0;
             void* act = ac->GetCurrentAction(&mir, 0, ACTLAYER_PRIMARY);
-            if (act && readable(act, 0x14)) {
-                InterlockedIncrement(&s_gActFrames);
-                if (*(uint32_t*)((char*)act + 8) != o.alias) InterlockedIncrement(&s_gActMis);
-            }
+            if (act && readable(act, 0x14)) { curAlias = *(uint32_t*)((char*)act + 8); haveCur = true; }
+        }
+    }
+    // action probe: against what the host says (once the host alias is 500 ms old)
+    if (haveCur && o.alias && now - o.aliasSinceUs > 500000) {
+        InterlockedIncrement(&s_gActFrames);
+        if (curAlias != o.alias) InterlockedIncrement(&s_gActMis);
+    }
+    float pos[3], quat[4]; OwnSample(o, now, pos, quat);
+    // moving probe: speed of the position we are about to give it, against the action it plays
+    if (o.haveWrite && o.lastWriteUs && now > o.lastWriteUs && haveCur) {
+        const float dx = pos[0] - o.lastWrite[0], dy = pos[1] - o.lastWrite[1], dz = pos[2] - o.lastWrite[2];
+        const float v = sqrtf(dx * dx + dy * dy + dz * dz) / ((float)(double)(now - o.lastWriteUs) * 1e-6f);
+        if (v > 0.3f) {
+            InterlockedIncrement(&s_mvFrames);
+            if (curAlias == o.alias) InterlockedIncrement(&s_mvActMatch);
+            else { InterlockedIncrement(&s_mvActMis); OwnNotePair(curAlias, o.alias); }
         }
     }
     if (!OwnGuardsOn()) return;
-    float pos[3], quat[4]; OwnSample(o, now, pos, quat);
     HookMath::Quaternion q; q.x = quat[0]; q.y = quat[1]; q.z = quat[2]; q.w = quat[3];
     HookMath::Transform m; HookMath::ToMatrix(&q, &m);
     m.M41 = pos[0]; m.M42 = pos[1]; m.M43 = pos[2];
-    e->SetGlobalMatrixInternal(&m, o.snap);
+    const int physMs = OwnPhysMs();
+    const bool phys = o.snap || (physMs > 0 && now - o.lastPhysUs >= (uint64_t)physMs * 1000ull);
+    e->SetGlobalMatrixInternal(&m, phys);
     InterlockedIncrement(&s_gWrites);
+    if (phys) InterlockedIncrement(&s_physWrites);
     AcquireSRWLockExclusive(&s_ownLock);
     const int j = OwnFind(key);
     if (j >= 0) {
         for (int k = 0; k < 3; ++k) s_own[j].lastWrite[k] = pos[k];
         s_own[j].haveWrite = true; s_own[j].lastWriteUs = now;
         if (o.snap) s_own[j].snap = false;
+        if (phys) s_own[j].lastPhysUs = now;
     }
     ReleaseSRWLockExclusive(&s_ownLock);
 }
@@ -6013,6 +6067,24 @@ static void OwnReport() {
       s_gLegacyWrites, s_gStarvedFallback, gaf, gam, gaf ? 100.0 * gam / gaf : 0.0, (long)s_ownN,
       pf, pm, pf ? 100.0 * pm / pf : 0.0, pm ? (double)psum / pm / 1e6 : 0.0, pmax / 1e6, pw);
     s_gLegacyWrites = 0; s_gStarvedFallback = 0;
+    const LONG cf = InterlockedExchange(&s_cxFrames, 0), cg = InterlockedExchange(&s_cxGround, 0);
+    const LONG ca = InterlockedExchange(&s_cxAir, 0), co = InterlockedExchange(&s_cxOther, 0);
+    const LONG mf = InterlockedExchange(&s_mvFrames, 0), mm = InterlockedExchange(&s_mvActMatch, 0);
+    const LONG mi = InterlockedExchange(&s_mvActMis, 0), pw2 = InterlockedExchange(&s_physWrites, 0);
+    char pairs[400]; pairs[0] = 0; int po = 0;
+    AcquireSRWLockExclusive(&s_mvPairLock);
+    for (int k = 0; k < 12; ++k) {
+        int best = -1;
+        for (int q = 0; q < 12; ++q) if (s_mvPairs[q].n && (best < 0 || s_mvPairs[q].n > s_mvPairs[best].n)) best = q;
+        if (best < 0) break;
+        if (po < 360) po += _snprintf_s(pairs + po, sizeof(pairs) - po, _TRUNCATE, " %u<-%u:%ld",
+                                       s_mvPairs[best].body, s_mvPairs[best].host, s_mvPairs[best].n);
+        s_mvPairs[best].n = 0;
+    }
+    ReleaseSRWLockExclusive(&s_mvPairLock);
+    L("[OwnAir] physMs=%d physWrites=%ld | ctx frames=%ld ground=%ld air=%ld (%.1f%%) other=%ld (last id %ld) | moving frames=%ld "
+      "actMatch=%ld actMis=%ld (%.1f%%) top body<-host:%s\n",
+      s_ownPhysMs, pw2, cf, cg, ca, cf ? 100.0 * ca / cf : 0.0, co, (long)s_cxOtherId, mf, mm, mi, mf ? 100.0 * mi / mf : 0.0, pairs);
 }
 
 static void ApplyGuards(const EntityPacket& pkt) {
@@ -10070,7 +10142,7 @@ static void DumpConfigOnce()
         { "Coop", "GuestKillMirror", 1 }, { "Coop", "HookSgm", 1 }, { "Coop", "HostileOnly", 0 },
         { "Coop", "HybridLoco", 1 }, { "Coop", "IdentityBand", 0 }, { "Coop", "IdResolver", 1 },
         { "Coop", "InstallHooks", 1 }, { "Coop", "IntegratePuppet", 0 }, { "Coop", "KillTrace", 1 },
-        { "Coop", "KrLog", 0 }, { "Coop", "LegacyPadIdHook", 1 }, { "Coop", "MirrorActions", 1 }, { "Coop", "MirrorActionsDeferred", 0 }, { "Coop", "OwnUpdateGuards", 0 }, { "Coop", "OwnUpdatePuppet", 0 }, { "Coop", "MinBlendInMs", 100 },
+        { "Coop", "KrLog", 0 }, { "Coop", "LegacyPadIdHook", 1 }, { "Coop", "MirrorActions", 1 }, { "Coop", "MirrorActionsDeferred", 0 }, { "Coop", "OwnPhysicsMs", 0 }, { "Coop", "OwnUpdateGuards", 0 }, { "Coop", "OwnUpdatePuppet", 0 }, { "Coop", "MinBlendInMs", 100 },
         { "Coop", "NetStrictPeer", 1 }, { "Coop", "NullReturnObserver", 1 }, { "Coop", "Probe", 0 },
         { "Coop", "PuppetParkX", 0 }, { "Coop", "PuppetPhysics", 0 }, { "Coop", "RegisterPad1", 0 },
         { "Coop", "RelevanceRadiusM", 250 }, { "Coop", "ReloadBuilder", 1 }, { "Coop", "SceneAwareExact", 0 },
