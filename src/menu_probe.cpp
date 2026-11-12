@@ -31,7 +31,7 @@
 namespace {
 
 const uintptr_t VA_IMAGE_BASE = 0x00400000;
-const size_t    SITE_COUNT    = 5;
+const size_t    SITE_COUNT    = 9;
 const size_t    PATTERN_MAX   = 32;
 const LONG      MAX_PER_SITE  = 200;
 const size_t    STUB_SIZE     = 64;
@@ -44,6 +44,12 @@ const SiteDesc kSites[SITE_COUNT] = {
     { "named-cmd   0x12DECD0", 0x012DECD0u, "55 8B EC 53 56 8B F1 8D 5E 1C 57 8B CB E8 0E 9B", 5, 16 },
     { "set-slot    0x13237E0", 0x013237E0u, "55 8B EC A1 28 81 E3 04 8B 90 84 11 00 00 8B 45", 8, 16 },
     { "transition  0x18609A0", 0x018609A0u, "55 8B EC A1 74 B1 DF 04 85 C0 74 1E 80 B8 A8 00", 8, 16 },
+    // v2 (2026-11-12, after the first capture): timing + threads. Sites 5/6 are per-frame updates (vtable slot 18 of
+    // TitleMenuPressStartComponent 0x026F4148 / TitleMenuSavegame 0x027004C8); they log only when their state changes.
+    { "start-update 0x17B4840", 0x017B4840u, "56 8B F1 8B 46 08 83 F8 02 74 05 83 F8 03 75 3B", 6, 16 },
+    { "save-update  0x18DAAB0", 0x018DAAB0u, "55 8B EC 8B 45 08 53 56 50 8B F1 E8 30 70 CF FF", 6, 16 },
+    { "save-init    0x18E4010", 0x018E4010u, "55 8B EC 83 EC 1C 56 8B F1 E8 42 37 F1 FE 8B 06", 6, 16 },
+    { "slot-hover   0x18E2390", 0x018E2390u, "55 8B EC 83 EC 28 A1 24 E5 AB 02 8A 80 8A 00 00", 6, 16 },
 };
 
 FILE*         g_log = nullptr;
@@ -100,11 +106,62 @@ size_t ParsePattern(const char* s, BYTE* out, size_t cap) {
 
 }  // namespace
 
+namespace {
+uint32_t Rd32(uint32_t a, uint32_t dflt = 0xDEAD0000u) { __try { return a >= 0x10000 ? *(volatile uint32_t*)a : dflt; } __except (EXCEPTION_EXECUTE_HANDLER) { return dflt; } }
+uint32_t Rd8(uint32_t a) { __try { return a >= 0x10000 ? *(volatile uint8_t*)a : 0xEEu; } __except (EXCEPTION_EXECUTE_HANDLER) { return 0xEEu; } }
+// Return addresses up the EBP chain (at a prologue hook EBP is still the caller's frame).
+void Stack(const SavedRegs* r, char* out, size_t n) {
+    size_t o = (size_t)_snprintf_s(out, n, _TRUNCATE, "%08X", r->ret);
+    uint32_t f = r->ebp;
+    for (int i = 0; i < 7 && f >= 0x10000 && o + 10 < n; ++i) {
+        const uint32_t ret = Rd32(f + 4), nf = Rd32(f);
+        if (ret < 0x00400000u || ret > 0x02000000u) break;
+        o += (size_t)_snprintf_s(out + o, n - o, _TRUNCATE, "<%08X", ret);
+        if (nf <= f) break;
+        f = nf;
+    }
+}
+// Save-slot record `i` (read-only): handle = *(*(0x4E38128)+4484)[i]; object = (h[2] >> 31) & h[0] (the engine's own
+// handle idiom, sub_132A6D0); bytes +64/+65/+66 all zero = empty slot (the NEW_GAME test in sub_18DAC60); dword +36.
+uint32_t SlotWord(int i) {
+    const uint32_t arr = Rd32(Rd32(0x04E38128u, 0) + 4484, 0), h = arr ? Rd32(arr + 4 * i, 0) : 0;
+    const uint32_t obj = h ? (uint32_t)(((int32_t)Rd32(h + 8, 0) >> 31) & Rd32(h, 0)) : 0;
+    if (!obj) return 0xFFFFFFFFu;
+    return (Rd8(obj + 64) << 16) | (Rd8(obj + 65) << 8) | Rd8(obj + 66) | ((Rd32(obj + 36, 0) & 0xFF) << 24);
+}
+}  // namespace
+
 extern "C" void __cdecl MenuProbe_LogHit(int site, const void* saved) {
     if (site < 0 || site >= (int)SITE_COUNT || !saved) return;
-    if (InterlockedIncrement(&g_hits[site]) > MAX_PER_SITE) return;
     const SavedRegs* r = (const SavedRegs*)saved;
-    const DWORD t = GetTickCount();
+    const DWORD t = GetTickCount(), tid = GetCurrentThreadId();
+    char stk[96];
+    if (site == 5) {   // per-frame: log state changes only
+        static uint32_t last[5] = { 1, 1, 1, 1, 1 };
+        const uint32_t ent = Rd32(r->ecx + 40);
+        const uint32_t cur[5] = { Rd32(r->ecx + 8), Rd8(r->ecx + 84), ent, ent >= 0x10000 ? Rd32(ent + 0xD8) : 0xFFFFFFFFu, Rd32(0x02AC0BA8u) };
+        if (!memcmp(cur, last, sizeof(cur))) return;
+        memcpy(last, cur, sizeof(cur));
+        const LONG n = InterlockedIncrement(&g_hits[site]);
+        if (n <= MAX_PER_SITE) Log("[MP] t=%lu tid=%lu start-update this=%08X state=%u wait=%u ent=%08X ent+D8=%d video=%08X (hit %ld)\n", t, tid, r->ecx, cur[0], cur[1], cur[2], (int)cur[3], cur[4], n);
+        return;
+    }
+    if (site == 6) {
+        static uint32_t last[9] = { 1 };
+        const uint32_t g = Rd32(0x02ABE524u);
+        const uint32_t cur[9] = { r->ecx, Rd32(r->ecx + 140), Rd8(r->ecx + 144), Rd32(r->ecx + 232), Rd32(r->ecx + 236), g >= 0x10000 ? Rd8(g + 138) : 0xEEu,
+                                  SlotWord(0), SlotWord(1), SlotWord(2) };
+        if (!memcmp(cur, last, sizeof(cur))) return;
+        memcpy(last, cur, sizeof(cur));
+        const LONG n = InterlockedIncrement(&g_hits[site]);
+        if (n <= MAX_PER_SITE) Log("[MP] t=%lu tid=%lu save-update this=%08X +140=%u +144=%u sel=%u +236..239=%08X g138=%u slots=%08X %08X %08X (hit %ld)\n",
+                                   t, tid, cur[0], cur[1], cur[2], cur[3], cur[4], cur[5], cur[6], cur[7], cur[8], n);
+        return;
+    }
+    if (InterlockedIncrement(&g_hits[site]) > MAX_PER_SITE) return;
+    if (site == 7) { Stack(r, stk, sizeof(stk)); Log("[MP] t=%lu tid=%lu save-init   this=%08X stack=%s\n", t, tid, r->ecx, stk); return; }
+    if (site == 8) { Stack(r, stk, sizeof(stk)); Log("[MP] t=%lu tid=%lu slot-hover  this=%08X slot=%u stack=%s\n", t, tid, r->ecx, r->a1, stk); return; }
+    if (site == 0) { Stack(r, stk, sizeof(stk)); Log("[MP] t=%lu tid=%lu slot-select stack=%s\n", t, tid, stk); }
     char s1[72], s3[72];
     switch (site) {
         case 0: Text(r->a1, true, s1, sizeof(s1));
