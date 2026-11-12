@@ -86,6 +86,8 @@ namespace {
     // guest: the host's endpoints from PEER (written by the recv thread before g_hostInfo = 1)
     sockaddr_in        g_hostPub{}, g_hostLan{};
     volatile LONG      g_hostInfo = 0;
+    uint64_t           g_relayRoomCfg = 0;       // [Net] RelayRoom (host): room id to re-register; 0 = new
+    volatile LONG      g_roomMissingLogged = 0;  // guest: "room not there yet" logged once
 
     // ---- received DEATH ring (B-4: a one-shot death packet must not be lost to the snapshot slot) --
     // g_remoteEntities is last-writer-wins: `g_remoteEntities = decoded` below overwrites whatever the
@@ -976,6 +978,14 @@ namespace {
             Relay::Error e; std::memcpy(&e, pl, sizeof(e));
             if (e.nonce != g_relayNonce) return;
             InterlockedExchange(&g_relayErr, e.code);
+            // A guest whose game reached the world before the host's game re-registered the room (the host's
+            // launcher closed it when the games started) sees "no such room" for a while: keep JOINing (the
+            // join thread's 10-min window) instead of giving up. Other refusals are final.
+            if (g_mode == LM_JOIN && e.code == Relay::E_UNKNOWN_ROOM) {
+                if (!InterlockedExchange(&g_roomMissingLogged, 1))
+                    dbg("[Lobby] relay: the room is not there yet (host still loading?) - retrying for up to 10 min\n");
+                return;
+            }
             _snprintf(m, sizeof(m), "[Lobby] relay server refused: %s\n", RelayErrText(e.code)); m[sizeof(m) - 1] = 0; dbg(m);
             if (g_mode == LM_JOIN) InterlockedCompareExchange(&g_joinState, 5, 1);
             else if (g_mode == LM_HOST && e.code == Relay::E_UNKNOWN_ROOM) {
@@ -998,13 +1008,15 @@ namespace {
         const uint64_t room = (uint64_t)InterlockedCompareExchange64(&g_relayRoom, 0, 0);
         PeerSet(g_relaySrv, Relay::kHostSlot);
         uint64_t t0 = GetTickCount64();
-        while (alive() && !InterlockedCompareExchange(&g_hostInfo, 0, 0) && GetTickCount64() - t0 < 15000) {
+        // JOIN until PEER: every 500 ms for 15 s, then every 2 s up to 10 min (the host's game may still be
+        // loading; "no such room" is not final in that window - see HandleRelayControl).
+        while (alive() && !InterlockedCompareExchange(&g_hostInfo, 0, 0) && GetTickCount64() - t0 < 600000) {
             RelayHello(Relay::T_JOIN, room);
-            Sleep(500);
+            Sleep(GetTickCount64() - t0 < 15000 ? 500 : 2000);
         }
         if (!alive()) return 0;
         if (!InterlockedCompareExchange(&g_hostInfo, 0, 0)) {
-            if (InterlockedCompareExchange(&g_joinState, 4, 1) == 1) dbg("[Lobby] join: the relay server did not answer in 15 s\n");
+            if (InterlockedCompareExchange(&g_joinState, 4, 1) == 1) dbg("[Lobby] join: no host in the relay room after 10 min\n");
             return 0;
         }
         if (!g_relayForce) {
@@ -1048,6 +1060,7 @@ namespace {
         InterlockedExchange(&g_hostInfo, 0);
         InterlockedExchange(&g_relayErr, 0);
         InterlockedExchange(&g_linkVia, 0);
+        InterlockedExchange(&g_roomMissingLogged, 0);
         InterlockedExchange64(&g_relayRoom, (LONG64)room);
         g_relayNonce = NewNonce();
         g_joinNonce = NewNonce() ^ 0x5bd1e995u;
@@ -1099,7 +1112,7 @@ namespace {
         if (relay) {
             g_relayNonce = NewNonce();
             for (int i = 0; i < 10 && !InterlockedCompareExchange(&g_relayRegistered, 0, 0); ++i) {
-                RelayHello(Relay::T_REGISTER, 0);
+                RelayHello(Relay::T_REGISTER, g_relayRoomCfg);   // [Net] RelayRoom (from the launcher) or 0 = new room
                 Sleep(1000);
             }
             if (!InterlockedCompareExchange(&g_relayRegistered, 0, 0))
@@ -1197,7 +1210,8 @@ namespace {
             // every 2 s while not registered (first answer lost, or the room was taken over).
             if (relay && now - lastRelay >= (InterlockedCompareExchange(&g_relayRegistered, 0, 0) ? 15000u : 2000u)) {
                 lastRelay = now;
-                RelayHello(Relay::T_REGISTER, (uint64_t)InterlockedCompareExchange64(&g_relayRoom, 0, 0));
+                const uint64_t cur = (uint64_t)InterlockedCompareExchange64(&g_relayRoom, 0, 0);
+                RelayHello(Relay::T_REGISTER, cur ? cur : g_relayRoomCfg);
             }
             if (haveSrv && InterlockedCompareExchange(&g_peerReady, 0, 0) == 0 && now - lastStun >= 25000) {
                 lastStun = now;
@@ -1501,6 +1515,10 @@ bool Init() {
     // [Net] RelayForce=1 (skip the direct attempt). docs/design/relay.md.
     GetPrivateProfileStringA("Net", "RelayServer", "", g_relayName, sizeof(g_relayName), Paths::Ini());
     g_relayForce = GetPrivateProfileIntA("Net", "RelayForce", 0, Paths::Ini());
+    // [Net] RelayRoom=<hex room id> (written by the launcher for the host): register THAT room, so the code the
+    // party already holds stays valid when the games take over from the launchers. Empty = a new room.
+    { char rr[32] = {0}; GetPrivateProfileStringA("Net", "RelayRoom", "", rr, sizeof(rr), Paths::Ini());
+      g_relayRoomCfg = rr[0] ? (_strtoui64(rr, nullptr, 16) & 0xFFFFFFFFFFull) : 0; }
     // Join mode: a valid JoinCode starts joining at once; an empty or invalid one leaves the link up and
     // idle until the player copies a code and presses F8 (Net::JoinByCode). Nothing is sent meanwhile.
     uint32_t joinIp = 0; uint16_t joinPort = 0;
