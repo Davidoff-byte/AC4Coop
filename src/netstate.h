@@ -153,6 +153,8 @@ enum LobbyType : uint32_t {
     LOBBY_HELLO   = 1,   // guest -> host, every 250 ms until WELCOME/REJECT or 15 s
     LOBBY_WELCOME = 2,   // host -> guest, echoes the guest's nonce
     LOBBY_REJECT  = 3,   // host -> guest, protoVer mismatch (protoVer field = the host's version)
+    LOBBY_PUNCH   = 4,   // host -> guest's endpoints (relay rendezvous): opens the host's NAT towards the
+                         // guest; carries nothing, every receiver ignores it (docs/design/relay.md)
 };
 #pragma pack(push, 1)
 struct LobbyPacket {
