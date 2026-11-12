@@ -34,9 +34,28 @@ void Log(const char* fmt, ...) {
     OutputDebugStringA(line);
 }
 
+int        g_skip = 0;
+
+// The boot videos, measured by VideoLog on 2026-11-12 (all four opened from 0x0084F3FE in sub_84F220, in this order):
+// videos\<lang>\warning_disclaimer.bik, videos\TWIMTBP.bik, videos\abstergo_logo.bik, videos\ac4bf_logo.bik.
+bool IsBootVideo(const char* name) {
+    if (!name) return false;
+    const char* leaf = strrchr(name, '\\'); leaf = leaf ? leaf + 1 : name;
+    return _stricmp(leaf, "warning_disclaimer.bik") == 0 || _stricmp(leaf, "TWIMTBP.bik") == 0 ||
+           _stricmp(leaf, "abstergo_logo.bik") == 0 || _stricmp(leaf, "ac4bf_logo.bik") == 0;
+}
+
 void* __stdcall MyBinkOpen(const char* name, unsigned flags) {
     void* ret = _ReturnAddress();
     const LONG n = InterlockedIncrement(&g_count);
+    // Skip: answer "no video" (NULL). sub_84F220 (the caller, 0x0084F3F8) already handles a NULL handle: it is the
+    // same state it produces itself when sub_9F23F0(file) fails - `if (!*(this+48)) { this->vfunc[+144](); byte
+    // this[29] = 1; return 0; }` (Hex-Rays, 2026-11-12). Only the four boot videos; every other video is untouched.
+    if (g_skip && IsBootVideo(name)) {
+        Log("[Video] #%ld t=%llums SKIP \"%s\" (caller rva %08x) -> NULL\n", n, ProcessAgeMs(), name,
+            (unsigned)((uintptr_t)ret - (uintptr_t)GetModuleHandleW(nullptr)));
+        return nullptr;
+    }
     void* h = g_realBinkOpen(name, flags);
     if (g_log)
         Log("[Video] #%ld t=%llums open \"%s\" flags=0x%08x caller=%p (rva %08x) -> %p\n", n, ProcessAgeMs(),
@@ -72,6 +91,7 @@ namespace VideoHook {
 void Install() {
     g_log = GetPrivateProfileIntA("Coop", "VideoLog", 0, Paths::Ini());
     const int skip = GetPrivateProfileIntA("Coop", "SkipIntroVideos", 0, Paths::Ini());
+    g_skip = skip;
     if (!g_log && !skip) return;
     void** slot = FindImportSlot("bink2w32.dll", "_BinkOpen@8");
     HMODULE bink = GetModuleHandleW(L"bink2w32.dll");
