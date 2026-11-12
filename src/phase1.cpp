@@ -5814,6 +5814,20 @@ static int OwnFlag(const char* key, int* cache, uint64_t* next) {
 static int s_ownG = 0, s_ownP = 0; static uint64_t s_ownGNext = 0, s_ownPNext = 0;
 static bool OwnGuardsOn() { return OwnFlag("OwnUpdateGuards", &s_ownG, &s_ownGNext) != 0; }
 static bool OwnPuppetOn() { return OwnFlag("OwnUpdatePuppet", &s_ownP, &s_ownPNext) != 0; }
+// ---- [Coop] GuardAnimFull (default 0; re-read every 2 s) --------------------------------------------------------
+// Proto 13: drive a mirrored guard's animation the way ApplyRemoteState drives the puppet off the ground (phase1.cpp
+// ~1848-1975), on the guard's own Human update (OwnDrain): SetTargetAction with the host's real channel + layer only
+// when the body's current alias differs (re-forcing a current action re-runs its transition and was seen to crash on
+// the puppet), seek to the host's phase on a switch, the same blend-in descriptor fix, and blend factors + time scale
+// written with ACTPERSIST_ALWAYS. Guards keep their own CharacterActionSet (the puppet's CAS step is player-only).
+// Replaces the alias-only path (MirrorAliasShouldApply / MirrorActQueue / channel 0xFFFF) while on.
+// Re-assert: if the body plays something else while the host alias is unchanged, the switch is re-issued at most
+// every 250 ms (counted: `reassert`, the evidence of a second writer). UNVERIFIED until O1/O2 pass on the rig.
+static int s_gaOn = 0; static uint64_t s_gaNext = 0;
+static bool GuardAnimFullOn() { return OwnFlag("GuardAnimFull", &s_gaOn, &s_gaNext) != 0; }
+static volatile LONG s_gaSwitch = 0, s_gaReassert = 0, s_gaBlendFix = 0, s_gaFactorWrites = 0;
+static volatile LONG s_phFrames = 0, s_phOk = 0;
+
 // [Coop] OwnPhysicsMs (default 0 = render-only writes, physics only on placement / >5 m jumps): in own-update
 // mode, also move the body's physics (SetGlobalMatrixInternal updatePhysics=true) at most every N ms; 1 = every
 // frame. A/B for "mirrored guards float" (2026-11-12): host heights were measured clean, so the question is
@@ -5855,12 +5869,23 @@ static void OwnAtomicMax(volatile LONG* t, LONG v) {
     while (v > cur) { const LONG prev = InterlockedCompareExchange(t, v, cur); if (prev == cur) break; cur = prev; }
 }
 
+// Guard animation apply state (GuardAnimFull): written only by the body's own update (OwnDrain), copied back
+// under s_ownLock like lastWrite.
+struct GaState {
+    uint32_t issuedAlias; uint64_t issuedUs;    // last SetTargetAction we issued, and when
+    void*    lastEv;      uint32_t frameN;      // evaluator seen last frame (a new one resets persistence)
+    uint64_t factorUs;                           // last blend factor / time scale write
+    uint32_t bfAlias; float bfLen, bfSfe, bfTgt; uint16_t bfFlags; uint8_t bfWait;   // blend-in fix, as the puppet's
+    uint8_t  zeroSlots[BLEND_MAX];              // slots we set non-zero last time (zeroed when they drop out)
+};
 struct OwnBody {
     unsigned int human, ent;
     float fromPos[3], fromQuat[4], toPos[3], toQuat[4];
     uint64_t t0Us, durUs, lastPubUs, lastWriteUs, aliasSinceUs, createdUs, lastPhysUs;
     float lastWrite[3]; bool haveWrite, snap;
     uint32_t alias;
+    GuardAnim anim; uint64_t animUs;            // proto 13: host animation block and when it last changed
+    GaState ga;
 };
 static const int OWN_MAX = 128;
 static OwnBody s_own[OWN_MAX];
@@ -5896,7 +5921,7 @@ static void OwnSample(const OwnBody& o, uint64_t nowUs, float* pos, float* quat)
 }
 
 // ApplyGuards (player's update): newest host target for this body.
-static void OwnPublish(Human* h, Entity* e, const float* pos, const float* quat, uint32_t alias) {
+static void OwnPublish(Human* h, Entity* e, const float* pos, const float* quat, uint32_t alias, const GuardAnim& anim) {
     const uint64_t now = OwnNowUs();
     AcquireSRWLockExclusive(&s_ownLock);
     int i = OwnFind((unsigned int)h);
@@ -5907,6 +5932,7 @@ static void OwnPublish(Human* h, Entity* e, const float* pos, const float* quat,
         for (int k = 0; k < 3; ++k) n.fromPos[k] = n.toPos[k] = pos[k];
         for (int k = 0; k < 4; ++k) n.fromQuat[k] = n.toQuat[k] = quat[k];
         n.t0Us = now; n.durUs = 0; n.lastPubUs = now; n.snap = true; n.alias = alias; n.aliasSinceUs = now;
+        n.anim = anim; n.animUs = now;
         InterlockedIncrement(&s_ownN);
     } else if (i >= 0) {
         OwnBody& o = s_own[i];
@@ -5929,6 +5955,7 @@ static void OwnPublish(Human* h, Entity* e, const float* pos, const float* quat,
         }
         o.lastPubUs = now;
         if (alias != o.alias) { o.alias = alias; o.aliasSinceUs = now; }
+        if (std::memcmp(&anim, &o.anim, sizeof(GuardAnim)) != 0) { o.anim = anim; o.animUs = now; }
     }
     ReleaseSRWLockExclusive(&s_ownLock);
 }
@@ -5961,6 +5988,101 @@ static bool OwnStarved(Human* h) {
     ReleaseSRWLockShared(&s_ownLock);
     if (starved) ++s_gStarvedFallback;
     return starved;
+}
+
+// Runs on the body's own update. `o` is a copy; the caller writes o.ga back.
+static void GuardAnimApply(Human* h, OwnBody& o, uint64_t now) {
+    const GuardAnim& g = o.anim;
+    ActionComponent* ac = h->GetActionComponent();
+    if (!readable(ac, 0x40)) return;
+    GaState& st = o.ga;
+    ++st.frameN;
+    unsigned char mir = 0;
+    void* cur = ac->GetCurrentAction(&mir, 0, g.layer);
+    const uint32_t curAlias = readable(cur, 0x0C) ? *(uint32_t*)((char*)cur + 8) : 0;
+    const float hostRatio = g.ratioQ / 65535.0f;
+    // ---- action switch ----
+    if (o.alias && curAlias != o.alias) {
+        const bool newTarget = st.issuedAlias != o.alias;
+        if (newTarget || now - st.issuedUs > 250000) {
+            ac->SetTargetAction((int)o.alias, 0, 0, (int)g.channel, (int)g.layer);
+            if (g_seekOnSwitch && hostRatio > 0.0f && hostRatio < 1.0f)
+                ac->SetCurrentActionRatio(hostRatio, 0, false, false, ACTLAYER_PRIMARY);
+            if (g.blendInMs >= 0) {
+                st.bfAlias = o.alias; st.bfLen = g.blendInMs / 1000.0f; st.bfSfe = g.blendInStartFromEnd;
+                st.bfTgt = g.blendInTargetStart; st.bfFlags = g.blendInFlags; st.bfWait = 10;
+            }
+            InterlockedIncrement(newTarget ? &s_gaSwitch : &s_gaReassert);
+            st.issuedAlias = o.alias; st.issuedUs = now;
+        }
+    }
+    // ---- blend-in fix (same checks and writes as the puppet's, ApplyRemoteState ~1886-1940) ----
+    if (st.bfWait > 0) {
+        char* ev = (char*)ac->GetCurrentEvaluator(0, ACTLAYER_PRIMARY);
+        void* evAct = (readable(ev, 0x2C0) && *(uint8_t*)(ev + 0xD4) == 4) ? *(void**)(ev + 0x2A8) : nullptr;
+        if (readable(evAct, 0x0C) && *(uint32_t*)((char*)evAct + 8) == st.bfAlias && *(uint8_t*)(ev + 0x258) == 0) {
+            const float t = *(float*)(ev + 0xE0);
+            const uint16_t wasFl = *(uint16_t*)(ev + 0x1DC);
+            uint16_t fl = st.bfFlags; float len = st.bfLen;
+            if ((fl & 7) == 6) fl = (uint16_t)((fl & ~7) | 1);
+            bool write = true;
+            if ((fl & 7) == 0) {
+                if ((wasFl & 7) != 0 || g_minBlendIn <= 0.0f) write = false;
+                else { fl = (uint16_t)((fl & ~7) | 1); len = g_minBlendIn; }
+            }
+            if (write && t < len) {
+                char* evNow = (char*)ac->GetCurrentEvaluator(0, ACTLAYER_PRIMARY);
+                if (evNow == ev && readable(ev, 0x2C0) && *(uint8_t*)(ev + 0x258) == 0) {
+                    *(float*)(ev + 0x1C8) = len; *(float*)(ev + 0x1CC) = st.bfSfe; *(float*)(ev + 0x1D0) = st.bfTgt;
+                    *(uint16_t*)(ev + 0x1DC) = fl; *(float*)(ev + 0xE4) = len;
+                    InterlockedIncrement(&s_gaBlendFix);
+                }
+            }
+            st.bfWait = 0;
+        } else {
+            --st.bfWait;
+        }
+    }
+    // ---- blend factors + time scale (persistent), only while the body plays the host's action ----
+    if (o.alias && curAlias == o.alias) {
+        void* ev = ac->GetCurrentEvaluator(0, ACTLAYER_PRIMARY);
+        const bool evNew = ev != st.lastEv;
+        st.lastEv = ev;
+        // Every frame for a new evaluator or a changed block, else every 4th frame (re-assert against the body's
+        // own blend-tree update).
+        if (evNew || o.animUs > st.factorUs || (st.frameN & 3) == 0) {
+            const int pn = ac->GetBlendFactorCount(0, ACTLAYER_PRIMARY);
+            uint8_t now8[BLEND_MAX] = {};
+            for (uint8_t k = 0; k < g.nBlend; ++k) {
+                const int slot = g.blendSlot[k];
+                if (slot >= pn || slot >= BLEND_MAX) continue;
+                ac->SetBlendFactorPersistence((unsigned char)slot, ACTPERSIST_ALWAYS, 0, ACTLAYER_PRIMARY);
+                ac->SetBlendFactor((unsigned char)slot, g.blendVal[k] / 255.0f, 0, ACTLAYER_PRIMARY);
+                now8[slot] = 1;
+            }
+            for (int slot = 0; slot < pn && slot < BLEND_MAX; ++slot)
+                if (st.zeroSlots[slot] && !now8[slot]) {
+                    ac->SetBlendFactorPersistence((unsigned char)slot, ACTPERSIST_ALWAYS, 0, ACTLAYER_PRIMARY);
+                    ac->SetBlendFactor((unsigned char)slot, 0.0f, 0, ACTLAYER_PRIMARY);
+                }
+            std::memcpy(st.zeroSlots, now8, sizeof(now8));
+            const float ts = g.timeScaleQ / 256.0f;
+            if (ts > 0.01f) {
+                ac->SetTimeScalePersistence(ACTPERSIST_ALWAYS, 0, ACTLAYER_PRIMARY);
+                ac->SetTimeScale(ts, 0, ACTLAYER_PRIMARY, false);
+            }
+            InterlockedIncrement(&s_gaFactorWrites);
+            st.factorUs = now;
+        }
+        // O2 phase probe: only within 60 ms of the host sample (the ratio moves while it ages)
+        if (now - o.animUs < 60000) {
+            float d = ac->GetCurrentActionRatio(0, ACTLAYER_PRIMARY) - hostRatio;
+            if (d < 0) d = -d;
+            if (d > 0.5f) d = 1.0f - d;                 // looping clips wrap
+            InterlockedIncrement(&s_phFrames);
+            if (d < 0.05f) InterlockedIncrement(&s_phOk);
+        }
+    }
 }
 
 static void OwnNoteMove(bool guard, float d) {
@@ -6051,6 +6173,13 @@ static void OwnDrain(Human* h) {
         InterlockedIncrement(&s_gActFrames);
         if (curAlias != o.alias) InterlockedIncrement(&s_gActMis);
     }
+    if (GuardAnimFullOn() && o.anim.valid) {
+        GuardAnimApply(h, o, now);
+        AcquireSRWLockExclusive(&s_ownLock);
+        const int ja = OwnFind(key);
+        if (ja >= 0) s_own[ja].ga = o.ga;
+        ReleaseSRWLockExclusive(&s_ownLock);
+    }
     float pos[3], quat[4]; OwnSample(o, now, pos, quat);
     // moving probe: speed of the position we are about to give it, against the action it plays
     if (o.haveWrite && o.lastWriteUs && now > o.lastWriteUs && haveCur) {
@@ -6126,6 +6255,13 @@ static void OwnReport() {
         s_mvPairs[best].n = 0;
     }
     ReleaseSRWLockExclusive(&s_mvPairLock);
+    {
+        const LONG sw = InterlockedExchange(&s_gaSwitch, 0), ra = InterlockedExchange(&s_gaReassert, 0);
+        const LONG bf = InterlockedExchange(&s_gaBlendFix, 0), fw = InterlockedExchange(&s_gaFactorWrites, 0);
+        const LONG phf = InterlockedExchange(&s_phFrames, 0), pho = InterlockedExchange(&s_phOk, 0);
+        L("[GuardAnim] full=%d switches=%ld reassert=%ld blendFix=%ld factorWrites=%ld | phase frames=%ld ok=%ld (%.1f%%)\n",
+          s_gaOn, sw, ra, bf, fw, phf, pho, phf ? 100.0 * pho / phf : 0.0);
+    }
     L("[OwnAir] physMs=%d physWrites=%ld | ctx frames=%ld ground=%ld air=%ld (%.1f%%) other=%ld (last id %ld) | moving frames=%ld "
       "actMatch=%ld actMis=%ld (%.1f%%) top body<-host:%s\n",
       s_ownPhysMs, pw2, cf, cg, ca, cf ? 100.0 * ca / cf : 0.0, co, (long)s_cxOtherId, mf, mm, mi, mf ? 100.0 * mi / mf : 0.0, pairs);
@@ -6455,7 +6591,7 @@ static void ApplyGuards(const EntityPacket& pkt) {
                         for (int k = 0; k < 4; ++k) s_last[slot].quat[k] = es.quat[k];
                     }
                 }
-                if (bh && !s_selfTestMode) OwnPublish(bh, (Entity*)best, es.pos, es.quat, es.actionAlias);
+                if (bh && !s_selfTestMode) OwnPublish(bh, (Entity*)best, es.pos, es.quat, es.actionAlias, es.anim);
                 const bool ownWrites = bh && !s_selfTestMode && OwnGuardsOn() && !OwnStarved(bh);
                 if (moved && !ownWrites) {
                     HookMath::Quaternion q; q.x=es.quat[0]; q.y=es.quat[1]; q.z=es.quat[2]; q.w=es.quat[3];
@@ -6470,7 +6606,8 @@ static void ApplyGuards(const EntityPacket& pkt) {
                     }
                 }
                 // Only re-issue the clip when the alias changed.
-                if (es.actionAlias && MirrorActionsEnabled() && MirrorAliasShouldApply(best, es.actionAlias)) {
+                if (es.actionAlias && MirrorActionsEnabled() && !(GuardAnimFullOn() && es.anim.valid)
+                    && MirrorAliasShouldApply(best, es.actionAlias)) {
                     if (bh && readable(bh, 4)) {
                         ActionComponent* ac = bh->GetActionComponent();
                         if (ac && readable(ac, 0x40) && MirrorActionsDeferred()) {
@@ -10185,7 +10322,7 @@ static void DumpConfigOnce()
         { "Coop", "EntityHost", 0 }, { "Coop", "EntitySelfTest", 0 }, { "Coop", "EntitySelfTestMax", 1 },
         { "Coop", "EntitySelfTestOffset", 0 }, { "Coop", "EntitySync", 0 }, { "Coop", "FixNullReturn", 1 },
         { "Coop", "ForceUnknownBuild", 0 }, { "Coop", "GhostMarkerSuppress", 1 }, { "Coop", "GhostProxy", 0 },
-        { "Coop", "GuardNullActionTarget", 0 }, { "Coop", "GuardNullTarget", 1 }, { "Coop", "GuardStaleReturn", 0 }, { "Coop", "GuardStaleTarget", 1 },
+        { "Coop", "GuardNullActionTarget", 0 }, { "Coop", "GuardNullTarget", 1 }, { "Coop", "GuardAnimFull", 0 }, { "Coop", "GuardStaleReturn", 0 }, { "Coop", "GuardStaleTarget", 1 },
         { "Coop", "GuestKillMirror", 1 }, { "Coop", "HookSgm", 1 }, { "Coop", "HostileOnly", 0 },
         { "Coop", "HybridLoco", 1 }, { "Coop", "IdentityBand", 0 }, { "Coop", "IdResolver", 1 },
         { "Coop", "InstallHooks", 1 }, { "Coop", "IntegratePuppet", 0 }, { "Coop", "KillTrace", 1 },
