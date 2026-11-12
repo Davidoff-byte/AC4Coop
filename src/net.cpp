@@ -37,8 +37,9 @@ namespace {
     // not up until WELCOME. While g_peerReady is 0, Send/SendEntities send nothing and RecvThread
     // accepts only lobby packets. In lobby mode g_peer can be rewritten by the recv thread (host
     // re-lock) while the game thread sends, so every read and write of it goes through g_peerLock.
-    // LM_LOBBY: [Net] Mode=lobby - bound and idle until the player picks Host or Join in the lobby panel
-    // (Net::StartHosting / Net::JoinByCode), which then switches g_mode once to LM_HOST or LM_JOIN. Until
+    // LM_LOBBY: [Net] Mode=lobby - bound and idle until Net::StartHosting / Net::JoinByCode (F8) switches g_mode
+    // once to LM_HOST or LM_JOIN (the in-game panel that offered Host/Join was removed; the launcher writes
+    // Mode=host / Mode=join itself, so lobby mode is only reached by a hand-edited ini). Until
     // then every lobby/relay/game datagram is ignored (the handlers test for LM_HOST / LM_JOIN exactly).
     enum LobbyMode { LM_MANUAL = 0, LM_HOST = 1, LM_JOIN = 2, LM_LOBBY = 3 };
     volatile LobbyMode g_mode = LM_MANUAL;
@@ -1196,7 +1197,7 @@ namespace {
         }
         m[sizeof(m) - 1] = 0; dbg(m);
         { char e[96]; _snprintf(e, sizeof(e), "[E] ev=lobby-host verdict=%s\n", verdict); e[sizeof(e) - 1] = 0; dbg(e); }
-        // For the status line / panel: when no code exists at all, say why instead of "getting code..." forever.
+        // For the status line: when no code exists at all, say why instead of "getting code..." forever.
         InterlockedExchangePointer((PVOID volatile*)&g_hostNote, (PVOID)(cIp ? "" : advice));
         InterlockedExchange(&g_hostDone, 1);
 
@@ -1446,7 +1447,7 @@ namespace {
 
 namespace {
     // Host mode setup: log the LAN and same-PC codes, then the host thread (relay room, UPnP, STUN).
-    // From Init (Mode=host) or from Net::StartHosting (Mode=lobby, the panel's Host button).
+    // From Init (Mode=host) or from Net::StartHosting (Mode=lobby).
     void BeginHosting(int bindPort) {
         char m[192];
         { char sm[160]; Stun::SelfTest(sm, sizeof(sm)); dbg(sm); }
@@ -1606,7 +1607,7 @@ bool Init() {
     } else if (g_mode == LM_LOBBY) {
         wsprintfA(m, "[Net] up: bound:%d mode=lobby%s%s\n", bindPort, g_relayName[0] ? " relay=" : "", g_relayName); dbg(m);
         g_bindPort = bindPort;
-        dbg("[Lobby] lobby mode: choose Host or Join in the AC4Coop panel (F6 shows it)\n");
+        dbg("[Lobby] lobby mode: copy a code and press F8 to join (hosting: use the launcher, or [Net] Mode=host)\n");
     } else {
         wsprintfA(m, "[Net] up: bound:%d mode=join%s%s\n", bindPort, g_relayName[0] ? " relay=" : "", g_relayName); dbg(m);
         g_bindPort = bindPort;
@@ -1645,7 +1646,7 @@ bool JoinByCode(const char* text, char* err, size_t errN) {
     if (InterlockedCompareExchange(&g_joinState, 0, 0) == 2) return fail("already connected to a host");
     uint32_t ip = 0; uint16_t port = 0;
     if (!text || !LobbyCode::Decode(text, &ip, &port)) return fail("that is not a valid code (12 characters, XXXX-XXXX-XXXX)");
-    if (g_mode == LM_LOBBY) { g_mode = LM_JOIN; MemoryBarrier(); dbg("[Lobby] panel: joining\n"); }
+    if (g_mode == LM_LOBBY) { g_mode = LM_JOIN; MemoryBarrier(); dbg("[Lobby] lobby mode -> joining\n"); }
     return BeginJoin(ip, port, err, errN);
 }
 
@@ -1656,7 +1657,7 @@ bool StartHosting(char* err, size_t errN) {
     if (g_mode == LM_JOIN) return fail("this game is joining; restart the game to host instead");
     if (g_mode != LM_LOBBY) return fail("hosting needs [Net] Mode=lobby (or host) in AC4Coop.ini");
     g_mode = LM_HOST; MemoryBarrier();
-    char m[96]; wsprintfA(m, "[Lobby] panel: hosting on port %d\n", g_bindPort); dbg(m);
+    char m[96]; wsprintfA(m, "[Lobby] lobby mode -> hosting on port %d\n", g_bindPort); dbg(m);
     BeginHosting(g_bindPort);
     return true;
 }
@@ -1672,7 +1673,7 @@ void LobbyStatus(char* out, size_t n) {
     if (!out || !n) return;
     out[0] = 0;
     if (!g_enabled || g_mode == LM_MANUAL) return;
-    if (g_mode == LM_LOBBY) { _snprintf(out, n, "choose Host or Join (F6: panel)"); out[n - 1] = 0; return; }
+    if (g_mode == LM_LOBBY) { _snprintf(out, n, "copy a code, press F8 to join"); out[n - 1] = 0; return; }
     char code[16];
     AcquireSRWLockShared(&g_codeLock);
     lstrcpynA(code, g_mode == LM_HOST ? g_hostCode : g_joinCodeText, sizeof(code));
