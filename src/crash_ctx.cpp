@@ -68,17 +68,22 @@ LONG CALLBACK Veh(EXCEPTION_POINTERS* ep)
     const EXCEPTION_RECORD* r = ep->ExceptionRecord;
     const CONTEXT* c = ep->ContextRecord;
     if (r->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) return EXCEPTION_CONTINUE_SEARCH;
-    // Execute faults only (ExceptionInformation[0] == 8). Read/write faults are raised and handled all the time by
-    // this plugin's own __try probes and must not be recorded or delayed.
-    if (r->NumberParameters < 2 || r->ExceptionInformation[0] != 8) return EXCEPTION_CONTINUE_SEARCH;
-    if (InterlockedExchange(&g_done, 1)) return EXCEPTION_CONTINUE_SEARCH;
+    // Execute faults, and read/write faults whose instruction is inside the game exe (the plugin's own __try probes
+    // fault inside the plugin, and never reach this). At most 3 records per process, one file each: the first
+    // fault inside an engine call is usually the interesting one even when a __try upstream swallows it.
+    if (r->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
+    const bool exec = r->ExceptionInformation[0] == 8;
+    if (!exec && !InExe((uintptr_t)r->ExceptionAddress)) return EXCEPTION_CONTINUE_SEARCH;
+    const LONG nrec = InterlockedIncrement(&g_done);
+    if (nrec > 3) return EXCEPTION_CONTINUE_SEARCH;
 
     char path[MAX_PATH];
-    wsprintfA(path, "%s\\AC4Coop_crashctx_%lu.txt", Paths::LogDir(), GetCurrentProcessId());
+    wsprintfA(path, "%s\\AC4Coop_crashctx_%lu_%ld.txt", Paths::LogDir(), GetCurrentProcessId(), nrec);
     g_file = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (g_file == INVALID_HANDLE_VALUE) return EXCEPTION_CONTINUE_SEARCH;
 
-    wsprintfA(g_line, "[CrashCtx] execute fault addr=%08X tid=%lu tick=%lu exe=%08X..%08X asi=%08X..%08X\r\n",
+    wsprintfA(g_line, "[CrashCtx] %s fault eip=%08X data=%08X tid=%lu tick=%lu exe=%08X..%08X asi=%08X..%08X\r\n",
+              exec ? "execute" : (r->ExceptionInformation[0] == 1 ? "write" : "read"), (unsigned)(uintptr_t)r->ExceptionAddress,
               (unsigned)r->ExceptionInformation[1], GetCurrentThreadId(), GetTickCount(),
               (unsigned)g_exeLo, (unsigned)g_exeHi, (unsigned)g_asiLo, (unsigned)g_asiHi);
     Out(g_line);

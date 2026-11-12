@@ -5826,6 +5826,16 @@ static bool OwnPuppetOn() { return OwnFlag("OwnUpdatePuppet", &s_ownP, &s_ownPNe
 static int s_gaOn = 0; static uint64_t s_gaNext = 0;
 static bool GuardAnimFullOn() { return OwnFlag("GuardAnimFull", &s_gaOn, &s_gaNext) != 0; }
 static volatile LONG s_gaSwitch = 0, s_gaReassert = 0, s_gaBlendFix = 0, s_gaFactorWrites = 0;
+// [Coop] GuardBlendFix (default 0; live): the blend-in descriptor copy. CRASH 2026-11-12 18:41 (build 22515964,
+// 9 s after GuardAnimFull=1, 17 blend fixes in the window): AV at 0x006855D1 in sub_685360, which tests the blend
+// node's type bits (node+0xFC == evaluator+0x1DC, the field the fix writes) and, when non-zero, reads
+// [[node+0x104]+0x90] - node+0x104 was 0. The puppet's rule upgrades "no blend" (type 0) to AROLLBROLL (1); on a
+// node the engine set up without a blend that pointer may never be linked. UNVERIFIED (the dump holds no heap).
+// So when on, the guard fix only adjusts a blend the engine already set up (node type != 0 and host type != 0) and
+// keeps the node's own type bits.
+static int s_gbfOn = 0; static uint64_t s_gbfNext = 0;
+static bool GuardBlendFixOn() { return OwnFlag("GuardBlendFix", &s_gbfOn, &s_gbfNext) != 0; }
+static volatile LONG s_gaFaults = 0, s_gaBanned = 0;
 static volatile LONG s_phFrames = 0, s_phOk = 0;
 
 // [Coop] OwnPhysicsMs (default 0 = render-only writes, physics only on placement / >5 m jumps): in own-update
@@ -5877,6 +5887,7 @@ struct GaState {
     uint64_t factorUs;                           // last blend factor / time scale write
     uint32_t bfAlias; float bfLen, bfSfe, bfTgt; uint16_t bfFlags; uint8_t bfWait;   // blend-in fix, as the puppet's
     uint8_t  zeroSlots[BLEND_MAX];              // slots we set non-zero last time (zeroed when they drop out)
+    uint8_t  banned;                            // a fault happened inside the apply for this body: never again
 };
 struct OwnBody {
     unsigned int human, ent;
@@ -5990,9 +6001,12 @@ static bool OwnStarved(Human* h) {
     return starved;
 }
 
-// Runs on the body's own update. `o` is a copy; the caller writes o.ga back.
-static void GuardAnimApply(Human* h, OwnBody& o, uint64_t now) {
+// Runs on the body's own update. `o` is a copy; the caller writes o.ga back. *step names the engine call in flight
+// (for the fault log): 1 GetActionComponent/GetCurrentAction, 2 SetTargetAction, 3 SetCurrentActionRatio,
+// 4 blend-in fix, 5 GetCurrentEvaluator/GetBlendFactorCount, 6 SetBlendFactor*, 7 SetTimeScale*, 8 phase probe.
+static void GuardAnimApply(Human* h, OwnBody& o, uint64_t now, volatile int* step) {
     const GuardAnim& g = o.anim;
+    *step = 1;
     ActionComponent* ac = h->GetActionComponent();
     if (!readable(ac, 0x40)) return;
     GaState& st = o.ga;
@@ -6005,10 +6019,12 @@ static void GuardAnimApply(Human* h, OwnBody& o, uint64_t now) {
     if (o.alias && curAlias != o.alias) {
         const bool newTarget = st.issuedAlias != o.alias;
         if (newTarget || now - st.issuedUs > 250000) {
+            *step = 2;
             ac->SetTargetAction((int)o.alias, 0, 0, (int)g.channel, (int)g.layer);
+            *step = 3;
             if (g_seekOnSwitch && hostRatio > 0.0f && hostRatio < 1.0f)
                 ac->SetCurrentActionRatio(hostRatio, 0, false, false, ACTLAYER_PRIMARY);
-            if (g.blendInMs >= 0) {
+            if (g.blendInMs >= 0 && GuardBlendFixOn()) {
                 st.bfAlias = o.alias; st.bfLen = g.blendInMs / 1000.0f; st.bfSfe = g.blendInStartFromEnd;
                 st.bfTgt = g.blendInTargetStart; st.bfFlags = g.blendInFlags; st.bfWait = 10;
             }
@@ -6018,18 +6034,16 @@ static void GuardAnimApply(Human* h, OwnBody& o, uint64_t now) {
     }
     // ---- blend-in fix (same checks and writes as the puppet's, ApplyRemoteState ~1886-1940) ----
     if (st.bfWait > 0) {
+        *step = 4;
         char* ev = (char*)ac->GetCurrentEvaluator(0, ACTLAYER_PRIMARY);
         void* evAct = (readable(ev, 0x2C0) && *(uint8_t*)(ev + 0xD4) == 4) ? *(void**)(ev + 0x2A8) : nullptr;
         if (readable(evAct, 0x0C) && *(uint32_t*)((char*)evAct + 8) == st.bfAlias && *(uint8_t*)(ev + 0x258) == 0) {
             const float t = *(float*)(ev + 0xE0);
             const uint16_t wasFl = *(uint16_t*)(ev + 0x1DC);
             uint16_t fl = st.bfFlags; float len = st.bfLen;
-            if ((fl & 7) == 6) fl = (uint16_t)((fl & ~7) | 1);
-            bool write = true;
-            if ((fl & 7) == 0) {
-                if ((wasFl & 7) != 0 || g_minBlendIn <= 0.0f) write = false;
-                else { fl = (uint16_t)((fl & ~7) | 1); len = g_minBlendIn; }
-            }
+            // Never change "no blend" into a blend, nor one blend type into another: only adjust an existing blend.
+            bool write = (fl & 7) != 0 && (wasFl & 7) != 0;
+            fl = (uint16_t)((fl & ~7) | (wasFl & 7));
             if (write && t < len) {
                 char* evNow = (char*)ac->GetCurrentEvaluator(0, ACTLAYER_PRIMARY);
                 if (evNow == ev && readable(ev, 0x2C0) && *(uint8_t*)(ev + 0x258) == 0) {
@@ -6045,6 +6059,7 @@ static void GuardAnimApply(Human* h, OwnBody& o, uint64_t now) {
     }
     // ---- blend factors + time scale (persistent), only while the body plays the host's action ----
     if (o.alias && curAlias == o.alias) {
+        *step = 5;
         void* ev = ac->GetCurrentEvaluator(0, ACTLAYER_PRIMARY);
         const bool evNew = ev != st.lastEv;
         st.lastEv = ev;
@@ -6053,6 +6068,7 @@ static void GuardAnimApply(Human* h, OwnBody& o, uint64_t now) {
         if (evNew || o.animUs > st.factorUs || (st.frameN & 3) == 0) {
             const int pn = ac->GetBlendFactorCount(0, ACTLAYER_PRIMARY);
             uint8_t now8[BLEND_MAX] = {};
+            *step = 6;
             for (uint8_t k = 0; k < g.nBlend; ++k) {
                 const int slot = g.blendSlot[k];
                 if (slot >= pn || slot >= BLEND_MAX) continue;
@@ -6067,6 +6083,7 @@ static void GuardAnimApply(Human* h, OwnBody& o, uint64_t now) {
                 }
             std::memcpy(st.zeroSlots, now8, sizeof(now8));
             const float ts = g.timeScaleQ / 256.0f;
+            *step = 7;
             if (ts > 0.01f) {
                 ac->SetTimeScalePersistence(ACTPERSIST_ALWAYS, 0, ACTLAYER_PRIMARY);
                 ac->SetTimeScale(ts, 0, ACTLAYER_PRIMARY, false);
@@ -6076,6 +6093,7 @@ static void GuardAnimApply(Human* h, OwnBody& o, uint64_t now) {
         }
         // O2 phase probe: only within 60 ms of the host sample (the ratio moves while it ages)
         if (now - o.animUs < 60000) {
+            *step = 8;
             float d = ac->GetCurrentActionRatio(0, ACTLAYER_PRIMARY) - hostRatio;
             if (d < 0) d = -d;
             if (d > 0.5f) d = 1.0f - d;                 // looping clips wrap
@@ -6083,6 +6101,15 @@ static void GuardAnimApply(Human* h, OwnBody& o, uint64_t now) {
             if (d < 0.05f) InterlockedIncrement(&s_phOk);
         }
     }
+}
+
+static int GaFilter(EXCEPTION_POINTERS* ep, uintptr_t* at, uintptr_t* data, uint32_t* rw) {
+    *at = (uintptr_t)ep->ExceptionRecord->ExceptionAddress;
+    if (ep->ExceptionRecord->NumberParameters >= 2) {
+        *rw = (uint32_t)ep->ExceptionRecord->ExceptionInformation[0];
+        *data = (uintptr_t)ep->ExceptionRecord->ExceptionInformation[1];
+    }
+    return EXCEPTION_EXECUTE_HANDLER;
 }
 
 static void OwnNoteMove(bool guard, float d) {
@@ -6173,8 +6200,20 @@ static void OwnDrain(Human* h) {
         InterlockedIncrement(&s_gActFrames);
         if (curAlias != o.alias) InterlockedIncrement(&s_gActMis);
     }
-    if (GuardAnimFullOn() && o.anim.valid) {
-        GuardAnimApply(h, o, now);
+    if (GuardAnimFullOn() && o.anim.valid && !o.ga.banned) {
+        volatile int step = 0; uintptr_t excAt = 0, excData = 0; uint32_t excRw = 0;
+        bool faulted = false;
+        __try { GuardAnimApply(h, o, now, &step); }
+        __except (GaFilter(GetExceptionInformation(), &excAt, &excData, &excRw)) { faulted = true; }
+        if (faulted) {
+            o.ga.banned = 1;
+            const LONG nf = InterlockedIncrement(&s_gaFaults);
+            InterlockedIncrement(&s_gaBanned);
+            if (nf <= 50)
+                L("[GuardAnim] FAULT step=%d at=%08X %s %08X ent=%08X alias=%u ch=%u ly=%d nBlend=%u bf=%d -> body banned\n",
+                  (int)step, (unsigned)excAt, excRw == 1 ? "write" : excRw == 8 ? "exec" : "read", (unsigned)excData,
+                  o.ent, o.alias, (unsigned)o.anim.channel, (int)o.anim.layer, (unsigned)o.anim.nBlend, s_gbfOn);
+        }
         AcquireSRWLockExclusive(&s_ownLock);
         const int ja = OwnFind(key);
         if (ja >= 0) s_own[ja].ga = o.ga;
@@ -6259,8 +6298,8 @@ static void OwnReport() {
         const LONG sw = InterlockedExchange(&s_gaSwitch, 0), ra = InterlockedExchange(&s_gaReassert, 0);
         const LONG bf = InterlockedExchange(&s_gaBlendFix, 0), fw = InterlockedExchange(&s_gaFactorWrites, 0);
         const LONG phf = InterlockedExchange(&s_phFrames, 0), pho = InterlockedExchange(&s_phOk, 0);
-        L("[GuardAnim] full=%d switches=%ld reassert=%ld blendFix=%ld factorWrites=%ld | phase frames=%ld ok=%ld (%.1f%%)\n",
-          s_gaOn, sw, ra, bf, fw, phf, pho, phf ? 100.0 * pho / phf : 0.0);
+        L("[GuardAnim] full=%d blendFixOn=%d switches=%ld reassert=%ld blendFix=%ld factorWrites=%ld faults=%ld bannedTotal=%ld | phase frames=%ld ok=%ld (%.1f%%)\n",
+          s_gaOn, s_gbfOn, sw, ra, bf, fw, InterlockedExchange(&s_gaFaults, 0), (long)s_gaBanned, phf, pho, phf ? 100.0 * pho / phf : 0.0);
     }
     L("[OwnAir] physMs=%d physWrites=%ld | ctx frames=%ld ground=%ld air=%ld (%.1f%%) other=%ld (last id %ld) | moving frames=%ld "
       "actMatch=%ld actMis=%ld (%.1f%%) top body<-host:%s\n",
@@ -10322,7 +10361,7 @@ static void DumpConfigOnce()
         { "Coop", "EntityHost", 0 }, { "Coop", "EntitySelfTest", 0 }, { "Coop", "EntitySelfTestMax", 1 },
         { "Coop", "EntitySelfTestOffset", 0 }, { "Coop", "EntitySync", 0 }, { "Coop", "FixNullReturn", 1 },
         { "Coop", "ForceUnknownBuild", 0 }, { "Coop", "GhostMarkerSuppress", 1 }, { "Coop", "GhostProxy", 0 },
-        { "Coop", "GuardNullActionTarget", 0 }, { "Coop", "GuardNullTarget", 1 }, { "Coop", "GuardAnimFull", 0 }, { "Coop", "GuardStaleReturn", 0 }, { "Coop", "GuardStaleTarget", 1 },
+        { "Coop", "GuardNullActionTarget", 0 }, { "Coop", "GuardNullTarget", 1 }, { "Coop", "GuardAnimFull", 0 }, { "Coop", "GuardBlendFix", 0 }, { "Coop", "GuardStaleReturn", 0 }, { "Coop", "GuardStaleTarget", 1 },
         { "Coop", "GuestKillMirror", 1 }, { "Coop", "HookSgm", 1 }, { "Coop", "HostileOnly", 0 },
         { "Coop", "HybridLoco", 1 }, { "Coop", "IdentityBand", 0 }, { "Coop", "IdResolver", 1 },
         { "Coop", "InstallHooks", 1 }, { "Coop", "IntegratePuppet", 0 }, { "Coop", "KillTrace", 1 },
