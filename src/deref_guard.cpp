@@ -251,6 +251,11 @@ volatile LONG g_staleHits = 0;
 volatile LONG g_staleNode = 0;
 LONG          g_staleLogged = 0;
 
+// Part C2 ([Coop] GuardStaleReturn): the object sub_733FB0 RETURNED at 0x006817FA carried a vtable outside the
+// module image. Counted by the trampoline with one `lock inc`, reported by the reporter thread.
+volatile LONG g_staleRetHits = 0;
+LONG          g_staleRetLogged = 0;
+
 // Site VAs as resolved in Init(), for the reporter's log lines (the site table itself holds offsets).
 uintptr_t     g_siteVa[SITE_COUNT];
 uintptr_t     g_staleVa = 0;
@@ -311,6 +316,15 @@ void DrainCounters()
 
         if (emit)
             Log("[DG] stale target at site 0x%08X node=%p\n", (unsigned)g_staleVa, (void*)node);
+    }
+
+    // Part C2: stale object returned to AnimNode_Reset (0x006817FA). First 20, then every 500.
+    if (g_staleRetHits) {
+        const LONG hits = g_staleRetHits;
+        if ((g_staleRetLogged < 20 && hits > g_staleRetLogged) || hits >= g_staleRetLogged + 500) {
+            g_staleRetLogged = hits;
+            Log("[NR] stale object returned at 0x006817FA: reset skipped, hits=%ld\n", (long)hits);
+        }
     }
 }
 
@@ -781,6 +795,51 @@ static bool PatchCallWithJump(BYTE* at, const void* target)
     return true;
 }
 
+// Part C2, [Coop] GuardStaleReturn=1 (default 0 until it has been seen to fire and survive in a game).
+//
+// EVIDENCE (crash 2026-11-12 15:58, build 949810E4, dump AC4BFSP.exe.29764.dmp): EIP=0x448A4BF8 (heap), return
+// address on the stack 0x00681817, EDI=ECX=0x4486F560, EDX=0x4486F558, EAX=EIP. That is exactly
+//   0068180E  mov edx,[edi]      ; "vtable" of the object sub_733FB0 returned = 0x4486F558, a heap address
+//   00681810  mov eax,[edx+18h]
+//   00681813  mov ecx,edi
+//   00681815  call eax           ; -> heap
+// (IDA disassembly of AnimNode_Reset 0x6817C0). sub_733FB0 returns its own argument when byte [arg+0xD4] == 4, so
+// the freed object is [esi+0x114] itself - the same node (ESI=0x445341B0) Part B had just reported as
+// "stale target at site 0x006795FD". The puppet had been removed from the world a moment earlier.
+//
+// The wrap below is Part C plus one test: a non-NULL return whose first dword is not inside the module image is
+// treated like NULL (leave through the function's own epilogue). EDX is free: it is caller-saved across the call
+// and the engine reloads it at 0x0068180E / overwrites DL at 0x0068184F before any read.
+//
+//   00  E8 <rel32>           call sub_733FB0
+//   05  85 C0                test eax,eax
+//   07  74 1E                jz   bail            (+0x27)
+//   09  8B 10                mov  edx,[eax]
+//   0B  81 FA <lo>           cmp  edx,imageBase
+//   11  72 0D                jb   stale           (+0x20)
+//   13  81 FA <hi>           cmp  edx,imageBase+imageSize
+//   19  73 05                jae  stale           (+0x20)
+//   1B  E9 <rel32>           jmp  0x006817FF      ; valid -> resume at `mov edi,eax`
+//   20  F0 FF 05 <addr>      lock inc dword ptr [g_staleRetHits]
+//   27  E9 <rel32>           jmp  0x006818E6      ; pop edi/ebx/esi; mov esp,ebp; pop ebp; retn
+static const size_t NR2_TRAMP_SIZE = 0x2C;
+
+static void BuildStaleReturnTramp(BYTE* t, uintptr_t callee, uintptr_t cont, uintptr_t epilogue)
+{
+    t[0x00] = 0xE8; *reinterpret_cast<int32_t*>(t + 0x01) = Rel32(t + 0x05, (const void*)callee);
+    t[0x05] = 0x85; t[0x06] = 0xC0;
+    t[0x07] = 0x74; t[0x08] = 0x1E;
+    t[0x09] = 0x8B; t[0x0A] = 0x10;
+    t[0x0B] = 0x81; t[0x0C] = 0xFA; *reinterpret_cast<uint32_t*>(t + 0x0D) = (uint32_t)g_imageBase;
+    t[0x11] = 0x72; t[0x12] = 0x0D;
+    t[0x13] = 0x81; t[0x14] = 0xFA; *reinterpret_cast<uint32_t*>(t + 0x15) = (uint32_t)(g_imageBase + g_imageSize);
+    t[0x19] = 0x73; t[0x1A] = 0x05;
+    t[0x1B] = 0xE9; *reinterpret_cast<int32_t*>(t + 0x1C) = Rel32(t + 0x20, (const void*)cont);
+    t[0x20] = 0xF0; t[0x21] = 0xFF; t[0x22] = 0x05;
+    *reinterpret_cast<uint32_t*>(t + 0x23) = (uint32_t)(uintptr_t)&g_staleRetHits;
+    t[0x27] = 0xE9; *reinterpret_cast<int32_t*>(t + 0x28) = Rel32(t + 0x2C, (const void*)epilogue);
+}
+
 static bool InstallNullReturnFix(uintptr_t moduleBase)
 {
     const uintptr_t site     = VaLiteral(moduleBase, LITERAL_NR_SITE);
@@ -811,13 +870,26 @@ static bool InstallNullReturnFix(uintptr_t moduleBase)
 
     Log("[NR] site 0x%08X call -> 0x%08X verified\n", (unsigned)site, (unsigned)callee);
 
-    BYTE* cave = AllocCaveNear(site, NR_TRAMP_SIZE + 16, "null-return");
+    const bool staleReturn = GetPrivateProfileIntA("Coop", "GuardStaleReturn", 0, Paths::Ini()) != 0;
+    BYTE* cave = AllocCaveNear(site, NR2_TRAMP_SIZE + 16, "null-return");
     if (!cave) {
         Log("[NR] install FAILED: no cave within rel32 range\n");
         return false;
     }
 
     BYTE* t = cave;
+    if (staleReturn) {
+        BuildStaleReturnTramp(t, callee, cont, epilogue);
+        FlushInstructionCache(GetCurrentProcess(), cave, NR2_TRAMP_SIZE);
+        if (!PatchCallWithJump((BYTE*)site, cave)) {
+            Log("[NR] install FAILED: patch of 0x%08X failed\n", (unsigned)site);
+            return false;
+        }
+        Log("[NR] trampoline 0x%08X (cave) installed with GuardStaleReturn: NULL or a vtable outside "
+            "0x%08X..0x%08X returns via 0x%08X\n", (unsigned)(uintptr_t)cave, (unsigned)g_imageBase,
+            (unsigned)(g_imageBase + g_imageSize), (unsigned)epilogue);
+        return true;
+    }
     t[0] = 0xE8;                                              // call sub_733FB0
     *reinterpret_cast<int32_t*>(t + 1) = Rel32(t + 5, (const void*)callee);
     t[5] = 0x85; t[6] = 0xC0;                                 // test eax,eax

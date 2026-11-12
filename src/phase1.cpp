@@ -9636,14 +9636,14 @@ static void DumpConfigOnce()
         { "Coop", "EntityHost", 0 }, { "Coop", "EntitySelfTest", 0 }, { "Coop", "EntitySelfTestMax", 1 },
         { "Coop", "EntitySelfTestOffset", 0 }, { "Coop", "EntitySync", 0 }, { "Coop", "FixNullReturn", 1 },
         { "Coop", "ForceUnknownBuild", 0 }, { "Coop", "GhostMarkerSuppress", 1 }, { "Coop", "GhostProxy", 0 },
-        { "Coop", "GuardNullActionTarget", 0 }, { "Coop", "GuardNullTarget", 1 }, { "Coop", "GuardStaleTarget", 1 },
+        { "Coop", "GuardNullActionTarget", 0 }, { "Coop", "GuardNullTarget", 1 }, { "Coop", "GuardStaleReturn", 0 }, { "Coop", "GuardStaleTarget", 1 },
         { "Coop", "GuestKillMirror", 1 }, { "Coop", "HookSgm", 1 }, { "Coop", "HostileOnly", 0 },
         { "Coop", "HybridLoco", 1 }, { "Coop", "IdentityBand", 0 }, { "Coop", "IdResolver", 1 },
         { "Coop", "InstallHooks", 1 }, { "Coop", "IntegratePuppet", 0 }, { "Coop", "KillTrace", 1 },
         { "Coop", "KrLog", 0 }, { "Coop", "LegacyPadIdHook", 1 }, { "Coop", "MinBlendInMs", 100 },
         { "Coop", "NetStrictPeer", 1 }, { "Coop", "NullReturnObserver", 1 }, { "Coop", "Probe", 0 },
         { "Coop", "PuppetParkX", 0 }, { "Coop", "PuppetPhysics", 0 }, { "Coop", "RegisterPad1", 0 },
-        { "Coop", "RelevanceRadiusM", 250 }, { "Coop", "ReloadBuilder", 1 }, { "Coop", "SceneAware", 1 },
+        { "Coop", "RelevanceRadiusM", 250 }, { "Coop", "ReloadBuilder", 1 }, { "Coop", "SceneAwareExact", 0 },
         { "Coop", "SeekOnSwitch", 1 }, { "Coop", "SkelAttach", 0 }, { "Coop", "ShipDump", 0 }, { "Coop", "ShipDumpFloats", 0 },
         { "Coop", "ShipGhost", 0 }, { "Coop", "ShipGhostSelfTest", 0 }, { "Coop", "ShipHPSync", 0 },
         { "Coop", "ShipPassenger", 0 }, { "Coop", "ShipRelevanceRadiusM", 1000 }, { "Coop", "ShipSync", 1 },
@@ -9708,7 +9708,14 @@ static void OnFrameInner(Human* updatedHuman) {
     if (!s_netStarted) {
         s_netStarted    = true;
         s_netStrictPeer = GetPrivateProfileIntA("Coop", "NetStrictPeer", 1, Paths::Ini());
-        s_sceneAware    = GetPrivateProfileIntA("Coop", "SceneAware",    1, Paths::Ini());
+        // The gate is keyed on the terrain cell the player stands in, and that cell is 2 m (measured 2026-11-12:
+        // a host walking 41.5 m in x produced 26 distinct keys, and key 000F6C25 decodes to cell (37,-37,0) at
+        // position (76,-74,1.8)). With the gate on, the peer's puppet was hidden - and after 3 s despawned -
+        // whenever the two players were not inside the same 2 m cube. It never separated interiors as intended.
+        // So the old key [Coop] SceneAware is NO LONGER READ (every deployed ini has it at 1); the exact-cell
+        // gate is only available as [Coop] SceneAwareExact=1, for A/B.
+        s_sceneAware    = GetPrivateProfileIntA("Coop", "SceneAwareExact", 0, Paths::Ini());
+        L("[Net] scene gate: SceneAwareExact=%d ([Coop] SceneAware is ignored: its cells are 2 m)\n", s_sceneAware);
         s_shipPassenger = GetPrivateProfileIntA("Coop", "ShipPassenger", 0, Paths::Ini());
         s_shipGhost     = GetPrivateProfileIntA("Coop", "ShipGhost",     0, Paths::Ini());
         s_ghostSelfTest = GetPrivateProfileIntA("Coop", "ShipGhostSelfTest", 0, Paths::Ini());
