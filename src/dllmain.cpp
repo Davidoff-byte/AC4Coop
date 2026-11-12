@@ -22,6 +22,7 @@
 #include "net.h"
 #include "lobby_ui.h"
 #include "ui_probe.h"
+#include "video_hook.h"
 #include "action_guard.h"
 #include "deref_guard.h"
 #include "combat_observe.h"
@@ -249,6 +250,9 @@ static bool HookGate(const char* key)
 
 static unsigned __stdcall PollThread(void*)
 {
+    // First thing: the boot videos start early. [Coop] VideoLog / SkipIntroVideos only (both default 0).
+    VideoHook::Install();
+
     char leaf[64];
     wsprintfA(leaf, "phase0_log_%u.txt", GetCurrentProcessId());
     char logPath[MAX_PATH];

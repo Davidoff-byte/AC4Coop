@@ -126,6 +126,9 @@
     <ClCompile Include="src\ui_probe.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="src\video_hook.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="src\net.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -154,6 +157,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\ui_probe.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\video_hook.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\net.h">
