@@ -13,6 +13,7 @@
 #include <commdlg.h>
 #include <bcrypt.h>
 #include <d3d11.h>
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -36,7 +37,7 @@ namespace {
 // ---------------------------------------------------------------- settings + args
 struct Args {
     std::string gameDir, name, relay, autoJoin, report, shot, payload;
-    int port = 0, autoStart = 0, exitAfter = 0;
+    int port = 0, autoStart = 0, exitAfter = 0, cycles = 1;
     bool noLaunch = false, autoHost = false, noUpnp = false, noStun = false, autoInstall = false;
 } A;
 
@@ -52,6 +53,14 @@ void LoadSettings() {
     if (!g_name[0]) { DWORD n = sizeof(g_name); if (!GetUserNameA(g_name, &n)) lstrcpyA(g_name, "Player"); g_name[Party::kNameLen - 1] = 0; }
     GetPrivateProfileStringA("Launcher", "RelayServer", "", g_relay, sizeof(g_relay), g_settings);
     g_port = GetPrivateProfileIntA("Launcher", "Port", 47801, g_settings);
+}
+// launcher_log.txt next to the exe: what the launcher did on Start / Install, for diagnosing a party remotely.
+void LogLine(const char* fmt, ...) {
+    char path[MAX_PATH]; _snprintf(path, MAX_PATH, "%s\\launcher_log.txt", g_exeDir);
+    FILE* f = fopen(path, "a"); if (!f) return;
+    SYSTEMTIME t; GetLocalTime(&t);
+    fprintf(f, "%04u-%02u-%02u %02u:%02u:%02u ", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+    va_list ap; va_start(ap, fmt); vfprintf(f, fmt, ap); va_end(ap); fputc('\n', f); fclose(f);
 }
 void SaveSettings() {
     if (!A.gameDir.empty()) return;   // test runs never overwrite the user's launcher.ini
@@ -153,7 +162,9 @@ bool Install() {
     }
     const std::string ini = Join(g_gameDir, "AC4Coop.ini"), tpl = Join(PayloadDir().c_str(), "AC4Coop.ini");
     if (!FileExists(ini) && FileExists(tpl)) CopyFileA(tpl.c_str(), ini.c_str(), TRUE);   // never overwrite the player's ini
-    g_installMsg = "Installed."; CheckGame(); return true;
+    g_installMsg = "Installed."; CheckGame();
+    LogLine("installed into %s (asi %.8s)", g_gameDir, G.asiSha.c_str());
+    return true;
 }
 
 // ---------------------------------------------------------------- start: write the game's ini, launch it
@@ -317,7 +328,7 @@ void ParseArgs() {
         if (a == "--game-dir") A.gameDir = next(); else if (a == "--name") A.name = next(); else if (a == "--relay") A.relay = next();
         else if (a == "--auto-join") A.autoJoin = next(); else if (a == "--report") A.report = next(); else if (a == "--shot") A.shot = next();
         else if (a == "--payload") A.payload = next(); else if (a == "--port") A.port = atoi(next().c_str());
-        else if (a == "--auto-start") A.autoStart = atoi(next().c_str()); else if (a == "--exit-after") A.exitAfter = atoi(next().c_str());
+        else if (a == "--auto-start") A.autoStart = atoi(next().c_str()); else if (a == "--cycles") A.cycles = atoi(next().c_str()); else if (a == "--exit-after") A.exitAfter = atoi(next().c_str());
         else if (a == "--no-launch") A.noLaunch = true; else if (a == "--auto-host") A.autoHost = true;
         else if (a == "--no-upnp") A.noUpnp = true; else if (a == "--no-stun") A.noStun = true;
         else if (a == "--auto-install") A.autoInstall = true;
@@ -362,6 +373,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int) {
 
     const ULONGLONG t0 = GetTickCount64();
     bool autoDone = false, shotDone = false, startHandled = false;
+    ULONGLONG startedAt = 0;
     bool done = false;
     while (!done) {
         MSG msg;
@@ -380,14 +392,26 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int) {
         }
         if (A.autoStart && s.isHost && s.phase == PartyNet::HOSTING && s.count >= A.autoStart) PartyNet::StartGame();
 
-        // START (host clicked it, or it arrived from the host): configure and launch this game, once.
+        // START (host clicked it, or it arrived from the host): configure and launch this game, once per party.
+        // Re-armed whenever the party leaves STARTED (Leave / Close party / a new Host or Join): it used to be
+        // once per launcher run, so a second party in the same window sent START to the guests but never wrote
+        // this game's ini or launched it (found in the first in-game test, 2026-11-12).
+        if (s.phase != PartyNet::STARTED && startHandled) { startHandled = false; g_launched = false; g_launchMsg.clear(); g_iniWritten.clear(); }
         if (s.phase == PartyNet::STARTED && !startHandled) {
             startHandled = true;
+            LogLine("START received (%s), code %s, game folder %s", s.isHost ? "host" : "guest", s.start.joinCode, g_gameDir);
             if (WriteGameIni(s)) {
+                LogLine("ini written: %s", g_iniWritten.c_str());
                 if (s.isHost) Sleep(800);       // let the START repeats go out before the port changes owner
                 PartyNet::Shutdown();           // the game binds this port next
                 g_launched = LaunchGame();
             }
+            LogLine("launch: %s", g_launchMsg.c_str());
+            startedAt = GetTickCount64();
+        }
+        // Test only (--cycles N): 3 s after a START was handled, leave and run the party again in this same window.
+        if (startHandled && A.cycles > 1 && startedAt && GetTickCount64() - startedAt > 3000) {
+            --A.cycles; startedAt = 0; PartyNet::Leave(); autoDone = false; LogLine("test: next party cycle (%d left)", A.cycles);
         }
         static ULONGLONG lastReport = 0;
         if (!A.report.empty() && GetTickCount64() - lastReport > 1000) { lastReport = GetTickCount64(); Report(s); }
