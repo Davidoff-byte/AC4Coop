@@ -42,8 +42,10 @@ namespace Net {
     // reject (a benign reorder is normal on a well-formed link), so it is counted separately and
     // excluded from `rejects` exactly as DEC_PENDING is.
     // ---- lobby mode (docs/design/lobby-code.md) ----
-    // 0 manual, 1 host, 2 join ([Net] Mode). Valid after Init.
+    // 0 manual, 1 host, 2 join, 3 lobby (not chosen yet) ([Net] Mode). Valid after Init.
     int      LobbyMode();
+    // Lobby mode only: become the host (relay room / UPnP / STUN, codes). False + err otherwise.
+    bool     StartHosting(char* err, size_t errN);
     // Join mode only: decode `text` (a pasted code) and start joining that host. False + err when the
     // code is invalid, the mode is not join, or a host is already connected.
     bool     JoinByCode(const char* text, char* err, size_t errN);

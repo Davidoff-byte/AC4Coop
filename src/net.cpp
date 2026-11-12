@@ -37,8 +37,11 @@ namespace {
     // not up until WELCOME. While g_peerReady is 0, Send/SendEntities send nothing and RecvThread
     // accepts only lobby packets. In lobby mode g_peer can be rewritten by the recv thread (host
     // re-lock) while the game thread sends, so every read and write of it goes through g_peerLock.
-    enum LobbyMode { LM_MANUAL = 0, LM_HOST = 1, LM_JOIN = 2 };
-    LobbyMode          g_mode = LM_MANUAL;
+    // LM_LOBBY: [Net] Mode=lobby - bound and idle until the player picks Host or Join in the lobby panel
+    // (Net::StartHosting / Net::JoinByCode), which then switches g_mode once to LM_HOST or LM_JOIN. Until
+    // then every lobby/relay/game datagram is ignored (the handlers test for LM_HOST / LM_JOIN exactly).
+    enum LobbyMode { LM_MANUAL = 0, LM_HOST = 1, LM_JOIN = 2, LM_LOBBY = 3 };
+    volatile LobbyMode g_mode = LM_MANUAL;
     SRWLOCK            g_peerLock = SRWLOCK_INIT;
     volatile LONG      g_peerReady = 1;
     uint32_t           g_joinNonce = 0;       // join: this attempt's nonce (WELCOME must echo it)
@@ -1422,6 +1425,30 @@ namespace {
     }
 }
 
+namespace {
+    // Host mode setup: log the LAN and same-PC codes, then the host thread (relay room, UPnP, STUN).
+    // From Init (Mode=host) or from Net::StartHosting (Mode=lobby, the panel's Host button).
+    void BeginHosting(int bindPort) {
+        char m[192];
+        { char sm[160]; Stun::SelfTest(sm, sizeof(sm)); dbg(sm); }
+        uint32_t lan = 0;
+        if (Upnp::DefaultRouteIPv4(&lan)) {
+            char code[15] = {0}; LobbyCode::Encode(lan, (uint16_t)bindPort, code);
+            _snprintf(m, sizeof(m), "[Lobby] host LAN code %s (%u.%u.%u.%u:%d) - same network only\n", code,
+                      lan >> 24, (lan >> 16) & 0xFF, (lan >> 8) & 0xFF, lan & 0xFF, bindPort);
+            m[sizeof(m) - 1] = 0; dbg(m);
+            SetHostCode(code);   // until the host thread finds an internet code
+        } else {
+            dbg("[Lobby] host LAN address not found (no IPv4 route) - no LAN code\n");
+        }
+        char loop[15] = {0}; LobbyCode::Encode(0x7F000001u, (uint16_t)bindPort, loop);
+        _snprintf(m, sizeof(m), "[Lobby] host same-PC code %s (127.0.0.1:%d)\n", loop, bindPort);
+        m[sizeof(m) - 1] = 0; dbg(m);
+        g_bindPort = bindPort;
+        _beginthreadex(nullptr, 0, HostThread, nullptr, 0, nullptr);   // relay + UPnP + STUN, off the game thread
+    }
+}
+
 namespace Net {
 
 bool BeginJoin(uint32_t ip, uint16_t port, char* err, size_t errN);   // below Init
@@ -1441,6 +1468,7 @@ bool Init() {
     g_mode = LM_MANUAL;
     if (_stricmp(modeStr, "host") == 0) g_mode = LM_HOST;
     else if (_stricmp(modeStr, "join") == 0) g_mode = LM_JOIN;
+    else if (_stricmp(modeStr, "lobby") == 0) g_mode = LM_LOBBY;
     else if (_stricmp(modeStr, "manual") != 0) {
         char m[96]; _snprintf(m, sizeof(m), "[Lobby] unknown [Net] Mode=%s, using manual\n", modeStr); m[sizeof(m) - 1] = 0; dbg(m);
     }
@@ -1488,7 +1516,7 @@ bool Init() {
     // Join mode: the guest needs no fixed port (its own NAT mapping carries the replies). A same-PC
     // second instance binds an ephemeral port so it cannot steal the host's LocalPort datagrams
     // (SO_REUSEADDR below: the last binder of a shared port receives).
-    if (g_mode == LM_JOIN && g_secondInstance) bindPort = 0;
+    if ((g_mode == LM_JOIN || g_mode == LM_LOBBY) && g_secondInstance) bindPort = 0;
     sockaddr_in local{};
     local.sin_family = AF_INET;
     local.sin_addr.s_addr = INADDR_ANY;
@@ -1528,28 +1556,17 @@ bool Init() {
     SelfTestWire();     // [Phase 2] prove the compact codec round-trips before any traffic
     { char lm[192]; LobbyCode::SelfTest(lm, sizeof(lm)); dbg(lm); }   // lobby-code format (slice 2): log only, no behaviour
     if (g_mode != LM_MANUAL) SelfTestLobby();
-    if (g_mode == LM_HOST) { char sm[160]; Stun::SelfTest(sm, sizeof(sm)); dbg(sm); }
     _beginthreadex(nullptr, 0, (unsigned (__stdcall*)(void*))RecvThread, nullptr, 0, nullptr);   // after the self-test (it resets the rx shadow)
     char m[192];
     if (g_mode == LM_MANUAL) {
         wsprintfA(m, "[Net] up: bound:%d -> %s:%d\n", bindPort, peerIp, sendPort); dbg(m);
     } else if (g_mode == LM_HOST) {
         wsprintfA(m, "[Net] up: bound:%d mode=host (waiting for a guest)\n", bindPort); dbg(m);
-        uint32_t lan = 0;
-        if (Upnp::DefaultRouteIPv4(&lan)) {
-            char code[15] = {0}; LobbyCode::Encode(lan, (uint16_t)bindPort, code);
-            _snprintf(m, sizeof(m), "[Lobby] host LAN code %s (%u.%u.%u.%u:%d) - same network only\n", code,
-                      lan >> 24, (lan >> 16) & 0xFF, (lan >> 8) & 0xFF, lan & 0xFF, bindPort);
-            m[sizeof(m) - 1] = 0; dbg(m);
-            SetHostCode(code);   // until the host thread finds an internet code
-        } else {
-            dbg("[Lobby] host LAN address not found (no IPv4 route) - no LAN code\n");
-        }
-        char loop[15] = {0}; LobbyCode::Encode(0x7F000001u, (uint16_t)bindPort, loop);
-        _snprintf(m, sizeof(m), "[Lobby] host same-PC code %s (127.0.0.1:%d)\n", loop, bindPort);
-        m[sizeof(m) - 1] = 0; dbg(m);
+        BeginHosting(bindPort);
+    } else if (g_mode == LM_LOBBY) {
+        wsprintfA(m, "[Net] up: bound:%d mode=lobby%s%s\n", bindPort, g_relayName[0] ? " relay=" : "", g_relayName); dbg(m);
         g_bindPort = bindPort;
-        _beginthreadex(nullptr, 0, HostThread, nullptr, 0, nullptr);   // UPnP + STUN, off the game thread
+        dbg("[Lobby] lobby mode: choose Host or Join in the AC4Coop panel (F6 shows it)\n");
     } else {
         wsprintfA(m, "[Net] up: bound:%d mode=join%s%s\n", bindPort, g_relayName[0] ? " relay=" : "", g_relayName); dbg(m);
         g_bindPort = bindPort;
@@ -1583,11 +1600,25 @@ void Log(const char* line) { dbg(line); }
 bool JoinByCode(const char* text, char* err, size_t errN) {
     auto fail = [&](const char* why) { if (err && errN) { lstrcpynA(err, why, (int)errN); } return false; };
     if (!g_enabled) return fail("network link is off");
-    if (g_mode != LM_JOIN) return fail("joining needs [Net] Mode=join in AC4Coop.ini");
+    if (g_mode == LM_HOST) return fail("this game is hosting; restart the game to join someone instead");
+    if (g_mode != LM_JOIN && g_mode != LM_LOBBY) return fail("joining needs [Net] Mode=lobby (or join) in AC4Coop.ini");
     if (InterlockedCompareExchange(&g_joinState, 0, 0) == 2) return fail("already connected to a host");
     uint32_t ip = 0; uint16_t port = 0;
-    if (!text || !LobbyCode::Decode(text, &ip, &port)) return fail("the clipboard does not hold a valid lobby code");
+    if (!text || !LobbyCode::Decode(text, &ip, &port)) return fail("that is not a valid code (12 characters, XXXX-XXXX-XXXX)");
+    if (g_mode == LM_LOBBY) { g_mode = LM_JOIN; MemoryBarrier(); dbg("[Lobby] panel: joining\n"); }
     return BeginJoin(ip, port, err, errN);
+}
+
+bool StartHosting(char* err, size_t errN) {
+    auto fail = [&](const char* why) { if (err && errN) { lstrcpynA(err, why, (int)errN); } return false; };
+    if (!g_enabled) return fail("network link is off");
+    if (g_mode == LM_HOST) return true;
+    if (g_mode == LM_JOIN) return fail("this game is joining; restart the game to host instead");
+    if (g_mode != LM_LOBBY) return fail("hosting needs [Net] Mode=lobby (or host) in AC4Coop.ini");
+    g_mode = LM_HOST; MemoryBarrier();
+    char m[96]; wsprintfA(m, "[Lobby] panel: hosting on port %d\n", g_bindPort); dbg(m);
+    BeginHosting(g_bindPort);
+    return true;
 }
 
 bool HostCode(char out[16]) {
@@ -1601,6 +1632,7 @@ void LobbyStatus(char* out, size_t n) {
     if (!out || !n) return;
     out[0] = 0;
     if (!g_enabled || g_mode == LM_MANUAL) return;
+    if (g_mode == LM_LOBBY) { _snprintf(out, n, "choose Host or Join (F6: panel)"); out[n - 1] = 0; return; }
     char code[16];
     AcquireSRWLockShared(&g_codeLock);
     lstrcpynA(code, g_mode == LM_HOST ? g_hostCode : g_joinCodeText, sizeof(code));
