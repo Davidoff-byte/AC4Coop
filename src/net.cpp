@@ -63,6 +63,8 @@ namespace {
     char               g_stunServer[128] = {0};
     int                g_upnpEnabled = 1;
     char               g_hostCode[16] = {0};  // best code to share (internet if we have one, else LAN); "" = none yet
+    const char* volatile g_hostNote = "";     // host thread's advice when it found no code at all (static string)
+    volatile LONG      g_hostDone = 0;        // 1 once the host thread reached its verdict
     SRWLOCK            g_codeLock = SRWLOCK_INIT;
 
     // ---- relay (docs/design/relay.md) ----------------------------------------------------------------
@@ -1181,6 +1183,9 @@ namespace {
         }
         m[sizeof(m) - 1] = 0; dbg(m);
         { char e[96]; _snprintf(e, sizeof(e), "[E] ev=lobby-host verdict=%s\n", verdict); e[sizeof(e) - 1] = 0; dbg(e); }
+        // For the status line / panel: when no code exists at all, say why instead of "getting code..." forever.
+        InterlockedExchangePointer((PVOID volatile*)&g_hostNote, (PVOID)(cIp ? "" : advice));
+        InterlockedExchange(&g_hostDone, 1);
 
         // ---- keep the mappings alive ----
         ULONGLONG lastStun = GetTickCount64(), lastMap = GetTickCount64(), lastRelay = GetTickCount64();
@@ -1432,7 +1437,24 @@ namespace {
         char m[192];
         { char sm[160]; Stun::SelfTest(sm, sizeof(sm)); dbg(sm); }
         uint32_t lan = 0;
-        if (Upnp::DefaultRouteIPv4(&lan)) {
+        bool haveLan = Upnp::DefaultRouteIPv4(&lan);
+        if (!haveLan) {
+            // Second way: this computer's own IPv4 addresses (first that is not loopback / link-local).
+            // A friend reported "getting code..." forever: the only way to get there is no route address AND
+            // no STUN answer; their log is still needed to know which failed (UNVERIFIED cause).
+            char hn[256] = {0};
+            addrinfo hints{}; hints.ai_family = AF_INET; addrinfo* res = nullptr;
+            if (gethostname(hn, sizeof(hn)) == 0 && getaddrinfo(hn, nullptr, &hints, &res) == 0) {
+                for (addrinfo* a = res; a && !haveLan; a = a->ai_next) {
+                    const uint32_t ip = ntohl(((sockaddr_in*)a->ai_addr)->sin_addr.s_addr);
+                    if ((ip >> 24) != 127 && (ip >> 16) != 0xA9FE && ip != 0) { lan = ip; haveLan = true; }
+                }
+                freeaddrinfo(res);
+            }
+            dbg(haveLan ? "[Lobby] no default IPv4 route; LAN address taken from this PC's own address list\n"
+                        : "[Lobby] no default IPv4 route and no usable local IPv4 address\n");
+        }
+        if (haveLan) {
             char code[15] = {0}; LobbyCode::Encode(lan, (uint16_t)bindPort, code);
             _snprintf(m, sizeof(m), "[Lobby] host LAN code %s (%u.%u.%u.%u:%d) - same network only\n", code,
                       lan >> 24, (lan >> 16) & 0xFF, (lan >> 8) & 0xFF, lan & 0xFF, bindPort);
@@ -1641,8 +1663,12 @@ void LobbyStatus(char* out, size_t n) {
     const LONG via = InterlockedCompareExchange(&g_linkVia, 0, 0);
     const char* viaTxt = via == 2 ? " (relay)" : via == 1 ? " (direct)" : "";
     if (g_mode == LM_HOST) {
-        _snprintf(out, n, "host code %s (F7 copies) | %s%s", code[0] ? code : "...", ready ? "guest joined" : "waiting for a guest",
-                  ready ? viaTxt : "");
+        const char* note = (const char*)InterlockedCompareExchangePointer((PVOID volatile*)&g_hostNote, nullptr, nullptr);
+        if (!code[0] && InterlockedCompareExchange(&g_hostDone, 0, 0) && note && note[0])
+            _snprintf(out, n, "no code: %s", note);
+        else
+            _snprintf(out, n, "host code %s (F7 copies) | %s%s", code[0] ? code : "...", ready ? "guest joined" : "waiting for a guest",
+                      ready ? viaTxt : "");
     } else {
         const LONG st = InterlockedCompareExchange(&g_joinState, 0, 0);
         char conn[32]; _snprintf(conn, sizeof(conn), "connected%s", viaTxt); conn[sizeof(conn) - 1] = 0;

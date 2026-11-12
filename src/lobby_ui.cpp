@@ -197,7 +197,15 @@ LRESULT CALLBACK PanelProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_APP_TOGGLE:
         if (IsWindowVisible(h) && wp == 0) ShowWindow(h, SW_HIDE);
-        else { PlacePanel(); ShowWindow(h, SW_SHOW); SetForegroundWindow(h); if (IsWindowEnabled(hEdit)) SetFocus(hEdit); }
+        else {
+            PlacePanel(); ShowWindow(h, SW_SHOW); SetForegroundWindow(h);
+            if (IsWindowEnabled(hEdit)) SetFocus(hEdit);
+            // The game hides the cursor over its own window (measured 2026-11-12: cursor_showing=0 at every
+            // position over the game while the panel was in front, 1 over the panel), so put the cursor on
+            // the panel where it is visible: on the Host button before a choice, else on Join / Copy.
+            HWND target = IsWindowEnabled(hHost) ? hHost : (IsWindowEnabled(hJoin) ? hJoin : hCopy);
+            RECT br; if (GetWindowRect(target, &br)) SetCursorPos((br.left + br.right) / 2, (br.top + br.bottom) / 2);
+        }
         return 0;
     case WM_CLOSE:
         ShowWindow(h, SW_HIDE);   // closing only hides it; F6 brings it back
