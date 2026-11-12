@@ -39,8 +39,13 @@ bool GetUdpMapping(const Gateway& gw, uint16_t extPort, uint32_t* client, uint16
 
 bool DeleteUdpMapping(const Gateway& gw, uint16_t extPort, char* err, size_t errN);
 
-// The local IPv4 of the default route (host order). A connected UDP socket sends nothing.
+// The local IPv4 of the default route (host order): PrimaryIPv4 first, then a connected UDP socket (sends nothing).
 bool DefaultRouteIPv4(uint32_t* ipHost);
+
+// The real adapter's IPv4 from the system routing table (best route to 8.8.8.8; the adapter must be up), or the
+// first up adapter with an IPv4 default gateway. `name` gets the adapter's friendly name. Unaffected by
+// per-application socket filtering (VPN split tunnelling) on the calling process.
+bool PrimaryIPv4(uint32_t* ipHost, char* name, size_t nameN);
 
 // Address class used by the verdicts: 0 public, 1 private (RFC 1918), 2 carrier-grade NAT (100.64/10),
 // 3 other non-routable (0/8, 127/8, 169.254/16).

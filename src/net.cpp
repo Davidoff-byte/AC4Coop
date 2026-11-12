@@ -88,6 +88,7 @@ namespace {
     sockaddr_in        g_hostPub{}, g_hostLan{};
     volatile LONG      g_hostInfo = 0;
     uint64_t           g_relayRoomCfg = 0;       // [Net] RelayRoom (host): room id to re-register; 0 = new
+    uint32_t           g_boundAddr = 0;          // the address the game socket is bound to (host order; 0 = all)
     volatile LONG      g_roomMissingLogged = 0;  // guest: "room not there yet" logged once
 
     // ---- received DEATH ring (B-4: a one-shot death packet must not be lost to the snapshot slot) --
@@ -898,7 +899,7 @@ namespace {
         return (uint32_t)q.LowPart ^ (GetCurrentProcessId() << 16) ^ (uint32_t)GetTickCount64() ^ 0x9E3779B9u;
     }
     void RelayHello(uint8_t type, uint64_t room) {
-        uint32_t lan = 0; Upnp::DefaultRouteIPv4(&lan);
+        uint32_t lan = g_boundAddr; if (!lan) Upnp::DefaultRouteIPv4(&lan);   // the address we are bound to, if any
         Relay::Hello h{ NET_PROTO_VER, lan, (uint16_t)g_bindPort, 0, g_relayNonce, 0, 0 };
         RelaySend(type, 0, room, &h, (int)sizeof(h));
     }
@@ -1105,8 +1106,8 @@ namespace {
     unsigned __stdcall HostThread(void*) {
         char m[384], err[256], a[32], b[32];
         const uint16_t port = (uint16_t)g_bindPort;
-        uint32_t lan = 0;
-        const bool haveLan = Upnp::DefaultRouteIPv4(&lan);
+        uint32_t lan = g_boundAddr;   // bound to the real adapter: map/announce exactly that address
+        const bool haveLan = lan != 0 || Upnp::DefaultRouteIPv4(&lan);
 
         // ---- relay room first (fast: the room code shows within a second) ----
         const bool relay = g_relayName[0] && RelayResolve();
@@ -1451,8 +1452,8 @@ namespace {
     void BeginHosting(int bindPort) {
         char m[192];
         { char sm[160]; Stun::SelfTest(sm, sizeof(sm)); dbg(sm); }
-        uint32_t lan = 0;
-        bool haveLan = Upnp::DefaultRouteIPv4(&lan);
+        uint32_t lan = g_boundAddr;   // bound to the real adapter: the LAN code is that address
+        bool haveLan = lan != 0 || Upnp::DefaultRouteIPv4(&lan);
         if (!haveLan) {
             // Second way: this computer's own IPv4 addresses (first that is not loopback / link-local).
             // A friend reported "getting code..." forever: the only way to get there is no route address AND
@@ -1478,9 +1479,11 @@ namespace {
         } else {
             dbg("[Lobby] host LAN address not found (no IPv4 route) - no LAN code\n");
         }
-        char loop[15] = {0}; LobbyCode::Encode(0x7F000001u, (uint16_t)bindPort, loop);
-        _snprintf(m, sizeof(m), "[Lobby] host same-PC code %s (127.0.0.1:%d)\n", loop, bindPort);
-        m[sizeof(m) - 1] = 0; dbg(m);
+        if (!g_boundAddr) {   // a socket bound to one adapter does not receive 127.0.0.1: no same-PC code then
+            char loop[15] = {0}; LobbyCode::Encode(0x7F000001u, (uint16_t)bindPort, loop);
+            _snprintf(m, sizeof(m), "[Lobby] host same-PC code %s (127.0.0.1:%d)\n", loop, bindPort);
+            m[sizeof(m) - 1] = 0; dbg(m);
+        }
         g_bindPort = bindPort;
         _beginthreadex(nullptr, 0, HostThread, nullptr, 0, nullptr);   // relay + UPnP + STUN, off the game thread
     }
@@ -1562,6 +1565,41 @@ bool Init() {
     local.sin_family = AF_INET;
     local.sin_addr.s_addr = INADDR_ANY;
     local.sin_port = htons((u_short)bindPort);
+    // [Net] BindIP=auto (default) | any | a.b.c.d - lobby modes only; manual mode keeps INADDR_ANY.
+    // auto: the real adapter from the system routing table (Upnp::PrimaryIPv4), so a VPN adapter that is down or
+    // a split-tunnel rule cannot leave the game on an address with no internet path (seen on a friend's PC:
+    // NordLynx 10.5.0.2, "no default IPv4 route", STUN unanswered, while the launcher on the same PC worked).
+    // UNVERIFIED that an explicit bind beats every split-tunnel driver: the log line below names the address used.
+    if (g_mode != LM_MANUAL) {
+        char bindCfg[32] = {0};
+        GetPrivateProfileStringA("Net", "BindIP", "auto", bindCfg, sizeof(bindCfg), Paths::Ini());
+        char m[200]; m[0] = 0;
+        if (_stricmp(bindCfg, "any") == 0) {
+            _snprintf(m, sizeof(m), "[Net] BindIP=any: all adapters (Windows picks the source)\n");
+        } else if (_stricmp(bindCfg, "auto") == 0) {
+            uint32_t ip = 0; char name[128] = {0};
+            // A socket bound to one adapter cannot talk to 127.0.0.1 on Windows (measured: sendto -> WSAEADDRNOTAVAIL
+            // 10049, the reverse -> WSAENETUNREACH 10051), so a same-PC relay or a same-PC code keeps all adapters.
+            char rs[128] = {0}; lstrcpynA(rs, g_relayName, sizeof(rs)); if (char* c = strchr(rs, ':')) *c = 0;
+            in_addr ra{}; const bool relayLoop = rs[0] && inet_pton(AF_INET, rs, &ra) == 1 && (ntohl(ra.s_addr) >> 24) == 127;
+            const bool joinLoop = joinNow && (joinIp >> 24) == 127;
+            if (relayLoop || joinLoop) {
+                _snprintf(m, sizeof(m), "[Net] BindIP=auto: all adapters (%s is on this PC: 127.x needs them)\n", relayLoop ? "the relay server" : "the join code");
+            } else if (Upnp::PrimaryIPv4(&ip, name, sizeof(name))) {
+                local.sin_addr.s_addr = htonl(ip);
+                _snprintf(m, sizeof(m), "[Net] BindIP=auto: %u.%u.%u.%u on '%s' (the adapter with the internet route)\n",
+                          ip >> 24, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF, name);
+            } else {
+                _snprintf(m, sizeof(m), "[Net] BindIP=auto: no up adapter with an internet route found - all adapters\n");
+            }
+        } else {
+            in_addr a{};
+            if (inet_pton(AF_INET, bindCfg, &a) == 1) { local.sin_addr = a; _snprintf(m, sizeof(m), "[Net] BindIP=%s\n", bindCfg); }
+            else _snprintf(m, sizeof(m), "[Net] BindIP=%s is not an IPv4 address - all adapters\n", bindCfg);
+        }
+        m[sizeof(m) - 1] = 0; if (m[0]) dbg(m);
+        g_boundAddr = ntohl(local.sin_addr.s_addr);
+    }
     if (bind(g_sock, (sockaddr*)&local, sizeof(local)) == SOCKET_ERROR) {
         bindPort = g_secondInstance ? localPort : peerPort;
         sendPort = g_secondInstance ? peerPort : localPort;

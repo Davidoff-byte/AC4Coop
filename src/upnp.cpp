@@ -4,6 +4,7 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <winhttp.h>
+#include <iphlpapi.h>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -13,6 +14,7 @@
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "iphlpapi.lib")
 
 namespace {
 
@@ -180,7 +182,43 @@ std::string IpStr(uint32_t ipHost) {
 
 namespace Upnp {
 
+// The real adapter: asked of the system routing table (GetBestInterface towards 8.8.8.8), not of a socket, so
+// a per-application VPN/split-tunnel filter on this process cannot hide it. The chosen adapter must be up and
+// have an IPv4 unicast address; if the best-route adapter is down (e.g. a disconnected VPN adapter left in the
+// table), the first up adapter that has an IPv4 default gateway is used instead.
+// Reported 2026-11-12: on a friend's PC the game ended up on NordLynx's 10.5.0.2 with no internet path while
+// the launcher on the same PC worked (net_log: "no default IPv4 route", STUN unanswered).
+bool PrimaryIPv4(uint32_t* ipHost, char* name, size_t nameN) {
+    if (name && nameN) name[0] = 0;
+    DWORD best = 0;
+    const bool haveBest = GetBestInterface(htonl(0x08080808u), &best) == NO_ERROR;
+    ULONG len = 16 * 1024;
+    std::string buf(len, '\0');
+    ULONG rc = GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER | GAA_FLAG_INCLUDE_GATEWAYS,
+                                    nullptr, (IP_ADAPTER_ADDRESSES*)&buf[0], &len);
+    if (rc == ERROR_BUFFER_OVERFLOW) { buf.assign(len, '\0'); rc = GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER | GAA_FLAG_INCLUDE_GATEWAYS, nullptr, (IP_ADAPTER_ADDRESSES*)&buf[0], &len); }
+    if (rc != NO_ERROR) return false;
+    auto firstV4 = [](IP_ADAPTER_ADDRESSES* a, uint32_t* out) {
+        for (IP_ADAPTER_UNICAST_ADDRESS* u = a->FirstUnicastAddress; u; u = u->Next)
+            if (u->Address.lpSockaddr && u->Address.lpSockaddr->sa_family == AF_INET) {
+                const uint32_t ip = ntohl(((sockaddr_in*)u->Address.lpSockaddr)->sin_addr.s_addr);
+                if ((ip >> 24) != 127 && (ip >> 16) != 0xA9FE) { *out = ip; return true; }
+            }
+        return false;
+    };
+    IP_ADAPTER_ADDRESSES* pick = nullptr; uint32_t ip = 0;
+    for (auto* a = (IP_ADAPTER_ADDRESSES*)&buf[0]; a && !pick; a = a->Next)
+        if (haveBest && a->IfIndex == best && a->OperStatus == IfOperStatusUp && firstV4(a, &ip)) pick = a;
+    for (auto* a = (IP_ADAPTER_ADDRESSES*)&buf[0]; a && !pick; a = a->Next)
+        if (a->OperStatus == IfOperStatusUp && a->FirstGatewayAddress && a->IfType != IF_TYPE_SOFTWARE_LOOPBACK && firstV4(a, &ip)) pick = a;
+    if (!pick) return false;
+    *ipHost = ip;
+    if (name && nameN) WideCharToMultiByte(CP_UTF8, 0, pick->FriendlyName, -1, name, (int)nameN, nullptr, nullptr);
+    return true;
+}
+
 bool DefaultRouteIPv4(uint32_t* ipHost) {
+    if (PrimaryIPv4(ipHost, nullptr, 0)) return true;   // routing table first (see PrimaryIPv4)
     SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (s == INVALID_SOCKET) return false;
     sockaddr_in dst{}; dst.sin_family = AF_INET; dst.sin_port = htons(53);
