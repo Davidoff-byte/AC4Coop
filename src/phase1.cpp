@@ -1207,6 +1207,8 @@ static int      g_proxyGhostCount = 0, g_proxyGhostNext = 0;
 // What the selector reports. A pure-query result: the selector records nothing.
 struct ProxyPick { uint32_t srcId; int idx; float srcMax; float tierDelta; uint32_t hint; uint32_t cls; int classMiss; const char* camSrc; };
 
+static void PuppetOwnNote(Human* h, Entity* e, const HookMath::Transform& m);   // own-update block, before ApplyGuards
+static void PuppetOwnClear();
 static Entity* ResolveEntityById(uint64_t id);   // engine registry, defined with the ApplyGuards
 static void ProxySrcClearAll();
 
@@ -1653,6 +1655,7 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
         // puppet exactly inside the player, which makes "did the guard attack the puppet" unobservable).
         if (g_puppetParkX != 0.0f) m.M41 += g_puppetParkX;
         g_puppet->SetGlobalMatrixInternal(&m, phys);
+        { Human* oh = AIEntityHelper::GetHuman(g_puppet); if (oh) PuppetOwnNote(oh, g_puppet, m); }
         // First apply on this puppet: report the effective mode once (the spawn site logs the other one).
         { static void* s_applyLogged = nullptr;
           if (s_applyLogged != (void*)g_puppet) { s_applyLogged = (void*)g_puppet; LogPuppetMode(); } }
@@ -2004,6 +2007,7 @@ void Phase1::DespawnPuppet() {
     if (!g_puppet) return;
     Entity* dead = g_puppet;
     g_puppet = nullptr;      // stop driving it right away, before the deferred removal runs
+    PuppetOwnClear();        // and stop the own-update re-assert / probe
     g_blockReg = nullptr;    // clear the pad-suppression marker
     g_lastRemoteCtx = -1;    // next puppet starts fresh (re-apply the first remote context)
     g_lastActionAlias = 0xFFFFFFFF;  // re-apply the peer's action onto the next puppet
@@ -5738,6 +5742,279 @@ static void HumanUpdateThreadProbe(bool player) {
     }
 }
 
+
+// ---- Own-update writes + fight probes ---------------------------------------------------------------------------
+// MEASURED 2026-11-12 (build 5D862E45, [Thread] lines): the player's Human update - where ApplyGuards and
+// ApplyRemoteState run - executed on 16 different worker threads in one session, and other Humans' updates share
+// those threads. So every write we make onto another body (guard transform, puppet matrix) is made from a
+// different Human's update, at an arbitrary point relative to that body's own update.
+// [Coop] OwnUpdateGuards=1: ApplyGuards only PUBLISHES a guard's target; the write happens in the frame hook when
+//   it fires for that guard's own Human (end of sub_16FA7D0, after its statechart call @0x016FA857 returned),
+//   every frame, blended from the rendered position to the newest target over one snapshot interval.
+// [Coop] OwnUpdatePuppet=1: the puppet's last applied matrix is re-written at the end of the puppet's own update.
+// Both default 0 and are re-read every 2 s. The probes run in both modes and give the oracle:
+//   moved   = frames in which the body is >2 cm away from where we last wrote it (another writer moved it)
+//   actMis  = frames in which a guard plays a different action than the host reports (alias stable >= 500 ms)
+//   overlap = a Human update finished on one thread while the player's update was running on another
+// UNVERIFIED until a guest run shows moved/actMis falling with the flags on.
+static int OwnFlag(const char* key, int* cache, uint64_t* next) {
+    const uint64_t now = GetTickCount64();
+    if (now >= *next) {
+        *next = now + 2000;
+        const int v = GetPrivateProfileIntA("Coop", key, 0, Paths::Ini()) != 0 ? 1 : 0;
+        if (v != *cache) L("[Own] %s=%d (was %d)\n", key, v, *cache);
+        *cache = v;
+    }
+    return *cache;
+}
+static int s_ownG = 0, s_ownP = 0; static uint64_t s_ownGNext = 0, s_ownPNext = 0;
+static bool OwnGuardsOn() { return OwnFlag("OwnUpdateGuards", &s_ownG, &s_ownGNext) != 0; }
+static bool OwnPuppetOn() { return OwnFlag("OwnUpdatePuppet", &s_ownP, &s_ownPNext) != 0; }
+
+static inline uint64_t OwnNowUs() {
+    static LARGE_INTEGER f = {};
+    if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    LARGE_INTEGER c; QueryPerformanceCounter(&c);
+    return (uint64_t)(c.QuadPart / f.QuadPart) * 1000000ull + (uint64_t)((c.QuadPart % f.QuadPart) * 1000000ull / f.QuadPart);
+}
+static void OwnAtomicMax(volatile LONG* t, LONG v) {
+    LONG cur = *t;
+    while (v > cur) { const LONG prev = InterlockedCompareExchange(t, v, cur); if (prev == cur) break; cur = prev; }
+}
+
+struct OwnBody {
+    unsigned int human, ent;
+    float fromPos[3], fromQuat[4], toPos[3], toQuat[4];
+    uint64_t t0Us, durUs, lastPubUs, lastWriteUs, aliasSinceUs, createdUs;
+    float lastWrite[3]; bool haveWrite, snap;
+    uint32_t alias;
+};
+static const int OWN_MAX = 128;
+static OwnBody s_own[OWN_MAX];
+static volatile LONG s_ownN = 0;
+static SRWLOCK s_ownLock = SRWLOCK_INIT;
+
+static volatile LONG s_ovl = 0, s_ovlDriven = 0, s_playerWorkTid = 0;
+static volatile LONG s_gFrames = 0, s_gMoved = 0, s_gWrites = 0, s_gActFrames = 0, s_gActMis = 0, s_gMoveMaxUm = 0;
+static volatile LONG64 s_gMoveSumUm = 0;
+static volatile LONG s_pFrames = 0, s_pMoved = 0, s_pWrites = 0, s_pMoveMaxUm = 0;
+static volatile LONG64 s_pMoveSumUm = 0;
+static unsigned s_gLegacyWrites = 0, s_gStarvedFallback = 0;
+
+static int OwnFind(unsigned int human) {             // caller holds the lock
+    for (int i = 0; i < s_ownN; ++i) if (s_own[i].human == human) return i;
+    return -1;
+}
+static void OwnQuatNlerp(const float* a, const float* b, float t, float* out) {
+    float d = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
+    const float sg = d < 0.0f ? -1.0f : 1.0f;
+    float n = 0.0f;
+    for (int k = 0; k < 4; ++k) { out[k] = a[k] + (sg * b[k] - a[k]) * t; n += out[k] * out[k]; }
+    n = sqrtf(n);
+    if (n > 1e-6f) for (int k = 0; k < 4; ++k) out[k] /= n;
+    else for (int k = 0; k < 4; ++k) out[k] = b[k];
+}
+static void OwnSample(const OwnBody& o, uint64_t nowUs, float* pos, float* quat) {
+    float t = o.durUs ? (float)(double)(nowUs - o.t0Us) / (float)(double)o.durUs : 1.0f;
+    if (nowUs < o.t0Us) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
+    for (int k = 0; k < 3; ++k) pos[k] = o.fromPos[k] + (o.toPos[k] - o.fromPos[k]) * t;
+    OwnQuatNlerp(o.fromQuat, o.toQuat, t, quat);
+}
+
+// ApplyGuards (player's update): newest host target for this body.
+static void OwnPublish(Human* h, Entity* e, const float* pos, const float* quat, uint32_t alias) {
+    const uint64_t now = OwnNowUs();
+    AcquireSRWLockExclusive(&s_ownLock);
+    int i = OwnFind((unsigned int)h);
+    if (i < 0 && s_ownN < OWN_MAX) {
+        i = s_ownN; OwnBody& n = s_own[i];
+        std::memset(&n, 0, sizeof(n));
+        n.human = (unsigned int)h; n.ent = (unsigned int)e; n.createdUs = now;
+        for (int k = 0; k < 3; ++k) n.fromPos[k] = n.toPos[k] = pos[k];
+        for (int k = 0; k < 4; ++k) n.fromQuat[k] = n.toQuat[k] = quat[k];
+        n.t0Us = now; n.durUs = 0; n.lastPubUs = now; n.snap = true; n.alias = alias; n.aliasSinceUs = now;
+        InterlockedIncrement(&s_ownN);
+    } else if (i >= 0) {
+        OwnBody& o = s_own[i];
+        o.ent = (unsigned int)e;
+        const bool changed = std::memcmp(o.toPos, pos, 12) != 0 || std::memcmp(o.toQuat, quat, 16) != 0;
+        if (changed) {
+            float cp[3], cq[4]; OwnSample(o, now, cp, cq);
+            const float dx = pos[0] - cp[0], dy = pos[1] - cp[1], dz = pos[2] - cp[2];
+            uint64_t dur = now - o.lastPubUs;
+            if (dur < 50000) dur = 50000;
+            if (dur > 250000) dur = 250000;
+            if (dx * dx + dy * dy + dz * dz > 25.0f) {          // > 5 m: place, do not glide (legacy bigJump rule)
+                for (int k = 0; k < 3; ++k) cp[k] = pos[k];
+                for (int k = 0; k < 4; ++k) cq[k] = quat[k];
+                o.snap = true;
+            }
+            for (int k = 0; k < 3; ++k) { o.fromPos[k] = cp[k]; o.toPos[k] = pos[k]; }
+            for (int k = 0; k < 4; ++k) { o.fromQuat[k] = cq[k]; o.toQuat[k] = quat[k]; }
+            o.t0Us = now; o.durUs = dur;
+        }
+        o.lastPubUs = now;
+        if (alias != o.alias) { o.alias = alias; o.aliasSinceUs = now; }
+    }
+    ReleaseSRWLockExclusive(&s_ownLock);
+}
+static void OwnForget(Human* h) {
+    AcquireSRWLockExclusive(&s_ownLock);
+    const int i = OwnFind((unsigned int)h);
+    if (i >= 0) { s_own[i] = s_own[s_ownN - 1]; InterlockedDecrement(&s_ownN); }
+    ReleaseSRWLockExclusive(&s_ownLock);
+}
+// Legacy path wrote the body itself: remember where, so the probe can tell whether something else moves it.
+static void OwnNoteLegacyWrite(Human* h, const float* pos) {
+    AcquireSRWLockExclusive(&s_ownLock);
+    const int i = OwnFind((unsigned int)h);
+    if (i >= 0) { for (int k = 0; k < 3; ++k) s_own[i].lastWrite[k] = pos[k]; s_own[i].haveWrite = true; }
+    ReleaseSRWLockExclusive(&s_ownLock);
+    ++s_gLegacyWrites;
+}
+// Own mode, ApplyGuards side: true when this body's own update has not written it for 300 ms (its update does
+// not reach the hook, e.g. not updated every frame) - ApplyGuards then writes it the legacy way.
+static bool OwnStarved(Human* h) {
+    const uint64_t now = OwnNowUs();
+    bool starved = false;
+    AcquireSRWLockShared(&s_ownLock);
+    const int i = OwnFind((unsigned int)h);
+    if (i >= 0) {
+        const OwnBody& o = s_own[i];
+        const uint64_t last = o.lastWriteUs ? o.lastWriteUs : o.createdUs;
+        starved = now - last > 300000;
+    }
+    ReleaseSRWLockShared(&s_ownLock);
+    if (starved) ++s_gStarvedFallback;
+    return starved;
+}
+
+static void OwnNoteMove(bool guard, float d) {
+    const LONG um = (LONG)(d * 1e6f > 2e9f ? 2e9f : d * 1e6f);
+    if (guard) {
+        InterlockedIncrement(&s_gMoved); InterlockedExchangeAdd64(&s_gMoveSumUm, um); OwnAtomicMax(&s_gMoveMaxUm, um);
+    } else {
+        InterlockedIncrement(&s_pMoved); InterlockedExchangeAdd64(&s_pMoveSumUm, um); OwnAtomicMax(&s_pMoveMaxUm, um);
+    }
+}
+
+// Puppet: the matrix ApplyRemoteState wrote last, and which Human it belongs to.
+static volatile LONG s_pupHumanKey = 0;
+static Entity*       s_pupEnt = nullptr;
+static HookMath::Transform s_pupM;
+static bool          s_pupHaveM = false;
+static SRWLOCK       s_pupLock = SRWLOCK_INIT;
+static void PuppetOwnNote(Human* h, Entity* e, const HookMath::Transform& m) {
+    AcquireSRWLockExclusive(&s_pupLock);
+    s_pupEnt = e; s_pupM = m; s_pupHaveM = true;
+    ReleaseSRWLockExclusive(&s_pupLock);
+    InterlockedExchange(&s_pupHumanKey, (LONG)(uintptr_t)h);
+}
+static void PuppetOwnClear() {
+    InterlockedExchange(&s_pupHumanKey, 0);
+    AcquireSRWLockExclusive(&s_pupLock);
+    s_pupEnt = nullptr; s_pupHaveM = false;
+    ReleaseSRWLockExclusive(&s_pupLock);
+}
+
+// Frame hook, every Human's update (any thread).
+static void OwnDrain(Human* h) {
+    const unsigned int key = (unsigned int)h;
+    // ---- puppet ----
+    if (s_pupHumanKey && (LONG)key == s_pupHumanKey) {
+        Entity* e = nullptr; HookMath::Transform m;
+        AcquireSRWLockShared(&s_pupLock);
+        const bool have = s_pupHaveM; e = s_pupEnt; m = s_pupM;
+        ReleaseSRWLockShared(&s_pupLock);
+        if (have && e && readable(e, 0x80)) {
+            InterlockedIncrement(&s_pFrames);
+            const float dx = e->m_GlobalMatrix.M41 - m.M41, dy = e->m_GlobalMatrix.M42 - m.M42, dz = e->m_GlobalMatrix.M43 - m.M43;
+            const float d = sqrtf(dx * dx + dy * dy + dz * dz);
+            if (d > 0.02f) OwnNoteMove(false, d);
+            if (OwnPuppetOn()) { e->SetGlobalMatrixInternal(&m, false); InterlockedIncrement(&s_pWrites); }
+        }
+        return;
+    }
+    // ---- mirrored guards ----
+    if (!s_ownN) return;
+    OwnBody o; bool found = false;
+    AcquireSRWLockShared(&s_ownLock);
+    const int i = OwnFind(key);
+    if (i >= 0) { o = s_own[i]; found = true; }
+    ReleaseSRWLockShared(&s_ownLock);
+    if (!found) return;
+    const uint64_t now = OwnNowUs();
+    if (now - o.lastPubUs > 1000000) return;                 // host stopped describing it: not ours any more
+    Entity* e = (Entity*)o.ent;
+    if (!readable(e, 0x80) || *(uint32_t*)e != 0x01E4CE90u) return;   // character entity vtable (GuestObjFindResolve)
+    InterlockedIncrement(&s_gFrames);
+    if (o.haveWrite) {
+        const float dx = e->m_GlobalMatrix.M41 - o.lastWrite[0], dy = e->m_GlobalMatrix.M42 - o.lastWrite[1],
+                    dz = e->m_GlobalMatrix.M43 - o.lastWrite[2];
+        const float d = sqrtf(dx * dx + dy * dy + dz * dz);
+        if (d > 0.02f) OwnNoteMove(true, d);
+    }
+    // action probe: what is this body playing, against what the host says (once the host alias is 500 ms old)
+    if (o.alias && now - o.aliasSinceUs > 500000) {
+        ActionComponent* ac = h->GetActionComponent();
+        if (ac && readable(ac, 0x40)) {
+            unsigned char mir = 0;
+            void* act = ac->GetCurrentAction(&mir, 0, ACTLAYER_PRIMARY);
+            if (act && readable(act, 0x14)) {
+                InterlockedIncrement(&s_gActFrames);
+                if (*(uint32_t*)((char*)act + 8) != o.alias) InterlockedIncrement(&s_gActMis);
+            }
+        }
+    }
+    if (!OwnGuardsOn()) return;
+    float pos[3], quat[4]; OwnSample(o, now, pos, quat);
+    HookMath::Quaternion q; q.x = quat[0]; q.y = quat[1]; q.z = quat[2]; q.w = quat[3];
+    HookMath::Transform m; HookMath::ToMatrix(&q, &m);
+    m.M41 = pos[0]; m.M42 = pos[1]; m.M43 = pos[2];
+    e->SetGlobalMatrixInternal(&m, o.snap);
+    InterlockedIncrement(&s_gWrites);
+    AcquireSRWLockExclusive(&s_ownLock);
+    const int j = OwnFind(key);
+    if (j >= 0) {
+        for (int k = 0; k < 3; ++k) s_own[j].lastWrite[k] = pos[k];
+        s_own[j].haveWrite = true; s_own[j].lastWriteUs = now;
+        if (o.snap) s_own[j].snap = false;
+    }
+    ReleaseSRWLockExclusive(&s_ownLock);
+}
+
+// Non-player Human update ended: was the player's update running on another thread at that moment?
+static void OwnOverlapNote(Human* h) {
+    const LONG pw = s_playerWorkTid;
+    if (!pw || pw == (LONG)GetCurrentThreadId()) return;
+    InterlockedIncrement(&s_ovl);
+    bool driven = (s_pupHumanKey && (LONG)(uintptr_t)h == s_pupHumanKey);
+    if (!driven && s_ownN) {
+        AcquireSRWLockShared(&s_ownLock);
+        driven = OwnFind((unsigned int)h) >= 0;
+        ReleaseSRWLockShared(&s_ownLock);
+    }
+    if (driven) InterlockedIncrement(&s_ovlDriven);
+}
+
+static void OwnReport() {
+    const LONG gf = InterlockedExchange(&s_gFrames, 0), gm = InterlockedExchange(&s_gMoved, 0);
+    const LONG gw = InterlockedExchange(&s_gWrites, 0), gaf = InterlockedExchange(&s_gActFrames, 0);
+    const LONG gam = InterlockedExchange(&s_gActMis, 0), gmax = InterlockedExchange(&s_gMoveMaxUm, 0);
+    const LONG64 gsum = InterlockedExchange64(&s_gMoveSumUm, 0);
+    const LONG pf = InterlockedExchange(&s_pFrames, 0), pm = InterlockedExchange(&s_pMoved, 0);
+    const LONG pw = InterlockedExchange(&s_pWrites, 0), pmax = InterlockedExchange(&s_pMoveMaxUm, 0);
+    const LONG64 psum = InterlockedExchange64(&s_pMoveSumUm, 0);
+    const LONG ov = InterlockedExchange(&s_ovl, 0), ovd = InterlockedExchange(&s_ovlDriven, 0);
+    L("[Own] guards=%d puppet=%d | overlap=%ld driven=%ld | guard frames=%ld moved=%ld (%.1f%%) mean=%.3f max=%.3f writes=%ld "
+      "legacyWrites=%u starved=%u actFrames=%ld actMis=%ld (%.1f%%) bodies=%ld | puppet frames=%ld moved=%ld (%.1f%%) mean=%.3f max=%.3f writes=%ld\n",
+      s_ownG, s_ownP, ov, ovd, gf, gm, gf ? 100.0 * gm / gf : 0.0, gm ? (double)gsum / gm / 1e6 : 0.0, gmax / 1e6, gw,
+      s_gLegacyWrites, s_gStarvedFallback, gaf, gam, gaf ? 100.0 * gam / gaf : 0.0, (long)s_ownN,
+      pf, pm, pf ? 100.0 * pm / pf : 0.0, pm ? (double)psum / pm / 1e6 : 0.0, pmax / 1e6, pw);
+    s_gLegacyWrites = 0; s_gStarvedFallback = 0;
+}
+
 static void ApplyGuards(const EntityPacket& pkt) {
     World* world = World::GetCurrentWorld();
     if (!world) return;
@@ -6027,6 +6304,7 @@ static void ApplyGuards(const EntityPacket& pkt) {
                 CharacterController* cc = (CharacterController*)bh->GetCharacterComponent();
                 if (readable(cc, 0x600)) cc->m_DriveEntity = false;
             }
+            if ((es.dead || locallyDead) && bh) OwnForget(bh);
             if (es.dead) {
                 static void* s_deadSeen[64];
                 static int   s_deadSeenN = 0;
@@ -6061,14 +6339,19 @@ static void ApplyGuards(const EntityPacket& pkt) {
                         for (int k = 0; k < 4; ++k) s_last[slot].quat[k] = es.quat[k];
                     }
                 }
-                if (moved) {
+                if (bh && !s_selfTestMode) OwnPublish(bh, (Entity*)best, es.pos, es.quat, es.actionAlias);
+                const bool ownWrites = bh && !s_selfTestMode && OwnGuardsOn() && !OwnStarved(bh);
+                if (moved && !ownWrites) {
                     HookMath::Quaternion q; q.x=es.quat[0]; q.y=es.quat[1]; q.z=es.quat[2]; q.w=es.quat[3];
                     HookMath::Transform m;
                     HookMath::ToMatrix(&q, &m);
                     m.M41 = es.pos[0]; m.M42 = es.pos[1]; m.M43 = es.pos[2];
                     // A capsule push per snapshot was pure jitter; only a jump (>5 m) needs physics.
                     bool bigJump = (dp > 25.0f);
-                    if (!s_selfTestMode) ((Entity*)best)->SetGlobalMatrixInternal(&m, bigJump);
+                    if (!s_selfTestMode) {
+                        ((Entity*)best)->SetGlobalMatrixInternal(&m, bigJump);
+                        if (bh) OwnNoteLegacyWrite(bh, es.pos);
+                    }
                 }
                 // Only re-issue the clip when the alias changed.
                 if (es.actionAlias && MirrorActionsEnabled() && MirrorAliasShouldApply(best, es.actionAlias)) {
@@ -9732,6 +10015,11 @@ static void OnFrameInner(Human* updatedHuman);
 // the process down. Crashes that follow from engine state we already corrupted will still happen, but a
 // bad pointer in our own code no longer kills the game - and the log names the frame instead of ending.
 static void __cdecl OnFrame(Human* updatedHuman) {
+    __try { OwnDrain(updatedHuman); }            // puppet / mirrored guard: probe, and write in own-update mode
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        static int s_on = 0;
+        if (s_on < 20) { ++s_on; L("[Frame] EXCEPTION 0x%08X in own-update write (skipped)\n", GetExceptionCode()); }
+    }
     __try { MirrorActDrain(updatedHuman); }      // no-op unless a request is queued for this Human
     __except (EXCEPTION_EXECUTE_HANDLER) {
         static int s_dn = 0;
@@ -9742,6 +10030,7 @@ static void __cdecl OnFrame(Human* updatedHuman) {
         static int s_n = 0;
         if (s_n < 20) { ++s_n; L("[Frame] EXCEPTION 0x%08X in on-frame work (skipped)\n", GetExceptionCode()); }
     }
+    InterlockedCompareExchange(&s_playerWorkTid, 0, (LONG)GetCurrentThreadId());   // player work over (if it was ours)
 }
 
 // ---- Config dump + RUN provenance --------------------------------------------------------
@@ -9781,7 +10070,7 @@ static void DumpConfigOnce()
         { "Coop", "GuestKillMirror", 1 }, { "Coop", "HookSgm", 1 }, { "Coop", "HostileOnly", 0 },
         { "Coop", "HybridLoco", 1 }, { "Coop", "IdentityBand", 0 }, { "Coop", "IdResolver", 1 },
         { "Coop", "InstallHooks", 1 }, { "Coop", "IntegratePuppet", 0 }, { "Coop", "KillTrace", 1 },
-        { "Coop", "KrLog", 0 }, { "Coop", "LegacyPadIdHook", 1 }, { "Coop", "MirrorActions", 1 }, { "Coop", "MirrorActionsDeferred", 0 }, { "Coop", "MinBlendInMs", 100 },
+        { "Coop", "KrLog", 0 }, { "Coop", "LegacyPadIdHook", 1 }, { "Coop", "MirrorActions", 1 }, { "Coop", "MirrorActionsDeferred", 0 }, { "Coop", "OwnUpdateGuards", 0 }, { "Coop", "OwnUpdatePuppet", 0 }, { "Coop", "MinBlendInMs", 100 },
         { "Coop", "NetStrictPeer", 1 }, { "Coop", "NullReturnObserver", 1 }, { "Coop", "Probe", 0 },
         { "Coop", "PuppetParkX", 0 }, { "Coop", "PuppetPhysics", 0 }, { "Coop", "RegisterPad1", 0 },
         { "Coop", "RelevanceRadiusM", 250 }, { "Coop", "ReloadBuilder", 1 }, { "Coop", "SceneAwareExact", 0 },
@@ -9818,8 +10107,9 @@ static void DumpConfigOnce()
 }
 
 static void OnFrameInner(Human* updatedHuman) {
-    if (!isPlayerUpdate(base(), updatedHuman)) { HumanUpdateThreadProbe(false); return; }
+    if (!isPlayerUpdate(base(), updatedHuman)) { HumanUpdateThreadProbe(false); OwnOverlapNote(updatedHuman); return; }
     HumanUpdateThreadProbe(true);
+    InterlockedExchange(&s_playerWorkTid, (LONG)GetCurrentThreadId());
 
     ProbeIdentityOnce();
 
@@ -10018,6 +10308,7 @@ static void OnFrameInner(Human* updatedHuman) {
                       s_bindRejBhv, s_bindRejAi, s_bindRejHp, s_bindRejArch, s_bindRejTaken,
                       s_bindUnmatched, (s_bindMinD < 1e8f) ? sqrtf(s_bindMinD) : -1.0f);
                 WideBindReport();
+                OwnReport();
                 L("[Mirror] actions on=%d calls=%u deferred=%d queued=%u applied=%ld expired=%ld noSlot=%u\n",
                   MirrorActionsEnabled() ? 1 : 0, s_mirrorActionCalls, MirrorActionsDeferred() ? 1 : 0, s_maqQueued,
                   InterlockedExchange(&s_maqApplied, 0), InterlockedExchange(&s_maqExpired, 0), s_maqNoSlot);
