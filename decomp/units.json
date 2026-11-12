@@ -9,6 +9,15 @@
    "size": 119,
    "status": "unknown"
   },
+  "0046D8E0": {
+   "addr": "0046D8E0",
+   "claimed_at": null,
+   "name": "SpawnEntityParamsBuild",
+   "owner": null,
+   "receipts": [],
+   "size": 120,
+   "status": "unknown"
+  },
   "00503330": {
    "addr": "00503330",
    "claimed_at": "2026-11-08T19:48:44Z",
@@ -85,6 +94,15 @@
    ],
    "size": 139,
    "status": "claimed"
+  },
+  "0054D4D0": {
+   "addr": "0054D4D0",
+   "claimed_at": null,
+   "name": "WorldGetCurrentWorld",
+   "owner": null,
+   "receipts": [],
+   "size": 16,
+   "status": "unknown"
   },
   "0054EC00": {
    "addr": "0054EC00",
@@ -311,6 +329,15 @@
    "size": 27,
    "status": "claimed"
   },
+  "0070E880": {
+   "addr": "0070E880",
+   "claimed_at": null,
+   "name": "WorldRemoveEntity",
+   "owner": null,
+   "receipts": [],
+   "size": 20,
+   "status": "unknown"
+  },
   "00733FB0": {
    "addr": "00733FB0",
    "claimed_at": "2026-11-08T12:37:07Z",
@@ -370,6 +397,15 @@
    ],
    "size": 74,
    "status": "claimed"
+  },
+  "007A3BD0": {
+   "addr": "007A3BD0",
+   "claimed_at": null,
+   "name": "RowSelectorDuplicate",
+   "owner": null,
+   "receipts": [],
+   "size": 183,
+   "status": "unknown"
   },
   "009F0B50": {
    "addr": "009F0B50",
@@ -439,6 +475,24 @@
    ],
    "size": 181,
    "status": "claimed"
+  },
+  "00A2D5A0": {
+   "addr": "00A2D5A0",
+   "claimed_at": null,
+   "name": "DuplicationManagerBegin",
+   "owner": null,
+   "receipts": [],
+   "size": 184,
+   "status": "unknown"
+  },
+  "00A2F320": {
+   "addr": "00A2F320",
+   "claimed_at": null,
+   "name": "DuplicationManagerEnd",
+   "owner": null,
+   "receipts": [],
+   "size": 114,
+   "status": "unknown"
   },
   "00A38120": {
    "addr": "00A38120",
@@ -620,6 +674,15 @@
    "size": 80,
    "status": "claimed"
   },
+  "013905A0": {
+   "addr": "013905A0",
+   "claimed_at": null,
+   "name": "AIEntityHelperGetHuman",
+   "owner": null,
+   "receipts": [],
+   "size": 58,
+   "status": "unknown"
+  },
   "01406C70": {
    "addr": "01406C70",
    "claimed_at": "2026-11-08T12:43:51Z",
@@ -642,6 +705,15 @@
    "owner": null,
    "receipts": [],
    "size": 59,
+   "status": "unknown"
+  },
+  "016FA7D0": {
+   "addr": "016FA7D0",
+   "claimed_at": null,
+   "name": "HumanUpdate",
+   "owner": null,
+   "receipts": [],
+   "size": 803,
    "status": "unknown"
   },
   "017106C0": {

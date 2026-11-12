@@ -29,6 +29,7 @@
 #include "action_guard.h"
 #include "deref_guard.h"
 #include "combat_observe.h"
+#include "guard_spawn_probe.h"
 #include "build_gate.h"
 #include "paths.h"
 #include <bcrypt.h>
@@ -576,6 +577,10 @@ BOOL APIENTRY DllMain(HMODULE hMod, DWORD reason, LPVOID)
         // ([Coop] CombatObserve=0) -- with the flag at 0 this is one GetPrivateProfileIntA and one
         // int test: no log file, no allocation, no VirtualProtect, no detour, no thread.
         CombatObserve::Init();
+
+        // Guard-shaped spawn probe (docs/evidence/guard-spawn-route-2026-11-12.md). [Coop] GuardSpawnProbe, default 0 ->
+        // one GetPrivateProfileIntA, nothing patched.
+        GuardSpawnProbe::Init();
 
         // Menu probe (boot straight into the world, part B): observation-only hooks on the title-menu save path.
         // [Coop] MenuProbe, default 0 -> one GetPrivateProfileIntA, nothing patched.
