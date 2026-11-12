@@ -98,7 +98,8 @@ def fmt_summary(s):
 # ---------------------------------------------------------------- entity records (src/net.cpp EncodeEntityPacket)
 # Record = u32 key, u8 kind (1 ship, 2 guard, 3 kill), u8 idKind (0 = real objId, 1 = made from kind+key), u16 mask,
 # u64 wireId, then the fields the mask names: POS 1 (3f), QUAT 2 (4f), ACTION 4 (u32), HP 0x10 (u16), ARCH 0x20 (u16),
-# DEAD 0x40 (u8), STAGE 0x80 (u8). The record region is cut into 1368 B chunks by byte offset, so a record can
+# DEAD 0x40 (u8), STAGE 0x80 (u8), proto 13: ANIM 0x200 (u16 channel, i16 layer, u16 ratioQ, u16 timeScaleQ,
+# i16 blendInMs, u16 blendInFlags, f32 startFromEnd, f32 targetStart, u8 n, n x (u8 slot, u8 value)). The record region is cut into 1368 B chunks by byte offset, so a record can
 # straddle two datagrams: chunks of one seq are joined before decoding.
 EF = ((1, "pos", "<3f"), (2, "quat", "<4f"), (4, "action", "<I"), (0x10, "hp", "<H"), (0x20, "arch", "<H"), (0x40, "dead", "<B"), (0x80, "stage", "<B"))
 
@@ -122,6 +123,11 @@ def entity_snapshots(recs):
                 if mask & bit:
                     v = struct.unpack_from(fmt, b, o); o += struct.calcsize(fmt)
                     r[name] = v if len(v) > 1 else v[0]
+            if mask & 0x200:
+                ch, ly, rq, tq, bms, bfl, sfe, tgt, nb = struct.unpack_from("<HhHHhHffB", b, o); o += 21
+                pairs = [(b[o + 2 * k], b[o + 2 * k + 1]) for k in range(nb)]; o += 2 * nb
+                r["anim"] = {"channel": ch, "layer": ly, "ratio": rq / 65535.0, "timeScale": tq / 256.0, "blendInMs": bms,
+                             "blendInFlags": bfl, "blend": pairs}
             out.append(r)
         yield p["t"], seq, p["epoch"], out
 
@@ -132,7 +138,8 @@ def entity_table(recs):
     for t, _, _, snap in entity_snapshots(recs):
         for r in snap:
             e = rows.setdefault((r["kind"], r["idKind"], r["id"]), {"n": 0, "keys": set(), "t0": t, "first": None, "last": None, "arch": None,
-                                                                    "dead": 0, "hp": None, "stages": set(), "actions": set()})
+                                                                    "dead": 0, "hp": None, "stages": set(), "actions": set(),
+                                                                    "anim": 0, "maxBlend": 0})
             e["n"] += 1; e["keys"].add(r["key"]); e["t1"] = t
             if "pos" in r: e["first"] = e["first"] or r["pos"]; e["last"] = r["pos"]
             if "arch" in r: e["arch"] = r["arch"]
@@ -140,6 +147,7 @@ def entity_table(recs):
             if "stage" in r: e["stages"].add(r["stage"])
             if "action" in r: e["actions"].add(r["action"])
             e["dead"] |= r.get("dead", 0)
+            if "anim" in r: e["anim"] += 1; e["maxBlend"] = max(e["maxBlend"], len(r["anim"]["blend"]))
     return rows
 
 
@@ -148,7 +156,8 @@ def fmt_entities(rows):
     for (k, idk, wid), e in sorted(rows.items(), key=lambda kv: (kv[0][0], kv[1]["t0"])):
         p = lambda v: "(" + ",".join(f"{x:.1f}" for x in v) + ")" if v else "-"
         out.append(f"  {names.get(k, k):5} id={'obj' if idk == 0 else 'syn'}:{wid:016x} keys={sorted(e['keys'])[:4]} arch={e['arch']} recs={e['n']:4} "
-                   f"t={e['t0']:.0f}-{e['t1']:.0f}s pos={p(e['first'])}->{p(e['last'])} hp={e['hp']} dead={e['dead']} stages={sorted(e['stages'])} actions={len(e['actions'])}")
+                   f"t={e['t0']:.0f}-{e['t1']:.0f}s pos={p(e['first'])}->{p(e['last'])} hp={e['hp']} dead={e['dead']} stages={sorted(e['stages'])} actions={len(e['actions'])}"
+                   + (f" anim={e['anim']} maxBlend={e['maxBlend']}" if e['anim'] else ""))
     return out
 
 
@@ -290,6 +299,8 @@ def cmd_replay(a):
                         d = d[:12] + struct.pack("<Q", live_world[0]) + d[20:]
                     elif k == "entity":
                         d = d[:20] + struct.pack("<Q", live_world[0]) + d[28:]
+                if a.as_proto and k in ("player", "entity"):
+                    d = d[:4] + struct.pack("<I", a.as_proto) + d[8:]
                 sock.sendto(d, peer); sent += 1
                 if time.monotonic() - t_begin >= a.seconds:
                     break
@@ -328,9 +339,13 @@ def selftest():
             + struct.pack("<IBBHQ3f", 9, 1, 1, 0x01, (1 << 32) | 9, 4.0, 5.0, 6.0))
     hdr = lambda ci: struct.pack("<IIIIIQHH", lp.NET_ENTITY_MAGIC, lp.NET_PROTO_VER, 50, 1, 2, 0x1234, ci, 2)
     rows = entity_table([(0.0, hdr(0) + body[:20]), (0.01, hdr(1) + body[20:])])
+    anim_body = (struct.pack("<IBBHQ", 11, 2, 0, 0x200, 0x77) + struct.pack("<HhHHhHffB", 0x102, 0, 40000, 300, 250, 0x601, 0.5, 0.25, 2)
+                 + bytes([4, 227, 37, 3]))
+    an = list(entity_snapshots([(0.0, struct.pack("<IIIIIQHH", lp.NET_ENTITY_MAGIC, lp.NET_PROTO_VER, 60, 1, 1, 0x1234, 0, 1) + anim_body)]))
+    ok = ok and len(an) == 1 and an[0][3][0]["anim"]["blend"] == [(4, 227), (37, 3)] and an[0][3][0]["anim"]["channel"] == 0x102
     g = rows.get((2, 0, 0xABCDEF0123)); sh = rows.get((1, 1, (1 << 32) | 9))
     ok = ok and len(rows) == 2 and g and sh and g["hp"] == 77 and g["arch"] == 412 and g["first"] == (1.0, 2.0, 3.0) and sh["first"] == (4.0, 5.0, 6.0)
-    print(f"[tap] selftest: {'PASS' if ok else 'FAIL'} (file round trip, classification, summary, entity decode across chunks)")
+    print(f"[tap] selftest: {'PASS' if ok else 'FAIL'} (file round trip, classification, summary, entity decode across chunks, anim block)")
     return 0 if ok else 1
 
 
@@ -346,6 +361,8 @@ def main(argv):
         if name == "replay":
             p.add_argument("--loops", type=int, default=1000); p.add_argument("--speed", type=float, default=1.0)
             p.add_argument("--adopt-world", action="store_true", help="rewrite the recording's worldId to the live game's")
+            p.add_argument("--as-proto", type=int, default=0, help="rewrite each datagram's protoVer (play an older recording "
+                           "into a newer build; proto 13 only ADDED the optional EF_ANIM block)")
     i = sub.add_parser("info"); i.add_argument("file"); i.add_argument("--entities", action="store_true", help="list every entity the stream names")
     a = ap.parse_args(argv)
     if a.cmd in ("record", "replay") and a.role == "join" and not a.code:

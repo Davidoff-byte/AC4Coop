@@ -282,6 +282,7 @@ namespace {
             uint16_t mask = 0;
             if (!sh) {
                 mask = (uint16_t)(EF_ALL & ~EF_OBJID);   // table saturated: send everything
+                if (!e.anim.valid) mask &= (uint16_t)~EF_ANIM;
             } else {
                 // Quantised delta: position/quaternion only go on the wire when they moved enough to be
                 // visible. The shadow keeps the SENT value, so small movements accumulate rather than
@@ -306,6 +307,9 @@ namespace {
                 // EF_DEAD = 1 and re-applies it idempotently.
                 if (e.dead != sh->st.dead || e.dead != 0u) mask |= EF_DEAD;
                 if (e.stage       != sh->st.stage)       mask |= EF_STAGE;
+                // proto 13: the animation block goes out whenever any of it differs from what was sent
+                // (the phase moves every snapshot while a clip plays). Never sent when not captured.
+                if (e.anim.valid && std::memcmp(&e.anim, &sh->st.anim, sizeof(GuardAnim)) != 0) mask |= EF_ANIM;
                 // objId is carried by the record identity, never by a field bit.
             }
             // Nothing changed since the last packet: omit the record entirely (0 bytes instead of a
@@ -325,6 +329,8 @@ namespace {
             if (mask & EF_ARCH)   need += 2;
             if (mask & EF_DEAD)   need += 1;
             if (mask & EF_STAGE)  need += 1;
+            const uint8_t nb = e.anim.nBlend > GUARD_ANIM_BLEND_MAX ? (uint8_t)GUARD_ANIM_BLEND_MAX : e.anim.nBlend;
+            if (mask & EF_ANIM)   need += GUARD_ANIM_WIRE_FIXED + 2u * nb;
             if (o + need > cap) break;   // full: send the records that fit; h.count is patched to `written` below
             std::memcpy(out + o, &e.key, 4); o += 4;
             out[o++] = e.kind;
@@ -338,6 +344,19 @@ namespace {
             if (mask & EF_ARCH)   { std::memcpy(out + o, &e.arch, 2); o += 2; }
             if (mask & EF_DEAD)   { out[o++] = e.dead; }
             if (mask & EF_STAGE)  { out[o++] = e.stage; }
+            if (mask & EF_ANIM) {
+                const GuardAnim& g = e.anim;
+                std::memcpy(out + o, &g.channel, 2); o += 2;
+                std::memcpy(out + o, &g.layer, 2); o += 2;
+                std::memcpy(out + o, &g.ratioQ, 2); o += 2;
+                std::memcpy(out + o, &g.timeScaleQ, 2); o += 2;
+                std::memcpy(out + o, &g.blendInMs, 2); o += 2;
+                std::memcpy(out + o, &g.blendInFlags, 2); o += 2;
+                std::memcpy(out + o, &g.blendInStartFromEnd, 4); o += 4;
+                std::memcpy(out + o, &g.blendInTargetStart, 4); o += 4;
+                out[o++] = nb;
+                for (uint8_t k = 0; k < nb; ++k) { out[o++] = g.blendSlot[k]; out[o++] = g.blendVal[k]; }
+            }
             if (sh) {
                 sh->st.key = e.key; sh->st.kind = e.kind; sh->st.objId = e.objId;
                 if (mask & EF_POS)    std::memcpy(sh->st.pos,  e.pos,  sizeof(e.pos));
@@ -347,6 +366,7 @@ namespace {
                 if (mask & EF_ARCH)   sh->st.arch = e.arch;
                 if (mask & EF_DEAD)   sh->st.dead = e.dead;
                 if (mask & EF_STAGE)  sh->st.stage = e.stage;
+                if (mask & EF_ANIM)   sh->st.anim = e.anim;
             }
             if (mask == (uint16_t)(EF_ALL & ~EF_OBJID)) ++fullRecs;
             ++written;
@@ -384,11 +404,15 @@ namespace {
             && a.quat[0] == b.quat[0] && a.quat[1] == b.quat[1]
             && a.quat[2] == b.quat[2] && a.quat[3] == b.quat[3]
             && a.actionAlias == b.actionAlias
-            && a.objId == b.objId && a.hp == b.hp && a.arch == b.arch;
+            && a.objId == b.objId && a.hp == b.hp && a.arch == b.arch
+            && std::memcmp(&a.anim, &b.anim, sizeof(GuardAnim)) == 0;
     }
 
     bool SelfTestWire() {
-        EntityPacket a{};
+        // Static: sizeof(EntityPacket) is ~16 KB at proto 13 and five of them are used here.
+        static EntityPacket a, b, c, d, f;
+        std::memset(&a, 0, sizeof(a)); std::memset(&b, 0, sizeof(b)); std::memset(&c, 0, sizeof(c));
+        std::memset(&d, 0, sizeof(d)); std::memset(&f, 0, sizeof(f));
         a.magic = NET_ENTITY_MAGIC; a.protoVer = NET_PROTO_VER; a.seq = 1; a.count = 3;
         for (int i = 0; i < 3; ++i) {
             EntityState& e = a.ents[i];
@@ -401,18 +425,23 @@ namespace {
             // fixture is what a cross-check-normalised sender emits: never dead=1 with a live hp.
             e.hp = (i == 1) ? 0xFFFFu : (uint16_t)(50 + i);
         }
+        {   // proto 13: record 0 carries a full animation block (3 blend factors)
+            GuardAnim& g = a.ents[0].anim;
+            g.valid = 1; g.channel = 0x0102; g.layer = 0; g.ratioQ = 40000; g.timeScaleQ = 300;
+            g.blendInMs = 250; g.blendInFlags = 0x0601; g.blendInStartFromEnd = 0.5f; g.blendInTargetStart = 0.25f;
+            g.nBlend = 3; g.blendSlot[0] = 4; g.blendVal[0] = 227; g.blendSlot[1] = 5; g.blendVal[1] = 20;
+            g.blendSlot[2] = 37; g.blendVal[2] = 3;
+        }
         std::memset(g_txShadow, 0, sizeof(g_txShadow));
         std::memset(g_rxShadow, 0, sizeof(g_rxShadow));
         g_txEpoch = g_rxEpoch = 1; g_txSinceReset = 0;
         uint8_t buf[16384];
         const size_t n1 = EncodeEntityPacket(a, buf, sizeof(buf));
-        EntityPacket b{};
         bool ok = n1 > 0 && DecodeEntityPacket(buf, n1, b) && b.count == 3;
         if (ok) for (int i = 0; i < 3; ++i) ok = ok && SameEntity(a.ents[i], b.ents[i]);
         // C2 §2.4 (2): second pass, nothing changed. The DEAD body must still be re-sent - the dead
         // bit is a level, not a delta - while the two live bodies must still be omitted.
         const size_t n2 = EncodeEntityPacket(a, buf, sizeof(buf));
-        EntityPacket c{};
         bool ok2 = n2 > sizeof(EntityWireHeader) && DecodeEntityPacket(buf, n2, c)
                    && c.count == 1 && c.ents[0].key == 1u && c.ents[0].dead == 1;
         // C2 §2.4 (3): third pass, resurrection. `dead` falls back to 0 and hp must come back off the
@@ -420,14 +449,12 @@ namespace {
         // record, EF_DEAD set on the wire, decoded dead == 0.
         a.ents[1].dead = 0; a.ents[1].hp = 40;
         const size_t n3 = EncodeEntityPacket(a, buf, sizeof(buf));
-        EntityPacket d{};
         bool ok3 = n3 > sizeof(EntityWireHeader) && DecodeEntityPacket(buf, n3, d)
                    && d.count == 1 && d.ents[0].key == 1u && d.ents[0].dead == 0
                    && d.ents[0].hp == 40;
         // C2 §2.4 (1): the no-change omission assertion STAYS, for live entities. This is the only
         // test protecting snapshot size; it is re-fixtured, never deleted, to make §2 pass.
         const size_t n4 = EncodeEntityPacket(a, buf, sizeof(buf));
-        EntityPacket f{};
         bool ok4 = (n4 == sizeof(EntityWireHeader)) && DecodeEntityPacket(buf, n4, f) && f.count == 0;
         // C2-n1: a genuinely HALF-DEAD record - dead = 1 with a live hp (50). At HEAD the codec's own
         // encoder does NOT normalise (net.cpp:272 writes e.hp verbatim); the dead=>sentinel step lives
@@ -436,7 +463,7 @@ namespace {
         // Scratch packets are reused: sizeof(EntityPacket) is ~93 KB and five of them are already here.
         EntityPacket& half = f;
         EntityPacket& halfOut = d;
-        half = EntityPacket{};
+        std::memset(&half, 0, sizeof(half));
         half.magic = NET_ENTITY_MAGIC; half.protoVer = NET_PROTO_VER; half.seq = 2; half.count = 1;
         half.ents[0].key = 7; half.ents[0].kind = 2; half.ents[0].dead = 1; half.ents[0].hp = 50;
         half.ents[0].stage = 1; half.ents[0].arch = 0x35F7;
@@ -444,18 +471,23 @@ namespace {
         bool ok5 = n5 > sizeof(EntityWireHeader) && DecodeEntityPacket(buf, n5, halfOut)
                    && halfOut.count == 1 && halfOut.ents[0].key == 7u && halfOut.ents[0].dead == 1
                    && halfOut.ents[0].hp == 0xFFFFu;
+        // proto 13: only the animation phase changes -> exactly that record, EF_ANIM only, decoded identically.
+        a.ents[0].anim.ratioQ = 41000;
+        const size_t n6 = EncodeEntityPacket(a, buf, sizeof(buf));
+        bool ok6 = n6 > sizeof(EntityWireHeader) && DecodeEntityPacket(buf, n6, c)
+                   && c.count == 1 && c.ents[0].key == 0u && SameEntity(a.ents[0], c.ents[0]);
         // Both peers must start from an empty shadow.
         std::memset(g_txShadow, 0, sizeof(g_txShadow));
         std::memset(g_rxShadow, 0, sizeof(g_rxShadow));
         g_txEpoch = g_rxEpoch = 1; g_txSinceReset = 0;
         char m[256];
-        wsprintfA(m, "[Net] wire codec selftest: roundtrip=%s nochange=%s deaddelta=%s resurrect=%s halfdead=%s"
-                     " (full=%u B, repeat=%u B, res=%u B, idle=%u B, half=%u B)\n",
+        wsprintfA(m, "[Net] wire codec selftest: roundtrip=%s nochange=%s deaddelta=%s resurrect=%s halfdead=%s anim=%s"
+                     " (full=%u B, repeat=%u B, res=%u B, idle=%u B, half=%u B, anim=%u B)\n",
                   ok ? "PASS" : "FAIL", ok4 ? "PASS" : "FAIL", ok2 ? "PASS" : "FAIL",
-                  ok3 ? "PASS" : "FAIL", ok5 ? "PASS" : "FAIL",
-                  (unsigned)n1, (unsigned)n2, (unsigned)n3, (unsigned)n4, (unsigned)n5);
+                  ok3 ? "PASS" : "FAIL", ok5 ? "PASS" : "FAIL", ok6 ? "PASS" : "FAIL",
+                  (unsigned)n1, (unsigned)n2, (unsigned)n3, (unsigned)n4, (unsigned)n5, (unsigned)n6);
         dbg(m);
-        return ok && ok2 && ok3 && ok4 && ok5;
+        return ok && ok2 && ok3 && ok4 && ok5 && ok6;
     }
 
     bool DecodeEntityPacket(const uint8_t* in, size_t len, EntityPacket& out, DecodeReason* why) {
@@ -515,6 +547,24 @@ namespace {
             if (mask & EF_ARCH)   { if (o + 2 > len) return fail(DEC_TRUNC); std::memcpy(&e.arch, in + o, 2); o += 2; }
             if (mask & EF_DEAD)   { if (o + 1 > len) return fail(DEC_TRUNC); e.dead = in[o++]; }
             if (mask & EF_STAGE)  { if (o + 1 > len) return fail(DEC_TRUNC); e.stage = in[o++]; }
+            if (mask & EF_ANIM) {
+                if (o + GUARD_ANIM_WIRE_FIXED > len) return fail(DEC_TRUNC);
+                GuardAnim g{};
+                g.valid = 1;
+                std::memcpy(&g.channel, in + o, 2); o += 2;
+                std::memcpy(&g.layer, in + o, 2); o += 2;
+                std::memcpy(&g.ratioQ, in + o, 2); o += 2;
+                std::memcpy(&g.timeScaleQ, in + o, 2); o += 2;
+                std::memcpy(&g.blendInMs, in + o, 2); o += 2;
+                std::memcpy(&g.blendInFlags, in + o, 2); o += 2;
+                std::memcpy(&g.blendInStartFromEnd, in + o, 4); o += 4;
+                std::memcpy(&g.blendInTargetStart, in + o, 4); o += 4;
+                g.nBlend = in[o++];
+                if (g.nBlend > GUARD_ANIM_BLEND_MAX) return fail(DEC_MASK);   // malformed block
+                if (o + 2u * g.nBlend > len) return fail(DEC_TRUNC);
+                for (uint8_t k = 0; k < g.nBlend; ++k) { g.blendSlot[k] = in[o++]; g.blendVal[k] = in[o++]; }
+                e.anim = g;
+            }
             // C2 §4.2 cross-check: one record may not present two answers for one fact. Only a
             // record that actually carried one of the two death fields is normalised - an untouched
             // shadow value must not ratchet, or a shadow of dead=1 would be re-derived as dead for

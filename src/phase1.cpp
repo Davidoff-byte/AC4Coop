@@ -4353,6 +4353,47 @@ static void CorpseBudgetReport() {
 // Extracted from CaptureGuards so the capture can select a set FIRST (nearest to the peer) and only
 // then serialise it. Callers run it inside CaptureGuards' __try, so the same readable() discipline
 // and the same SEH frame still cover every dereference here.
+// proto 13 (netstate.h GuardAnim): a guard's animation state, read with the same engine calls and the same
+// channel/layer convention CaptureLocalState uses for the player (GetTimeScale 0x6528B0 family,
+// GetCurrentActionRatio 0x667170, GetCurrentEvaluator / GetBlendFactorCount via 0x666BB0, GetBlendFactor 0x667590;
+// Action+0x0C body-part channel, Action+0x10 layer, evaluator +0xD4 type / +0x1C8 / +0x1CC / +0x1D0 / +0x1DC).
+static unsigned s_animBlendDropped = 0;   // non-zero factors beyond GUARD_ANIM_BLEND_MAX (should stay 0)
+static void CaptureGuardAnim(ActionComponent* ac, void* act, GuardAnim& g) {
+    std::memset(&g, 0, sizeof(g));
+    g.channel = 0xFFFF; g.blendInMs = -1;
+    void* bpc = *(void**)((char*)act + 0x0C);
+    if (readable(bpc, 0x0A)) g.channel = *(uint16_t*)((char*)bpc + 8);
+    g.layer = (int16_t)*(int32_t*)((char*)act + 0x10);
+    float r = ac->GetCurrentActionRatio(0, ACTLAYER_PRIMARY);
+    if (!(r >= 0.0f)) r = 0.0f;
+    if (r > 1.0f) r = 1.0f;
+    g.ratioQ = (uint16_t)(r * 65535.0f + 0.5f);
+    float ts = ac->GetTimeScale(0, ACTLAYER_PRIMARY);
+    if (!(ts >= 0.0f)) ts = 1.0f;
+    if (ts > 255.99f) ts = 255.99f;
+    g.timeScaleQ = (uint16_t)(ts * 256.0f + 0.5f);
+    char* ev = (char*)ac->GetCurrentEvaluator(0, ACTLAYER_PRIMARY);
+    if (readable(ev, 0x2B0) && *(uint8_t*)(ev + 0xD4) == 4) {
+        float len = *(float*)(ev + 0x1C8);
+        if (len == len && len >= 0.0f && len < 32.0f) g.blendInMs = (int16_t)(len * 1000.0f + 0.5f);
+        g.blendInFlags        = *(uint16_t*)(ev + 0x1DC);
+        g.blendInStartFromEnd = *(float*)(ev + 0x1CC);
+        g.blendInTargetStart  = *(float*)(ev + 0x1D0);
+    }
+    int n = ac->GetBlendFactorCount(0, ACTLAYER_PRIMARY);
+    if (n > BLEND_MAX) n = BLEND_MAX;
+    for (int i = 0; i < n; ++i) {
+        float v = ac->GetBlendFactor((unsigned char)i, 0, ACTLAYER_PRIMARY);
+        if (!(v > 0.0f)) continue;
+        if (v > 1.0f) v = 1.0f;
+        const int q = (int)(v * 255.0f + 0.5f);
+        if (q == 0) continue;
+        if (g.nBlend >= GUARD_ANIM_BLEND_MAX) { ++s_animBlendDropped; continue; }
+        g.blendSlot[g.nBlend] = (uint8_t)i; g.blendVal[g.nBlend] = (uint8_t)q; ++g.nBlend;
+    }
+    g.valid = 1;
+}
+
 static void EmitGuardEntity(EntityPacket& pkt, uint32_t& count, int idx, Entity* e, Component* bhvC,
                             HandleContainer* hc, float px, float py, float pz, uint64_t nowMs) {
     const float x=e->m_GlobalMatrix.M41, y=e->m_GlobalMatrix.M42, z=e->m_GlobalMatrix.M43;
@@ -4424,7 +4465,10 @@ static void EmitGuardEntity(EntityPacket& pkt, uint32_t& count, int idx, Entity*
         if (ac && readable(ac, 0x40)) {
             unsigned char mirrored = 0;
             void* act = ac->GetCurrentAction(&mirrored, 0, ACTLAYER_PRIMARY);
-            if (act && readable(act, 0x14)) es.actionAlias = *(uint32_t*)((char*)act + 8);
+            if (act && readable(act, 0x14)) {
+                es.actionAlias = *(uint32_t*)((char*)act + 8);
+                CaptureGuardAnim(ac, act, es.anim);   // proto 13
+            }
         }
     }
     // G10 (ops/AI-T5-G10.md 7.2): es is fully populated and gh/gpB already range-checked; the statics
@@ -5068,7 +5112,7 @@ static void GuestPushDeath(uint64_t objId, unsigned int ent, float x, float y, f
     // old "table-full => do not remember" branch is gone.
     if (GktMarkPushed(objId, ent) < 0) { GktSkip(objId, ent, "tombstone"); return; }
 
-    EntityPacket out;
+    static EntityPacket out;   // static: ~16 KB at proto 13 (player-update thread only)
     memset(&out, 0, sizeof(out));
     out.magic    = NET_ENTITY_MAGIC;
     out.protoVer = NET_PROTO_VER;
@@ -6722,7 +6766,7 @@ static void EntitySyncTick() {
 
     // Poll incoming packets BEFORE the self-test branch (D-019). The old order returned early with
     // EntitySelfTest=1, so every incoming entity and kill packet was dropped.
-    EntityPacket in;
+    static EntityPacket in;   // static: ~16 KB at proto 13, and this runs on the game's worker threads
     const bool gotPacket = Net::GetEntities(in);
     const bool haveIn = gotPacket && in.protoVer == NET_PROTO_VER;
     // T27: one join line per process. Until now the only evidence that a peer had ever been heard was
@@ -6742,7 +6786,8 @@ static void EntitySyncTick() {
     // there even before, because the snapshot slot is last-writer-wins. This is the queue that guarantees
     // "the death the peer sent is seen exactly once, no matter how many snapshots arrive around it".
     {
-        EntityPacket kp{};
+        static EntityPacket kp;
+        std::memset(&kp, 0, sizeof(kp));
         if (Net::GetKillEntities(kp, 16) > 0) ProcessKillEvents(kp);
     }
     // Order is deliberate: the exactly-once ring is applied BEFORE the retained snapshot's kill lane.
@@ -6753,7 +6798,8 @@ static void EntitySyncTick() {
     if (haveIn) ProcessKillEvents(in);
 
     if (s_selfTest) {
-        EntityPacket pkt;
+        static EntityPacket pkt;
+        std::memset(&pkt, 0, sizeof(pkt));   // every field of every record starts at 0 (anim.valid = 0)
         CaptureShips(pkt);
         CaptureGuards(pkt);   // guards too: verify the mirror pipeline (capture -> drive) in one instance
         static int s_selfMax = -1;
@@ -6775,7 +6821,8 @@ static void EntitySyncTick() {
         uint32_t snapInterval = g_snapHz > 0 ? (1000u / (uint32_t)g_snapHz) : 0u;
         if (snapInterval == 0 || s_lastSnapMs == 0 || snapNow - s_lastSnapMs >= snapInterval) {
             s_lastSnapMs = snapNow;
-            EntityPacket pkt;
+            static EntityPacket pkt;
+        std::memset(&pkt, 0, sizeof(pkt));   // every field of every record starts at 0 (anim.valid = 0)
             CaptureShips(pkt);
             CaptureGuards(pkt);   // append the characters after the ships
             if (pkt.count) Net::SendEntities(pkt);
@@ -8169,7 +8216,7 @@ static void SendHealthEvent(uint64_t objId, unsigned short life, float x, float 
             }
         if (s_pushedDeathN < 256) s_pushedDeathIds[s_pushedDeathN++] = objId;
     }
-    EntityPacket out;
+    static EntityPacket out;   // static: ~16 KB at proto 13 (player-update thread only)
     memset(&out, 0, sizeof(out));
     out.magic = NET_ENTITY_MAGIC;
     out.protoVer = NET_PROTO_VER;

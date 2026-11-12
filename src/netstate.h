@@ -138,7 +138,9 @@ static_assert(sizeof(PlayerState) == 576, "PlayerState wire size changed - updat
 static const uint32_t NET_MAGIC = 0x43344341; // 'AC4C'
 // Wire/struct-layout version. PlayerState is #pragma pack(1): adding a field shifts every following
 // offset, so both peers MUST run the same build. Bump this whenever the layout changes.
-static const uint32_t NET_PROTO_VER = 12;  // 12: lobby handshake (LobbyPacket below); PlayerState/entity layouts unchanged
+static const uint32_t NET_PROTO_VER = 13;  // 13: guard animation block (EF_ANIM, GuardAnim) on the entity lane;
+                                           //     PlayerState and LobbyPacket unchanged
+                                           // 12: lobby handshake (LobbyPacket below); PlayerState/entity layouts unchanged
                                            // 11: entity chunking + worldId, hullHP removed, shipMaxHP
                                            // (GcLShip+0xB4) + shipClass (entity+0x9C) added; 10: float shipHP (GcLShip+0xD0)
 
@@ -192,6 +194,28 @@ enum EntityKind : uint8_t {
 };
 
 #pragma pack(push, 1)
+// Proto 13: the animation state of a guard, read on the host with the same engine calls CaptureLocalState uses
+// for the player (phase1.cpp CaptureGuardAnim) and applied on the guest the way ApplyRemoteState drives the
+// puppet. Quantised for the wire; `valid` = 0 means "not captured" and is never sent.
+static const int GUARD_ANIM_BLEND_MAX = 16;   // non-zero blend factors carried per guard (the 46-slot ground tree
+                                              // has 1-8 non-zero slots in every capture logged so far)
+struct GuardAnim {
+    uint8_t  valid;           // 1 = captured on the host
+    uint16_t channel;         // Action::m_BodyPartChannel (*(u16*)(*(act+0x0C)+8)); 0xFFFF = unknown
+    int16_t  layer;           // Action::m_Layer (*(i32*)(act+0x10))
+    uint16_t ratioQ;          // GetCurrentActionRatio(0, PRIMARY) * 65535, clamped [0,1]
+    uint16_t timeScaleQ;      // GetTimeScale(0, PRIMARY) * 256 (q8.8), clamped [0, 255.99]
+    int16_t  blendInMs;       // current evaluator +0x1C8 (blend-in length, s) * 1000; -1 = none
+    uint16_t blendInFlags;    // evaluator +0x1DC
+    float    blendInStartFromEnd;   // evaluator +0x1CC
+    float    blendInTargetStart;    // evaluator +0x1D0
+    uint8_t  nBlend;          // entries used in blendSlot/blendVal
+    uint8_t  blendSlot[GUARD_ANIM_BLEND_MAX];   // controller slot index (GetBlendFactor(i, 0, PRIMARY))
+    uint8_t  blendVal[GUARD_ANIM_BLEND_MAX];    // factor * 255, rounded (factors are clamped to [0,1])
+};
+// Wire size of the EF_ANIM block: 2+2+2+2+2+2+4+4+1 fixed, then nBlend x (slot u8, value u8).
+static const int GUARD_ANIM_WIRE_FIXED = 21;
+
 struct EntityState {
     uint32_t key;          // index in the source list selected by `kind`
     uint8_t  kind;         // EntityKind: 1 = ship, 2 = guard, 3 = kill. 0/reserved is NEVER valid here.
@@ -204,6 +228,7 @@ struct EntityState {
     uint64_t objId;        // host-assigned stable identity (HandleContainer::m_ObjectID); 0 = unknown
     uint16_t hp;           // host-authoritative Life (guards); 0xFFFF = dead
     uint16_t arch;         // archetype id at behaviour+0x14: lets the peer match class-to-class
+    GuardAnim anim;        // proto 13: guards only (EF_ANIM)
 };
 
 struct EntityPacket {
@@ -243,8 +268,9 @@ enum EntityField : uint16_t {
     EF_OBJID  = 1u << 8,   // u64 objId - declared only so the set is complete. NOT a legal mask bit:
                            // objId rides the record's wireId (idKind == 0), and net.cpp rejects a
                            // mask containing this bit.
-    EF_ALL    = 0x01F7u,   // every live bit (bit 3 retired). A LEGAL wire mask is
-                           // EF_ALL & ~EF_OBJID == 0x00F7; never send EF_ALL itself.
+    EF_ANIM   = 1u << 9,   // proto 13: GuardAnim block, GUARD_ANIM_WIRE_FIXED + 2*nBlend bytes
+    EF_ALL    = 0x03F7u,   // every live bit (bit 3 retired). A LEGAL wire mask is
+                           // EF_ALL & ~EF_OBJID == 0x02F7; never send EF_ALL itself.
 };
 
 #pragma pack(push, 1)
@@ -264,4 +290,4 @@ static const int ENTITY_WIRE_HEADER_SIZE = 32;
 // Fixed part (key+kind+idKind+mask+wireId = 16) + every optional field. The true worst case is
 // 16 + 38 = 54 (objId is the wireId inside the fixed part, not an extra field); 62 is deliberate
 // headroom - do not "correct" this constant below 54.
-static const int ENTITY_WIRE_RECORD_MAX  = 16 + 46;
+static const int ENTITY_WIRE_RECORD_MAX  = 16 + 46 + GUARD_ANIM_WIRE_FIXED + 2 * GUARD_ANIM_BLEND_MAX;   // proto 13
