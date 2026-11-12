@@ -215,6 +215,8 @@ bool InstallOne(size_t i, HMODULE game) {
 void MenuProbe::Init() {
     if (g_installed) return;
     if (GetPrivateProfileIntA("Coop", "MenuProbe", 0, Paths::Ini()) == 0) return;
+    // AutoContinue detours two of the same prologues (0x17B4840, 0x18E2390): never both.
+    if (GetPrivateProfileIntA("Coop", "AutoContinue", 0, Paths::Ini()) != 0) { OutputDebugStringA("[MP] skipped: AutoContinue=1\n"); return; }
     if (!BuildGate::Trusted()) return;
     HMODULE game = (HMODULE)GameModuleBase;
     if (!game) game = GetModuleHandleA("ac4bfsp.exe");

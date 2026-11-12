@@ -132,6 +132,9 @@
     <ClCompile Include="src\menu_probe.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="src\auto_continue.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="src\net.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -166,6 +169,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\menu_probe.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\auto_continue.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\net.h">

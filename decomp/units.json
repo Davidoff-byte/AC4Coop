@@ -464,6 +464,15 @@
    "size": 759,
    "status": "claimed"
   },
+  "00F91B20": {
+   "addr": "00F91B20",
+   "claimed_at": null,
+   "name": "EntityIsTitleMenuType",
+   "owner": null,
+   "receipts": [],
+   "size": 88,
+   "status": "unknown"
+  },
   "00FB3220": {
    "addr": "00FB3220",
    "claimed_at": "2026-11-08T19:48:45Z",
@@ -626,6 +635,15 @@
    "size": 457,
    "status": "claimed"
   },
+  "014ACD10": {
+   "addr": "014ACD10",
+   "claimed_at": null,
+   "name": "TitleMenuAcceptStart",
+   "owner": null,
+   "receipts": [],
+   "size": 59,
+   "status": "unknown"
+  },
   "017106C0": {
    "addr": "017106C0",
    "claimed_at": "2026-11-08T12:12:51Z",
@@ -715,6 +733,15 @@
    ],
    "size": 56,
    "status": "claimed"
+  },
+  "018DAC60": {
+   "addr": "018DAC60",
+   "claimed_at": null,
+   "name": "TitleMenuSavegameSelectSlot",
+   "owner": null,
+   "receipts": [],
+   "size": 686,
+   "status": "unknown"
   },
   "019FB4C0": {
    "addr": "019FB4C0",

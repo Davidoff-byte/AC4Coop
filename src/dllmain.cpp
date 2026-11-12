@@ -24,6 +24,7 @@
 #include "ui_probe.h"
 #include "video_hook.h"
 #include "menu_probe.h"
+#include "auto_continue.h"
 #include "action_guard.h"
 #include "deref_guard.h"
 #include "combat_observe.h"
@@ -574,6 +575,9 @@ BOOL APIENTRY DllMain(HMODULE hMod, DWORD reason, LPVOID)
         // Menu probe (boot straight into the world, part B): observation-only hooks on the title-menu save path.
         // [Coop] MenuProbe, default 0 -> one GetPrivateProfileIntA, nothing patched.
         MenuProbe::Init();
+
+        // Boot straight into the world: accept "press start" and pick the save slot. [Coop] AutoContinue, default 0.
+        AutoContinue::Init();
 
         // Front B (peer-to-peer UDP link) is started on the first in-world frame instead of at
         // DLL attach. The game's launch chain (Steam -> Ubisoft -> DRM -> real game) starts more
