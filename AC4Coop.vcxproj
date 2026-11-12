@@ -124,6 +124,7 @@
     <ClCompile Include="src\upnp.cpp" />
     <ClCompile Include="src\stun.cpp" />
     <ClCompile Include="src\lobby_ui.cpp" />
+    <ClCompile Include="src\ui_probe.cpp" />
     <ClCompile Include="src\action_guard.cpp" />
     <ClCompile Include="src\build_gate.cpp" />
     <ClCompile Include="src\deref_guard.cpp" />
@@ -141,6 +142,7 @@
     <ClInclude Include="src\upnp.h" />
     <ClInclude Include="src\stun.h" />
     <ClInclude Include="src\lobby_ui.h" />
+    <ClInclude Include="src\ui_probe.h" />
     <ClInclude Include="src\netstate.h" />
     <ClInclude Include="src\action_guard.h" />
     <ClInclude Include="src\build_gate.h" />

@@ -21,6 +21,7 @@
 #include "phase1.h"
 #include "net.h"
 #include "lobby_ui.h"
+#include "ui_probe.h"
 #include "action_guard.h"
 #include "deref_guard.h"
 #include "combat_observe.h"
@@ -315,6 +316,8 @@ static unsigned __stdcall PollThread(void*)
         logline("[AC4Coop] heartbeat pid=%u start tick=0 ts=%s\n",
                 (unsigned)GetCurrentProcessId(), ts);
     }
+
+    UiProbe::Start();   // [Coop] UiProbe=1 only (default 0): measures the present + input paths for the overlay
 
     while (g_run)
     {
