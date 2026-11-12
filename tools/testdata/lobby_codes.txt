@@ -1,0 +1,20 @@
+# Lobby-code test vectors (docs/LEDGER.md slice 2, docs/design/lobby-code.md).
+# Single source for BOTH implementations: tools/lobby_code.py reads this file; src/lobby_code_vectors.h is
+# generated from it (py tools\lobby_code.py --gen-header) and the Python selftest fails if the header drifts.
+#
+# valid   <ip:port>  <code>           encode(ip,port) == code  and  decode(code) == ip:port
+# accept  <ip:port>  <text>           decode(text) == ip:port  (case / separator tolerance)
+# reject  <text>                      decode(text) == invalid
+# Fields are separated by TABs (a text may contain spaces).
+valid	127.0.0.1:47801	FW00-00DT-Q7MB
+valid	192.168.1.20:47801	R2M0-255T-Q5JA
+valid	203.0.113.7:47801	SC07-21XT-Q5F7
+valid	0.0.0.0:0	0000-0000-03GG
+valid	255.255.255.255:65535	ZZZZ-ZZZZ-ZYEF
+accept	203.0.113.7:47801	sc07-21xt-q5f7
+accept	203.0.113.7:47801	SC07 21XT Q5F7
+reject	SC07-21XT-Q5F
+reject	SC07-21XT-Q5FU
+reject	SC07-21XT-Q5F8
+reject	SC07-21XT-Q5F7-0
+reject

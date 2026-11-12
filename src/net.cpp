@@ -9,6 +9,7 @@
 #include <process.h>      // _beginthreadex: RecvThread calls CRT (dbg -> printf/fputs); see dllmain.cpp "_beginthreadex, not CreateThread"
 #include "net.h"
 #include "paths.h"
+#include "lobby_code.h"
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -808,6 +809,7 @@ bool Init() {
     g_enabled = true;
     g_lastRecvMs = 0;   // no packet accepted yet
     SelfTestWire();     // [Phase 2] prove the compact codec round-trips before any traffic
+    { char lm[192]; LobbyCode::SelfTest(lm, sizeof(lm)); dbg(lm); }   // lobby-code format (slice 2): log only, no behaviour
     _beginthreadex(nullptr, 0, (unsigned (__stdcall*)(void*))RecvThread, nullptr, 0, nullptr);   // after the self-test (it resets the rx shadow)
     char m[128]; wsprintfA(m, "[Net] up: bound:%d -> %s:%d\n", bindPort, peerIp, sendPort); dbg(m);
     return true;
