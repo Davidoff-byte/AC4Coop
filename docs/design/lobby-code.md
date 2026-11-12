@@ -31,7 +31,7 @@ So only the host's router must accept an unsolicited packet. That is what the po
      The code will not work from outside. Log it plainly and still show the LAN code.
    - No UPnP gateway → show the STUN address with a warning: it works only if the router forwards the
      port (manual port forward, or a NAT that accepts it).
-4. Show the code: **window title** (`AC4Coop | host code K7M2-9QXD-4A`, via `windowed.cpp`), the log, and
+4. Show the code: **window title** (`AC4Coop | host code SC07-21XT-Q5F7`, via `windowed.cpp`), the log, and
    the clipboard. A **LAN code** (LAN IP) is shown too, for same-network and same-PC testing.
 5. Wait for `HELLO`. Lock `g_peer` to the first guest whose `HELLO` carries the right protocol version and
    code check. Reply `WELCOME`. Drop everything from other sources (the existing strict-peer gate, applied to
@@ -45,10 +45,13 @@ So only the host's router must accept an unsolicited packet. That is what the po
    The window title and the log say what happened.
 
 ### The code
-- 32-bit IPv4 + 16-bit port + 2-bit check = 50 bits → **10 Crockford base32 characters**, shown as
-  `XXXX-XXXX-XX`. Crockford base32 has no I/L/O/U, is case-insensitive and ignores dashes when typed.
+- 32-bit IPv4 + 16-bit port + 12-bit check = 60 bits → **12 Crockford base32 characters**, shown as
+  `XXXX-XXXX-XXXX`. Crockford base32 has no I/L/O/U, is case-insensitive and ignores dashes when typed.
+- Check: the low 12 bits of CRC-16/CCITT-FALSE over the 6 address bytes. Decided 2026-11-12 over a 10-character
+  code with a 2-bit check, which let about 1 typo in 4 decode to a wrong address. The exact spec and test
+  vectors are in `docs/LEDGER.md`, slice 2.
 - No secret is in it: anyone who knows the code and runs the same build can take the guest slot. That is
-  acceptable for testing between friends. An optional 20-bit session token (14 characters) can be added
+  acceptable for testing between friends. An optional session token (a few more characters) can be added
   later without changing anything else.
 
 ### Wire
