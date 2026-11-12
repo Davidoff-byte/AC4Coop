@@ -128,6 +128,7 @@
     <ClCompile Include="src\video_hook.cpp" />
     <ClCompile Include="src\menu_probe.cpp" />
     <ClCompile Include="src\auto_continue.cpp" />
+    <ClCompile Include="src\crash_ctx.cpp" />
     <ClCompile Include="src\action_guard.cpp" />
     <ClCompile Include="src\build_gate.cpp" />
     <ClCompile Include="src\deref_guard.cpp" />
@@ -149,6 +150,7 @@
     <ClInclude Include="src\video_hook.h" />
     <ClInclude Include="src\menu_probe.h" />
     <ClInclude Include="src\auto_continue.h" />
+    <ClInclude Include="src\crash_ctx.h" />
     <ClInclude Include="src\netstate.h" />
     <ClInclude Include="src\action_guard.h" />
     <ClInclude Include="src\build_gate.h" />

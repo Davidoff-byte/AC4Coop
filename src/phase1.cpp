@@ -5614,6 +5614,23 @@ static void WideBindReport() {
     s_wbNeed = s_wbExact = s_wbWide = s_wbNoArch = s_wbFar = s_wbPool = s_wbRuns = 0; s_wbFarMin = 1e9f;
 }
 
+// [Coop] MirrorActions (default 1 = unchanged): 0 stops the guest replaying the host's action clip on a mirrored
+// guard (ApplyGuards' SetTargetAction). Position, rotation, health and death are still mirrored. A/B switch for the
+// freed-action-state crashes of 2026-11-12 (0x00681815 and 0x0073623F): both were a call through the action state a
+// mirrored body's state linked to at +0x1F4. Re-read every 2 s so one session can run both settings.
+static bool MirrorActionsEnabled() {
+    static int s_v = 1; static uint64_t s_next = 0;
+    const uint64_t now = GetTickCount64();
+    if (now >= s_next) {
+        s_next = now + 2000;
+        const int v = GetPrivateProfileIntA("Coop", "MirrorActions", 1, Paths::Ini()) != 0 ? 1 : 0;
+        if (v != s_v) L("[Mirror] MirrorActions=%d (was %d)\n", v, s_v);
+        s_v = v;
+    }
+    return s_v != 0;
+}
+static unsigned s_mirrorActionCalls = 0;   // SetTargetAction calls issued on mirrored guards (5 s window)
+
 static void ApplyGuards(const EntityPacket& pkt) {
     World* world = World::GetCurrentWorld();
     if (!world) return;
@@ -5947,11 +5964,21 @@ static void ApplyGuards(const EntityPacket& pkt) {
                     if (!s_selfTestMode) ((Entity*)best)->SetGlobalMatrixInternal(&m, bigJump);
                 }
                 // Only re-issue the clip when the alias changed.
-                if (es.actionAlias && MirrorAliasShouldApply(best, es.actionAlias)) {
+                if (es.actionAlias && MirrorActionsEnabled() && MirrorAliasShouldApply(best, es.actionAlias)) {
                     if (bh && readable(bh, 4)) {
                         ActionComponent* ac = bh->GetActionComponent();
-                        if (ac && readable(ac, 0x40))
+                        if (ac && readable(ac, 0x40)) {
                             ac->SetTargetAction((int)es.actionAlias, 0, 0, 0xFFFF, ACTLAYER_PRIMARY);
+                            ++s_mirrorActionCalls;
+                            // One line per call, capped: the last lines before a crash name the bodies whose
+                            // action stacks were just changed.
+                            static unsigned s_lines = 0;
+                            if (s_lines < 3000) {
+                                ++s_lines;
+                                L("[MirrorAct] ent=%08X objId=%016llX alias=%u\n", (unsigned int)best,
+                                  (unsigned long long)es.objId, (unsigned)es.actionAlias);
+                            }
+                        }
                     }
                 }
             }
@@ -9629,7 +9656,7 @@ static void DumpConfigOnce()
     struct K { const char* s; const char* k; int d; };
     static const K keys[] = {
         { "Coop", "ActionDeathLog", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "CombatObserve", 0 },
-        { "Coop", "CombatTest", 0 }, { "Coop", "CorpseKeepSec", 30 }, { "Coop", "CrowdProbeIntegrate", 1 },
+        { "Coop", "CombatTest", 0 }, { "Coop", "CrashContext", 0 }, { "Coop", "CorpseKeepSec", 30 }, { "Coop", "CrowdProbeIntegrate", 1 },
         { "Coop", "CrowdProbeLiveKeys", 1 }, { "Coop", "DamageRelay", 0 }, { "Coop", "Diag", 0 },
         { "Coop", "DisableCrowd", 0 }, { "Coop", "DisablePuppetAI", 1 }, { "Coop", "DisableSpawns", 0 },
         { "Coop", "DriveActions", 1 }, { "Coop", "DriveContext", 0 }, { "Coop", "DriveLocomotion", 0 },
@@ -9640,7 +9667,7 @@ static void DumpConfigOnce()
         { "Coop", "GuestKillMirror", 1 }, { "Coop", "HookSgm", 1 }, { "Coop", "HostileOnly", 0 },
         { "Coop", "HybridLoco", 1 }, { "Coop", "IdentityBand", 0 }, { "Coop", "IdResolver", 1 },
         { "Coop", "InstallHooks", 1 }, { "Coop", "IntegratePuppet", 0 }, { "Coop", "KillTrace", 1 },
-        { "Coop", "KrLog", 0 }, { "Coop", "LegacyPadIdHook", 1 }, { "Coop", "MinBlendInMs", 100 },
+        { "Coop", "KrLog", 0 }, { "Coop", "LegacyPadIdHook", 1 }, { "Coop", "MirrorActions", 1 }, { "Coop", "MinBlendInMs", 100 },
         { "Coop", "NetStrictPeer", 1 }, { "Coop", "NullReturnObserver", 1 }, { "Coop", "Probe", 0 },
         { "Coop", "PuppetParkX", 0 }, { "Coop", "PuppetPhysics", 0 }, { "Coop", "RegisterPad1", 0 },
         { "Coop", "RelevanceRadiusM", 250 }, { "Coop", "ReloadBuilder", 1 }, { "Coop", "SceneAwareExact", 0 },
@@ -9876,6 +9903,8 @@ static void OnFrameInner(Human* updatedHuman) {
                       s_bindRejBhv, s_bindRejAi, s_bindRejHp, s_bindRejArch, s_bindRejTaken,
                       s_bindUnmatched, (s_bindMinD < 1e8f) ? sqrtf(s_bindMinD) : -1.0f);
                 WideBindReport();
+                L("[Mirror] actions on=%d calls=%u\n", MirrorActionsEnabled() ? 1 : 0, s_mirrorActionCalls);
+                s_mirrorActionCalls = 0;
             }
             // Component histogram, same window. ALL non-zero distinct component vtable ids by
             // descending count (32 slots), then the two ids the soldier filter trusts, each as
