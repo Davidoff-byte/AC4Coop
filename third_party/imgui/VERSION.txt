@@ -1,0 +1,6 @@
+Dear ImGui v1.91.5 (https://github.com/ocornut/imgui), MIT licence (LICENSE.txt).
+Source: https://github.com/ocornut/imgui/archive/refs/tags/v1.91.5.zip
+        1,947,814 bytes, sha256 15c60ad10e331378cda381002418f42ea2e98b9c05758eb493b23181bb38ca45 (downloaded 2026-11-12)
+Vendored unmodified: the core files, imconfig.h, imgui_demo.cpp (needed by ShowDemoWindow references, not shipped
+in the UI), and backends/imgui_impl_win32 + imgui_impl_dx11. Do not edit these files; update by replacing them
+from a newer tag and recording its zip hash here.

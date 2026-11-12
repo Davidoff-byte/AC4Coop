@@ -4,3 +4,6 @@
 decomp/candidates/** -text
 decomp/evidence/**  -text
 decomp/receipts/**  -text
+
+# Vendored third-party code: keep the upstream bytes exactly (VERSION.txt records the source zip hash).
+third_party/** -text
