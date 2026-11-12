@@ -2931,6 +2931,57 @@ static void BoardableTestTick() {
         s_stage = 4;
     }
 }
+// ---- Naval spawn-suppression test: [Coop] NavalCountLog (default 0) -------------------------------------------
+// Question (ship-identity-2026-11-12.md): does DisableSpawns (SpawningRequest::Spawn declined, RVA 0x39B8D0) stop NAVAL
+// traffic spawns? Self-controlled in ONE session: phase A (180 s) spawns allowed, phase B (180 s) g_disableSpawns=1,
+// then restored to 0. Every 10 s: naval-list count (u16 mgr+0x3EE) and how many ship ids (hc+0x0C, u64) were never seen
+// before. Oracle: [E] ev=naval-spawn verdict=PASS (new ids in A, none in B after its first window) | FAIL (new ids in B)
+// | INCONCLUSIVE (no new ids in A: quiet sea, the test could not have seen a block). Read-only apart from the flag.
+static void NavalCountTick() {
+    static int s_on = -1, s_phase = 0, s_win = 0, s_newA = 0, s_newB = 0, s_seenN = 0;
+    static DWORD s_t0 = 0, s_next = 0; static uint64_t s_seen[512];
+    if (s_on < 0) s_on = GetPrivateProfileIntA("Coop", "NavalCountLog", 0, Paths::Ini()) != 0 ? 1 : 0;
+    if (!s_on || s_phase >= 2) return;
+    const DWORD now = GetTickCount();
+    if (now < s_next) return;
+    s_next = now + 10000;
+    __try {
+        void* mgr = GetNavalManager();
+        if (!mgr || !readable((char*)mgr + 0x3E8, 8)) return;
+        if (!s_t0) { s_t0 = now; L("[Naval] test start: phase A (spawns allowed) 180 s, then phase B (DisableSpawns) 180 s\n"); }
+        const unsigned short n = *(unsigned short*)((char*)mgr + 0x3EE);
+        int valid = 0, fresh = 0;
+        for (int i = 0; i < (int)n && i < 256; ++i) {
+            void* hc = GetShipHandle(mgr, i);
+            if (!hc || !readable((char*)hc + 0x0C, 8)) continue;
+            Entity* se = (Entity*)*(void**)hc;
+            if (!se || !readable(se, 4) || *(uint32_t*)se != 0x01E4A128u) continue;
+            ++valid;
+            const uint64_t id = *(uint64_t*)((char*)hc + 0x0C);
+            bool known = false;
+            for (int k = 0; k < s_seenN; ++k) if (s_seen[k] == id) { known = true; break; }
+            if (!known) { if (s_seenN < 512) s_seen[s_seenN++] = id; ++fresh; }
+        }
+        const DWORD el = now - s_t0;
+        const bool first = (s_win == 0);
+        if (s_phase == 0) { if (!first) s_newA += fresh; }
+        else              { if (s_win > 0) s_newB += fresh; }   // skip the first B window (spawns already in flight)
+        L("[Naval] phase=%c t=%us n=%u valid=%d new=%d%s disableSpawns=%d seen=%d\n",
+          s_phase == 0 ? 'A' : 'B', (unsigned)(el / 1000), (unsigned)n, valid, fresh, first ? " (baseline)" : "", g_disableSpawns, s_seenN);
+        ++s_win;
+        if (s_phase == 0 && el >= 180000) {
+            g_disableSpawns = 1; s_phase = 1; s_win = 0;
+            L("[Naval] -> phase B: DisableSpawns ON\n"); L("[E] ev=naval-phase phase=B\n");
+        } else if (s_phase == 1 && el >= 360000) {
+            g_disableSpawns = 0; s_phase = 2;
+            const char* v = (s_newA == 0) ? "INCONCLUSIVE" : (s_newB == 0 ? "PASS" : "FAIL");
+            L("[E] ev=naval-spawn verdict=%s newA=%d newB=%d (DisableSpawns restored to 0)\n", v, s_newA, s_newB);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        L("[Naval] EXCEPTION code=0x%08X\n", GetExceptionCode()); g_disableSpawns = 0; s_phase = 2;
+    }
+}
+
 // Choose a naval-list ship to duplicate as the peer's class. Walks [mgr+0x3E8] (handle containers,
 // stride 0xD0, count u16 @ +0x3EE).
 //
@@ -9540,7 +9591,7 @@ static void DumpConfigOnce()
 
     struct K { const char* s; const char* k; int d; };
     static const K keys[] = {
-        { "Coop", "ActionDeathLog", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "CombatObserve", 0 },
+        { "Coop", "ActionDeathLog", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "CombatObserve", 0 },
         { "Coop", "CombatTest", 0 }, { "Coop", "CorpseKeepSec", 30 }, { "Coop", "CrowdProbeIntegrate", 1 },
         { "Coop", "CrowdProbeLiveKeys", 1 }, { "Coop", "DamageRelay", 0 }, { "Coop", "Diag", 0 },
         { "Coop", "DisableCrowd", 0 }, { "Coop", "DisablePuppetAI", 1 }, { "Coop", "DisableSpawns", 0 },
@@ -9909,6 +9960,7 @@ static void OnFrameInner(Human* updatedHuman) {
     // F8 live test (no-op unless [Coop] BoardableTest=1). Must sit ABOVE the Net::Enabled() block: that block always
     // returns, so anything after it never runs in a networked session (first placement, 19788a1, never fired).
     BoardableTestTick();
+    NavalCountTick();                                      // naval spawn-suppression test, no-op unless NavalCountLog=1
     if (Net::Enabled()) {
         EntitySyncTick();   // host broadcasts entity transforms; peer mirrors them (synced worlds)
         // Capture only succeeds in a real playable world (not title/whiteroom). Require it to be
@@ -10679,6 +10731,9 @@ void Phase1::InstallFrameHook() {
     }
     InstallNoPauseHook();
     if (g_disableSpawns) { InstallSpawnRequestHook(); InstallCrowdSpawnHook(); }
+    // NavalCountLog flips g_disableSpawns at runtime, so the SpawningRequest gate must exist even when the flag starts at 0
+    // (MySpawnRequest is a pure pass-through while g_disableSpawns == 0). Crowd hook stays tied to the ini flag.
+    else if (GetPrivateProfileIntA("Coop", "NavalCountLog", 0, Paths::Ini()) != 0) { InstallSpawnRequestHook(); L("[Naval] spawn gate installed (pass-through until phase B)\n"); }
     uintptr_t b = base();
     uint8_t* at = (uint8_t*)(b + RVA_HumanUpdate);
     g_frameJmpBack = (uint32_t)(b + RVA_HumanUpdate + HU_STEAL_LEN);
