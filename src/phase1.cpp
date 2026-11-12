@@ -2840,50 +2840,97 @@ static Entity* GetLocalShip() {
 // and the mission condition BoardingCondition reads obj->vtbl[+408]() && obj->vtbl[+368]() (u8 predicates).
 // This test does exactly the action's call on the NEAREST non-local AI ship within 200 m, once, and logs the byte
 // and both predicates before and after. Question answered live: does the flag alone make the ship boardable?
+static void BoardStateOf(void* o, int* flag, int* b95, int* p408, int* p368) {
+    *flag = *b95 = *p408 = *p368 = -1;
+    __try {
+        if (!readable(o, 0x3AA)) return;
+        *flag = *((unsigned char*)o + 0x3A9);
+        uint32_t* bs = *(uint32_t**)((char*)o + 0x40);
+        if (readable(bs, 12)) *b95 = (int)((bs[2] >> 31) & 1u);
+        void** vt = *(void***)o;
+        if (readable((void*)vt, 412)) {
+            *p408 = ((unsigned char (__thiscall*)(void*))vt[408 / 4])(o);
+            *p368 = ((unsigned char (__thiscall*)(void*))vt[368 / 4])(o);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+// Self-running F8 test (no keypress). Stages, on the NEAREST non-local AI ship within 200 m:
+//   0 find + log baseline  ->  1 SetBoardable(obj,1) + log  ->  2 hull -> 5 % of max via WriteShipHullHP (slot 0x12C,
+//   the engine's damage-aware setter, same path as F9)  ->  3 log every second for 20 s  ->  verdict.
+// ORACLE (machine, no human): the game's own BoardingCondition = vtbl[+408]() && vtbl[+368]() (IDA 0x14A3E30).
+//   [E] ev=boardtest verdict=PASS  -> both predicates true at some sample after stage 2
+//   [E] ev=boardtest verdict=FAIL  -> never both true in 20 s
 static void BoardableTestTick() {
-    static int s_on = -1, s_done = 0; static DWORD s_next = 0;
+    static int s_on = -1, s_stage = 0, s_samples = 0, s_pass = 0; static DWORD s_next = 0;
+    static Entity* s_ship = nullptr; static void* s_obj = nullptr;
     if (s_on < 0) s_on = GetPrivateProfileIntA("Coop", "BoardableTest", 0, Paths::Ini()) != 0 ? 1 : 0;
-    if (!s_on || s_done) return;
+    if (!s_on || s_stage >= 4) return;
     const DWORD now = GetTickCount();
     if (now < s_next) return;
-    s_next = now + 2000;                                       // look every 2 s until one ship qualifies
+    s_next = now + (s_stage == 0 ? 2000 : 1000);
     __try {
-        World* world = World::GetCurrentWorld();
-        Entity* player = world ? world->GetPlayer() : nullptr;
-        void* mgr = GetNavalManager();
-        if (!player || !mgr || !readable((char*)mgr + 0x3E8, 8)) return;
-        const unsigned short n = *(unsigned short*)((char*)mgr + 0x3EE);
-        Entity* local = GetLocalShip();
-        Entity* best = nullptr; float bestD2 = 200.0f * 200.0f;
-        const float px = player->m_GlobalMatrix.M41, py = player->m_GlobalMatrix.M42;
-        for (int i = 0; i < (int)n && i < 128; ++i) {
-            Entity* se = GetShipEntity(mgr, i);
-            if (!se || !readable(se, 0x50) || *(uint32_t*)se != 0x01E4A128u || se == local) continue;
-            if (se == (Entity*)g_ghostShip) continue;
-            const float dx = se->m_GlobalMatrix.M41 - px, dy = se->m_GlobalMatrix.M42 - py;
-            if (dx * dx + dy * dy < bestD2) { bestD2 = dx * dx + dy * dy; best = se; }
+        int f, b, q, r;
+        if (s_stage == 0) {
+            World* world = World::GetCurrentWorld();
+            Entity* player = world ? world->GetPlayer() : nullptr;
+            void* mgr = GetNavalManager();
+            if (!player || !mgr || !readable((char*)mgr + 0x3E8, 8)) return;
+            const unsigned short n = *(unsigned short*)((char*)mgr + 0x3EE);
+            Entity* local = GetLocalShip();
+            Entity* best = nullptr; float bestD2 = 200.0f * 200.0f;
+            const float px = player->m_GlobalMatrix.M41, py = player->m_GlobalMatrix.M42;
+            for (int i = 0; i < (int)n && i < 128; ++i) {
+                Entity* se = GetShipEntity(mgr, i);
+                if (!se || !readable(se, 0x50) || *(uint32_t*)se != 0x01E4A128u || se == local) continue;
+                if (se == (Entity*)g_ghostShip) continue;
+                const float dx = se->m_GlobalMatrix.M41 - px, dy = se->m_GlobalMatrix.M42 - py;
+                if (dx * dx + dy * dy < bestD2) { bestD2 = dx * dx + dy * dy; best = se; }
+            }
+            if (!best) return;
+            void* obj = ((void* (__cdecl*)(void*))0x0122BA20)((void*)best);
+            if (!readable(obj, 0x548) || !readable(*(void**)obj, 0x1A0)) { L("[Board] ship=%p obj=%p unreadable - test aborted\n", best, obj); s_stage = 4; return; }
+            s_ship = best; s_obj = obj;
+            float hp = -1.0f; ReadShipHullHP(best, &hp);
+            BoardStateOf(obj, &f, &b, &q, &r);
+            L("[Board] S0 baseline ship=%p obj=%p vt=%08X dist=%.1f hull=%.1f flag=%d bit95=%d pred408=%d pred368=%d\n",
+              best, obj, *(uint32_t*)obj, sqrtf(bestD2), hp, f, b, q, r);
+            s_stage = 1; return;
         }
-        if (!best) return;
-        void* obj = ((void* (__cdecl*)(void*))0x0122BA20)((void*)best);
-        if (!readable(obj, 0x548) || !readable(*(void**)obj, 0x1A0)) { L("[Board] ship=%p obj=%p unreadable - skipped\n", best, obj); s_done = 1; return; }
-        typedef unsigned char (__thiscall* Pred)(void*);
-        void** vt = *(void***)obj;
-        const unsigned char b0 = *((unsigned char*)obj + 0x3A9), m0 = *((unsigned char*)obj + 0x540);
-        const unsigned char p408a = ((Pred)vt[408 / 4])(obj), p368a = ((Pred)vt[368 / 4])(obj);
-        L("[Board] BEFORE ship=%p obj=%p dist=%.1f +0x3A9=%u +0x540=%u pred408=%u pred368=%u\n",
-          best, obj, sqrtf(bestD2), b0, m0, p408a, p368a);
-        ((void (__thiscall*)(void*, unsigned char))0x01207960)(obj, 1);                  // SetBoardable(obj, 1)
-        const unsigned char b1 = *((unsigned char*)obj + 0x3A9), m1 = *((unsigned char*)obj + 0x540);
-        const unsigned char p408b = ((Pred)vt[408 / 4])(obj), p368b = ((Pred)vt[368 / 4])(obj);
-        L("[Board] AFTER  ship=%p +0x3A9=%u +0x540=%u pred408=%u pred368=%u\n", best, b1, m1, p408b, p368b);
-        L("[E] ev=boardable-set ok=%d\n", (b1 == 1) ? 1 : 0);
-        s_done = 1;
+        if (!readable(s_ship, 0x50) || *(uint32_t*)s_ship != 0x01E4A128u || !readable(s_obj, 0x548)) {
+            L("[Board] ship gone at stage %d - test aborted\n", s_stage); L("[E] ev=boardtest verdict=ABORT\n"); s_stage = 4; return;
+        }
+        if (s_stage == 1) {
+            ((void (__thiscall*)(void*, unsigned char))0x01207960)(s_obj, 1);                   // SetBoardable(obj, 1)
+            BoardStateOf(s_obj, &f, &b, &q, &r);
+            L("[Board] S1 after SetBoardable flag=%d bit95=%d pred408=%d pred368=%d\n", f, b, q, r);
+            s_stage = 2; return;
+        }
+        if (s_stage == 2) {
+            void* ho = ShipGcLObj(s_ship);
+            const float mx = (ho && readable((char*)ho + 0xB4, 4)) ? *(float*)((char*)ho + 0xB4) : 0.0f;
+            float hp = -1.0f; ReadShipHullHP(s_ship, &hp);
+            const bool w = (mx > 0.0f) && WriteShipHullHP(s_ship, mx * 0.05f);
+            float hp2 = -1.0f; ReadShipHullHP(s_ship, &hp2);
+            BoardStateOf(s_obj, &f, &b, &q, &r);
+            L("[Board] S2 damage write=%d hull %.1f -> %.1f (max %.1f, ShipGcLObj=%p sameobj=%d) flag=%d bit95=%d pred408=%d pred368=%d\n",
+              w ? 1 : 0, hp, hp2, mx, ho, ho == s_obj ? 1 : 0, f, b, q, r);
+            s_stage = 3; return;
+        }
+        // stage 3: sample once a second for 20 s
+        BoardStateOf(s_obj, &f, &b, &q, &r);
+        float hp = -1.0f; ReadShipHullHP(s_ship, &hp);
+        L("[Board] S3 t=%ds hull=%.1f flag=%d bit95=%d pred408=%d pred368=%d\n", s_samples, hp, f, b, q, r);
+        if (q == 1 && r == 1) s_pass = 1;
+        if (++s_samples >= 20 || s_pass) {
+            L("[E] ev=boardtest verdict=%s samples=%d\n", s_pass ? "PASS" : "FAIL", s_samples);
+            s_stage = 4;
+        }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        L("[Board] EXCEPTION code=0x%08X\n", GetExceptionCode());
-        s_done = 1;
+        L("[Board] EXCEPTION at stage %d code=0x%08X\n", s_stage, GetExceptionCode());
+        L("[E] ev=boardtest verdict=ABORT\n");
+        s_stage = 4;
     }
 }
-
 // Choose a naval-list ship to duplicate as the peer's class. Walks [mgr+0x3E8] (handle containers,
 // stride 0xD0, count u16 @ +0x3EE).
 //
