@@ -43,6 +43,8 @@ namespace {
     uint32_t           g_joinNonce = 0;       // join: this attempt's nonce (WELCOME must echo it)
     uint32_t           g_joinCheck = 0;       // join: check of the typed code (sent in HELLO, logged by the host)
     volatile LONG      g_joinState = 0;       // join: 0 idle, 1 sending HELLO, 2 welcomed, 3 rejected, 4 timed out
+    volatile LONG      g_joinGen = 0;         // join attempt generation (F8 restarts)
+    char               g_joinCodeText[16] = {0};   // the code of the current attempt, for the status line
 
     // ---- host: UPnP + STUN (slices 4-5) ------------------------------------------------------------
     // The STUN request goes out of the GAME socket (so the NAT mapping it reports is the one the guest
@@ -734,16 +736,17 @@ namespace {
     // Join mode: HELLO every 250 ms for the first 15 s (the design's window), then every 2 s for up to
     // 10 min, because in practice the host is often still loading when the guest reaches the world.
     // Deviation from lobby-code.md (15 s then stop) - the 15 s line is still logged as the design's verdict.
-    unsigned __stdcall JoinThread(void*) {
+    unsigned __stdcall JoinThread(void* genArg) {
+        const LONG gen = (LONG)(intptr_t)genArg;   // a newer F8 join attempt retires this thread
         const uint64_t t0 = GetTickCount64();
         int sent = 0;
         bool slowLogged = false;
         char pa[48]; FmtAddr(PeerCopy(), pa, sizeof(pa));
         char m[256];
-        while (InterlockedCompareExchange(&g_joinState, 0, 0) == 1) {
+        while (InterlockedCompareExchange(&g_joinState, 0, 0) == 1 && InterlockedCompareExchange(&g_joinGen, 0, 0) == gen) {
             const uint64_t el = GetTickCount64() - t0;
             if (el > 600000) {
-                if (InterlockedCompareExchange(&g_joinState, 4, 1) == 1) {
+                if (InterlockedCompareExchange(&g_joinGen, 0, 0) == gen && InterlockedCompareExchange(&g_joinState, 4, 1) == 1) {
                     _snprintf(m, sizeof(m), "[Lobby] join gave up: no answer from %s after %d HELLOs in 10 min\n", pa, sent);
                     m[sizeof(m) - 1] = 0; dbg(m);
                 }
@@ -760,6 +763,29 @@ namespace {
             Sleep(el > 15000 ? 2000 : 250);
         }
         return 0;
+    }
+
+    // Start (or restart) a join attempt to ip:port. Called from Init (JoinCode=) and Net::JoinByCode (F8).
+    // Ordering: state 0 first, so a late WELCOME for the previous attempt is ignored while nonce and peer
+    // change; state 1 last publishes the new attempt.
+    void StartJoin(uint32_t ipHost, uint16_t port, const char* codeText) {
+        InterlockedExchange(&g_joinState, 0);
+        InterlockedExchange(&g_peerReady, 0);
+        sockaddr_in peer{}; peer.sin_family = AF_INET; peer.sin_port = htons(port); peer.sin_addr.s_addr = htonl(ipHost);
+        PeerSet(peer);
+        LARGE_INTEGER qpc; QueryPerformanceCounter(&qpc);
+        g_joinNonce = (uint32_t)qpc.LowPart ^ (GetCurrentProcessId() << 16) ^ (uint32_t)GetTickCount64();
+        g_joinCheck = CodeCheckOf(ipHost, port);
+        AcquireSRWLockExclusive(&g_codeLock);
+        lstrcpynA(g_joinCodeText, codeText, sizeof(g_joinCodeText));
+        ReleaseSRWLockExclusive(&g_codeLock);
+        const LONG gen = InterlockedIncrement(&g_joinGen);
+        InterlockedExchange(&g_joinState, 1);
+        char pa[48]; FmtAddr(peer, pa, sizeof(pa));
+        char m[160];
+        _snprintf(m, sizeof(m), "[Lobby] joining %s -> host %s (nonce=%08x)\n", codeText, pa, (unsigned)g_joinNonce);
+        m[sizeof(m) - 1] = 0; dbg(m);
+        _beginthreadex(nullptr, 0, JoinThread, (void*)(intptr_t)gen, 0, nullptr);
     }
 
     void SetHostCode(const char* code) {
@@ -1116,11 +1142,16 @@ bool Init() {
     // Host mode only: [Net] Upnp=1 (default) and [Net] StunServer=stun.l.google.com:19302 (default; empty = off).
     g_upnpEnabled = GetPrivateProfileIntA("Net", "Upnp", 1, Paths::Ini());
     GetPrivateProfileStringA("Net", "StunServer", "stun.l.google.com:19302", g_stunServer, sizeof(g_stunServer), Paths::Ini());
+    // Join mode: a valid JoinCode starts joining at once; an empty or invalid one leaves the link up and
+    // idle until the player copies a code and presses F8 (Net::JoinByCode). Nothing is sent meanwhile.
     uint32_t joinIp = 0; uint16_t joinPort = 0;
-    if (g_mode == LM_JOIN && !LobbyCode::Decode(joinCode, &joinIp, &joinPort)) {
-        char m[160]; _snprintf(m, sizeof(m), "[Lobby] JoinCode \"%s\" is invalid (typo?) - nothing sent, link off\n", joinCode);
-        m[sizeof(m) - 1] = 0; dbg(m);
-        return false;
+    bool joinNow = false;
+    if (g_mode == LM_JOIN) {
+        joinNow = joinCode[0] && LobbyCode::Decode(joinCode, &joinIp, &joinPort);
+        if (joinCode[0] && !joinNow) {
+            char m[192]; _snprintf(m, sizeof(m), "[Lobby] JoinCode \"%s\" is invalid (typo?) - nothing sent; copy the host's code and press F8\n", joinCode);
+            m[sizeof(m) - 1] = 0; dbg(m);
+        }
     }
 
     WSADATA wsa;
@@ -1176,14 +1207,7 @@ bool Init() {
         peer.sin_port = htons((u_short)sendPort);
         inet_pton(AF_INET, peerIp, &peer.sin_addr);
         g_peerReady = 1;
-    } else if (g_mode == LM_JOIN) {
-        peer.sin_port = htons(joinPort);
-        peer.sin_addr.s_addr = htonl(joinIp);
-        g_peerReady = 0;
-        LARGE_INTEGER qpc; QueryPerformanceCounter(&qpc);
-        g_joinNonce = (uint32_t)qpc.LowPart ^ (GetCurrentProcessId() << 16) ^ (uint32_t)GetTickCount64();
-        g_joinCheck = CodeCheckOf(joinIp, joinPort);
-    } else {   // host: no peer until the first HELLO
+    } else {   // host: no peer until the first HELLO; join: no peer until StartJoin below / F8
         g_peerReady = 0;
     }
     PeerSet(peer);
@@ -1218,14 +1242,55 @@ bool Init() {
         g_bindPort = bindPort;
         _beginthreadex(nullptr, 0, HostThread, nullptr, 0, nullptr);   // UPnP + STUN, off the game thread
     } else {
-        char pa[48]; FmtAddr(peer, pa, sizeof(pa));
-        _snprintf(m, sizeof(m), "[Net] up: bound:%d mode=join code=%s -> host %s (nonce=%08x)\n",
-                  bindPort, joinCode, pa, (unsigned)g_joinNonce);
-        m[sizeof(m) - 1] = 0; dbg(m);
-        InterlockedExchange(&g_joinState, 1);
-        _beginthreadex(nullptr, 0, JoinThread, nullptr, 0, nullptr);
+        wsprintfA(m, "[Net] up: bound:%d mode=join\n", bindPort); dbg(m);
+        if (joinNow) StartJoin(joinIp, joinPort, joinCode);
+        else dbg("[Lobby] join mode idle: copy the host's code and press F8 in the game\n");
     }
     return true;
+}
+
+int LobbyMode() { return (int)g_mode; }
+
+void Log(const char* line) { dbg(line); }
+
+bool JoinByCode(const char* text, char* err, size_t errN) {
+    auto fail = [&](const char* why) { if (err && errN) { lstrcpynA(err, why, (int)errN); } return false; };
+    if (!g_enabled) return fail("network link is off");
+    if (g_mode != LM_JOIN) return fail("joining needs [Net] Mode=join in AC4Coop.ini");
+    if (InterlockedCompareExchange(&g_joinState, 0, 0) == 2) return fail("already connected to a host");
+    uint32_t ip = 0; uint16_t port = 0;
+    if (!text || !LobbyCode::Decode(text, &ip, &port)) return fail("the clipboard does not hold a valid lobby code");
+    char canon[15] = {0}; LobbyCode::Encode(ip, port, canon);
+    StartJoin(ip, port, canon);
+    return true;
+}
+
+bool HostCode(char out[16]) {
+    AcquireSRWLockShared(&g_codeLock);
+    lstrcpynA(out, g_hostCode, 16);
+    ReleaseSRWLockShared(&g_codeLock);
+    return g_mode == LM_HOST && out[0] != 0;
+}
+
+void LobbyStatus(char* out, size_t n) {
+    if (!out || !n) return;
+    out[0] = 0;
+    if (!g_enabled || g_mode == LM_MANUAL) return;
+    char code[16];
+    AcquireSRWLockShared(&g_codeLock);
+    lstrcpynA(code, g_mode == LM_HOST ? g_hostCode : g_joinCodeText, sizeof(code));
+    ReleaseSRWLockShared(&g_codeLock);
+    const bool ready = InterlockedCompareExchange(&g_peerReady, 0, 0) != 0;
+    if (g_mode == LM_HOST) {
+        _snprintf(out, n, "host code %s (F7 copies) | %s", code[0] ? code : "...", ready ? "guest joined" : "waiting for a guest");
+    } else {
+        const LONG st = InterlockedCompareExchange(&g_joinState, 0, 0);
+        const char* s = st == 1 ? "joining..." : st == 2 ? "connected" : st == 3 ? "refused: different builds"
+                      : st == 4 ? "no answer from host" : "copy a code, press F8 to join";
+        if (code[0]) _snprintf(out, n, "join %s | %s", code, s);
+        else _snprintf(out, n, "%s", s);
+    }
+    out[n - 1] = 0;
 }
 
 bool Enabled() { return g_enabled; }

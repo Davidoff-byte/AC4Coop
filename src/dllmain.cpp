@@ -20,6 +20,7 @@
 #include "windowed.h"
 #include "phase1.h"
 #include "net.h"
+#include "lobby_ui.h"
 #include "action_guard.h"
 #include "deref_guard.h"
 #include "combat_observe.h"
@@ -359,6 +360,10 @@ static unsigned __stdcall PollThread(void*)
         bool f10 = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
         if (f10 && !f10prev) { logline("[AC4Coop] F10 -> sink nearby ships\n"); Phase1::RequestShipTest(2); }
         f10prev = f10;
+
+        // Lobby UI (docs/design/lobby-code.md slice 6): window title, clipboard, F7 (host: copy the code)
+        // and F8 (join: use the code on the clipboard). Inert in [Net] Mode=manual and before Net::Init.
+        LobbyUi::Tick();
 
         // V (edge-triggered): toggle the pad-1 test stick and compare player vs puppet movement.
         static bool vprev = false;

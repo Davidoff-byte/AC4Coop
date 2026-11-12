@@ -1,4 +1,5 @@
 #pragma once
+#include <cstddef>
 #include "netstate.h"
 
 // Host-IP peer-to-peer UDP link. Both sides send their local PlayerState and receive the peer's.
@@ -40,6 +41,20 @@ namespace Net {
     // reordered chunk of an already-superseded snapshot. Dropping it is correct, and it is NOT a
     // reject (a benign reorder is normal on a well-formed link), so it is counted separately and
     // excluded from `rejects` exactly as DEC_PENDING is.
+    // ---- lobby mode (docs/design/lobby-code.md) ----
+    // 0 manual, 1 host, 2 join ([Net] Mode). Valid after Init.
+    int      LobbyMode();
+    // Join mode only: decode `text` (a pasted code) and start joining that host. False + err when the
+    // code is invalid, the mode is not join, or a host is already connected.
+    bool     JoinByCode(const char* text, char* err, size_t errN);
+    // Host mode: the code to share (the internet code once the host thread has one, else the LAN code).
+    bool     HostCode(char out[16]);
+    // One line for the window title, e.g. "host code K7M2-9QXD-4AB1 (F7 copies) | guest joined".
+    void     LobbyStatus(char* out, size_t n);
+    // Append a line to net_log.txt (+ OutputDebugString). The file is opened deny-write by this unit, so
+    // other units must log through here rather than open it themselves.
+    void     Log(const char* line);
+
     struct Stats { uint32_t txPackets, txBytes, txEnts, rxPackets, rxBytes, rejects, protoMismatch, sizeMismatch, staleChunks; };
     void GetStats(Stats& out);
     void ResetStats();
