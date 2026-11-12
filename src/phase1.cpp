@@ -4213,6 +4213,17 @@ static Entity* SelectProxySource(float peerMax, uint32_t peerClass, ProxyPick* o
     } __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
 }
 
+// [Coop] ShipMirror (default 0): host-authoritative AI ship mirror (ops/evidence/ship-identity-2026-11-12.md).
+// AI traffic ids are minted per machine, so the guest cannot find "the same" ship; it keeps a pool of proxy clones keyed
+// by the HOST's object id. Wire: unchanged (proto 11) - kind-1 records already carry objId, and the unused hp/arch fields
+// carry hull per-mille (0..1000; never 0xFFFF, which the decoder treats as dead) and the ship class (entity+0x9C decode).
+static bool IsMirrorProxy(void* e);   // defined with the guest-side pool, below ApplyShips' helpers
+static int ShipMirrorEnabled() {
+    static int s = -1;
+    if (s < 0) s = GetPrivateProfileIntA("Coop", "ShipMirror", 0, Paths::Ini()) != 0 ? 1 : 0;
+    return s;
+}
+
 static void fillShipState(EntityState& es, Entity* ent, uint32_t key, uint64_t objId) {
     es.key = key; es.kind = 1;
     // Real identity, from the same HandleContainer accessor the guard lane uses (phase1.cpp:3217).
@@ -4222,6 +4233,17 @@ static void fillShipState(EntityState& es, Entity* ent, uint32_t key, uint64_t o
     es.pos[0] = m->M41; es.pos[1] = m->M42; es.pos[2] = m->M43;
     HookMath::Quaternion q; HookMath::FromMatrix(m, &q);
     es.quat[0] = q.x; es.quat[1] = q.y; es.quat[2] = q.z; es.quat[3] = q.w;
+    if (ShipMirrorEnabled()) {
+        float hp = -1.0f; void* ho = ShipGcLObj(ent);
+        const float mx = (ho && readable((char*)ho + 0xB4, 4)) ? *(float*)((char*)ho + 0xB4) : 0.0f;
+        if (mx > 0.0f && ReadShipHullHP(ent, &hp)) {
+            float pm = hp / mx * 1000.0f;
+            if (!(pm >= 0.0f)) pm = 0.0f;
+            if (pm > 1000.0f) pm = 1000.0f;
+            es.hp = (uint16_t)(pm + 0.5f);
+        }
+        es.arch = (uint16_t)ReadShipClass(ent);
+    }
 }
 
 static void CaptureShips(EntityPacket& pkt) {
@@ -4490,6 +4512,9 @@ static void CaptureShips(EntityPacket& pkt) {
                 }
             }
             if (ent == localShip) continue;   // skip the Jackdaw (synced via g_ghostShip)
+            // ShipMirror: clones can sit in the naval list (the ghost does); never capture our own proxies, or a
+            // same-machine self-test would mirror proxies of proxies. Also skip the peer ghost for the same reason.
+            if (ShipMirrorEnabled() && (IsMirrorProxy(ent) || ent == (Entity*)g_ghostShip)) continue;
             // [Relevance] Same combined rule as the guards, but with the (wider) ship radius.
             if (!IsRelevantToPeer(ent->m_GlobalMatrix.M41, ent->m_GlobalMatrix.M42, ent->m_GlobalMatrix.M43,
                                   g_shipRelevanceRadiusM)) continue;
@@ -4530,6 +4555,97 @@ static Entity* FindLocalShipByObjId(void* mgr, int n, uint64_t objId) {
     return nullptr;
 }
 
+// ---- ShipMirror guest side: pooled proxies keyed by the host's object id ------------------------------------
+// Constraints read from this file: proxies are DuplicateShip clones (a local ship is the source); clones are never
+// World::RemoveEntity'd (SHIP-RE C11 erase crash) - they are parked at y=-100000 like DespawnGhostShip and REUSED.
+// Source pick: a local naval-list ship of the same class (entity+0x9C), else the local ship (logged classMiss).
+// Drive: SetGlobalMatrixInternal(&m, true) like the ghost; Z = local water height (authority C4) when known.
+// Hull: WriteShipHullHPRaw (the slot-0x12C setter faults on clones) = max * permille / 1000.
+// [Coop] ShipMirrorForceProxy=1 skips local matching (solo EntitySelfTest: every record becomes a proxy).
+struct MirrorSlot { uint64_t hostId; void* proxy; uint32_t cls; uint64_t seenMs; uint16_t hpApplied; bool live; };
+static const int MIRROR_MAX = 8;
+static MirrorSlot g_mirror[MIRROR_MAX];
+static int g_mirrorN = 0;
+static bool IsMirrorProxy(void* e) {
+    for (int i = 0; i < g_mirrorN; ++i) if (g_mirror[i].proxy == e) return true;
+    return false;
+}
+static Entity* MirrorPickSource(void* mgr, int n, uint32_t cls, bool* classMiss) {
+    Entity* local = GetLocalShip();
+    *classMiss = false;
+    if (cls) {
+        for (int s = 0; s < n; ++s) {
+            Entity* c = GetShipEntity(mgr, s);
+            if (!c || !readable(c, 0xA0) || *(uint32_t*)c != 0x01E4A128u) continue;
+            if (c == local || c == (Entity*)g_ghostShip || IsMirrorProxy(c)) continue;
+            if (ReadShipClass(c) == cls) return c;
+        }
+    }
+    *classMiss = true;
+    return local;                                   // fallback: clone the local ship (wrong look, logged)
+}
+static void MirrorPark(MirrorSlot& m) {
+    __try {
+        HookMath::Transform hide; hide.M41 = 0.0f; hide.M42 = -100000.0f; hide.M43 = 0.0f;
+        ((Entity*)m.proxy)->SetGlobalMatrixInternal(&hide, false);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    m.live = false; m.hostId = 0;
+}
+// Drive (or create) the proxy for one host ship record. Returns the position error after the drive (metres), -1 on no proxy.
+static float MirrorApply(void* mgr, int n, const EntityState& es, int* created, int* classMisses) {
+    if (!es.objId) return -1.0f;
+    static uint64_t s_nextCreateMs = 0;
+    const uint64_t now = GetTickCount64();
+    MirrorSlot* slot = nullptr;
+    for (int i = 0; i < g_mirrorN; ++i) if (g_mirror[i].live && g_mirror[i].hostId == es.objId) { slot = &g_mirror[i]; break; }
+    if (!slot) {
+        // reuse a parked proxy of the same class first, then any parked one, then create (rate-limited, pool-bounded)
+        for (int pass = 0; pass < 2 && !slot; ++pass)
+            for (int i = 0; i < g_mirrorN; ++i)
+                if (!g_mirror[i].live && (pass == 1 || g_mirror[i].cls == es.arch)) { slot = &g_mirror[i]; break; }
+        if (!slot && g_mirrorN < MIRROR_MAX && now >= s_nextCreateMs) {
+            s_nextCreateMs = now + 500;
+            bool miss = false;
+            Entity* src = MirrorPickSource(mgr, n, es.arch, &miss);
+            void* dup = src ? DuplicateShip(src) : nullptr;
+            if (!dup) { L("[ShipMirror] create FAILED host=%llu cls=%u src=%p\n", (unsigned long long)es.objId, (unsigned)es.arch, src); return -1.0f; }
+            MirrorSlot& m = g_mirror[g_mirrorN++];
+            m.proxy = dup; m.cls = miss ? 0 : es.arch; m.hpApplied = 0xFFFF;
+            slot = &m; ++*created; if (miss) ++*classMisses;
+            L("[ShipMirror] created proxy=%p for host=%llu cls=%u src=%p classMiss=%d pool=%d\n",
+              dup, (unsigned long long)es.objId, (unsigned)es.arch, src, miss ? 1 : 0, g_mirrorN);
+            L("[E] ev=shipmirror-create host=%llu cls=%u classMiss=%d\n", (unsigned long long)es.objId, (unsigned)es.arch, miss ? 1 : 0);
+        }
+        if (!slot) return -1.0f;
+        slot->hostId = es.objId; slot->live = true; slot->hpApplied = 0xFFFF;
+    }
+    slot->seenMs = now;
+    float err = -1.0f;
+    __try {
+        HookMath::Quaternion q; q.x = es.quat[0]; q.y = es.quat[1]; q.z = es.quat[2]; q.w = es.quat[3];
+        HookMath::Transform m; HookMath::ToMatrix(&q, &m);
+        m.M41 = es.pos[0]; m.M42 = es.pos[1]; m.M43 = (g_localShipZ != 0.0f) ? g_localShipZ : es.pos[2];
+        ((Entity*)slot->proxy)->SetGlobalMatrixInternal(&m, true);
+        const HookMath::Transform& got = ((BaseEntity*)slot->proxy)->m_GlobalMatrix;
+        const float dx = got.M41 - es.pos[0], dy = got.M42 - es.pos[1];
+        err = sqrtf(dx * dx + dy * dy);
+        if (es.hp <= 1000 && es.hp != slot->hpApplied) {
+            void* ho = ShipGcLObj(slot->proxy);
+            const float mx = (ho && readable((char*)ho + 0xB4, 4)) ? *(float*)((char*)ho + 0xB4) : 0.0f;
+            if (mx > 0.0f && WriteShipHullHPRaw(slot->proxy, mx * (float)es.hp / 1000.0f)) slot->hpApplied = es.hp;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { err = -2.0f; }
+    return err;
+}
+static void MirrorRetireStale() {
+    const uint64_t now = GetTickCount64();
+    for (int i = 0; i < g_mirrorN; ++i)
+        if (g_mirror[i].live && now - g_mirror[i].seenMs > 5000) {
+            L("[ShipMirror] retire proxy=%p host=%llu (no record for 5 s)\n", g_mirror[i].proxy, (unsigned long long)g_mirror[i].hostId);
+            MirrorPark(g_mirror[i]);
+        }
+}
+
 // Option 3: mirror the ORIGINAL ship's render (no deep-copy). For each received ship, drive the local
 // matching ship's RENDER matrix to the host's transform via the SetGlobalMatrixInternal hook. The ship's
 // own physics/AI keeps running (its logic position stays local), but the visual follows the host.
@@ -4551,10 +4667,22 @@ static void ApplyShips(const EntityPacket& pkt) {
     uint32_t nObj = 0, nNear = 0, nUnresolved = 0, nDup = 0;
     Entity* used[MAX_SYNC_ENTITIES];
     int usedN = 0;
+    // ShipMirror bookkeeping (see MirrorApply). ForceProxy is a solo-test knob: every record becomes a proxy.
+    const bool mirror = ShipMirrorEnabled() != 0;
+    static int s_forceProxy = -1;
+    if (s_forceProxy < 0) s_forceProxy = GetPrivateProfileIntA("Coop", "ShipMirrorForceProxy", 0, Paths::Ini()) != 0 ? 1 : 0;
+    static int s_mCreated = 0, s_mMiss = 0, s_mSamples = 0; static double s_mErrSum = 0.0; static float s_mErrMax = 0.0f;
+    static uint64_t s_mNextLog = 0;
+    int mProxied = 0;
     __try {
         for (uint32_t i = 0; i < pkt.count && i < (uint32_t)MAX_SYNC_ENTITIES; ++i) {
             const EntityState& es = pkt.ents[i];
             if (es.kind != 1) continue;
+            if (mirror && s_forceProxy) {
+                const float e = MirrorApply(mgr, (int)n, es, &s_mCreated, &s_mMiss);
+                if (e >= 0.0f) { ++mProxied; ++s_mSamples; s_mErrSum += e; if (e > s_mErrMax) s_mErrMax = e; }
+                continue;
+            }
 
             Entity* ent = nullptr;
             // (a) stable identity from the host
@@ -4568,6 +4696,7 @@ static void ApplyShips(const EntityPacket& pkt) {
                 for (int s = 0; s < (int)n; ++s) {
                     Entity* c = GetShipEntity(mgr, s);
                     if (!c || c == localShip || c == player || c == (Entity*)g_ghostShip) continue;
+                    if (mirror && IsMirrorProxy(c)) continue;      // a proxy is never a "local match"
                     if (*(uint32_t*)c != 0x01E4A128u) continue;   // same ship vtable used at capture
                     bool taken = false;
                     for (int u = 0; u < usedN; ++u) if (used[u] == c) { taken = true; break; }
@@ -4580,8 +4709,14 @@ static void ApplyShips(const EntityPacket& pkt) {
                 }
                 if (ent) ++nNear;
             }
-            // (c) no identity, no plausible local ship -> drop the entry
-            if (!ent || !readable(ent, 4)) { ++nUnresolved; continue; }
+            // (c) no identity, no plausible local ship -> ShipMirror: drive a proxy keyed by the host id; else drop the entry
+            if (!ent || !readable(ent, 4)) {
+                if (mirror) {
+                    const float e = MirrorApply(mgr, (int)n, es, &s_mCreated, &s_mMiss);
+                    if (e >= 0.0f) { ++mProxied; ++s_mSamples; s_mErrSum += e; if (e > s_mErrMax) s_mErrMax = e; continue; }
+                }
+                ++nUnresolved; continue;
+            }
 
             // NEVER drive the local ship / ghost / player, whatever id or position resolved to them.
             if (ent == localShip || ent == player || ent == (Entity*)g_ghostShip) { ++nUnresolved; continue; }
@@ -4601,6 +4736,20 @@ static void ApplyShips(const EntityPacket& pkt) {
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
     g_syncCount = count;
+    if (mirror) {
+        MirrorRetireStale();
+        const uint64_t now = GetTickCount64();
+        if (now >= s_mNextLog) {
+            s_mNextLog = now + 5000;
+            int live = 0; for (int k = 0; k < g_mirrorN; ++k) if (g_mirror[k].live) ++live;
+            const double mean = s_mSamples ? s_mErrSum / s_mSamples : -1.0;
+            // ORACLE line (machine-checkable): proxies follow their host ship within err metres; pool bounded; no crash.
+            L("[ShipMirror] stat live=%d pool=%d created=%d classMiss=%d thisPkt=%d samples=%d meanErr=%.2f maxErr=%.2f force=%d\n",
+              live, g_mirrorN, s_mCreated, s_mMiss, mProxied, s_mSamples, mean, s_mErrMax, s_forceProxy);
+            L("[E] ev=shipmirror-stat live=%d created=%d meanErr=%.2f maxErr=%.2f\n", live, s_mCreated, mean, s_mErrMax);
+            s_mSamples = 0; s_mErrSum = 0.0; s_mErrMax = 0.0f;
+        }
+    }
 
     // One line per stats window (~10 s at 60 fps) and only when something was actually skipped.
     static int s_applyCalls = 0;
@@ -13390,7 +13539,7 @@ static void DumpConfigOnce()
 
     struct K { const char* s; const char* k; int d; };
     static const K keys[] = {
-        { "Coop", "ActionDeathLog", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "CombatObserve", 0 },
+        { "Coop", "ActionDeathLog", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "CombatObserve", 0 },
         { "Coop", "CombatTest", 0 }, { "Coop", "CrashContext", 0 }, { "Coop", "CorpseKeepSec", 30 }, { "Coop", "CrowdProbeIntegrate", 1 },
         { "Coop", "CrowdProbeLiveKeys", 1 }, { "Coop", "DamageRelay", 0 }, { "Coop", "Diag", 0 },
         { "Coop", "DisableCrowd", 0 }, { "Coop", "DisablePuppetAI", 1 }, { "Coop", "DisableSpawns", 0 },
