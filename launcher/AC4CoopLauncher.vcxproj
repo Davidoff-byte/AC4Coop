@@ -52,6 +52,7 @@
   <ItemGroup>
     <ClCompile Include="main.cpp" />
     <ClCompile Include="party_net.cpp" />
+    <ClCompile Include="firewall.cpp" />
     <ClCompile Include="..\src\lobby_code.cpp" />
     <ClCompile Include="..\src\upnp.cpp" />
     <ClCompile Include="..\src\stun.cpp" />

@@ -47,6 +47,10 @@ bool DefaultRouteIPv4(uint32_t* ipHost);
 // per-application socket filtering (VPN split tunnelling) on the calling process.
 bool PrimaryIPv4(uint32_t* ipHost, char* name, size_t nameN);
 
+// Friendly names (comma-separated) of up adapters that look like a VPN / virtual tunnel; returns how many.
+// A hint for the player and for logs only.
+int VpnLikeAdapters(char* out, size_t n);
+
 // Address class used by the verdicts: 0 public, 1 private (RFC 1918), 2 carrier-grade NAT (100.64/10),
 // 3 other non-routable (0/8, 127/8, 169.254/16).
 int AddressClass(uint32_t ipHost);

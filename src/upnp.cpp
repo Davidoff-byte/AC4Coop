@@ -217,6 +217,36 @@ bool PrimaryIPv4(uint32_t* ipHost, char* name, size_t nameN) {
     return true;
 }
 
+// Names of adapters that are up, have an IPv4 address and look like a VPN / virtual tunnel: interface type
+// tunnel (131), PPP (23) or proprietary-virtual (53), or a description naming a known tunnel driver. A hint for
+// the player and for remote logs only (a friend's game sat on NordLynx 10.5.0.2 with no internet path,
+// 2026-11-12); nothing is decided from it.
+int VpnLikeAdapters(char* out, size_t n) {
+    if (out && n) out[0] = 0;
+    ULONG len = 16 * 1024;
+    std::string buf(len, '\0');
+    const ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+    ULONG rc = GetAdaptersAddresses(AF_INET, flags, nullptr, (IP_ADAPTER_ADDRESSES*)&buf[0], &len);
+    if (rc == ERROR_BUFFER_OVERFLOW) { buf.assign(len, '\0'); rc = GetAdaptersAddresses(AF_INET, flags, nullptr, (IP_ADAPTER_ADDRESSES*)&buf[0], &len); }
+    if (rc != NO_ERROR) return 0;
+    static const wchar_t* kWords[] = { L"wireguard", L"nordlynx", L"wintun", L"tap-windows", L"openvpn", L"vpn", L"zerotier",
+                                       L"tailscale", L"hamachi", L"warp", L"proton" };
+    int count = 0; std::string names;
+    for (auto* a = (IP_ADAPTER_ADDRESSES*)&buf[0]; a; a = a->Next) {
+        if (a->OperStatus != IfOperStatusUp || !a->FirstUnicastAddress) continue;
+        bool vpn = a->IfType == IF_TYPE_TUNNEL || a->IfType == IF_TYPE_PPP || a->IfType == IF_TYPE_PROP_VIRTUAL;
+        std::wstring d = std::wstring(a->Description ? a->Description : L"") + L" " + (a->FriendlyName ? a->FriendlyName : L"");
+        for (auto& ch : d) ch = (wchar_t)towlower(ch);
+        for (const wchar_t* w : kWords) if (d.find(w) != std::wstring::npos) vpn = true;
+        if (!vpn) continue;
+        char nm[128] = {0}; WideCharToMultiByte(CP_UTF8, 0, a->FriendlyName, -1, nm, sizeof(nm), nullptr, nullptr);
+        if (count++) names += ", ";
+        names += nm;
+    }
+    if (out && n) lstrcpynA(out, names.c_str(), (int)n);
+    return count;
+}
+
 bool DefaultRouteIPv4(uint32_t* ipHost) {
     if (PrimaryIPv4(ipHost, nullptr, 0)) return true;   // routing table first (see PrimaryIPv4)
     SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);

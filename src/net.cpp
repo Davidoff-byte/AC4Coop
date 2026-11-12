@@ -1168,7 +1168,8 @@ namespace {
         // ---- verdict and code ----
         const char* verdict; const char* advice; uint32_t cIp = 0; uint16_t cPort = 0;
         if (!stun) {
-            verdict = "NO_STUN"; advice = "internet address unknown; only the LAN code below is known to work";
+            verdict = "NO_STUN"; advice = "internet address unknown (no answer from the internet: a VPN or firewall may be "
+                                          "blocking the game); only the LAN code below is known to work";
         } else if (haveLan && lan == g_stunIp) {
             verdict = "PUBLIC"; advice = "this PC is directly on the internet; friends can join with the code";
             cIp = g_stunIp; cPort = port;
@@ -1599,6 +1600,11 @@ bool Init() {
         }
         m[sizeof(m) - 1] = 0; if (m[0]) dbg(m);
         g_boundAddr = ntohl(local.sin_addr.s_addr);
+        // For remote diagnosis: which VPN-type adapters are up (hint only; see Upnp::VpnLikeAdapters).
+        char vpn[256] = {0};
+        if (Upnp::VpnLikeAdapters(vpn, sizeof(vpn)) > 0) {
+            _snprintf(m, sizeof(m), "[Net] note: VPN-type adapters are up: %s\n", vpn); m[sizeof(m) - 1] = 0; dbg(m);
+        }
     }
     if (bind(g_sock, (sockaddr*)&local, sizeof(local)) == SOCKET_ERROR) {
         bindPort = g_secondInstance ? localPort : peerPort;

@@ -22,6 +22,8 @@
 #include "backends/imgui_impl_win32.h"
 #include "backends/imgui_impl_dx11.h"
 #include "party_net.h"
+#include "firewall.h"
+#include "upnp.h"       // VpnLikeAdapters (hint line)
 #include "netstate.h"   // NET_PROTO_VER only (header-only constants)
 
 #pragma comment(lib, "d3d11.lib")
@@ -36,7 +38,7 @@ namespace {
 
 // ---------------------------------------------------------------- settings + args
 struct Args {
-    std::string gameDir, name, relay, autoJoin, report, shot, payload;
+    std::string gameDir, name, relay, autoJoin, report, shot, payload, fwApply, fwStatus;
     int port = 0, autoStart = 0, exitAfter = 0, cycles = 1;
     bool noLaunch = false, autoHost = false, noUpnp = false, noStun = false, autoInstall = false;
 } A;
@@ -140,19 +142,33 @@ bool FindGame() {
     return false;
 }
 
-struct GameInfo { bool found = false, known = false, modInstalled = false, modCurrent = false; std::string label, exeSha, asiSha, payloadAsiSha; } G;
+struct GameInfo { bool found = false, known = false, modInstalled = false, modCurrent = false; std::string label, exeSha, asiSha, payloadAsiSha;
+                  Firewall::Status fw = Firewall::UNKNOWN; std::string fwText, vpn; } G;
+void CheckFirewall() {
+    char d[200] = {0};
+    G.fw = G.found ? Firewall::Query(Join(g_gameDir, "AC4BFSP.exe").c_str(), d, sizeof(d)) : Firewall::UNKNOWN;
+    G.fwText = d;
+}
 void CheckGame() {
     G = GameInfo{};
     const std::string exe = Join(g_gameDir, "AC4BFSP.exe");
     G.found = g_gameDir[0] && FileExists(exe);
+    CheckFirewall();
+    { char v[256] = {0}; if (Upnp::VpnLikeAdapters(v, sizeof(v)) > 0) G.vpn = v; }
     char hex[65];
     if (G.found && Sha256File(exe, hex)) { G.exeSha = hex; G.known = KnownBuild(hex, &G.label); }
     if (Sha256File(Join(PayloadDir().c_str(), "AC4Coop.asi"), hex)) G.payloadAsiSha = hex;
     if (G.found && Sha256File(Join(g_gameDir, "AC4Coop.asi"), hex)) { G.modInstalled = true; G.asiSha = hex; G.modCurrent = G.asiSha == G.payloadAsiSha; }
 }
 
+// Unattended test runs (--exit-after / --shot / --report) must never change a game folder or the firewall from a
+// stray click: on 2026-11-12 a screenshot run pointed at the real game folder reinstalled an older mod file when
+// a click landed on the button as the window appeared. In a test run only --auto-install may install.
+bool TestRun() { return A.exitAfter || !A.shot.empty() || !A.report.empty(); }
+
 std::string g_installMsg;
 bool Install() {
+    if (TestRun() && !A.autoInstall) { g_installMsg = "Test run: install is disabled"; LogLine("install refused: test run"); return false; }
     const char* files[] = { "AC4Coop.asi", "dinput8.dll", "known_builds.txt" };
     for (const char* f : files) {
         const std::string src = Join(PayloadDir().c_str(), f), dst = Join(g_gameDir, f);
@@ -172,6 +188,8 @@ std::string g_launchMsg;
 bool g_launched = false;
 std::string g_iniWritten;
 bool WriteGameIni(const PartyNet::State& s) {
+    // A test run writes only into a folder named on its command line, never into the player's saved game folder.
+    if (TestRun() && A.gameDir.empty()) { g_launchMsg = "Test run without --game-dir: nothing written"; return false; }
     const std::string ini = Join(g_gameDir, "AC4Coop.ini");
     if (!FileExists(ini)) { g_launchMsg = "AC4Coop.ini is missing - click Install first"; return false; }
     CopyFileA(ini.c_str(), (ini + ".launcher.bak").c_str(), FALSE);
@@ -266,6 +284,23 @@ void UiGame() {
     else ImGui::TextColored(kWarn, "Mod installed but different from this launcher's build (%.8s vs %.8s)", G.asiSha.c_str(), G.payloadAsiSha.c_str());
     if (ImGui::Button(G.modInstalled ? "Update / repair mod" : "Install mod")) Install();
     if (!g_installMsg.empty()) { ImGui::SameLine(); ImGui::TextColored(kDim, "%s", g_installMsg.c_str()); }
+    // Windows Firewall: a host must receive an unsolicited packet. Read-only status; the fix is one admin prompt.
+    static std::string fwMsg;
+    if (G.fw != Firewall::UNKNOWN) {
+        const bool good = G.fw == Firewall::ALLOWED || G.fw == Firewall::FIREWALL_OFF;
+        ImGui::TextColored(good ? kOk : G.fw == Firewall::BLOCKED ? kBad : kWarn, "%s", G.fwText.c_str());
+        if (!good) {
+            if (ImGui::Button("Allow the game through the firewall (admin prompt)")) {
+                char m[200] = {0};
+                if (TestRun()) lstrcpyA(m, "Test run: firewall change is disabled");
+                else Firewall::RunElevated(Join(g_gameDir, "AC4BFSP.exe").c_str(), m, sizeof(m));
+                fwMsg = m; LogLine("firewall: %s", m); CheckFirewall();
+            }
+        }
+        if (!fwMsg.empty()) { ImGui::SameLine(); ImGui::TextColored(kDim, "%s", fwMsg.c_str()); }
+    }
+    if (!G.vpn.empty())
+        ImGui::TextColored(kWarn, "VPN-type adapter active: %s. If the game cannot connect, disconnect the VPN (or its kill switch / split tunnelling).", G.vpn.c_str());
 }
 
 void UiParty(const PartyNet::State& s) {
@@ -332,6 +367,8 @@ void ParseArgs() {
         else if (a == "--no-launch") A.noLaunch = true; else if (a == "--auto-host") A.autoHost = true;
         else if (a == "--no-upnp") A.noUpnp = true; else if (a == "--no-stun") A.noStun = true;
         else if (a == "--auto-install") A.autoInstall = true;
+        else if (a == "--firewall-apply") A.fwApply = next();     // elevated helper mode (started by RunElevated)
+        else if (a == "--firewall-status") A.fwStatus = next();   // read-only: log the status and exit
     }
     LocalFree(w);
 }
@@ -350,6 +387,19 @@ void Report(const PartyNet::State& s) {
 
 int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int) {
     ParseArgs(); LoadSettings();
+    // Helper modes: no window. --firewall-apply runs elevated (one UAC prompt from the button); --firewall-status
+    // is read-only.
+    if (!A.fwApply.empty()) {
+        char m[256] = {0}; const bool ok = Firewall::Apply(A.fwApply.c_str(), m, sizeof(m));
+        LogLine("firewall-apply \"%s\": %s", A.fwApply.c_str(), m);
+        return ok ? 0 : 1;
+    }
+    if (!A.fwStatus.empty()) {
+        char m[256] = {0}, v[256] = {0}; const Firewall::Status st = Firewall::Query(A.fwStatus.c_str(), m, sizeof(m));
+        Upnp::VpnLikeAdapters(v, sizeof(v));
+        LogLine("firewall-status \"%s\": %d %s | vpn-type adapters: %s", A.fwStatus.c_str(), (int)st, m, v[0] ? v : "none");
+        return 0;
+    }
     if (!A.gameDir.empty()) lstrcpynA(g_gameDir, A.gameDir.c_str(), MAX_PATH);
     if (!A.name.empty()) lstrcpynA(g_name, A.name.c_str(), sizeof(g_name));
     if (!A.relay.empty()) lstrcpynA(g_relay, A.relay.c_str(), sizeof(g_relay));
