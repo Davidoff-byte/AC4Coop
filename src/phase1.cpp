@@ -3102,9 +3102,28 @@ static void CaptureShips(EntityPacket& pkt) {
                 float hp = 0.0f;
                 if (!ReadShipHullHP(se, &hp)) continue;
                 const float want = (mode == 2) ? -1.0f : hp - mx * ((float)fracPct / 100.0f);
+                // F8 instrumentation (RUN-2026-11-12-F8-boardable.md): the boardable byte GcLShip+0x3A9, state bit 95 of
+                // the u32 bitset at *(GcLShip+0x40) (what vtbl[+408] tests, desc 0x028E96D0 index 95), and the +408/+368
+                // predicates themselves, before and after the damage write. Read-only, SEH-guarded.
+                auto boardState = [](void* o, int* flag, int* b95, int* p408, int* p368) {
+                    *flag = *b95 = *p408 = *p368 = -1;
+                    __try {
+                        if (!readable(o, 0x3AA)) return;
+                        *flag = *((unsigned char*)o + 0x3A9);
+                        uint32_t* bs = *(uint32_t**)((char*)o + 0x40);
+                        if (readable(bs, 12)) *b95 = (int)((bs[2] >> 31) & 1u);
+                        void** vt = *(void***)o;
+                        if (readable((void*)vt, 412)) {
+                            *p408 = ((unsigned char (__thiscall*)(void*))vt[408 / 4])(o);
+                            *p368 = ((unsigned char (__thiscall*)(void*))vt[368 / 4])(o);
+                        }
+                    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+                };
+                int f0, b0, q0, r0; boardState(ho, &f0, &b0, &q0, &r0);
                 if (WriteShipHullHP(se, want)) {
-                    L("[ShipTest] mode=%d ship=%d obj=%08X max=%.1f hp=%.1f -> %.1f\n",
-                      mode, si, (unsigned)ho, mx, hp, want);
+                    int f1, b1, q1, r1; boardState(ho, &f1, &b1, &q1, &r1);
+                    L("[ShipTest] mode=%d ship=%d obj=%08X max=%.1f hp=%.1f -> %.1f  board: flag %d->%d bit95 %d->%d pred408 %d->%d pred368 %d->%d\n",
+                      mode, si, (unsigned)ho, mx, hp, want, f0, f1, b0, b1, q0, q1, r0, r1);
                     ++hits;
                 }
             }
