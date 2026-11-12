@@ -5490,6 +5490,130 @@ static void ApplyRelayedHealth(uint64_t objId, Entity* e, const EntityState& es)
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
+// ---- Wide bind: [Coop] BindRadiusM (default 0 = off, the 1.5 m match below is unchanged) ---------------------
+// WHY: a 90 s host recording (tools/wire_tap.py info --entities, 2026-11-12, build 0181E851) named 51 guards and
+// every objId was in the runtime-minted band 0xF0000000..0xF7FFFFFF (docs: ship-identity-2026-11-12), rising with
+// spawn time. A minted id is a per-process counter, so it is not an identity the guest shares: the resolver cannot
+// be relied on and the 1.5 m position match only catches an NPC that stands on the same spot in both games.
+// WHAT: with BindRadiusM > 1.5 the guest GIVES each host guard a body - the nearest free local NPC of the same
+// archetype within the radius. Exact (<= 1.5 m) pairs are taken first, then the closest remaining pairs, so a body
+// that already stands where a host guard stands is never handed to another one. The choice is recorded in the
+// objId table; ApplyGuards' existing sticky path then drives it. UNVERIFIED in game until a guest run says so.
+// The value is re-read every 2 s so a live test can change it without a relaunch.
+static float WideBindRadiusM() {
+    static float s_r = 0.0f; static uint64_t s_next = 0;
+    const uint64_t now = GetTickCount64();
+    if (now >= s_next) {
+        s_next = now + 2000;
+        const int v = GetPrivateProfileIntA("Coop", "BindRadiusM", 0, Paths::Ini());
+        const float r = (v > 1) ? (float)(v > 200 ? 200 : v) : 0.0f;
+        if (r != s_r) L("[WideBind] BindRadiusM=%.0f (was %.0f)\n", (double)r, (double)s_r);
+        s_r = r;
+    }
+    return s_r;
+}
+
+static unsigned s_wbNeed = 0, s_wbExact = 0, s_wbWide = 0, s_wbNoArch = 0, s_wbFar = 0, s_wbPool = 0, s_wbRuns = 0;
+static float    s_wbFarMin = 1e9f;   // nearest same-archetype free body that was beyond the radius (m)
+
+static void WideBindPrepass(const EntityPacket& pkt, World* world, Entity* player) {
+    const float R = WideBindRadiusM();
+    if (R <= 1.5f) return;
+    static uint64_t s_nextMs = 0;
+    const uint64_t now = GetTickCount64();
+    if (now < s_nextMs) return;          // 4 Hz is plenty: a binding, once made, is sticky
+    s_nextMs = now + 250;
+
+    struct Need { uint64_t objId; float pos[3]; uint16_t arch; int cand; float d2; };
+    struct Cand { Entity* e; float pos[3]; uint16_t arch; bool taken; };
+    static Need need[MAX_SYNC_ENTITIES]; static Cand cand[512];
+    int nN = 0, nC = 0;
+    for (uint32_t i = 0; i < pkt.count && nN < MAX_SYNC_ENTITIES; ++i) {
+        const EntityState& es = pkt.ents[i];
+        if (es.kind != 2 || !es.objId || es.dead || !es.arch) continue;   // never conscript a body just to kill it
+        if (!FiniteVec(es.pos, 3)) continue;
+        if (es.key < (uint32_t)SYNC_SLOT_MAX && s_guestSlot[es.key].used && s_guestSlot[es.key].objId == es.objId
+            && MirrorCandidateBhv((Entity*)s_guestSlot[es.key].ent, player)) continue;        // slot already has a body
+        const unsigned int have = GuestObjFind(es.objId);
+        if (have && MirrorCandidateBhv((Entity*)have, player)) continue;                      // table already has one
+        Need& n = need[nN++];
+        n.objId = es.objId; n.pos[0] = es.pos[0]; n.pos[1] = es.pos[1]; n.pos[2] = es.pos[2];
+        n.arch = es.arch; n.cand = -1; n.d2 = 1e30f;
+    }
+    if (!nN) return;
+    ++s_wbRuns; s_wbNeed += (unsigned)nN;
+
+    BaseBigArray<Reference>& ents = world->m_EntityManager.m_Entities;
+    const int nobj = ents.GetSize();
+    for (int j = 0; j < nobj && nC < 512; ++j) {
+        Reference* ref = ents.GetElement(j);
+        if (!ref || !readable(ref, 4)) break;
+        HandleContainer* hc = ref->m_HandleContainer;
+        if (!hc || !readable(hc, 4)) continue;
+        Entity* e = (Entity*)hc->m_Object;
+        Component* bhv = MirrorCandidateBhv(e, player);
+        if (!bhv) continue;
+        if (GuestObjOfEnt((unsigned int)e)) continue;                    // already plays a host guard
+        if (MirrorKilledLocally(e)) continue;
+        Cand& c = cand[nC++];
+        c.e = e; c.taken = false;
+        c.arch = (uint16_t)(*(uint32_t*)((char*)bhv + 0x14) & 0xFFFF);   // same field ApplyGuards compares
+        c.pos[0] = e->m_GlobalMatrix.M41; c.pos[1] = e->m_GlobalMatrix.M42; c.pos[2] = e->m_GlobalMatrix.M43;
+    }
+    s_wbPool += (unsigned)nC;
+
+    // Two rounds over the same greedy "closest remaining pair" rule: limit 1.5 m, then limit R.
+    const float limits[2] = { 1.5f * 1.5f, R * R };
+    for (int round = 0; round < 2; ++round) {
+        for (;;) {
+            int bn = -1, bc = -1; float bd = limits[round];
+            for (int a = 0; a < nN; ++a) {
+                if (need[a].cand >= 0) continue;
+                for (int b = 0; b < nC; ++b) {
+                    if (cand[b].taken || cand[b].arch != need[a].arch) continue;
+                    const float dx = cand[b].pos[0] - need[a].pos[0], dy = cand[b].pos[1] - need[a].pos[1],
+                                dz = cand[b].pos[2] - need[a].pos[2];
+                    const float d2 = dx * dx + dy * dy + dz * dz;
+                    if (d2 <= bd) { bd = d2; bn = a; bc = b; }
+                }
+            }
+            if (bn < 0) break;
+            need[bn].cand = bc; need[bn].d2 = bd; cand[bc].taken = true;
+            GuestObjAdd(need[bn].objId, (unsigned int)cand[bc].e);
+            if (round == 0) ++s_wbExact; else ++s_wbWide;
+            static unsigned s_lines = 0;
+            if (s_lines < 400) {
+                ++s_lines;
+                L("[WideBind] objId=%016llX arch=%u -> ent=%08X d=%.1f m (%s)\n", (unsigned long long)need[bn].objId,
+                  (unsigned)need[bn].arch, (unsigned int)cand[bc].e, (double)sqrtf(bd), round == 0 ? "exact" : "wide");
+            }
+        }
+    }
+    // What was left without a body, and why: no free body of that archetype at all, or the nearest is beyond R.
+    for (int a = 0; a < nN; ++a) {
+        if (need[a].cand >= 0) continue;
+        float md = 1e30f;
+        for (int b = 0; b < nC; ++b) {
+            if (cand[b].taken || cand[b].arch != need[a].arch) continue;
+            const float dx = cand[b].pos[0] - need[a].pos[0], dy = cand[b].pos[1] - need[a].pos[1],
+                        dz = cand[b].pos[2] - need[a].pos[2];
+            const float d2 = dx * dx + dy * dy + dz * dz;
+            if (d2 < md) md = d2;
+        }
+        if (md > 1e29f) ++s_wbNoArch;
+        else { ++s_wbFar; const float m = sqrtf(md); if (m < s_wbFarMin) s_wbFarMin = m; }
+    }
+}
+
+// Printed with the 5 s [Sync] bind line; resets its own counters.
+static void WideBindReport() {
+    if (!s_wbRuns) return;
+    L("[WideBind] R=%.0f runs=%u need=%u exact=%u wide=%u left(noArchetype=%u beyondRadius=%u nearest=%.1f) poolPerRun=%.1f\n",
+      (double)WideBindRadiusM(), s_wbRuns, s_wbNeed, s_wbExact, s_wbWide, s_wbNoArch, s_wbFar,
+      (double)(s_wbFarMin < 1e8f ? s_wbFarMin : -1.0f), (double)s_wbPool / (double)s_wbRuns);
+    s_wbNeed = s_wbExact = s_wbWide = s_wbNoArch = s_wbFar = s_wbPool = s_wbRuns = 0; s_wbFarMin = 1e9f;
+}
+
 static void ApplyGuards(const EntityPacket& pkt) {
     World* world = World::GetCurrentWorld();
     if (!world) return;
@@ -5501,7 +5625,9 @@ static void ApplyGuards(const EntityPacket& pkt) {
     s_driveN = 0;                       // rebuild the per-frame drive cache
     unsigned int usedEnt[MAX_SYNC_ENTITIES]; int usedN = 0;   // one local body per host entity, per packet
     const uint64_t nowMs = GetTickCount64();                  // slot table clock (TASK 2)
+    const float wideR = WideBindRadiusM();                    // 0 = wide bind off
     __try {
+        WideBindPrepass(pkt, world, player);                  // no-op unless [Coop] BindRadiusM > 1
         for (uint32_t i = 0; i < pkt.count; ++i) {
             const EntityState& es = pkt.ents[i];
             if (es.kind != 2) continue;
@@ -5543,6 +5669,14 @@ static void ApplyGuards(const EntityPacket& pkt) {
             if (g_idResolver && es.objId) {
                 Entity* re = ResolveEntityById(es.objId);
                 Component* rb = re ? MirrorCandidateBhv(re, player) : nullptr;
+                // Wide bind: a host-minted id can also exist in this process and name a DIFFERENT entity. Trust a
+                // resolver hit only if it is the body already bound to this id, or (unbound) one inside the radius.
+                if (rb && wideR > 0.0f) {
+                    const unsigned int bound = GuestObjFind(es.objId);
+                    const float rx = re->m_GlobalMatrix.M41 - es.pos[0], ry = re->m_GlobalMatrix.M42 - es.pos[1],
+                                rz = re->m_GlobalMatrix.M43 - es.pos[2];
+                    if (bound ? bound != (unsigned int)re : (rx * rx + ry * ry + rz * rz) > wideR * wideR) rb = nullptr;
+                }
                 if (rb && (!es.arch || (uint16_t)(*(uint32_t*)((char*)rb + 0x14) & 0xFFFF) == es.arch)) {
                     best = re; bestBhv = rb; via = "resolver";
                     if (IdResLogNow(&s_idResHit))
@@ -5842,6 +5976,26 @@ static void ApplyGuards(const EntityPacket& pkt) {
         if (!gs.used) continue;
         if (nowMs - gs.lastPktMs <= SYNC_SLOT_STALE_MS) continue;
         L("[Slot] release slot=%u reason=stale-packet\n", i);
+        // Wide bind only: the host has dropped this guard (despawned or out of its range), so hand the body back
+        // to the local AI and free it for another host guard. Without this a conscripted body stays a statue
+        // (behaviour off, drive flag clear) for the rest of the session. Same two writes the kill pre-state uses
+        // to undo the mirror tick's disable (GuestKillMirrorEntity, "behaviour re-enabled").
+        if (wideR > 0.0f && gs.ent) {
+            __try {
+                Entity* re = (Entity*)gs.ent;
+                Component* rb = MirrorCandidateBhv(re, player);
+                if (rb && readable(rb, 0x40) && !MirrorKilledLocally(re)) {
+                    ((Component*)rb)->SetEnabled(true);
+                    Human* rh = AIEntityHelper::GetHuman(re);
+                    if (rh && readable(rh, 4)) {
+                        CharacterController* rcc = (CharacterController*)rh->GetCharacterComponent();
+                        if (readable(rcc, 0x600)) rcc->m_DriveEntity = true;
+                    }
+                    L("[WideBind] released ent=%08X objId=%016llX back to local AI\n", gs.ent, (unsigned long long)gs.objId);
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
+            GuestObjForget(gs.objId);
+        }
         gs.used = 0; gs.ent = 0; gs.objId = 0;
     }
 }
@@ -9474,7 +9628,7 @@ static void DumpConfigOnce()
 
     struct K { const char* s; const char* k; int d; };
     static const K keys[] = {
-        { "Coop", "ActionDeathLog", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "CombatObserve", 0 },
+        { "Coop", "ActionDeathLog", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "CombatObserve", 0 },
         { "Coop", "CombatTest", 0 }, { "Coop", "CorpseKeepSec", 30 }, { "Coop", "CrowdProbeIntegrate", 1 },
         { "Coop", "CrowdProbeLiveKeys", 1 }, { "Coop", "DamageRelay", 0 }, { "Coop", "Diag", 0 },
         { "Coop", "DisableCrowd", 0 }, { "Coop", "DisablePuppetAI", 1 }, { "Coop", "DisableSpawns", 0 },
@@ -9714,6 +9868,7 @@ static void OnFrameInner(Human* updatedHuman) {
                       s_bindSent, s_bindScanN, s_bindRejSelf, s_bindRejComps, s_bindRejSkel,
                       s_bindRejBhv, s_bindRejAi, s_bindRejHp, s_bindRejArch, s_bindRejTaken,
                       s_bindUnmatched, (s_bindMinD < 1e8f) ? sqrtf(s_bindMinD) : -1.0f);
+                WideBindReport();
             }
             // Component histogram, same window. ALL non-zero distinct component vtable ids by
             // descending count (32 slots), then the two ids the soldier filter trusts, each as
