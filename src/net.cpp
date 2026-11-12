@@ -10,6 +10,8 @@
 #include "net.h"
 #include "paths.h"
 #include "lobby_code.h"
+#include "upnp.h"
+#include "stun.h"
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -41,6 +43,20 @@ namespace {
     uint32_t           g_joinNonce = 0;       // join: this attempt's nonce (WELCOME must echo it)
     uint32_t           g_joinCheck = 0;       // join: check of the typed code (sent in HELLO, logged by the host)
     volatile LONG      g_joinState = 0;       // join: 0 idle, 1 sending HELLO, 2 welcomed, 3 rejected, 4 timed out
+
+    // ---- host: UPnP + STUN (slices 4-5) ------------------------------------------------------------
+    // The STUN request goes out of the GAME socket (so the NAT mapping it reports is the one the guest
+    // must reach); the recv thread recognises the answer and parks it here for the host thread.
+    uint8_t            g_stunTid[12] = {0};
+    volatile LONG      g_stunPending = 0;     // 1 while a request with g_stunTid is outstanding
+    volatile LONG      g_stunDone = 0;        // 1 once g_stunIp/g_stunPort hold an answer
+    uint32_t           g_stunIp = 0;          // host order
+    uint16_t           g_stunPort = 0;
+    int                g_bindPort = 0;        // the port the game socket is bound to (host thread input)
+    char               g_stunServer[128] = {0};
+    int                g_upnpEnabled = 1;
+    char               g_hostCode[16] = {0};  // best code to share (internet if we have one, else LAN); "" = none yet
+    SRWLOCK            g_codeLock = SRWLOCK_INIT;
 
     // ---- received DEATH ring (B-4: a one-shot death packet must not be lost to the snapshot slot) --
     // g_remoteEntities is last-writer-wins: `g_remoteEntities = decoded` below overwrites whatever the
@@ -643,24 +659,6 @@ namespace {
         LobbyPacket p{ NET_LOBBY_MAGIC, NET_PROTO_VER, type, nonce, check };
         sendto(g_sock, (const char*)&p, sizeof(p), 0, (const sockaddr*)&to, sizeof(to));
     }
-    // This PC's LAN IPv4 (host order): the source address the OS would use for the default route.
-    // A connected UDP socket sends nothing; getsockname just reports the route's local address.
-    bool LanIPv4(uint32_t* out) {
-        SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-        if (s == INVALID_SOCKET) return false;
-        sockaddr_in dst{}; dst.sin_family = AF_INET; dst.sin_port = htons(53);
-        inet_pton(AF_INET, "8.8.8.8", &dst.sin_addr);
-        bool ok = false;
-        if (connect(s, (sockaddr*)&dst, sizeof(dst)) == 0) {
-            sockaddr_in me{}; int ml = sizeof(me);
-            if (getsockname(s, (sockaddr*)&me, &ml) == 0 && me.sin_addr.s_addr != 0) {
-                *out = ntohl(me.sin_addr.s_addr); ok = true;
-            }
-        }
-        closesocket(s);
-        return ok;
-    }
-
     // The 12-bit check of the code for ip:port (the same CRC the code itself carries).
     uint32_t CodeCheckOf(uint32_t ipHost, uint16_t port) {
         const uint8_t b[6] = { (uint8_t)(ipHost >> 24), (uint8_t)(ipHost >> 16), (uint8_t)(ipHost >> 8),
@@ -764,6 +762,149 @@ namespace {
         return 0;
     }
 
+    void SetHostCode(const char* code) {
+        AcquireSRWLockExclusive(&g_codeLock);
+        lstrcpynA(g_hostCode, code, sizeof(g_hostCode));
+        ReleaseSRWLockExclusive(&g_codeLock);
+    }
+    void FmtIp(uint32_t ip, char* out, size_t n) {
+        _snprintf(out, n, "%u.%u.%u.%u", ip >> 24, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF);
+        out[n - 1] = 0;
+    }
+
+    // One STUN Binding request out of the game socket; the recv thread completes it. Returns true when
+    // an answer arrived within waitMs.
+    bool StunOnce(const sockaddr_in& srv, int waitMs) {
+        InterlockedExchange(&g_stunPending, 0);
+        LARGE_INTEGER q; QueryPerformanceCounter(&q);
+        uint32_t seed = q.LowPart ^ (GetCurrentProcessId() << 8) ^ (uint32_t)GetTickCount64();
+        for (int i = 0; i < 12; ++i) { seed = seed * 1103515245u + 12345u; g_stunTid[i] = (uint8_t)(seed >> 16); }
+        InterlockedExchange(&g_stunDone, 0);
+        InterlockedExchange(&g_stunPending, 1);
+        uint8_t req[20]; Stun::BuildRequest(req, g_stunTid);
+        sendto(g_sock, (const char*)req, sizeof(req), 0, (const sockaddr*)&srv, sizeof(srv));
+        const ULONGLONG t0 = GetTickCount64();
+        while (GetTickCount64() - t0 < (ULONGLONG)waitMs) {
+            if (InterlockedCompareExchange(&g_stunDone, 0, 0)) return true;
+            Sleep(20);
+        }
+        InterlockedExchange(&g_stunPending, 0);
+        return false;
+    }
+
+    // Host mode background work: UPnP mapping, STUN check, the verdict and the code; then keep the NAT
+    // mappings alive (STUN every 25 s until a guest joins; UPnP lease renewed every 30 min). Never on the
+    // game thread. Removal on quit is NOT done: the only exit hook is DLL_PROCESS_DETACH, where WinHTTP
+    // must not run (loader lock). The 7200 s lease expires on its own, and the next host start deletes a
+    // stale "AC4Coop" mapping of this PC before adding a new one.
+    unsigned __stdcall HostThread(void*) {
+        char m[384], err[256], a[32], b[32];
+        const uint16_t port = (uint16_t)g_bindPort;
+        uint32_t lan = 0;
+        const bool haveLan = Upnp::DefaultRouteIPv4(&lan);
+
+        // ---- UPnP ----
+        Upnp::Gateway gw{};
+        bool upnpGw = false, mapped = false, haveExt = false;
+        uint16_t extPort = 0; uint32_t ext = 0, lease = 0;
+        if (!g_upnpEnabled) dbg("[Lobby] UPnP off ([Net] Upnp=0)\n");
+        else if (!haveLan) dbg("[Lobby] UPnP skipped: no LAN address\n");
+        else if (!(upnpGw = Upnp::Discover(lan, &gw, err, sizeof(err)))) {
+            _snprintf(m, sizeof(m), "[Lobby] UPnP: %s\n", err); m[sizeof(m) - 1] = 0; dbg(m);
+        } else {
+            _snprintf(m, sizeof(m), "[Lobby] UPnP gateway %s (%s)\n", gw.location, gw.service); m[sizeof(m) - 1] = 0; dbg(m);
+            for (int k = 0; k < 10; ++k) {   // stale mappings this PC left behind (crash / quit without cleanup)
+                uint32_t cl = 0; uint16_t ip2 = 0; char desc[64] = {0};
+                const uint16_t p = (uint16_t)(port + k);
+                if (Upnp::GetUdpMapping(gw, p, &cl, &ip2, desc, sizeof(desc), err, sizeof(err)) && cl == lan && strcmp(desc, "AC4Coop") == 0) {
+                    const bool del = Upnp::DeleteUdpMapping(gw, p, err, sizeof(err));
+                    _snprintf(m, sizeof(m), "[Lobby] UPnP removed stale AC4Coop mapping UDP %u: %s\n", p, del ? "ok" : err);
+                    m[sizeof(m) - 1] = 0; dbg(m);
+                }
+            }
+            int ue = 0;
+            mapped = Upnp::AddUdpMappingAny(gw, port, 7200, "AC4Coop", &extPort, &ue, &lease, err, sizeof(err));
+            if (mapped) _snprintf(m, sizeof(m), "[Lobby] UPnP mapped UDP %u -> this PC:%u (lease %u s%s)\n", extPort, port,
+                                  lease, extPort != port ? ", port conflict skipped" : "");
+            else _snprintf(m, sizeof(m), "[Lobby] UPnP mapping refused: %s\n", err);
+            m[sizeof(m) - 1] = 0; dbg(m);
+            haveExt = Upnp::GetExternalIp(gw, &ext, err, sizeof(err));
+            if (haveExt) { FmtIp(ext, a, sizeof(a)); _snprintf(m, sizeof(m), "[Lobby] UPnP external address %s\n", a); }
+            else _snprintf(m, sizeof(m), "[Lobby] UPnP external address unknown: %s\n", err);
+            m[sizeof(m) - 1] = 0; dbg(m);
+        }
+
+        // ---- STUN ----
+        sockaddr_in srv{};
+        bool haveSrv = false, stun = false;
+        if (!g_stunServer[0]) dbg("[Lobby] STUN off ([Net] StunServer= empty)\n");
+        else if (!(haveSrv = Stun::Resolve(g_stunServer, &srv))) {
+            _snprintf(m, sizeof(m), "[Lobby] STUN server %s did not resolve\n", g_stunServer); m[sizeof(m) - 1] = 0; dbg(m);
+        } else {
+            for (int i = 0; i < 3 && !stun; ++i) stun = StunOnce(srv, 1000);
+            if (stun) { FmtIp(g_stunIp, a, sizeof(a)); _snprintf(m, sizeof(m), "[Lobby] STUN: the internet sees %s:%u\n", a, g_stunPort); }
+            else _snprintf(m, sizeof(m), "[Lobby] STUN: no answer from %s in 3 tries\n", g_stunServer);
+            m[sizeof(m) - 1] = 0; dbg(m);
+        }
+
+        // ---- verdict and code ----
+        const char* verdict; const char* advice; uint32_t cIp = 0; uint16_t cPort = 0;
+        if (!stun) {
+            verdict = "NO_STUN"; advice = "internet address unknown; only the LAN code below is known to work";
+        } else if (haveLan && lan == g_stunIp) {
+            verdict = "PUBLIC"; advice = "this PC is directly on the internet; friends can join with the code";
+            cIp = g_stunIp; cPort = port;
+        } else if (mapped && haveExt && ext == g_stunIp) {
+            verdict = "OK"; advice = "single router, UPnP opened the port; friends can join with the code";
+            cIp = g_stunIp; cPort = extPort;
+        } else if (haveExt && Upnp::AddressClass(ext) == 2) {
+            verdict = "CGNAT"; advice = "carrier-grade NAT at the ISP: friends outside cannot reach this PC; let a friend host";
+            cIp = g_stunIp; cPort = g_stunPort;
+        } else if (haveExt && Upnp::AddressClass(ext) == 1) {
+            verdict = "DOUBLE_NAT"; advice = "this router sits behind another one: friends outside probably cannot join; "
+                                             "let a friend with a simple router host, or forward UDP on the outer router";
+            cIp = g_stunIp; cPort = g_stunPort;
+        } else {
+            verdict = "NO_UPNP"; advice = "the router did not open the port: forward UDP to this PC by hand, or let a friend host";
+            cIp = g_stunIp; cPort = g_stunPort;
+        }
+        if (cIp) {
+            char code[15] = {0}; LobbyCode::Encode(cIp, cPort, code);
+            SetHostCode(code);
+            FmtIp(cIp, a, sizeof(a));
+            _snprintf(m, sizeof(m), "[Lobby] host internet code %s (%s:%u) verdict=%s - %s\n", code, a, cPort, verdict, advice);
+        } else {
+            _snprintf(m, sizeof(m), "[Lobby] host verdict=%s - %s\n", verdict, advice);
+        }
+        m[sizeof(m) - 1] = 0; dbg(m);
+        { char e[96]; _snprintf(e, sizeof(e), "[E] ev=lobby-host verdict=%s\n", verdict); e[sizeof(e) - 1] = 0; dbg(e); }
+
+        // ---- keep the mappings alive ----
+        ULONGLONG lastStun = GetTickCount64(), lastMap = GetTickCount64();
+        uint32_t prevIp = g_stunIp; uint16_t prevPort = g_stunPort;
+        for (;;) {
+            Sleep(1000);
+            const ULONGLONG now = GetTickCount64();
+            if (haveSrv && InterlockedCompareExchange(&g_peerReady, 0, 0) == 0 && now - lastStun >= 25000) {
+                lastStun = now;
+                if (StunOnce(srv, 1000) && (g_stunIp != prevIp || g_stunPort != prevPort)) {
+                    FmtIp(prevIp, a, sizeof(a)); FmtIp(g_stunIp, b, sizeof(b));
+                    _snprintf(m, sizeof(m), "[Lobby] STUN: public mapping changed %s:%u -> %s:%u (the old code no longer works)\n",
+                              a, prevPort, b, g_stunPort);
+                    m[sizeof(m) - 1] = 0; dbg(m);
+                    prevIp = g_stunIp; prevPort = g_stunPort;
+                }
+            }
+            if (mapped && lease != 0 && now - lastMap >= 1800000) {
+                lastMap = now;
+                int ue = 0; uint32_t l2 = 0;
+                if (!Upnp::AddUdpMapping(gw, extPort, port, 7200, "AC4Coop", &ue, &l2, err, sizeof(err))) {
+                    _snprintf(m, sizeof(m), "[Lobby] UPnP lease renewal failed: %s\n", err); m[sizeof(m) - 1] = 0; dbg(m);
+                }
+            }
+        }
+    }
+
     // Lobby handshake selftest: the frozen 20-byte layout and the constants the Python twin pins.
     void SelfTestLobby() {
         LobbyPacket p{ NET_LOBBY_MAGIC, NET_PROTO_VER, LOBBY_HELLO, 0x01020304u, 0x0ABCu };
@@ -788,6 +929,19 @@ namespace {
             int n = recvfrom(g_sock, buf, sizeof(buf), 0, (sockaddr*)&from, &flen);
             if (n >= 4) {
                 uint32_t magic = *(uint32_t*)buf;
+                // STUN answer for the host thread (slice 5). A game datagram can never pass LooksLikeStun:
+                // byte 0 of 'AC4C'/'AC4E'/'AC4L' is 'A' (0x41), whose top bits are not 00. Host mode only.
+                if (g_mode == LM_HOST && Stun::LooksLikeStun((const uint8_t*)buf, n)) {
+                    if (InterlockedCompareExchange(&g_stunPending, 0, 0)) {
+                        uint32_t sip = 0; uint16_t sport = 0;
+                        if (Stun::ParseResponse((const uint8_t*)buf, n, g_stunTid, &sip, &sport)) {
+                            g_stunIp = sip; g_stunPort = sport;
+                            InterlockedExchange(&g_stunPending, 0);
+                            InterlockedExchange(&g_stunDone, 1);
+                        }
+                    }
+                    continue;
+                }
                 // Lobby lane (slice 3): handled first and never counted as game traffic. Manual mode
                 // ignores lobby packets entirely.
                 if (magic == NET_LOBBY_MAGIC) {
@@ -959,6 +1113,9 @@ bool Init() {
     else if (_stricmp(modeStr, "manual") != 0) {
         char m[96]; _snprintf(m, sizeof(m), "[Lobby] unknown [Net] Mode=%s, using manual\n", modeStr); m[sizeof(m) - 1] = 0; dbg(m);
     }
+    // Host mode only: [Net] Upnp=1 (default) and [Net] StunServer=stun.l.google.com:19302 (default; empty = off).
+    g_upnpEnabled = GetPrivateProfileIntA("Net", "Upnp", 1, Paths::Ini());
+    GetPrivateProfileStringA("Net", "StunServer", "stun.l.google.com:19302", g_stunServer, sizeof(g_stunServer), Paths::Ini());
     uint32_t joinIp = 0; uint16_t joinPort = 0;
     if (g_mode == LM_JOIN && !LobbyCode::Decode(joinCode, &joinIp, &joinPort)) {
         char m[160]; _snprintf(m, sizeof(m), "[Lobby] JoinCode \"%s\" is invalid (typo?) - nothing sent, link off\n", joinCode);
@@ -1038,6 +1195,7 @@ bool Init() {
     SelfTestWire();     // [Phase 2] prove the compact codec round-trips before any traffic
     { char lm[192]; LobbyCode::SelfTest(lm, sizeof(lm)); dbg(lm); }   // lobby-code format (slice 2): log only, no behaviour
     if (g_mode != LM_MANUAL) SelfTestLobby();
+    if (g_mode == LM_HOST) { char sm[160]; Stun::SelfTest(sm, sizeof(sm)); dbg(sm); }
     _beginthreadex(nullptr, 0, (unsigned (__stdcall*)(void*))RecvThread, nullptr, 0, nullptr);   // after the self-test (it resets the rx shadow)
     char m[192];
     if (g_mode == LM_MANUAL) {
@@ -1045,17 +1203,20 @@ bool Init() {
     } else if (g_mode == LM_HOST) {
         wsprintfA(m, "[Net] up: bound:%d mode=host (waiting for a guest)\n", bindPort); dbg(m);
         uint32_t lan = 0;
-        if (LanIPv4(&lan)) {
+        if (Upnp::DefaultRouteIPv4(&lan)) {
             char code[15] = {0}; LobbyCode::Encode(lan, (uint16_t)bindPort, code);
             _snprintf(m, sizeof(m), "[Lobby] host LAN code %s (%u.%u.%u.%u:%d) - same network only\n", code,
                       lan >> 24, (lan >> 16) & 0xFF, (lan >> 8) & 0xFF, lan & 0xFF, bindPort);
             m[sizeof(m) - 1] = 0; dbg(m);
+            SetHostCode(code);   // until the host thread finds an internet code
         } else {
             dbg("[Lobby] host LAN address not found (no IPv4 route) - no LAN code\n");
         }
         char loop[15] = {0}; LobbyCode::Encode(0x7F000001u, (uint16_t)bindPort, loop);
         _snprintf(m, sizeof(m), "[Lobby] host same-PC code %s (127.0.0.1:%d)\n", loop, bindPort);
         m[sizeof(m) - 1] = 0; dbg(m);
+        g_bindPort = bindPort;
+        _beginthreadex(nullptr, 0, HostThread, nullptr, 0, nullptr);   // UPnP + STUN, off the game thread
     } else {
         char pa[48]; FmtAddr(peer, pa, sizeof(pa));
         _snprintf(m, sizeof(m), "[Net] up: bound:%d mode=join code=%s -> host %s (nonce=%08x)\n",
