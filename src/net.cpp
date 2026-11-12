@@ -12,6 +12,7 @@
 #include "lobby_code.h"
 #include "upnp.h"
 #include "stun.h"
+#include "relay_proto.h"
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -44,6 +45,7 @@ namespace {
     uint32_t           g_joinCheck = 0;       // join: check of the typed code (sent in HELLO, logged by the host)
     volatile LONG      g_joinState = 0;       // join: 0 idle, 1 sending HELLO, 2 welcomed, 3 rejected, 4 timed out
     volatile LONG      g_joinGen = 0;         // join attempt generation (F8 restarts)
+    uint32_t           g_lockedNonce = 0;     // host: nonce of the HELLO that locked the current guest (recv thread)
     char               g_joinCodeText[16] = {0};   // the code of the current attempt, for the status line
 
     // ---- host: UPnP + STUN (slices 4-5) ------------------------------------------------------------
@@ -59,6 +61,26 @@ namespace {
     int                g_upnpEnabled = 1;
     char               g_hostCode[16] = {0};  // best code to share (internet if we have one, else LAN); "" = none yet
     SRWLOCK            g_codeLock = SRWLOCK_INIT;
+
+    // ---- relay (docs/design/relay.md) ----------------------------------------------------------------
+    // A relayed peer's address IS the relay server's endpoint, plus a slot on that server (g_peerSlot,
+    // under g_peerLock with g_peer). Everything sent to the server endpoint goes out wrapped in a DATA
+    // header (SendRaw); every DATA from the server is unwrapped at the top of RecvThread before any other
+    // check, so the handshake, the strict-peer gate and the decoders see the same datagrams as on a direct
+    // link. With [Net] RelayServer empty (the default) none of this runs.
+    char               g_relayName[128] = {0};   // [Net] RelayServer as written
+    sockaddr_in        g_relaySrv{};             // resolved off the game thread (RelayResolve); 0 until then
+    volatile LONG      g_relayResolved = 0;      // 1 ok, -1 failed
+    int                g_relayForce = 0;         // [Net] RelayForce=1: skip the direct attempt
+    uint16_t           g_peerSlot = 0;           // slot of g_peer on the relay (meaningful when g_peer == g_relaySrv)
+    volatile LONG64    g_relayRoom = 0;          // host: from REGISTERED; guest: from the room code
+    uint32_t           g_relayNonce = 0;         // REGISTER / JOIN nonce
+    volatile LONG      g_relayRegistered = 0;    // host: REGISTERED seen
+    volatile LONG      g_linkVia = 0;            // 0 none, 1 direct, 2 relay
+    volatile LONG      g_relayErr = 0;           // last relay ERR code (guest status line)
+    // guest: the host's endpoints from PEER (written by the recv thread before g_hostInfo = 1)
+    sockaddr_in        g_hostPub{}, g_hostLan{};
+    volatile LONG      g_hostInfo = 0;
 
     // ---- received DEATH ring (B-4: a one-shot death packet must not be lost to the snapshot slot) --
     // g_remoteEntities is last-writer-wins: `g_remoteEntities = decoded` below overwrites whatever the
@@ -637,19 +659,24 @@ namespace {
     }
 
     // ---- lobby helpers (slice 3) ------------------------------------------------------------------
-    sockaddr_in PeerCopy() {
+    sockaddr_in PeerCopy(uint16_t* slot = nullptr) {
         AcquireSRWLockShared(&g_peerLock);
         sockaddr_in p = g_peer;
+        if (slot) *slot = g_peerSlot;
         ReleaseSRWLockShared(&g_peerLock);
         return p;
     }
-    void PeerSet(const sockaddr_in& p) {
+    void PeerSet(const sockaddr_in& p, uint16_t slot = Relay::kHostSlot) {
         AcquireSRWLockExclusive(&g_peerLock);
         g_peer = p;
+        g_peerSlot = slot;
         ReleaseSRWLockExclusive(&g_peerLock);
     }
     bool SameAddr(const sockaddr_in& a, const sockaddr_in& b) {
         return a.sin_addr.s_addr == b.sin_addr.s_addr && a.sin_port == b.sin_port;
+    }
+    bool IsRelay(const sockaddr_in& a) {
+        return InterlockedCompareExchange(&g_relayResolved, 0, 0) == 1 && SameAddr(a, g_relaySrv);
     }
     void FmtAddr(const sockaddr_in& a, char* out, size_t n) {
         char ip[32] = {0};
@@ -657,9 +684,23 @@ namespace {
         _snprintf(out, n, "%s:%u", ip, (unsigned)ntohs(a.sin_port));
         out[n - 1] = 0;
     }
-    void SendLobby(uint32_t type, uint32_t nonce, uint32_t check, const sockaddr_in& to) {
+    // A relay control message (or DATA) to the relay server: 16-byte header + payload.
+    void RelaySend(uint8_t type, uint16_t slot, uint64_t room, const void* payload, int n) {
+        uint8_t b[Relay::kMaxDatagram];
+        if (n < 0 || n + (int)sizeof(Relay::Hdr) > (int)sizeof(b)) return;
+        Relay::Hdr h{ Relay::kMagic, Relay::kVersion, type, slot, room };
+        std::memcpy(b, &h, sizeof(h));
+        if (n) std::memcpy(b + sizeof(h), payload, (size_t)n);
+        sendto(g_sock, (const char*)b, (int)sizeof(h) + n, 0, (const sockaddr*)&g_relaySrv, sizeof(g_relaySrv));
+    }
+    // The one send path for game and lobby datagrams: direct, or wrapped in DATA when `to` is the relay.
+    void SendRaw(const void* buf, int n, const sockaddr_in& to, uint16_t slot) {
+        if (IsRelay(to)) RelaySend(Relay::T_DATA, slot, (uint64_t)InterlockedCompareExchange64(&g_relayRoom, 0, 0), buf, n);
+        else sendto(g_sock, (const char*)buf, n, 0, (const sockaddr*)&to, sizeof(to));
+    }
+    void SendLobby(uint32_t type, uint32_t nonce, uint32_t check, const sockaddr_in& to, uint16_t slot = Relay::kHostSlot) {
         LobbyPacket p{ NET_LOBBY_MAGIC, NET_PROTO_VER, type, nonce, check };
-        sendto(g_sock, (const char*)&p, sizeof(p), 0, (const sockaddr*)&to, sizeof(to));
+        SendRaw(&p, (int)sizeof(p), to, slot);
     }
     // The 12-bit check of the code for ip:port (the same CRC the code itself carries).
     uint32_t CodeCheckOf(uint32_t ipHost, uint16_t port) {
@@ -669,12 +710,15 @@ namespace {
     }
 
     // One lobby datagram (exactly sizeof(LobbyPacket), magic already checked). Recv thread only.
-    void HandleLobby(const LobbyPacket& p, const sockaddr_in& from) {
-        char fa[48]; FmtAddr(from, fa, sizeof(fa));
+    // `slot`: the relay slot the datagram came from when `from` is the relay server (else kHostSlot).
+    void HandleLobby(const LobbyPacket& p, const sockaddr_in& from, uint16_t slot) {
+        const bool viaRelay = IsRelay(from);
+        char fa[64]; FmtAddr(from, fa, sizeof(fa));
+        if (viaRelay) { size_t l = strlen(fa); _snprintf(fa + l, sizeof(fa) - l, " (relay slot %u)", (unsigned)slot); fa[sizeof(fa) - 1] = 0; }
         char m[192];
         if (g_mode == LM_HOST && p.type == LOBBY_HELLO) {
             if (p.protoVer != NET_PROTO_VER) {
-                SendLobby(LOBBY_REJECT, p.nonce, 0, from);
+                SendLobby(LOBBY_REJECT, p.nonce, 0, from, slot);
                 static int s_logs = 0;
                 if (s_logs++ < 4) {
                     _snprintf(m, sizeof(m), "[Lobby] HELLO from %s refused: guest proto=%u, host proto=%u\n",
@@ -683,18 +727,27 @@ namespace {
                 }
                 return;
             }
-            const sockaddr_in cur = PeerCopy();
+            uint16_t curSlot = 0;
+            const sockaddr_in cur = PeerCopy(&curSlot);
             const bool ready = InterlockedCompareExchange(&g_peerReady, 0, 0) != 0;
-            if (ready && SameAddr(cur, from)) {   // a retry that crossed our WELCOME: answer again, no log
-                SendLobby(LOBBY_WELCOME, p.nonce, 0, from);
+            const bool sameGuest = SameAddr(cur, from) && (!viaRelay || curSlot == slot);
+            if (ready && sameGuest) {   // a retry that crossed our WELCOME: answer again, no log
+                SendLobby(LOBBY_WELCOME, p.nonce, 0, from, slot);
                 return;
             }
+            // The same join attempt arriving on another path (a relay guest HELLOs the host's public AND LAN
+            // endpoints): keep the path we locked and stay silent here, so the guest can only lock onto the
+            // same path (it takes the first WELCOME's source). Found by the offline relay matrix (X1): a
+            // re-lock here left host and guest on different paths and every game datagram was dropped.
+            if (ready && p.nonce == g_lockedNonce) return;
             // Re-lock rule: the guest slot is taken by the first HELLO. A different source may take it
             // over only if it is the same machine (same IP, new NAT port after a guest restart) or the
-            // current guest has been silent for 10 s.
+            // current guest has been silent for 10 s. Through the relay every guest shares the server's
+            // address, so "same machine" does not apply there: only silence frees the slot.
             const uint64_t now = GetTickCount64();
             const bool silent = g_lastRecvMs == 0 || now - g_lastRecvMs > 10000;
-            if (ready && cur.sin_addr.s_addr != from.sin_addr.s_addr && !silent) {
+            const bool sameMachine = !viaRelay && !IsRelay(cur) && cur.sin_addr.s_addr == from.sin_addr.s_addr;
+            if (ready && !sameMachine && !silent) {
                 static int s_full = 0;
                 if (s_full++ < 4) {
                     char ca[48]; FmtAddr(cur, ca, sizeof(ca));
@@ -704,10 +757,12 @@ namespace {
                 return;
             }
             InterlockedExchange(&g_peerReady, 0);
-            PeerSet(from);
+            PeerSet(from, slot);
+            g_lockedNonce = p.nonce;
             g_lastRecvMs = 0;
+            InterlockedExchange(&g_linkVia, viaRelay ? 2 : 1);
             InterlockedExchange(&g_peerReady, 1);
-            SendLobby(LOBBY_WELCOME, p.nonce, 0, from);
+            SendLobby(LOBBY_WELCOME, p.nonce, 0, from, slot);
             _snprintf(m, sizeof(m), "[Lobby] guest joined %s (nonce=%08x codeCheck=%03x%s)\n", fa,
                       (unsigned)p.nonce, (unsigned)(p.codeCheck & 0xFFF), ready ? " re-lock" : "");
             m[sizeof(m) - 1] = 0; dbg(m);
@@ -716,10 +771,18 @@ namespace {
         }
         if (g_mode == LM_JOIN && (p.type == LOBBY_WELCOME || p.type == LOBBY_REJECT)) {
             const sockaddr_in cur = PeerCopy();
-            if (!SameAddr(cur, from) || p.nonce != g_joinNonce) return;   // not our host / not this attempt
+            // Our host is: the current peer; or, in a relay join, either endpoint PEER gave us, or the
+            // relay itself (slot 0) - the WELCOME answers whichever path our HELLO took.
+            const bool relayJoin = InterlockedCompareExchange64(&g_relayRoom, 0, 0) != 0;
+            const bool hostEp = relayJoin && InterlockedCompareExchange(&g_hostInfo, 0, 0) &&
+                                (SameAddr(from, g_hostPub) || SameAddr(from, g_hostLan));
+            const bool ours = SameAddr(cur, from) || hostEp || (relayJoin && viaRelay && slot == Relay::kHostSlot);
+            if (!ours || p.nonce != g_joinNonce) return;   // not our host / not this attempt
             if (InterlockedCompareExchange(&g_joinState, 0, 0) != 1) return;   // already decided
             if (p.type == LOBBY_WELCOME) {
                 if (InterlockedCompareExchange(&g_joinState, 2, 1) != 1) return;
+                PeerSet(from, Relay::kHostSlot);   // lock onto the path that answered
+                InterlockedExchange(&g_linkVia, viaRelay ? 2 : 1);
                 InterlockedExchange(&g_peerReady, 1);
                 _snprintf(m, sizeof(m), "[Lobby] joined host %s\n", fa);
                 m[sizeof(m) - 1] = 0; dbg(m);
@@ -771,6 +834,9 @@ namespace {
     void StartJoin(uint32_t ipHost, uint16_t port, const char* codeText) {
         InterlockedExchange(&g_joinState, 0);
         InterlockedExchange(&g_peerReady, 0);
+        InterlockedExchange64(&g_relayRoom, 0);   // a direct code: not a relay join
+        InterlockedExchange(&g_hostInfo, 0);
+        InterlockedExchange(&g_linkVia, 0);
         sockaddr_in peer{}; peer.sin_family = AF_INET; peer.sin_port = htons(port); peer.sin_addr.s_addr = htonl(ipHost);
         PeerSet(peer);
         LARGE_INTEGER qpc; QueryPerformanceCounter(&qpc);
@@ -796,6 +862,200 @@ namespace {
     void FmtIp(uint32_t ip, char* out, size_t n) {
         _snprintf(out, n, "%u.%u.%u.%u", ip >> 24, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF);
         out[n - 1] = 0;
+    }
+
+    // ---- relay (docs/design/relay.md) ------------------------------------------------------------------
+    // Resolve [Net] RelayServer once, off the game thread (DNS can block). Default port 47800.
+    bool RelayResolve() {
+        const LONG st = InterlockedCompareExchange(&g_relayResolved, 0, 0);
+        if (st) return st == 1;
+        char hp[160]; lstrcpynA(hp, g_relayName, sizeof(hp));
+        if (!strchr(hp, ':')) { size_t l = strlen(hp); _snprintf(hp + l, sizeof(hp) - l, ":47800"); hp[sizeof(hp) - 1] = 0; }
+        sockaddr_in a{};
+        char m[256];
+        if (!Stun::Resolve(hp, &a)) {
+            InterlockedExchange(&g_relayResolved, -1);
+            _snprintf(m, sizeof(m), "[Lobby] relay server \"%s\" did not resolve - room codes are off\n", hp);
+            m[sizeof(m) - 1] = 0; dbg(m);
+            return false;
+        }
+        g_relaySrv = a;
+        InterlockedExchange(&g_relayResolved, 1);
+        char sa[48]; FmtAddr(a, sa, sizeof(sa));
+        _snprintf(m, sizeof(m), "[Lobby] relay server %s = %s\n", hp, sa); m[sizeof(m) - 1] = 0; dbg(m);
+        return true;
+    }
+    uint32_t NewNonce() {
+        LARGE_INTEGER q; QueryPerformanceCounter(&q);
+        return (uint32_t)q.LowPart ^ (GetCurrentProcessId() << 16) ^ (uint32_t)GetTickCount64() ^ 0x9E3779B9u;
+    }
+    void RelayHello(uint8_t type, uint64_t room) {
+        uint32_t lan = 0; Upnp::DefaultRouteIPv4(&lan);
+        Relay::Hello h{ NET_PROTO_VER, lan, (uint16_t)g_bindPort, 0, g_relayNonce, 0, 0 };
+        RelaySend(type, 0, room, &h, (int)sizeof(h));
+    }
+    void RoomCode(uint64_t room, char out[15]) {
+        uint32_t ip = 0; uint16_t port = 0;
+        Relay::AddressFromRoom(room, &ip, &port);
+        LobbyCode::Encode(ip, port, out);
+    }
+    sockaddr_in Sa(uint32_t ipHost, uint16_t port) {
+        sockaddr_in a{}; a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(ipHost); a.sin_port = htons(port);
+        return a;
+    }
+    const char* RelayErrText(LONG code) {
+        switch (code) {
+            case Relay::E_UNKNOWN_ROOM: return "no such room (expired, mistyped, or a different relay server)";
+            case Relay::E_ROOM_FULL:    return "room full";
+            case Relay::E_PROTO:        return "the host runs a different build";
+            case Relay::E_VERSION:      return "the relay server is a different version";
+            case Relay::E_NOT_MEMBER:   return "not a member of that room";
+            case 100:                   return "relay server name did not resolve";
+            default:                    return "relay error";
+        }
+    }
+
+    // Host: punch towards a guest the relay introduced (opens our NAT for its endpoints). 3 s, both endpoints.
+    struct PunchArgs { sockaddr_in pub, lan; uint32_t nonce; };
+    unsigned __stdcall PunchThread(void* arg) {
+        PunchArgs* a = (PunchArgs*)arg;
+        for (int i = 0; i < 12 && InterlockedCompareExchange(&g_peerReady, 0, 0) == 0; ++i) {
+            SendLobby(LOBBY_PUNCH, a->nonce, 0, a->pub);
+            if (a->lan.sin_addr.s_addr && a->lan.sin_port && !SameAddr(a->lan, a->pub)) SendLobby(LOBBY_PUNCH, a->nonce, 0, a->lan);
+            Sleep(250);
+        }
+        delete a;
+        return 0;
+    }
+
+    // Guest: keep the room membership (and our NAT mapping towards the server) alive, every 15 s.
+    unsigned __stdcall RelayKeepThread(void*) {
+        for (;;) {
+            const uint64_t room = (uint64_t)InterlockedCompareExchange64(&g_relayRoom, 0, 0);
+            if (room && InterlockedCompareExchange(&g_relayResolved, 0, 0) == 1) RelaySend(Relay::T_KEEPALIVE, 0, room, nullptr, 0);
+            Sleep(15000);
+        }
+    }
+
+    // A relay control datagram from the relay server (recv thread). DATA never comes here.
+    void HandleRelayControl(const Relay::Hdr& h, const uint8_t* pl, int pn) {
+        char m[256], a[48], b[48];
+        if (h.type == Relay::T_REGISTERED && g_mode == LM_HOST && pn >= (int)sizeof(Relay::Registered)) {
+            Relay::Registered r; std::memcpy(&r, pl, sizeof(r));
+            if (r.nonce != g_relayNonce) return;
+            const uint64_t room = h.room & 0xFFFFFFFFFFull;
+            const uint64_t prev = (uint64_t)InterlockedExchange64(&g_relayRoom, (LONG64)room);
+            if (!InterlockedExchange(&g_relayRegistered, 1) || prev != room) {
+                char code[15] = {0}; RoomCode(room, code);
+                SetHostCode(code);
+                FmtAddr(g_relaySrv, a, sizeof(a));
+                _snprintf(m, sizeof(m), "[Lobby] relay room %010llx registered at %s: room code %s\n", (unsigned long long)room, a, code);
+                m[sizeof(m) - 1] = 0; dbg(m);
+                { char e[96]; _snprintf(e, sizeof(e), "[E] ev=relay-room code=%s\n", code); e[sizeof(e) - 1] = 0; dbg(e); }
+            }
+        } else if (h.type == Relay::T_PEER && pn >= (int)sizeof(Relay::Peer)) {
+            Relay::Peer p; std::memcpy(&p, pl, sizeof(p));
+            const sockaddr_in pub = Sa(p.pubIp, p.pubPort), lan = Sa(p.lanIp, p.lanPort);
+            FmtAddr(pub, a, sizeof(a)); FmtAddr(lan, b, sizeof(b));
+            if (g_mode == LM_HOST) {
+                _snprintf(m, sizeof(m), "[Lobby] relay: guest slot %u is %s (LAN %s)%s\n", (unsigned)h.slot, a, b,
+                          g_relayForce ? " - RelayForce=1, no punch" : " - punching");
+                m[sizeof(m) - 1] = 0; dbg(m);
+                if (!g_relayForce) _beginthreadex(nullptr, 0, PunchThread, new PunchArgs{ pub, lan, p.nonce }, 0, nullptr);
+            } else if (g_mode == LM_JOIN && p.nonce == g_relayNonce && !InterlockedCompareExchange(&g_hostInfo, 0, 0)) {
+                g_hostPub = pub; g_hostLan = lan;
+                InterlockedExchange(&g_hostInfo, 1);
+                _snprintf(m, sizeof(m), "[Lobby] relay: host is %s (LAN %s)\n", a, b); m[sizeof(m) - 1] = 0; dbg(m);
+            }
+        } else if (h.type == Relay::T_ERR && pn >= (int)sizeof(Relay::Error)) {
+            Relay::Error e; std::memcpy(&e, pl, sizeof(e));
+            if (e.nonce != g_relayNonce) return;
+            InterlockedExchange(&g_relayErr, e.code);
+            _snprintf(m, sizeof(m), "[Lobby] relay server refused: %s\n", RelayErrText(e.code)); m[sizeof(m) - 1] = 0; dbg(m);
+            if (g_mode == LM_JOIN) InterlockedCompareExchange(&g_joinState, 5, 1);
+            else if (g_mode == LM_HOST && e.code == Relay::E_UNKNOWN_ROOM) {
+                // Our room id was taken over (we were silent too long): register a new room on the next beat.
+                InterlockedExchange64(&g_relayRoom, 0);
+                InterlockedExchange(&g_relayRegistered, 0);
+            }
+        }
+    }
+
+    // Guest, room code: ask the relay for the host (JOIN until PEER), try the host directly for 3 s
+    // (unless RelayForce), then fall back to HELLO through the relay with the usual retry schedule.
+    unsigned __stdcall RelayJoinThread(void* genArg) {
+        const LONG gen = (LONG)(intptr_t)genArg;
+        auto alive = [&] { return InterlockedCompareExchange(&g_joinState, 0, 0) == 1 && InterlockedCompareExchange(&g_joinGen, 0, 0) == gen; };
+        char m[256];
+        if (!RelayResolve()) { InterlockedExchange(&g_relayErr, 100); InterlockedCompareExchange(&g_joinState, 5, 1); return 0; }
+        static volatile LONG s_keep = 0;
+        if (!InterlockedExchange(&s_keep, 1)) _beginthreadex(nullptr, 0, RelayKeepThread, nullptr, 0, nullptr);
+        const uint64_t room = (uint64_t)InterlockedCompareExchange64(&g_relayRoom, 0, 0);
+        PeerSet(g_relaySrv, Relay::kHostSlot);
+        uint64_t t0 = GetTickCount64();
+        while (alive() && !InterlockedCompareExchange(&g_hostInfo, 0, 0) && GetTickCount64() - t0 < 15000) {
+            RelayHello(Relay::T_JOIN, room);
+            Sleep(500);
+        }
+        if (!alive()) return 0;
+        if (!InterlockedCompareExchange(&g_hostInfo, 0, 0)) {
+            if (InterlockedCompareExchange(&g_joinState, 4, 1) == 1) dbg("[Lobby] join: the relay server did not answer in 15 s\n");
+            return 0;
+        }
+        if (!g_relayForce) {
+            PeerSet(g_hostPub, Relay::kHostSlot);
+            t0 = GetTickCount64();
+            while (alive() && GetTickCount64() - t0 < 3000) {
+                SendLobby(LOBBY_HELLO, g_joinNonce, g_joinCheck, g_hostPub);
+                if (g_hostLan.sin_addr.s_addr && g_hostLan.sin_port && !SameAddr(g_hostLan, g_hostPub))
+                    SendLobby(LOBBY_HELLO, g_joinNonce, g_joinCheck, g_hostLan);
+                Sleep(250);
+            }
+            if (!alive()) return 0;   // WELCOMEd directly (or superseded)
+            dbg("[Lobby] join: no direct answer in 3 s - using the relay\n");
+        } else {
+            dbg("[Lobby] join: RelayForce=1 - using the relay\n");
+        }
+        PeerSet(g_relaySrv, Relay::kHostSlot);
+        t0 = GetTickCount64();
+        int sent = 0; bool slowLogged = false;
+        while (alive()) {
+            const uint64_t el = GetTickCount64() - t0;
+            if (el > 600000) {
+                if (InterlockedCompareExchange(&g_joinState, 4, 1) == 1) dbg("[Lobby] join gave up: no WELCOME through the relay in 10 min\n");
+                break;
+            }
+            if (el > 15000 && !slowLogged) {
+                slowLogged = true;
+                _snprintf(m, sizeof(m), "[Lobby] no WELCOME through the relay after %d HELLOs in 15 s - still trying every 2 s\n", sent);
+                m[sizeof(m) - 1] = 0; dbg(m);
+            }
+            SendLobby(LOBBY_HELLO, g_joinNonce, g_joinCheck, g_relaySrv, Relay::kHostSlot);
+            ++sent;
+            Sleep(el > 15000 ? 2000 : 250);
+        }
+        return 0;
+    }
+
+    void StartRelayJoin(uint64_t room, const char* codeText) {
+        InterlockedExchange(&g_joinState, 0);
+        InterlockedExchange(&g_peerReady, 0);
+        InterlockedExchange(&g_hostInfo, 0);
+        InterlockedExchange(&g_relayErr, 0);
+        InterlockedExchange(&g_linkVia, 0);
+        InterlockedExchange64(&g_relayRoom, (LONG64)room);
+        g_relayNonce = NewNonce();
+        g_joinNonce = NewNonce() ^ 0x5bd1e995u;
+        g_joinCheck = 0;
+        AcquireSRWLockExclusive(&g_codeLock);
+        lstrcpynA(g_joinCodeText, codeText, sizeof(g_joinCodeText));
+        ReleaseSRWLockExclusive(&g_codeLock);
+        const LONG gen = InterlockedIncrement(&g_joinGen);
+        InterlockedExchange(&g_joinState, 1);
+        char m[160];
+        _snprintf(m, sizeof(m), "[Lobby] joining room %s (%010llx) through relay %s\n", codeText, (unsigned long long)room, g_relayName);
+        m[sizeof(m) - 1] = 0; dbg(m);
+        _beginthreadex(nullptr, 0, RelayJoinThread, (void*)(intptr_t)gen, 0, nullptr);
     }
 
     // One STUN Binding request out of the game socket; the recv thread completes it. Returns true when
@@ -828,6 +1088,18 @@ namespace {
         const uint16_t port = (uint16_t)g_bindPort;
         uint32_t lan = 0;
         const bool haveLan = Upnp::DefaultRouteIPv4(&lan);
+
+        // ---- relay room first (fast: the room code shows within a second) ----
+        const bool relay = g_relayName[0] && RelayResolve();
+        if (relay) {
+            g_relayNonce = NewNonce();
+            for (int i = 0; i < 10 && !InterlockedCompareExchange(&g_relayRegistered, 0, 0); ++i) {
+                RelayHello(Relay::T_REGISTER, 0);
+                Sleep(1000);
+            }
+            if (!InterlockedCompareExchange(&g_relayRegistered, 0, 0))
+                dbg("[Lobby] relay server did not answer REGISTER in 10 s - still retrying every 15 s; direct codes below\n");
+        }
 
         // ---- UPnP ----
         Upnp::Gateway gw{};
@@ -894,9 +1166,11 @@ namespace {
             verdict = "NO_UPNP"; advice = "the router did not open the port: forward UDP to this PC by hand, or let a friend host";
             cIp = g_stunIp; cPort = g_stunPort;
         }
+        const bool roomCode = InterlockedCompareExchange(&g_relayRegistered, 0, 0) != 0;
+        if (roomCode) advice = "the relay room code is the one to share; this direct code is an alternative";
         if (cIp) {
             char code[15] = {0}; LobbyCode::Encode(cIp, cPort, code);
-            SetHostCode(code);
+            if (!roomCode) SetHostCode(code);
             FmtIp(cIp, a, sizeof(a));
             _snprintf(m, sizeof(m), "[Lobby] host internet code %s (%s:%u) verdict=%s - %s\n", code, a, cPort, verdict, advice);
         } else {
@@ -906,11 +1180,17 @@ namespace {
         { char e[96]; _snprintf(e, sizeof(e), "[E] ev=lobby-host verdict=%s\n", verdict); e[sizeof(e) - 1] = 0; dbg(e); }
 
         // ---- keep the mappings alive ----
-        ULONGLONG lastStun = GetTickCount64(), lastMap = GetTickCount64();
+        ULONGLONG lastStun = GetTickCount64(), lastMap = GetTickCount64(), lastRelay = GetTickCount64();
         uint32_t prevIp = g_stunIp; uint16_t prevPort = g_stunPort;
         for (;;) {
             Sleep(1000);
             const ULONGLONG now = GetTickCount64();
+            // Relay: re-REGISTER every 15 s (keeps the room and our NAT mapping towards the server alive);
+            // every 2 s while not registered (first answer lost, or the room was taken over).
+            if (relay && now - lastRelay >= (InterlockedCompareExchange(&g_relayRegistered, 0, 0) ? 15000u : 2000u)) {
+                lastRelay = now;
+                RelayHello(Relay::T_REGISTER, (uint64_t)InterlockedCompareExchange64(&g_relayRoom, 0, 0));
+            }
             if (haveSrv && InterlockedCompareExchange(&g_peerReady, 0, 0) == 0 && now - lastStun >= 25000) {
                 lastStun = now;
                 if (StunOnce(srv, 1000) && (g_stunIp != prevIp || g_stunPort != prevPort)) {
@@ -968,18 +1248,41 @@ namespace {
                     }
                     continue;
                 }
+                // Relay lane (docs/design/relay.md): only from the configured relay server, lobby modes only.
+                // Control messages go to HandleRelayControl; DATA is unwrapped here, before every other check,
+                // so what follows sees the inner datagram exactly as on a direct link, with `from` = the server
+                // and rxSlot = the member it came from.
+                uint16_t rxSlot = Relay::kHostSlot;
+                if (magic == Relay::kMagic && g_mode != LM_MANUAL && n >= (int)sizeof(Relay::Hdr) && IsRelay(from)) {
+                    Relay::Hdr rh; std::memcpy(&rh, buf, sizeof(rh));
+                    if (rh.version != Relay::kVersion) continue;
+                    if (rh.type != Relay::T_DATA) {
+                        HandleRelayControl(rh, (const uint8_t*)buf + sizeof(rh), n - (int)sizeof(rh));
+                        continue;
+                    }
+                    if ((rh.room & 0xFFFFFFFFFFull) != (uint64_t)InterlockedCompareExchange64(&g_relayRoom, 0, 0)) continue;
+                    rxSlot = rh.slot;
+                    n -= (int)sizeof(rh);
+                    if (n < 4) continue;
+                    std::memmove(buf, buf + sizeof(rh), (size_t)n);
+                    magic = *(uint32_t*)buf;
+                }
                 // Lobby lane (slice 3): handled first and never counted as game traffic. Manual mode
                 // ignores lobby packets entirely.
                 if (magic == NET_LOBBY_MAGIC) {
                     if (g_mode != LM_MANUAL && n == (int)sizeof(LobbyPacket)) {
                         LobbyPacket lp; std::memcpy(&lp, buf, sizeof(lp));
-                        HandleLobby(lp, from);
+                        HandleLobby(lp, from, rxSlot);
                     }
                     continue;
                 }
                 // Before the handshake there is no peer: drop game packets unseen (lobby modes only).
                 if (InterlockedCompareExchange(&g_peerReady, 0, 0) == 0) continue;
-                const sockaddr_in peer = PeerCopy();   // one consistent copy per datagram (g_peerLock)
+                uint16_t peerSlot = 0;
+                const sockaddr_in peer = PeerCopy(&peerSlot);   // one consistent copy per datagram (g_peerLock)
+                // Relayed peer: other members of the room arrive from the same server endpoint; only the
+                // locked member's slot is our peer.
+                if (IsRelay(peer) && IsRelay(from) && rxSlot != peerSlot) continue;
                 // X4b: player SIZE mismatch, named instead of anonymous. A peer on a different build
                 // (older/newer struct) sends our player magic with a foreign length, so playerPkt is
                 // false and `if (playerPkt && !playerOk)` below never runs: no protoMismatch line, no
@@ -1121,6 +1424,8 @@ namespace {
 
 namespace Net {
 
+bool BeginJoin(uint32_t ip, uint16_t port, char* err, size_t errN);   // below Init
+
 bool Init() {
     if (GetPrivateProfileIntA("Net", "Enabled", 0, Paths::Ini()) == 0) return false;
 
@@ -1142,6 +1447,10 @@ bool Init() {
     // Host mode only: [Net] Upnp=1 (default) and [Net] StunServer=stun.l.google.com:19302 (default; empty = off).
     g_upnpEnabled = GetPrivateProfileIntA("Net", "Upnp", 1, Paths::Ini());
     GetPrivateProfileStringA("Net", "StunServer", "stun.l.google.com:19302", g_stunServer, sizeof(g_stunServer), Paths::Ini());
+    // Lobby modes: [Net] RelayServer=host[:port] (default empty = no relay, nothing below changes) and
+    // [Net] RelayForce=1 (skip the direct attempt). docs/design/relay.md.
+    GetPrivateProfileStringA("Net", "RelayServer", "", g_relayName, sizeof(g_relayName), Paths::Ini());
+    g_relayForce = GetPrivateProfileIntA("Net", "RelayForce", 0, Paths::Ini());
     // Join mode: a valid JoinCode starts joining at once; an empty or invalid one leaves the link up and
     // idle until the player copies a code and presses F8 (Net::JoinByCode). Nothing is sent meanwhile.
     uint32_t joinIp = 0; uint16_t joinPort = 0;
@@ -1242,10 +1551,28 @@ bool Init() {
         g_bindPort = bindPort;
         _beginthreadex(nullptr, 0, HostThread, nullptr, 0, nullptr);   // UPnP + STUN, off the game thread
     } else {
-        wsprintfA(m, "[Net] up: bound:%d mode=join\n", bindPort); dbg(m);
-        if (joinNow) StartJoin(joinIp, joinPort, joinCode);
-        else dbg("[Lobby] join mode idle: copy the host's code and press F8 in the game\n");
+        wsprintfA(m, "[Net] up: bound:%d mode=join%s%s\n", bindPort, g_relayName[0] ? " relay=" : "", g_relayName); dbg(m);
+        g_bindPort = bindPort;
+        char err[160] = {0};
+        if (joinNow && !BeginJoin(joinIp, joinPort, err, sizeof(err))) {
+            _snprintf(m, sizeof(m), "[Lobby] JoinCode %s not used: %s\n", joinCode, err); m[sizeof(m) - 1] = 0; dbg(m);
+        } else if (!joinNow) dbg("[Lobby] join mode idle: copy the host's code and press F8 in the game\n");
     }
+    return true;
+}
+
+// A decoded code -> a direct join, or a relay room join (room codes: first octet 255, start with 'Z').
+bool BeginJoin(uint32_t ip, uint16_t port, char* err, size_t errN) {
+    char canon[15] = {0}; LobbyCode::Encode(ip, port, canon);
+    if (Relay::IsRoomAddress(ip)) {
+        if (!g_relayName[0]) {
+            if (err && errN) lstrcpynA(err, "a room code (Z...) needs [Net] RelayServer= in AC4Coop.ini (the host's relay server)", (int)errN);
+            return false;
+        }
+        StartRelayJoin(Relay::RoomFromAddress(ip, port), canon);
+        return true;
+    }
+    StartJoin(ip, port, canon);
     return true;
 }
 
@@ -1260,9 +1587,7 @@ bool JoinByCode(const char* text, char* err, size_t errN) {
     if (InterlockedCompareExchange(&g_joinState, 0, 0) == 2) return fail("already connected to a host");
     uint32_t ip = 0; uint16_t port = 0;
     if (!text || !LobbyCode::Decode(text, &ip, &port)) return fail("the clipboard does not hold a valid lobby code");
-    char canon[15] = {0}; LobbyCode::Encode(ip, port, canon);
-    StartJoin(ip, port, canon);
-    return true;
+    return BeginJoin(ip, port, err, errN);
 }
 
 bool HostCode(char out[16]) {
@@ -1281,12 +1606,17 @@ void LobbyStatus(char* out, size_t n) {
     lstrcpynA(code, g_mode == LM_HOST ? g_hostCode : g_joinCodeText, sizeof(code));
     ReleaseSRWLockShared(&g_codeLock);
     const bool ready = InterlockedCompareExchange(&g_peerReady, 0, 0) != 0;
+    const LONG via = InterlockedCompareExchange(&g_linkVia, 0, 0);
+    const char* viaTxt = via == 2 ? " (relay)" : via == 1 ? " (direct)" : "";
     if (g_mode == LM_HOST) {
-        _snprintf(out, n, "host code %s (F7 copies) | %s", code[0] ? code : "...", ready ? "guest joined" : "waiting for a guest");
+        _snprintf(out, n, "host code %s (F7 copies) | %s%s", code[0] ? code : "...", ready ? "guest joined" : "waiting for a guest",
+                  ready ? viaTxt : "");
     } else {
         const LONG st = InterlockedCompareExchange(&g_joinState, 0, 0);
-        const char* s = st == 1 ? "joining..." : st == 2 ? "connected" : st == 3 ? "refused: different builds"
-                      : st == 4 ? "no answer from host" : "copy a code, press F8 to join";
+        char conn[32]; _snprintf(conn, sizeof(conn), "connected%s", viaTxt); conn[sizeof(conn) - 1] = 0;
+        const char* s = st == 1 ? "joining..." : st == 2 ? conn : st == 3 ? "refused: different builds"
+                      : st == 4 ? "no answer from host" : st == 5 ? RelayErrText(InterlockedCompareExchange(&g_relayErr, 0, 0))
+                      : "copy a code, press F8 to join";
         if (code[0]) _snprintf(out, n, "join %s | %s", code, s);
         else _snprintf(out, n, "%s", s);
     }
@@ -1299,8 +1629,9 @@ bool IsSecondInstance() { return g_secondInstance; }
 
 void Send(const PlayerState& s) {
     if (!g_enabled || InterlockedCompareExchange(&g_peerReady, 0, 0) == 0) return;   // lobby: no peer yet
-    const sockaddr_in peer = PeerCopy();
-    sendto(g_sock, (const char*)&s, sizeof(s), 0, (const sockaddr*)&peer, sizeof(peer));
+    uint16_t slot = 0;
+    const sockaddr_in peer = PeerCopy(&slot);
+    SendRaw(&s, (int)sizeof(s), peer, slot);   // direct, or DATA through the relay
     InterlockedIncrement(&g_txPackets);
     InterlockedAdd(&g_txBytes, (LONG)sizeof(s));
 }
@@ -1333,7 +1664,8 @@ int DrainRemote(PlayerState* out, int max) {
 void SendEntities(const EntityPacket& p) {
     // Lobby: no peer yet -> send nothing, and do not encode either (the encoder advances the delta shadow).
     if (!g_enabled || InterlockedCompareExchange(&g_peerReady, 0, 0) == 0) return;
-    const sockaddr_in peer = PeerCopy();
+    uint16_t slot = 0;
+    const sockaddr_in peer = PeerCopy(&slot);
     const size_t n = EncodeEntityPacket(p, g_txBuf, sizeof(g_txBuf));   // [header][records]
     if (n == 0) return;
     const size_t hdr = sizeof(EntityWireHeader);
@@ -1353,7 +1685,7 @@ void SendEntities(const EntityPacket& p) {
         h.chunkTotal = total;
         std::memcpy(chunk, &h, sizeof(h));
         std::memcpy(chunk + hdr, g_txBuf + hdr + off, len);
-        sendto(g_sock, (const char*)chunk, (int)(hdr + len), 0, (const sockaddr*)&peer, sizeof(peer));
+        SendRaw(chunk, (int)(hdr + len), peer, slot);   // <= 1400 B + 16 B relay header <= Relay::kMaxDatagram
         InterlockedIncrement(&g_txPackets);
         InterlockedAdd(&g_txBytes, (LONG)(hdr + len));   // actual bytes on the wire (per chunk)
     }
