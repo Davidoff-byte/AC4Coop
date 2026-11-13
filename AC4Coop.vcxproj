@@ -130,6 +130,7 @@
     <ClCompile Include="src\auto_continue.cpp" />
     <ClCompile Include="src\crash_ctx.cpp" />
     <ClCompile Include="src\action_guard.cpp" />
+    <ClCompile Include="src\action_writer.cpp" />
     <ClCompile Include="src\build_gate.cpp" />
     <ClCompile Include="src\deref_guard.cpp" />
     <ClCompile Include="src\combat_observe.cpp" />

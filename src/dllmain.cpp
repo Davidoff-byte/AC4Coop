@@ -26,6 +26,7 @@
 #include "menu_probe.h"
 #include "auto_continue.h"
 #include "crash_ctx.h"
+#include "action_writer.h"
 #include "action_guard.h"
 #include "deref_guard.h"
 #include "combat_observe.h"
@@ -568,6 +569,9 @@ BOOL APIENTRY DllMain(HMODULE hMod, DWORD reason, LPVOID)
         // Read-only crash recorder for execute faults (a call through a freed or null object): registers, stack
         // and the objects they name, to AC4Coop_crashctx_<pid>.txt. [Coop] CrashContext, default 0.
         CrashCtx::Init();
+
+        // Action-writer probe on the evaluator switch 0x00651C20 (observation only). [Coop] ActionWriterProbe, default 0.
+        ActionWriter::Init();
 
         // Stage 2A combat observer (E2-combat.md §1.2). OBSERVATION ONLY, installed as a byte-patch
         // hook: four whole-instruction prologues are detoured into private stubs that log the call

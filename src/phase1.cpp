@@ -5,6 +5,7 @@
 #include "net.h"
 #include "Hook.h"
 #include "build_info.h"
+#include "action_writer.h"
 #include <windows.h>
 #include <cstdint>
 #include <cstdio>
@@ -6312,6 +6313,7 @@ static void OwnDrain(Human* h) {
             unsigned char mir = 0;
             void* act = ac->GetCurrentAction(&mir, 0, ACTLAYER_PRIMARY);
             if (act && readable(act, 0x14)) { curAlias = *(uint32_t*)((char*)act + 8); haveCur = true; }
+            if (o.alias) ActionWriter::NoteMirrored(ac, o.alias);
         }
     }
     // action probe: against what the host says (once the host alias is 500 ms old)
@@ -6322,8 +6324,10 @@ static void OwnDrain(Human* h) {
     if (GuardAnimFullOn() && o.anim.valid && !o.ga.banned) {
         volatile int step = 0; uintptr_t excAt = 0, excData = 0; uint32_t excRw = 0;
         bool faulted = false;
+        ActionWriter::SetOwn(true);
         __try { GuardAnimApply(h, o, now, &step); }
         __except (GaFilter(GetExceptionInformation(), &excAt, &excData, &excRw)) { faulted = true; }
+        ActionWriter::SetOwn(false);
         if (faulted) {
             o.ga.banned = 1;
             const LONG nf = InterlockedIncrement(&s_gaFaults);
@@ -6431,6 +6435,7 @@ static void OwnReport() {
           InterlockedExchange(&s_phBehind, 0), InterlockedExchange(&s_phAhead, 0),
           InterlockedExchange(&s_phRate[0], 0), InterlockedExchange(&s_phRate[1], 0), InterlockedExchange(&s_phRate[2], 0));
     }
+    { char aw[1024]; if (ActionWriter::FormatReport(aw, sizeof(aw)) > 0) L("%s\n", aw); }
     L("[OwnAir] physMs=%d physWrites=%ld | ctx frames=%ld ground=%ld air=%ld (%.1f%%) other=%ld (last id %ld) | moving frames=%ld "
       "actMatch=%ld actMis=%ld (%.1f%%) top body<-host:%s\n",
       s_ownPhysMs, pw2, cf, cg, ca, cf ? 100.0 * ca / cf : 0.0, co, (long)s_cxOtherId, mf, mm, mi, mf ? 100.0 * mi / mf : 0.0, pairs);
