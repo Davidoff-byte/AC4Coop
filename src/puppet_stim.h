@@ -9,4 +9,7 @@ namespace PuppetStim
 {
     // Called from the puppet's own Human update on the host (phase1 OwnDrain, puppet branch).
     void OnPuppetUpdate(void* puppetEntity);
+    // [Coop] FightSkipPuppet (live; hook installed when the key is present): the host's fight system gives the
+    // puppet no orders (sub_13F22E0 takes its no-AI exit for it).
+    void Init();
 }

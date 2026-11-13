@@ -19,6 +19,7 @@
 //   later receivers over frames with sub_64A050 (here: all posted at once).
 #include "puppet_stim.h"
 #include "paths.h"
+#include "Hook.h"
 #include "Scimitar/Entity.h"
 
 #include <windows.h>
@@ -31,6 +32,7 @@
 
 void Phase1_LogLine(const char* s);
 bool Phase1_IsEntityHost();
+void* Phase1_PuppetEntity();
 
 namespace {
 
@@ -115,7 +117,70 @@ int Fire(void* pup)
     return posted;
 }
 
+// ---- [Coop] FightSkipPuppet -------------------------------------------------------------------------------------
+// Run 7164 (build b2ad941, mode 2): guards reacted to the puppet's gunshot and the host's fight system enlisted the
+// puppet as a fighter. sub_161BD30 (fight member loop) -> sub_13F22E0(entity) -> nav service vt+64 -> sub_1780610
+// (CSrvNavigation, vtable 0x026F4B70) read *(*(nav+0x84)+0x14)+0x0C with the middle pointer null: read fault
+// eip=0x01780657 (AC4Coop_crashctx_7164_1.txt; the puppet entity is the argument on the stack).
+// sub_13F22E0 is void __cdecl(Entity*), 6 callers (0xFE19BB, 0x14B6F7C, 0x156CD7C, 0x161BDEE, 0x1B03775,
+// 0x1BE170B); it already returns without doing anything for an entity with no AI data (*(e+0x5C) == 0 or
+// *(*(e+0x5C)+0x8DC) == 0). With the flag on, the puppet takes that same exit: the host never gives the guest's body
+// fight orders (the guest drives it). Prologue (7 bytes, whole instructions):
+//   0x013F22E0  55 / 8B EC / 51 / 8B 55 08   push ebp / mov ebp,esp / push ecx / mov edx,[ebp+8]
+const uintptr_t VA_FIGHTMEMBER = 0x013F22E0;
+const uintptr_t FM_STEAL = 7;
+const BYTE kFmPrologue[FM_STEAL] = { 0x55, 0x8B, 0xEC, 0x51, 0x8B, 0x55, 0x08 };
+DWORD g_fmTramp = 0;
+volatile LONG g_fmSkipped = 0;
+int g_fmOn = 0; ULONGLONG g_fmNext = 0;
+
+int __cdecl FmSkip(void* e)
+{
+    __try {
+        const ULONGLONG now = GetTickCount64();
+        if (now >= g_fmNext) { g_fmNext = now + 2000; g_fmOn = GetPrivateProfileIntA("Coop", "FightSkipPuppet", 0, Paths::Ini()) != 0; }
+        if (!g_fmOn || !e) return 0;
+        if (e != Phase1_PuppetEntity()) return 0;
+        if (InterlockedIncrement(&g_fmSkipped) <= 20) Log("[PupStim] fight order for the puppet skipped (sub_13F22E0)\n");
+        return 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return 0;
+}
+
+__declspec(naked) void FmDetour()
+{
+    __asm {
+        pushad
+        mov  eax, [esp + 36]        // arg (original esp+4)
+        push eax
+        call FmSkip
+        add  esp, 4
+        test eax, eax
+        popad
+        jnz  skip
+        jmp  dword ptr [g_fmTramp]
+    skip:
+        ret                         // cdecl: the caller pops the argument
+    }
+}
+
 }  // namespace
+
+void PuppetStim::Init()
+{
+    if (GetPrivateProfileIntA("Coop", "FightSkipPuppet", -1, Paths::Ini()) < 0) return;   // key absent: no hook
+    const uintptr_t site = GameModuleBase + (VA_FIGHTMEMBER - 0x00400000);
+    if (memcmp((const void*)site, kFmPrologue, FM_STEAL) != 0) { OutputDebugStringA("[PupStim] prologue mismatch at 0x13F22E0\n"); return; }
+    BYTE* t = (BYTE*)VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!t) return;
+    memcpy(t, kFmPrologue, FM_STEAL);
+    t[FM_STEAL] = 0x68;                                        // push imm32; ret = absolute jump to the resume
+    *reinterpret_cast<DWORD*>(t + FM_STEAL + 1) = (DWORD)(site + FM_STEAL);
+    t[FM_STEAL + 5] = 0xC3;
+    FlushInstructionCache(GetCurrentProcess(), t, FM_STEAL + 6);
+    g_fmTramp = (DWORD)(uintptr_t)t;
+    Hook::DetourFunc((BYTE*)site, (DWORD)(uintptr_t)&FmDetour, (DWORD)FM_STEAL);
+}
 
 void PuppetStim::OnPuppetUpdate(void* pup)
 {
