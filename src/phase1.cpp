@@ -6,6 +6,7 @@
 #include "Hook.h"
 #include "build_info.h"
 #include "action_writer.h"
+#include "guard_sight.h"
 #include <windows.h>
 #include <cstdint>
 #include <cstdio>
@@ -5926,6 +5927,54 @@ static int OwnPhysMs() {
 static volatile LONG s_cxFrames = 0, s_cxGround = 0, s_cxAir = 0, s_cxOther = 0, s_cxOtherId = 0;
 static volatile LONG s_mvFrames = 0, s_mvActMatch = 0, s_mvActMis = 0, s_physWrites = 0;
 static volatile LONG s_o1Frames = 0, s_o1Mis = 0, s_o5Frames = 0, s_o5Bad = 0;
+// [Coop] FloatProbe (default 0; live; read-only). S2 run-time IK probe, spec: docs/evidence/humanik-ik-2026-11-13.md
+// section 9 on branch re/humanik-ik-s2 (AC4BFSP md5 2058342866688f780c8b34526a65bc35). After our matrix write, read the
+// borrowed body's SkeletonComponent (vt 0x01E41E58):
+//   branch B (comp+0x4C == 0): comp+0x336 bit 1 = ground adaptation on; comp+0x2C0 = root Z offset applied this frame
+//     (H1 candidate when |.| >= 0.05 m);
+//   branch A (comp+0x4C = BipedFootIK2, vt 0x01E46BB4): fik+4 bit 0x40 = foot IK on (and comp+0x337 bit 0x10 clear),
+//     fik+6 bit 1 = ground contact this frame, fik+0x750 = stored contact offset (z at +0x758; H2 candidate when on,
+//     no contact and |z| >= 0.05 m);
+//   comp+0xF4 = third vertical offset source; CharacterController (vt 0x01E6EE10) +0x90 & 0x3F == 0x15 = branch B reset.
+// The 0.05 m threshold is the spec's suggestion, not derived from the binary. Reads may be one frame stale (S2 9.4).
+static int s_stOn = 0; static uint64_t s_stNext = 0; static volatile LONG s_stuckLines = 0;
+static bool StuckProbeOn();
+static int s_fpOn = 0; static uint64_t s_fpNext = 0;
+static void OwnAtomicMax(volatile LONG* t, LONG v);
+static int OwnFlag(const char* key, int* cache, uint64_t* next);
+static bool FloatProbeOn() { return OwnFlag("FloatProbe", &s_fpOn, &s_fpNext) != 0; }
+static bool StuckProbeOn() { return OwnFlag("StuckProbe", &s_stOn, &s_stNext) != 0; }
+static volatile LONG s_fpFrames = 0, s_fpBrA = 0, s_fpBrB = 0, s_fpBOn = 0, s_fpH1 = 0, s_fpAOn = 0, s_fpContact = 0,
+                     s_fpH2 = 0, s_fpF4 = 0, s_fpCc15 = 0, s_fpS5MaxMm = 0, s_fpA5MaxMm = 0;
+static void FloatProbe(Entity* e) {
+    void* comp = FindComponentByVtable(e, 0x01E41E58u);
+    if (!comp) return;
+    __try {
+        const char* c = (const char*)comp;
+        InterlockedIncrement(&s_fpFrames);
+        if (fabsf(*(const float*)(c + 0xF4)) >= 0.05f) InterlockedIncrement(&s_fpF4);
+        const char* fik = *(const char* const*)(c + 0x4C);
+        if (!fik) {
+            InterlockedIncrement(&s_fpBrB);
+            const float s5 = *(const float*)(c + 0x2C0);
+            if (c[0x336] & 1) InterlockedIncrement(&s_fpBOn);
+            if (fabsf(s5) >= 0.05f) InterlockedIncrement(&s_fpH1);
+            OwnAtomicMax(&s_fpS5MaxMm, (LONG)(fabsf(s5) * 1000.0f));
+        } else if (*(const uint32_t*)fik == 0x01E46BB4u) {
+            InterlockedIncrement(&s_fpBrA);
+            const bool on = (*(const uint16_t*)(fik + 4) & 0x40) && !(c[0x337] & 0x10);
+            const bool contact = (fik[6] & 1) != 0;
+            const float a5z = *(const float*)(fik + 0x758);
+            if (on) InterlockedIncrement(&s_fpAOn);
+            if (contact) InterlockedIncrement(&s_fpContact);
+            if (on && !contact && fabsf(a5z) >= 0.05f) InterlockedIncrement(&s_fpH2);
+            OwnAtomicMax(&s_fpA5MaxMm, (LONG)(fabsf(a5z) * 1000.0f));
+        }
+        const char* cc = (const char*)FindComponentByVtable(e, 0x01E6EE10u);
+        if (cc && (*(const uint32_t*)(cc + 0x90) & 0x3F) == 0x15) InterlockedIncrement(&s_fpCc15);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
 struct OwnPair { uint32_t body, host; LONG n; };
 static OwnPair s_mvPairs[12]; static SRWLOCK s_mvPairLock = SRWLOCK_INIT;
 static void OwnNotePair(uint32_t body, uint32_t host) {
@@ -5961,6 +6010,8 @@ struct GaState {
     uint32_t rateAlias; float rate, lastR, nudge; uint64_t lastRUs, seekUs;
     // GuardInterpBuffer: the alias at render time, and since when (drives the switch and the probes' grace)
     uint32_t renderAlias; uint64_t renderAliasUs;
+    // StuckProbe: since when the body has shown another alias than the host's, and the last log
+    uint64_t misSinceUs, stuckLogUs;
 };
 // [Coop] GuardInterpBuffer (default 0; live): proto 14 guard snapshots keyed by the host's capture time. The body is
 // rendered at (guest now - GuardInterpDelayMs) on the host timeline, interpolated between the two bracketing samples
@@ -6386,6 +6437,14 @@ static void PuppetOwnNote(Human* h, Entity* e, const HookMath::Transform& m) {
     ReleaseSRWLockExclusive(&s_pupLock);
     InterlockedExchange(&s_pupHumanKey, (LONG)(uintptr_t)h);
 }
+// For guard_sight.cpp ([Coop] GuardSeesPuppet): the live puppet entity (nullptr when none) and the host role.
+void* Phase1_PuppetEntity() {
+    AcquireSRWLockShared(&s_pupLock);
+    Entity* e = s_pupEnt;
+    ReleaseSRWLockShared(&s_pupLock);
+    return e;
+}
+bool Phase1_IsEntityHost() { return g_entHost == 1; }
 static void PuppetOwnClear() {
     InterlockedExchange(&s_pupHumanKey, 0);
     AcquireSRWLockExclusive(&s_pupLock);
@@ -6464,6 +6523,34 @@ static void OwnDrain(Human* h) {
         InterlockedIncrement(&s_gActFrames);
         if (curAlias != o.alias) InterlockedIncrement(&s_gActMis);
     }
+    // [Coop] StuckProbe (default 0; live; read-only; <= 60 lines per process). 2026-11-13 gate run (build 24F7CCBC):
+    // 82% of moving mismatch frames were one pair (body 778649630, host 93469659) that persisted although our
+    // re-assert reached the switch function. For a body mismatched > 1 s, once per 5 s: the host's channel/layer, the
+    // current action on the host's layer and on the primary layer, the current evaluator's type (+0xD4, 4 = action),
+    // transition flag (+0x258) and queued next action (+0x2A4 -> alias at +8; sub_669220 switches to it), and our
+    // last issued switch.
+    if (haveCur && o.alias && curAlias != o.alias) { if (!o.ga.misSinceUs) o.ga.misSinceUs = now; }
+    else o.ga.misSinceUs = 0;
+    if (StuckProbeOn() && o.ga.misSinceUs && now - o.ga.misSinceUs > 1000000 && now - o.ga.stuckLogUs > 5000000
+        && InterlockedIncrement(&s_stuckLines) <= 60) {
+        o.ga.stuckLogUs = now;
+        ActionComponent* ac = h->GetActionComponent();
+        uint32_t onLayer = 0, nextAlias = 0; int evType = -1, evTrans = -1;
+        __try {
+            unsigned char mir = 0;
+            void* a2 = ac->GetCurrentAction(&mir, 0, (int)o.anim.layer);
+            if (readable(a2, 0x0C)) onLayer = *(uint32_t*)((char*)a2 + 8);
+            char* ev = (char*)ac->GetCurrentEvaluator(0, ACTLAYER_PRIMARY);
+            if (readable(ev, 0x2B0)) {
+                evType = *(uint8_t*)(ev + 0xD4); evTrans = *(uint8_t*)(ev + 0x258);
+                void* nx = *(void**)(ev + 0x2A4);
+                if (readable(nx, 0x0C)) nextAlias = *(uint32_t*)((char*)nx + 8);
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        L("[Stuck] ent=%08X host=%u ch=%u ly=%d | body primary=%u onHostLayer=%u | ev type=%d trans=%d next=%u | issued=%u %lldms ago | mis %lldms\n",
+          o.ent, o.alias, (unsigned)o.anim.channel, (int)o.anim.layer, curAlias, onLayer, evType, evTrans, nextAlias,
+          o.ga.issuedAlias, o.ga.issuedUs ? (long long)((now - o.ga.issuedUs) / 1000) : -1LL, (long long)((now - o.ga.misSinceUs) / 1000));
+    }
     if (GuardAnimFullOn() && o.anim.valid && !o.ga.banned) {
         volatile int step = 0; uintptr_t excAt = 0, excData = 0; uint32_t excRw = 0;
         bool faulted = false;
@@ -6517,12 +6604,16 @@ static void OwnDrain(Human* h) {
     const bool phys = o.snap || (physMs > 0 && now - o.lastPhysUs >= (uint64_t)physMs * 1000ull);
     e->SetGlobalMatrixInternal(&m, phys);
     InterlockedIncrement(&s_gWrites);
+    if (FloatProbeOn()) FloatProbe(e);
     if (phys) InterlockedIncrement(&s_physWrites);
     AcquireSRWLockExclusive(&s_ownLock);
     const int j = OwnFind(key);
     if (j >= 0) {
         for (int k = 0; k < 3; ++k) s_own[j].lastWrite[k] = pos[k];
         s_own[j].haveWrite = true; s_own[j].lastWriteUs = now; s_own[j].vEma = vEmaNew;
+        // timers that must persist when GuardAnimFull is off (its block writes the whole o.ga back otherwise)
+        s_own[j].ga.renderAlias = o.ga.renderAlias; s_own[j].ga.renderAliasUs = o.ga.renderAliasUs;
+        s_own[j].ga.misSinceUs = o.ga.misSinceUs; s_own[j].ga.stuckLogUs = o.ga.stuckLogUs;
         if (o.snap) s_own[j].snap = false;
         if (phys) s_own[j].lastPhysUs = now;
     }
@@ -6597,6 +6688,19 @@ static void OwnReport() {
         const LONG f5 = InterlockedExchange(&s_o5Frames, 0), b5 = InterlockedExchange(&s_o5Bad, 0);
         L("[O5] buffer=%d O1 frames=%ld mis=%ld (agree %.1f%%) | O5 frames=%ld jitter=%ld (%.2f%%)\n",
           s_gibOn, f1, m1, f1 ? 100.0 * (f1 - m1) / f1 : 0.0, f5, b5, f5 ? 100.0 * b5 / f5 : 0.0);
+    }
+    if (s_fpOn) {
+        const unsigned char* opt = nullptr;
+        __try { opt = *(const unsigned char* const*)0x02ABEC08; } __except (EXCEPTION_EXECUTE_HANDLER) { opt = nullptr; }
+        unsigned o63 = 255, o64 = 255;
+        __try { if (opt) { o63 = opt[0x63]; o64 = opt[0x64]; } } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        L("[Float] frames=%ld | branchB=%ld adaptOn=%ld H1cand=%ld maxS5=%.3fm | branchA=%ld footIkOn=%ld contact=%ld H2cand=%ld"
+          " maxA5z=%.3fm | F4>=5cm=%ld ccReset=%ld | opt63=%u opt64=%u\n",
+          InterlockedExchange(&s_fpFrames, 0), InterlockedExchange(&s_fpBrB, 0), InterlockedExchange(&s_fpBOn, 0),
+          InterlockedExchange(&s_fpH1, 0), InterlockedExchange(&s_fpS5MaxMm, 0) / 1000.0,
+          InterlockedExchange(&s_fpBrA, 0), InterlockedExchange(&s_fpAOn, 0), InterlockedExchange(&s_fpContact, 0),
+          InterlockedExchange(&s_fpH2, 0), InterlockedExchange(&s_fpA5MaxMm, 0) / 1000.0,
+          InterlockedExchange(&s_fpF4, 0), InterlockedExchange(&s_fpCc15, 0), o63, o64);
     }
     L("[OwnAir] physMs=%d physWrites=%ld | ctx frames=%ld ground=%ld air=%ld (%.1f%%) other=%ld (last id %ld) | moving frames=%ld "
       "actMatch=%ld actMis=%ld (%.1f%%) top body<-host:%s\n",
@@ -11068,6 +11172,13 @@ static void OnFrameInner(Human* updatedHuman) {
             L("[HB] tick=%llu net=%d entSync=%d host=%d world=%p\n",
               (unsigned long long)hbNow, Net::Enabled() ? 1 : 0, g_entSync, g_entHost,
               (void*)World::GetCurrentWorld());
+        }
+        // [Sight] (GuardSeesPuppet, host side) every 5 s: OwnReport only runs on the guest path.
+        static uint64_t s_sightNext = 0;
+        if (hbNow >= s_sightNext) {
+            s_sightNext = hbNow + 5000;
+            char sb[256];
+            if (GuardSight::FormatReport(sb, sizeof(sb)) > 0) L("%s\n", sb);
         }
     }
     // F8 live test (no-op unless [Coop] BoardableTest=1). Must sit ABOVE the Net::Enabled() block: that block always

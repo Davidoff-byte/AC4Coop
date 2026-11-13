@@ -27,6 +27,7 @@
 #include "auto_continue.h"
 #include "crash_ctx.h"
 #include "action_writer.h"
+#include "guard_sight.h"
 #include "action_guard.h"
 #include "deref_guard.h"
 #include "combat_observe.h"
@@ -572,6 +573,10 @@ BOOL APIENTRY DllMain(HMODULE hMod, DWORD reason, LPVOID)
 
         // Action-writer probe on the evaluator switch 0x00651C20 (observation only). [Coop] ActionWriterProbe, default 0.
         ActionWriter::Init();
+
+        // Guards perceive the co-op puppet (host): redirect of the three GetPlayer calls that choose the sight /
+        // detection target. [Coop] GuardSeesPuppet (live; patch installed when the key is present).
+        GuardSight::Init();
 
         // Stage 2A combat observer (E2-combat.md §1.2). OBSERVATION ONLY, installed as a byte-patch
         // hook: four whole-instruction prologues are detoured into private stubs that log the call
