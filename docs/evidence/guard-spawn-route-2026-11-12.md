@@ -280,8 +280,10 @@ INI    : GuardSpawnProbe=1 GuardSpawnProbeCycles=20 GuardSpawnProbeDelayS=30 (ho
 last clone was removed). A read fault the game survived: `eip=006855D1` in `sub_685360` (`mov ecx,[esi+104h]` -> ecx=0 ->
 `cmp [ecx+90h], eax`), esi=`2FEE5AE0`. `edi=4644B860` is the **puppet's CharacterActionSet** (`phase1_log_7792.txt:434`:
 `CAS set from local player (pac=4644B860 ...)`). None of the probe's 58 distinct pointers (clone entities, cycle selectors and
-captured selectors) appears anywhere in the record. Not attributed to the probe; not attributed to
-anything else either. The stack scan lists ASI-range values, but this Release build has no map file to resolve them.
+captured selectors) appears anywhere in the record. Not attributed to the probe.
+Attribution by the Track A session (its statement, 2026-11-13; not re-derived here): the fault came from Track A's
+puppet blend-in fix, which wrote blend type 2 onto a node whose `+0x104` was NULL. That is consistent with `edi` = the
+puppet CAS above. The stack scan lists ASI-range values, but this Release build has no map file to resolve them.
 
 **Probe defect found by this run:** the log was opened with `fopen_s`, which denies all sharing, so it could not be read
 while the game ran. Fixed in `5347330` (`_fsopen(..., _SH_DENYWR)`), not yet installed.
