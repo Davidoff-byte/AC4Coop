@@ -251,8 +251,8 @@ INI    : GuardSpawnProbe=1 GuardSpawnProbeCycles=20 GuardSpawnProbeDelayS=30 (ho
 
 | check | result |
 |---|---|
-| `selHcIsBuilder` (RowSelector+0x10 is the builder) | **1 on all 25 first-seen builds with a real handle.** The one 0 is `builderId=0`, `selHc=04DD5F8C` (the engine's invalid-handle sentinel), on the player's 32-component builder |
-| every logged build via 0x5FAC00 has builder vtable `0x01E57790` | yes, 26/26 |
+| `selHcIsBuilder` (RowSelector+0x10 is the builder) | **1 on 22 of the 23 first-seen builds** (every one with a real handle). The one 0 is `builderId=0`, `selHc=04DD5F8C` (the engine's invalid-handle sentinel), on the player's 32-component builder |
+| every logged build via 0x5FAC00 has builder vtable `0x01E57790` | yes, 23/23 |
 | NPC types captured (skeleton + BhvGenericNPC at build time) | 17 builder ids, arch `35F7`/`318C`/`31EC`/`3594`, 16-20 components, every `Duplicate` ok=1 |
 | clone of capture #0 (builder `00000006'12CECF74`, arch 35F7, 19 comps) | 20/20 built (rc=0), added, held 3 s, removed. Every one had a skeleton, BhvGenericNPC, arch 35F7 and a CSrvNPCHealth service reading 36/36 |
 | same component list as the source | **14/20.** Cycles 5, 9, 10, 14, 15 and 19 built with **18** components instead of 19, both at build and at hold. This is the only reason the verdict is FAIL |
@@ -279,8 +279,8 @@ INI    : GuardSpawnProbe=1 GuardSpawnProbeCycles=20 GuardSpawnProbeDelayS=30 (ho
 **Crash-context record in the same run** (`AC4Coop_crashctx_7792_1.txt`, 10:49:46, about t=483 s in world, about 6 min after the
 last clone was removed). A read fault the game survived: `eip=006855D1` in `sub_685360` (`mov ecx,[esi+104h]` -> ecx=0 ->
 `cmp [ecx+90h], eax`), esi=`2FEE5AE0`. `edi=4644B860` is the **puppet's CharacterActionSet** (`phase1_log_7792.txt:434`:
-`CAS set from local player (pac=4644B860 ...)`). None of the probe's 58 pointers (20 clone entities, 20 cycle selectors,
-17 captured selectors, the source's) appears anywhere in the record. Not attributed to the probe; not attributed to
+`CAS set from local player (pac=4644B860 ...)`). None of the probe's 58 distinct pointers (clone entities, cycle selectors and
+captured selectors) appears anywhere in the record. Not attributed to the probe; not attributed to
 anything else either. The stack scan lists ASI-range values, but this Release build has no map file to resolve them.
 
 **Probe defect found by this run:** the log was opened with `fopen_s`, which denies all sharing, so it could not be read
