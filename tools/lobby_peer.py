@@ -39,7 +39,7 @@ NETSTATE = ROOT / "src" / "netstate.h"
 NET_MAGIC = 0x43344341         # 'AC4C'  netstate.h
 NET_ENTITY_MAGIC = 0x45344341  # 'AC4E'  netstate.h
 NET_LOBBY_MAGIC = 0x4C344341   # 'AC4L'  netstate.h
-NET_PROTO_VER = 13             # netstate.h (13: guard animation block)
+NET_PROTO_VER = 14   # 14: entity header += u32 hostMs (36 B); PlayerState unchanged
 SIZEOF_PLAYERSTATE = 576       # netstate.h static_assert
 LOBBY_FMT = "<IIIII"           # magic, protoVer, type, nonce, codeCheck  (frozen, 20 B)
 HELLO, WELCOME, REJECT = 1, 2, 3

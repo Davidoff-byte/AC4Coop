@@ -138,7 +138,9 @@ static_assert(sizeof(PlayerState) == 576, "PlayerState wire size changed - updat
 static const uint32_t NET_MAGIC = 0x43344341; // 'AC4C'
 // Wire/struct-layout version. PlayerState is #pragma pack(1): adding a field shifts every following
 // offset, so both peers MUST run the same build. Bump this whenever the layout changes.
-static const uint32_t NET_PROTO_VER = 13;  // 13: guard animation block (EF_ANIM, GuardAnim) on the entity lane;
+static const uint32_t NET_PROTO_VER = 14;  // 14: entity header += u32 hostMs (36 B); PlayerState, LobbyPacket and
+                                           //     the record format unchanged
+                                           // 13: guard animation block (EF_ANIM, GuardAnim) on the entity lane;
                                            //     PlayerState and LobbyPacket unchanged
                                            // 12: lobby handshake (LobbyPacket below); PlayerState/entity layouts unchanged
                                            // 11: entity chunking + worldId, hullHP removed, shipMaxHP
@@ -235,6 +237,7 @@ struct EntityPacket {
     uint32_t magic;        // NET_ENTITY_MAGIC
     uint32_t protoVer;     // NET_PROTO_VER (both peers MUST match)
     uint32_t seq;          // sender frame counter
+    uint32_t hostMs;       // proto 14: sender capture time (EntityWireHeader::hostMs); 0 = not stamped
     uint32_t count;        // valid entries in ents[]
     EntityState ents[MAX_SYNC_ENTITIES];
 };
@@ -284,9 +287,11 @@ struct EntityWireHeader {
                           // world differs from the local one (world-transitions X5).
     uint16_t chunkIndex;  // this chunk's 0-based index
     uint16_t chunkTotal;  // chunks in this snapshot (1 = single-chunk, the common case)
+    uint32_t hostMs;      // proto 14: sender's capture time (QPC ms, wraps at 2^32); the receiver buffers and
+                          // interpolates on it instead of on its own receive/tick time
 };
 #pragma pack(pop)
-static const int ENTITY_WIRE_HEADER_SIZE = 32;
+static const int ENTITY_WIRE_HEADER_SIZE = 36;
 // Fixed part (key+kind+idKind+mask+wireId = 16) + every optional field. The true worst case is
 // 16 + 38 = 54 (objId is the wireId inside the fixed part, not an extra field); 62 is deliberate
 // headroom - do not "correct" this constant below 54.

@@ -104,6 +104,29 @@ def fmt_summary(s):
 EF = ((1, "pos", "<3f"), (2, "quat", "<4f"), (4, "action", "<I"), (0x10, "hp", "<H"), (0x20, "arch", "<H"), (0x40, "dead", "<B"), (0x80, "stage", "<B"))
 
 
+ENTITY_CHUNK_MAX = 1400   # src/net.cpp: datagram budget; record bytes per chunk = 1400 - header
+
+
+def ent_hdr_len(d):
+    """Entity header size: 32 B up to proto 13, 36 B from proto 14 (u32 hostMs appended)."""
+    return 36 if struct.unpack_from("<I", d, 4)[0] >= 14 else 32
+
+
+def rechunk_as_14(chunks, host_ms):
+    """Proto-13 chunks of one snapshot (all of them, any order) -> proto-14 datagrams: 36 B header with hostMs,
+    record bytes re-split at 1364 B (the receiver places chunk i at i * (1400 - 36))."""
+    chunks = sorted(chunks, key=lambda d: struct.unpack_from("<H", d, 28)[0])
+    body = b"".join(d[32:] for d in chunks)
+    per = ENTITY_CHUNK_MAX - 36
+    n = max(1, (len(body) + per - 1) // per)
+    h0 = chunks[0]
+    out = []
+    for i in range(n):
+        hdr = h0[:4] + struct.pack("<I", 14) + h0[8:28] + struct.pack("<HHI", i, n, host_ms & 0xFFFFFFFF)
+        out.append(hdr + body[i * per:(i + 1) * per])
+    return out
+
+
 def entity_snapshots(recs):
     """Yield (t, seq, epoch, [record dict]) for every complete snapshot, in order."""
     parts = {}
@@ -111,7 +134,7 @@ def entity_snapshots(recs):
         if kind(d) != "entity": continue
         _, _, seq, epoch, count, _, ci, ct = struct.unpack_from("<IIIIIQHH", d)
         p = parts.setdefault(seq, {"t": t, "epoch": epoch, "count": count, "ct": ct, "c": {}})
-        p["c"][ci] = d[32:]
+        p["c"][ci] = d[ent_hdr_len(d):]
         if len(p["c"]) < ct: continue
         del parts[seq]
         b = b"".join(p["c"][i] for i in range(ct)); o = 0; out = []
@@ -276,6 +299,7 @@ def cmd_replay(a):
     try:
         while passes < a.loops and time.monotonic() - t_begin < a.seconds:
             t_pass = time.monotonic()
+            pend = {}   # --as-proto 14: chunks of the snapshot being gathered, by seq
             for t, d in recs:
                 while True:
                     try:
@@ -299,6 +323,16 @@ def cmd_replay(a):
                         d = d[:12] + struct.pack("<Q", live_world[0]) + d[20:]
                     elif k == "entity":
                         d = d[:20] + struct.pack("<Q", live_world[0]) + d[28:]
+                if a.as_proto >= 14 and k == "entity" and ent_hdr_len(d) == 32:
+                    # proto 13 recording into a proto 14 guest: gather the snapshot's chunks, then send it re-split
+                    # with hostMs = this replay's send clock (the recording's timing is what is being replayed)
+                    seq_, ct_ = struct.unpack_from("<I", d, 8)[0], struct.unpack_from("<H", d, 30)[0]
+                    pend.setdefault(seq_, []).append(d)
+                    if len(pend[seq_]) < ct_:
+                        continue
+                    for dd in rechunk_as_14(pend.pop(seq_), int(time.monotonic() * 1000)):
+                        sock.sendto(dd, peer); sent += 1
+                    continue
                 if a.as_proto and k in ("player", "entity"):
                     d = d[:4] + struct.pack("<I", a.as_proto) + d[8:]
                 sock.sendto(d, peer); sent += 1
@@ -337,15 +371,21 @@ def selftest():
     # two records, cut mid-record across two chunks: a guard with pos+arch+hp and a ship with pos only
     body = (struct.pack("<IBBHQ3fHH", 5, 2, 0, 0x31, 0xABCDEF0123, 1.0, 2.0, 3.0, 77, 412)      # field order: pos, hp, arch
             + struct.pack("<IBBHQ3f", 9, 1, 1, 0x01, (1 << 32) | 9, 4.0, 5.0, 6.0))
-    hdr = lambda ci: struct.pack("<IIIIIQHH", lp.NET_ENTITY_MAGIC, lp.NET_PROTO_VER, 50, 1, 2, 0x1234, ci, 2)
+    hdr = lambda ci: struct.pack("<IIIIIQHH", lp.NET_ENTITY_MAGIC, 13, 50, 1, 2, 0x1234, ci, 2)   # proto 13: 32 B header
     rows = entity_table([(0.0, hdr(0) + body[:20]), (0.01, hdr(1) + body[20:])])
     anim_body = (struct.pack("<IBBHQ", 11, 2, 0, 0x200, 0x77) + struct.pack("<HhHHhHffB", 0x102, 0, 40000, 300, 250, 0x601, 0.5, 0.25, 2)
                  + bytes([4, 227, 37, 3]))
-    an = list(entity_snapshots([(0.0, struct.pack("<IIIIIQHH", lp.NET_ENTITY_MAGIC, lp.NET_PROTO_VER, 60, 1, 1, 0x1234, 0, 1) + anim_body)]))
+    an = list(entity_snapshots([(0.0, struct.pack("<IIIIIQHH", lp.NET_ENTITY_MAGIC, 13, 60, 1, 1, 0x1234, 0, 1) + anim_body)]))
     ok = ok and len(an) == 1 and an[0][3][0]["anim"]["blend"] == [(4, 227), (37, 3)] and an[0][3][0]["anim"]["channel"] == 0x102
+    # proto 14: the same two-chunk snapshot re-split with a 36 B header and hostMs decodes to the same rows; a body
+    # longer than one chunk is cut at 1364 B
+    r14 = rechunk_as_14([hdr(1) + body[20:], hdr(0) + body[:20]], 123456)
+    rows14 = entity_table([(0.0, d) for d in r14])
+    big = rechunk_as_14([hdr(0) + b"z" * 1368, hdr(1) + b"z" * 500], 7)
+    ok = ok and len(r14) == 1 and struct.unpack_from("<I", r14[0], 32)[0] == 123456 and ent_hdr_len(r14[0]) == 36         and rows14 == rows and [len(d) - 36 for d in big] == [1364, 504] and struct.unpack_from("<HH", big[1], 28) == (1, 2)
     g = rows.get((2, 0, 0xABCDEF0123)); sh = rows.get((1, 1, (1 << 32) | 9))
     ok = ok and len(rows) == 2 and g and sh and g["hp"] == 77 and g["arch"] == 412 and g["first"] == (1.0, 2.0, 3.0) and sh["first"] == (4.0, 5.0, 6.0)
-    print(f"[tap] selftest: {'PASS' if ok else 'FAIL'} (file round trip, classification, summary, entity decode across chunks, anim block)")
+    print(f"[tap] selftest: {'PASS' if ok else 'FAIL'} (file round trip, classification, summary, entity decode across chunks, anim block, proto 14 re-split)")
     return 0 if ok else 1
 
 

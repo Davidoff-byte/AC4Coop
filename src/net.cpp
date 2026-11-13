@@ -167,7 +167,10 @@ namespace {
     // (the list shifts as NPCs stream in/out), so keying a delta shadow on it both kills the savings
     // and can apply a delta to the wrong entity. objId is stable; where there is none (ships) we
     // synthesise an id with bit 63 set, which can never collide with a real objId.
-    struct ShadowSlot { uint64_t id; EntityState st; };
+    // rPos/rQuat/rAct (sender only): snapshots left in which the field is re-sent after a change, so one lost
+    // datagram cannot leave the receiver on a stale value until the next change or epoch.
+    struct ShadowSlot { uint64_t id; EntityState st; uint8_t rPos, rQuat, rAct; };
+    static const uint8_t RESEND_AFTER_CHANGE = 3;
     static const int SHADOW_SLOTS = 4096;
     ShadowSlot g_txShadow[SHADOW_SLOTS];
     ShadowSlot g_rxShadow[SHADOW_SLOTS];
@@ -175,6 +178,8 @@ namespace {
     uint32_t   g_txEpoch = 1;
     uint32_t   g_txSinceReset = 0;
     uint32_t   g_rxEpoch = 1;
+    uint32_t   g_rxDoneSeq = 0;      // proto 14: seq of the last snapshot fully decoded (stale filter)
+    bool       g_rxHaveDone = false;
     static const uint32_t EPOCH_PACKETS = 64;    // both sides drop their shadow this often; also the
                                                  // self-heal bound after a lost delta packet (~3 s)
     uint32_t   g_wireFullRecs = 0;               // instrumentation: records that carried every field
@@ -268,7 +273,7 @@ namespace {
             ++g_txEpoch;
         }
         EntityWireHeader h{};
-        h.magic = p.magic; h.protoVer = p.protoVer; h.seq = p.seq; h.epoch = g_txEpoch;
+        h.magic = p.magic; h.protoVer = p.protoVer; h.seq = p.seq; h.epoch = g_txEpoch; h.hostMs = p.hostMs;
         h.worldId = ReadLocalWorldId();      // X5: sender's world id rides the header
         h.count = 0;                         // patched to the WRITTEN count after the loop
         std::memcpy(out, &h, sizeof(h));
@@ -286,11 +291,12 @@ namespace {
             } else {
                 // Quantised delta: position/quaternion only go on the wire when they moved enough to be
                 // visible. The shadow keeps the SENT value, so small movements accumulate rather than
-                // being lost. 5 cm / ~0.3 deg.
+                // being lost. 2 mm / ~0.3 deg (proto 14: was 5 cm, which sent a slow walk in bursts and
+                // left a guard up to 5 cm off where it stopped).
                 const float dx = e.pos[0] - sh->st.pos[0];
                 const float dy = e.pos[1] - sh->st.pos[1];
                 const float dz = e.pos[2] - sh->st.pos[2];
-                if (dx * dx + dy * dy + dz * dz > 0.0025f) mask |= EF_POS;
+                if (dx * dx + dy * dy + dz * dz > 0.000004f) mask |= EF_POS;
                 float dq = 0.0f;
                 for (int q = 0; q < 4; ++q) { float d = e.quat[q] - sh->st.quat[q]; dq += (d < 0.0f ? -d : d); }
                 if (dq > 0.005f) mask |= EF_QUAT;
@@ -311,6 +317,14 @@ namespace {
                 // (the phase moves every snapshot while a clip plays). Never sent when not captured.
                 if (e.anim.valid && std::memcmp(&e.anim, &sh->st.anim, sizeof(GuardAnim)) != 0) mask |= EF_ANIM;
                 // objId is carried by the record identity, never by a field bit.
+            }
+            // proto 14: after a change, keep sending pos / quat / action for RESEND_AFTER_CHANGE more snapshots.
+            // The receiver applies them like any delta (same value), so a single lost datagram costs one
+            // snapshot, not the time until the next change.
+            if (sh) {
+                if (mask & EF_POS)    sh->rPos  = RESEND_AFTER_CHANGE; else if (sh->rPos)  { mask |= EF_POS;    --sh->rPos;  }
+                if (mask & EF_QUAT)   sh->rQuat = RESEND_AFTER_CHANGE; else if (sh->rQuat) { mask |= EF_QUAT;   --sh->rQuat; }
+                if (mask & EF_ACTION) sh->rAct  = RESEND_AFTER_CHANGE; else if (sh->rAct)  { mask |= EF_ACTION; --sh->rAct;  }
             }
             // Nothing changed since the last packet: omit the record entirely (0 bytes instead of a
             // 16-byte stub). Absence is safe - ApplyGuards/ApplyShips only drive what is present.
@@ -408,6 +422,7 @@ namespace {
             && std::memcmp(&a.anim, &b.anim, sizeof(GuardAnim)) == 0;
     }
 
+    DecodeReason DecodeEntityChunk(const uint8_t* in, size_t len, EntityPacket& out, DecodeReason* why);
     bool SelfTestWire() {
         // Static: sizeof(EntityPacket) is ~16 KB at proto 13 and five of them are used here.
         static EntityPacket a, b, c, d, f;
@@ -439,6 +454,16 @@ namespace {
         const size_t n1 = EncodeEntityPacket(a, buf, sizeof(buf));
         bool ok = n1 > 0 && DecodeEntityPacket(buf, n1, b) && b.count == 3;
         if (ok) for (int i = 0; i < 3; ++i) ok = ok && SameEntity(a.ents[i], b.ents[i]);
+        // proto 14: a change to pos/quat/action is re-sent for RESEND_AFTER_CHANGE more snapshots. The first repeat
+        // still carries all three records; then the window is drained (each repeat decoded, so both shadows stay
+        // in step) and the assertions below test the steady state they always tested.
+        const size_t nr = EncodeEntityPacket(a, buf, sizeof(buf));
+        bool okR = nr > sizeof(EntityWireHeader) && DecodeEntityPacket(buf, nr, c) && c.count == 3;
+        if (okR) for (int i = 0; i < 3; ++i) okR = okR && SameEntity(a.ents[i], c.ents[i]);
+        for (int r = 1; r < (int)RESEND_AFTER_CHANGE; ++r) {
+            const size_t nx = EncodeEntityPacket(a, buf, sizeof(buf));
+            okR = okR && nx > sizeof(EntityWireHeader) && DecodeEntityPacket(buf, nx, c);
+        }
         // C2 §2.4 (2): second pass, nothing changed. The DEAD body must still be re-sent - the dead
         // bit is a level, not a delta - while the two live bodies must still be omitted.
         const size_t n2 = EncodeEntityPacket(a, buf, sizeof(buf));
@@ -476,18 +501,40 @@ namespace {
         const size_t n6 = EncodeEntityPacket(a, buf, sizeof(buf));
         bool ok6 = n6 > sizeof(EntityWireHeader) && DecodeEntityPacket(buf, n6, c)
                    && c.count == 1 && c.ents[0].key == 0u && SameEntity(a.ents[0], c.ents[0]);
+        // proto 14: stale filter on the chunk path. Negative control: the same datagram twice (2nd = DEC_STALE), an
+        // older seq (DEC_STALE); a jump far outside the window (restart / kill-push seq domain) is accepted.
+        bool okS;
+        {
+            DecodeReason w = DEC_OK;
+            g_rxHaveDone = false; g_rxDoneSeq = 0;
+            a.ents[0].anim.ratioQ = 42000; a.seq = 100;
+            auto one = [&buf]() { const uint16_t ci = 0, ct = 1; std::memcpy(buf + 28, &ci, 2); std::memcpy(buf + 30, &ct, 2); };
+            const size_t s1 = EncodeEntityPacket(a, buf, sizeof(buf));
+            one();
+            okS = DecodeEntityChunk(buf, s1, c, &w) == DEC_OK;
+            okS = okS && DecodeEntityChunk(buf, s1, c, &w) == DEC_STALE;
+            a.seq = 99; a.ents[0].anim.ratioQ = 42500;
+            const size_t s2 = EncodeEntityPacket(a, buf, sizeof(buf));
+            one();
+            okS = okS && DecodeEntityChunk(buf, s2, c, &w) == DEC_STALE;
+            a.seq = 100 + 5000; a.ents[0].anim.ratioQ = 43000;
+            const size_t s3 = EncodeEntityPacket(a, buf, sizeof(buf));
+            one();
+            okS = okS && DecodeEntityChunk(buf, s3, c, &w) == DEC_OK;
+            g_rxHaveDone = false; g_rxDoneSeq = 0;
+        }
         // Both peers must start from an empty shadow.
         std::memset(g_txShadow, 0, sizeof(g_txShadow));
         std::memset(g_rxShadow, 0, sizeof(g_rxShadow));
         g_txEpoch = g_rxEpoch = 1; g_txSinceReset = 0;
         char m[256];
-        wsprintfA(m, "[Net] wire codec selftest: roundtrip=%s nochange=%s deaddelta=%s resurrect=%s halfdead=%s anim=%s"
-                     " (full=%u B, repeat=%u B, res=%u B, idle=%u B, half=%u B, anim=%u B)\n",
-                  ok ? "PASS" : "FAIL", ok4 ? "PASS" : "FAIL", ok2 ? "PASS" : "FAIL",
-                  ok3 ? "PASS" : "FAIL", ok5 ? "PASS" : "FAIL", ok6 ? "PASS" : "FAIL",
-                  (unsigned)n1, (unsigned)n2, (unsigned)n3, (unsigned)n4, (unsigned)n5, (unsigned)n6);
+        wsprintfA(m, "[Net] wire codec selftest: roundtrip=%s resend=%s nochange=%s deaddelta=%s resurrect=%s halfdead=%s anim=%s"
+                     " stale=%s (full=%u B, resend=%u B, repeat=%u B, res=%u B, idle=%u B, half=%u B, anim=%u B)\n",
+                  ok ? "PASS" : "FAIL", okR ? "PASS" : "FAIL", ok4 ? "PASS" : "FAIL", ok2 ? "PASS" : "FAIL",
+                  ok3 ? "PASS" : "FAIL", ok5 ? "PASS" : "FAIL", ok6 ? "PASS" : "FAIL", okS ? "PASS" : "FAIL",
+                  (unsigned)n1, (unsigned)nr, (unsigned)n2, (unsigned)n3, (unsigned)n4, (unsigned)n5, (unsigned)n6);
         dbg(m);
-        return ok && ok2 && ok3 && ok4 && ok5 && ok6;
+        return ok && okR && ok2 && ok3 && ok4 && ok5 && ok6 && okS;
     }
 
     bool DecodeEntityPacket(const uint8_t* in, size_t len, EntityPacket& out, DecodeReason* why) {
@@ -520,7 +567,7 @@ namespace {
             std::memset(g_rxShadow, 0, sizeof(g_rxShadow));
             g_rxEpoch = h.epoch;
         }
-        out.magic = h.magic; out.protoVer = h.protoVer; out.seq = h.seq; out.count = 0;
+        out.magic = h.magic; out.protoVer = h.protoVer; out.seq = h.seq; out.hostMs = h.hostMs; out.count = 0;
         size_t o = sizeof(h);
         for (uint32_t i = 0; i < h.count; ++i) {
             if (o + 16 > len) return fail(DEC_TRUNC);
@@ -602,9 +649,27 @@ namespace {
         const size_t hdr = sizeof(h);
         const size_t chunkBytes = len - hdr;
 
+        // proto 14: a snapshot that is not newer than the last one completed is dropped BEFORE it is decoded
+        // into the delta shadow (a late single-chunk datagram used to overwrite both the shadow and the
+        // snapshot slot, stepping guards backwards). Only differences inside STALE_WINDOW count: kill pushes use
+        // GetTickCount as seq (another domain) and a restarted host starts again near 0 - both are far
+        // outside the window, pass, and do not move the marker (see SnapshotDone).
+        static const int32_t STALE_WINDOW = 4096;
+        if (g_rxHaveDone) {
+            const int32_t d = SeqDiff(h.seq, g_rxDoneSeq);
+            if (d <= 0 && d > -STALE_WINDOW) return fail(DEC_STALE);
+        }
+        auto SnapshotDone = [&h]() {
+            const int32_t d = SeqDiff(h.seq, g_rxDoneSeq);
+            if (!g_rxHaveDone || (d > 0 && d < STALE_WINDOW) || d <= -STALE_WINDOW) {
+                g_rxDoneSeq = h.seq; g_rxHaveDone = true;
+            }
+        };
+
         // Fast path: a single-chunk snapshot (the common case) decodes straight out of the datagram.
         if (h.chunkTotal == 1) {
             if (!DecodeEntityPacket(in, len, out, why)) return *why;   // reason already set
+            SnapshotDone();
             return DEC_OK;
         }
 
@@ -653,6 +718,7 @@ namespace {
             const bool ok = DecodeEntityPacket(g_asm.data, total, out, why);
             std::memset(&g_asm, 0, sizeof(g_asm));
             if (!ok) return *why;
+            SnapshotDone();
             return DEC_OK;
         }
         return DEC_PENDING;

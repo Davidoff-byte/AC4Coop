@@ -3371,6 +3371,12 @@ static void CaptureShips(EntityPacket& pkt) {
     } __except (EXCEPTION_EXECUTE_HANDLER) { count = 0; }
     pkt.count = count;
     pkt.seq = ++g_entSeq;
+    {   // proto 14: capture time on the same QPC clock the guest's OwnNowUs uses (ms, wraps at 2^32)
+        static LARGE_INTEGER f = {};
+        if (!f.QuadPart) QueryPerformanceFrequency(&f);
+        LARGE_INTEGER c; QueryPerformanceCounter(&c);
+        pkt.hostMs = (uint32_t)((c.QuadPart / f.QuadPart) * 1000ull + (c.QuadPart % f.QuadPart) * 1000ull / f.QuadPart);
+    }
     static bool logged = false;
     if (!logged) { logged = true; L("[ShipSync] ship list count=%u captured=%u withObjId=%u\n", (unsigned)n, count, withId); }
 }
@@ -5945,8 +5951,18 @@ struct GaState {
     uint8_t  banned;                            // a fault happened inside the apply for this body: never again
     // [Coop] GuardPhaseLock: measured playback rate (ratio/s at the host's time scale) of the current alias
     uint32_t rateAlias; float rate, lastR, nudge; uint64_t lastRUs, seekUs;
+    // GuardInterpBuffer: the alias at render time, and since when (drives the switch and the probes' grace)
+    uint32_t renderAlias; uint64_t renderAliasUs;
 };
+// [Coop] GuardInterpBuffer (default 0; live): proto 14 guard snapshots keyed by the host's capture time. The body is
+// rendered at (guest now - GuardInterpDelayMs) on the host timeline, interpolated between the two bracketing samples
+// (position, rotation, and the animation block: ratio with loop wrap, time scale, blend factors), extrapolated for at
+// most GuardExtrapMs past the newest sample and then held. Replaces the "chase the newest target over the guest
+// tick gap" glide (OwnSample's from/to segment), whose step length and lag varied with every packet.
+struct OwnSnap { int64_t hostUs; float pos[3], quat[4]; uint32_t alias; GuardAnim anim; };
+static const int OWN_RING = 8;
 struct OwnBody {
+    OwnSnap  ring[OWN_RING]; uint8_t ringN, ringHead;   // ringHead = newest
     unsigned int human, ent;
     float fromPos[3], fromQuat[4], toPos[3], toQuat[4];
     uint64_t t0Us, durUs, lastPubUs, lastWriteUs, aliasSinceUs, createdUs, lastPhysUs;
@@ -5980,7 +5996,100 @@ static void OwnQuatNlerp(const float* a, const float* b, float t, float* out) {
     if (n > 1e-6f) for (int k = 0; k < 4; ++k) out[k] /= n;
     else for (int k = 0; k < 4; ++k) out[k] = b[k];
 }
+// Host clock -> guest clock. hostUs is the host's ms stamp unwrapped against the first one seen (int32 difference,
+// valid for 24 days). The offset is the minimum (guest receive time - host time) over the current and previous 2 s
+// window: the least-delayed packet bounds the true offset, and the window lets it follow drift and route changes.
+static uint32_t s_hostBaseMs = 0; static bool s_hostBaseSet = false;
+static int64_t  s_offCur = INT64_MAX, s_offPrev = INT64_MAX; static uint64_t s_offWinUs = 0;
+static int s_gibOn = 0; static uint64_t s_gibNext = 0;
+static int s_gibDelay = 120, s_gibExtrap = 100; static uint64_t s_gibDelayN = 0, s_gibExtrapN = 0;
+static int OwnInt(const char* key, int def, int* cache, uint64_t* next);
+static int OwnFlag(const char* key, int* cache, uint64_t* next);
+static bool GuardInterpBufferOn() { return OwnFlag("GuardInterpBuffer", &s_gibOn, &s_gibNext) != 0; }
+static int64_t OwnHostUs(uint32_t hostMs) {
+    if (!s_hostBaseSet) { s_hostBaseMs = hostMs; s_hostBaseSet = true; }
+    return (int64_t)(int32_t)(hostMs - s_hostBaseMs) * 1000;
+}
+static void OwnOffsetNote(int64_t hostUs, uint64_t rxUs) {   // under s_ownLock (exclusive)
+    if (rxUs - s_offWinUs > 2000000) { s_offPrev = s_offCur; s_offCur = INT64_MAX; s_offWinUs = rxUs; }
+    const int64_t off = (int64_t)rxUs - hostUs;
+    if (off < s_offCur) s_offCur = off;
+}
+static int64_t OwnOffset() { return s_offCur < s_offPrev ? s_offCur : s_offPrev; }
+static float OwnLerpRatio(float a, float b, float f, bool* wrapped) {
+    *wrapped = b < a;                     // the clip looped between the two samples
+    if (*wrapped) b += 1.0f;
+    float r = a + (b - a) * f;
+    if (r >= 1.0f) r -= 1.0f;
+    return r;
+}
+// Animation block at render time: a's, with ratio / time scale / blend factors interpolated toward b when both
+// samples play the same alias.
+static void OwnLerpAnim(const OwnSnap& a, const OwnSnap& b, float f, GuardAnim& out) {
+    out = a.anim;
+    if (!a.anim.valid || !b.anim.valid || a.alias != b.alias || f <= 0.0f) return;
+    bool w = false;
+    out.ratioQ = (uint16_t)(OwnLerpRatio(a.anim.ratioQ / 65535.0f, b.anim.ratioQ / 65535.0f, f, &w) * 65535.0f);
+    out.timeScaleQ = (uint16_t)(a.anim.timeScaleQ + (int)((b.anim.timeScaleQ - (int)a.anim.timeScaleQ) * f));
+    float v[256] = {}; bool seen[256] = {};
+    for (uint8_t k = 0; k < a.anim.nBlend; ++k) { v[a.anim.blendSlot[k]] = a.anim.blendVal[k] * (1.0f - f); seen[a.anim.blendSlot[k]] = true; }
+    for (uint8_t k = 0; k < b.anim.nBlend; ++k) { v[b.anim.blendSlot[k]] += b.anim.blendVal[k] * f; seen[b.anim.blendSlot[k]] = true; }
+    uint8_t n = 0;
+    for (int s = 0; s < 256 && n < GUARD_ANIM_BLEND_MAX; ++s)
+        if (seen[s]) { const int q = (int)(v[s] + 0.5f); if (q > 0) { out.blendSlot[n] = (uint8_t)s; out.blendVal[n] = (uint8_t)(q > 255 ? 255 : q); ++n; } }
+    out.nBlend = n;
+}
+// Sample the ring at guest time nowUs. Returns false when the ring is empty. anim/alias are optional.
+static bool OwnRingSample(const OwnBody& o, uint64_t nowUs, float* pos, float* quat, uint32_t* alias, GuardAnim* anim) {
+    if (!o.ringN) return false;
+    const int64_t off = OwnOffset();
+    if (off == INT64_MAX) return false;
+    const int64_t delay = (int64_t)OwnInt("GuardInterpDelayMs", 120, &s_gibDelay, &s_gibDelayN) * 1000;
+    const int64_t T = (int64_t)nowUs - off - delay;           // render time on the host timeline
+    // newest .. oldest
+    const OwnSnap* a = nullptr; const OwnSnap* b = nullptr; const OwnSnap* prev = nullptr;
+    for (int k = 0; k < o.ringN; ++k) {
+        const OwnSnap& s = o.ring[(o.ringHead - k + OWN_RING) % OWN_RING];
+        if (s.hostUs <= T) { a = &s; if (k + 1 < o.ringN) prev = &o.ring[(o.ringHead - k - 1 + OWN_RING) % OWN_RING]; break; }
+        b = &s;
+    }
+    if (!a) {                                                 // before the oldest sample: hold the oldest
+        const OwnSnap& s = *b;
+        for (int k = 0; k < 3; ++k) pos[k] = s.pos[k];
+        for (int k = 0; k < 4; ++k) quat[k] = s.quat[k];
+        if (alias) *alias = s.alias;
+        if (anim) *anim = s.anim;
+        return true;
+    }
+    if (b) {                                                  // bracketed: interpolate
+        const float f = (float)(double)(T - a->hostUs) / (float)(double)(b->hostUs - a->hostUs);
+        const float dx = b->pos[0] - a->pos[0], dy = b->pos[1] - a->pos[1], dz = b->pos[2] - a->pos[2];
+        const bool jump = dx * dx + dy * dy + dz * dz > 25.0f;   // > 5 m: step, never glide (legacy bigJump rule)
+        for (int k = 0; k < 3; ++k) pos[k] = jump ? a->pos[k] : a->pos[k] + (b->pos[k] - a->pos[k]) * f;
+        if (jump) for (int k = 0; k < 4; ++k) quat[k] = a->quat[k];
+        else OwnQuatNlerp(a->quat, b->quat, f, quat);
+        if (alias) *alias = a->alias;
+        if (anim) OwnLerpAnim(*a, *b, f, *anim);
+        return true;
+    }
+    // past the newest sample: extrapolate position for at most GuardExtrapMs, then hold
+    int64_t ex = T - a->hostUs;
+    const int64_t exMax = (int64_t)OwnInt("GuardExtrapMs", 100, &s_gibExtrap, &s_gibExtrapN) * 1000;
+    if (ex > exMax) ex = exMax;
+    for (int k = 0; k < 3; ++k) pos[k] = a->pos[k];
+    if (prev && a->hostUs > prev->hostUs) {
+        const float dt = (float)(double)(a->hostUs - prev->hostUs);
+        const float dx = a->pos[0] - prev->pos[0], dy = a->pos[1] - prev->pos[1], dz = a->pos[2] - prev->pos[2];
+        if (dx * dx + dy * dy + dz * dz <= 25.0f)
+            for (int k = 0; k < 3; ++k) pos[k] = a->pos[k] + (a->pos[k] - prev->pos[k]) * ((float)(double)ex / dt);
+    }
+    for (int k = 0; k < 4; ++k) quat[k] = a->quat[k];
+    if (alias) *alias = a->alias;
+    if (anim) *anim = a->anim;
+    return true;
+}
 static void OwnSample(const OwnBody& o, uint64_t nowUs, float* pos, float* quat) {
+    if (s_gibOn && OwnRingSample(o, nowUs, pos, quat, nullptr, nullptr)) return;
     float t = o.durUs ? (float)(double)(nowUs - o.t0Us) / (float)(double)o.durUs : 1.0f;
     if (nowUs < o.t0Us) t = 0.0f;
     if (t > 1.0f) t = 1.0f;
@@ -5989,9 +6098,22 @@ static void OwnSample(const OwnBody& o, uint64_t nowUs, float* pos, float* quat)
 }
 
 // ApplyGuards (player's update): newest host target for this body.
-static void OwnPublish(Human* h, Entity* e, const float* pos, const float* quat, uint32_t alias, const GuardAnim& anim) {
+static void OwnRingPush(OwnBody& o, int64_t hostUs, const float* pos, const float* quat, uint32_t alias,
+                        const GuardAnim& anim) {
+    if (o.ringN && hostUs <= o.ring[o.ringHead].hostUs) return;   // same or older snapshot: nothing new
+    o.ringHead = (uint8_t)((o.ringHead + 1) % OWN_RING);
+    OwnSnap& s = o.ring[o.ringHead];
+    s.hostUs = hostUs; s.alias = alias; s.anim = anim;
+    for (int k = 0; k < 3; ++k) s.pos[k] = pos[k];
+    for (int k = 0; k < 4; ++k) s.quat[k] = quat[k];
+    if (o.ringN < OWN_RING) ++o.ringN;
+}
+static void OwnPublish(Human* h, Entity* e, const float* pos, const float* quat, uint32_t alias, const GuardAnim& anim,
+                       uint32_t hostMs) {
     const uint64_t now = OwnNowUs();
     AcquireSRWLockExclusive(&s_ownLock);
+    const int64_t hostUs = hostMs ? OwnHostUs(hostMs) : 0;
+    if (hostMs) OwnOffsetNote(hostUs, now);
     int i = OwnFind((unsigned int)h);
     if (i < 0 && s_ownN < OWN_MAX) {
         i = s_ownN; OwnBody& n = s_own[i];
@@ -6001,6 +6123,7 @@ static void OwnPublish(Human* h, Entity* e, const float* pos, const float* quat,
         for (int k = 0; k < 4; ++k) n.fromQuat[k] = n.toQuat[k] = quat[k];
         n.t0Us = now; n.durUs = 0; n.lastPubUs = now; n.snap = true; n.alias = alias; n.aliasSinceUs = now;
         n.anim = anim; n.animUs = now;
+        if (hostMs) OwnRingPush(n, hostUs, pos, quat, alias, anim);
         InterlockedIncrement(&s_ownN);
     } else if (i >= 0) {
         OwnBody& o = s_own[i];
@@ -6024,6 +6147,7 @@ static void OwnPublish(Human* h, Entity* e, const float* pos, const float* quat,
         o.lastPubUs = now;
         if (alias != o.alias) { o.alias = alias; o.aliasSinceUs = now; }
         if (std::memcmp(&anim, &o.anim, sizeof(GuardAnim)) != 0) { o.anim = anim; o.animUs = now; }
+        if (hostMs) OwnRingPush(o, hostUs, pos, quat, alias, anim);
     }
     ReleaseSRWLockExclusive(&s_ownLock);
 }
@@ -6288,6 +6412,16 @@ static void OwnDrain(Human* h) {
     if (!found) return;
     const uint64_t now = OwnNowUs();
     if (now - o.lastPubUs > 1000000) return;                 // host stopped describing it: not ours any more
+    // GuardInterpBuffer: action + animation block at the render time the position is sampled at, so a switch,
+    // the clip phase and the stride all land when the body reaches that point (not when the packet arrived).
+    // This copy of the body is local; only o.ga is written back.
+    if (GuardInterpBufferOn() && o.ringN) {
+        uint32_t ra = 0; GuardAnim rg; float rp[3], rq[4];
+        if (OwnRingSample(o, now, rp, rq, &ra, &rg)) {
+            if (ra != o.ga.renderAlias) { o.ga.renderAlias = ra; o.ga.renderAliasUs = now; }
+            o.alias = ra; o.aliasSinceUs = o.ga.renderAliasUs; o.anim = rg; o.animUs = now;
+        }
+    }
     Entity* e = (Entity*)o.ent;
     if (!readable(e, 0x80) || *(uint32_t*)e != 0x01E4CE90u) return;   // character entity vtable (GuestObjFindResolve)
     InterlockedIncrement(&s_gFrames);
@@ -6765,7 +6899,7 @@ static void ApplyGuards(const EntityPacket& pkt) {
                         for (int k = 0; k < 4; ++k) s_last[slot].quat[k] = es.quat[k];
                     }
                 }
-                if (bh && !s_selfTestMode) OwnPublish(bh, (Entity*)best, es.pos, es.quat, es.actionAlias, es.anim);
+                if (bh && !s_selfTestMode) OwnPublish(bh, (Entity*)best, es.pos, es.quat, es.actionAlias, es.anim, pkt.hostMs);
                 const bool ownWrites = bh && !s_selfTestMode && OwnGuardsOn() && !OwnStarved(bh);
                 if (moved && !ownWrites) {
                     HookMath::Quaternion q; q.x=es.quat[0]; q.y=es.quat[1]; q.z=es.quat[2]; q.w=es.quat[3];
@@ -7066,9 +7200,16 @@ static void EntitySyncTick() {
         }
     }
 
+    // ~10 Hz throttle (60fps / 6). [Coop] EntityFrameCadence (default 0, load-time): when on, only the slow work
+    // keeps this throttle (self-test, the retained snapshot's kill lane, the guest death scan); the host checks
+    // its SnapshotHz timer every frame (it used to be checked every 6th frame, so 20 Hz became ~10 Hz and moved
+    // with the frame rate) and the guest applies a snapshot on the frame it arrives (it used to wait 0-100 ms).
     static uint32_t tick = 0;
-    if (++tick < 6) return;      // ~10 Hz throttle (60fps / 6)
-    tick = 0;
+    const bool slowTick = ++tick >= 6;
+    if (slowTick) tick = 0;
+    static int s_frameCadence = -1;
+    if (s_frameCadence < 0) s_frameCadence = GetPrivateProfileIntA("Coop", "EntityFrameCadence", 0, Paths::Ini());
+    if (!s_frameCadence && !slowTick) return;
 
     // Self-test (single machine): clone the local NPC ships into ghosts and drive them at +offset X,
     // so the user sees the duplicate ships (proves the deep-copy + render override with no peer).
@@ -7106,8 +7247,9 @@ static void EntitySyncTick() {
     // entry would consume DeathAppliedRecently and swallow the ring's fresh death - and on the guest a
     // stale entry can still resolve through the 4 m position fallback onto whatever body is there now.
     // Both lanes collapse duplicates in DeathAppliedRecently, so this only decides which lane wins.
-    if (haveIn) ProcessKillEvents(in);
+    if (haveIn && slowTick) ProcessKillEvents(in);
 
+    if (s_selfTest && !slowTick) return;
     if (s_selfTest) {
         static EntityPacket pkt;
         std::memset(&pkt, 0, sizeof(pkt));   // every field of every record starts at 0 (anim.valid = 0)
@@ -7128,7 +7270,8 @@ static void EntitySyncTick() {
         // Snapshot cadence, decoupled from the frame rate: sending the 7 KB EntityPacket every frame was
         // the whole bandwidth cost of this protocol. [Net] SnapshotHz (default 20).
         static uint64_t s_lastSnapMs = 0;
-        uint64_t snapNow = GetTickCount64();
+        // QPC ms when checked every frame (GetTickCount64 steps in ~15.6 ms, which made 50 ms gaps 47 or 62 ms).
+        uint64_t snapNow = s_frameCadence ? OwnNowUs() / 1000 : GetTickCount64();
         uint32_t snapInterval = g_snapHz > 0 ? (1000u / (uint32_t)g_snapHz) : 0u;
         if (snapInterval == 0 || s_lastSnapMs == 0 || snapNow - s_lastSnapMs >= snapInterval) {
             s_lastSnapMs = snapNow;
@@ -7141,14 +7284,20 @@ static void EntitySyncTick() {
         // Peer-reported kills (guest -> host): resolve by position and kill the real guard. Kill
         // processing already ran above (before the self-test branch); do NOT poll a second time here.
     } else if (haveIn) {
-        ApplyShips(in);
-        ApplyGuards(in);   // apply the characters
+        // Frame cadence: a snapshot is applied once, on the frame it is first seen (GetEntities hands back the
+        // retained slot every call); the slow tick still re-applies it, as before, for binding upkeep.
+        static uint32_t s_appliedSeq = 0;
+        if (!s_frameCadence || slowTick || in.seq != s_appliedSeq) {
+            s_appliedSeq = in.seq;
+            ApplyShips(in);
+            ApplyGuards(in);   // apply the characters
+        }
         // ProcessKillEvents already ran above (host->guest packets carry no kill entries)
     }
 
     // Guest: guards this peer kills are its own business - no host snapshot describes them - so the
     // guest's death lane samples them here, on the same throttled tick the snapshots already use.
-    if (!g_entHost) GuestDeathScan();
+    if (!g_entHost && slowTick) GuestDeathScan();
 }
 
 
