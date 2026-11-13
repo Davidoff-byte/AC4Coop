@@ -313,6 +313,8 @@ def cmd_replay(a):
                         break
                     time.sleep(min(dt, 0.005))
                 k = kind(d)
+                if a.player_only and k != "player":
+                    continue                      # e.g. a host recording played INTO a host game: no guard/kill lane
                 if passes and k == "player":      # later passes: keep seq rising
                     d = d[:8] + struct.pack("<I", (struct.unpack_from("<I", d, 8)[0] + passes * span_p) & 0xFFFFFFFF) + d[12:]
                 elif passes and k == "entity":    # ... and give the pass its own delta epoch (receivers drop their base on a new epoch)
@@ -404,6 +406,8 @@ def main(argv):
         if name == "replay":
             p.add_argument("--loops", type=int, default=1000); p.add_argument("--speed", type=float, default=1.0)
             p.add_argument("--adopt-world", action="store_true", help="rewrite the recording's worldId to the live game's")
+            p.add_argument("--player-only", action="store_true", help="send only PlayerState datagrams (no entity/kill lane): "
+                           "replaying a host recording into a host game, where recorded kills would kill real guards")
             p.add_argument("--as-proto", type=int, default=0, help="rewrite each datagram's protoVer (play an older recording "
                            "into a newer build; proto 13 only ADDED the optional EF_ANIM block)")
     i = sub.add_parser("info"); i.add_argument("file"); i.add_argument("--entities", action="store_true", help="list every entity the stream names")
