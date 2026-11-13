@@ -135,6 +135,7 @@ void SightProbe(void* los, void* G, void* P, void* player)
     }
 }
 
+int g_dktOn = 0; ULONGLONG g_dktNext = 0; volatile LONG g_dktKept = 0;
 // mode 0 = request create, 1 = per-update retarget (decides), 2 = detection start (reads)
 void* __cdecl Choose(void* obs, void* player, int mode, void* los)
 {
@@ -143,6 +144,22 @@ void* __cdecl Choose(void* obs, void* player, int mode, void* los)
     if (!On(nowMs) || !Phase1_IsEntityHost() || !obs || !player) return player;
     void* pup = Phase1_PuppetEntity();
     if (!pup || pup == obs || World(pup) != World(player)) return player;
+    // [Coop] DetectKeepTarget (live, default 0). At 0x131EFD5 `los` is the CRLDetect (esi). CreateReaction
+    // (0x1055CB0) set CRLDetect+0x74 to the stimulus's handle (S3 evidence section 8); the start function then
+    // overwrites +0x74 with this call's result. When the reaction was created FOR the puppet, keep the puppet, so
+    // the guard detects the body that triggered it. Handle -> entity: (*(h+8) >> 31) & *h (engine pattern, e.g.
+    // sub_13F22E0, sub_1340E60). Run 13532 (15ee79a): 7 CanReact passes for the puppet (stimulus 95), each matched
+    // by a detection start, but the guards stayed on alert only.
+    if (mode == 2 && los) {
+        if (nowMs >= g_dktNext) { g_dktNext = nowMs + 2000; g_dktOn = GetPrivateProfileIntA("Coop", "DetectKeepTarget", 0, Paths::Ini()) != 0; }
+        if (g_dktOn) {
+            __try {
+                const int* h = *(const int* const*)((const char*)los + 0x74);
+                const void* e = h ? (const void*)(uintptr_t)((h[2] >> 31) & h[0]) : nullptr;
+                if (e == pup) { InterlockedIncrement(&g_dktKept); InterlockedIncrement(&g_puppetPicks); return pup; }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+    }
     float po[3], pp[3], pq[3];
     if (!Pos(obs, po) || !Pos(player, pp) || !Pos(pup, pq)) return player;
 
@@ -216,7 +233,7 @@ __declspec(naked) void StubDetect()
         mov  eax, 0x0070E810
         call eax
         pop  edx
-        push 0                      // los (not probed here)
+        push esi                    // the CRLDetect (DetectKeepTarget reads its +0x74)
         push 2
         push eax
         push edx
@@ -259,11 +276,11 @@ void GuardSight::Init()
 int GuardSight::FormatReport(char* out, int cap)
 {
     if (!g_installed || cap < 64) return 0;
-    int n = _snprintf_s(out, cap, _TRUNCATE, "[Sight] on=%d host=%d puppet=%p | calls create=%ld retarget=%ld detect=%ld | puppetPicks=%ld switches=%ld",
+    int n = _snprintf_s(out, cap, _TRUNCATE, "[Sight] on=%d host=%d puppet=%p | calls create=%ld retarget=%ld detect=%ld keptPuppet=%ld | puppetPicks=%ld switches=%ld",
                        g_on, Phase1_IsEntityHost() ? 1 : 0, Phase1_PuppetEntity(),
                        InterlockedExchange(&g_calls[0], 0), InterlockedExchange(&g_calls[1], 0),
-                       InterlockedExchange(&g_calls[2], 0), InterlockedExchange(&g_puppetPicks, 0),
-                       InterlockedExchange(&g_switches, 0));
+                       InterlockedExchange(&g_calls[2], 0), InterlockedExchange(&g_dktKept, 0),
+                       InterlockedExchange(&g_puppetPicks, 0), InterlockedExchange(&g_switches, 0));
     if (g_spOn && n > 0 && n < cap - 200) {
         const SpSample s = g_spLast;
         n += _snprintf_s(out + n, cap - n, _TRUNCATE,
