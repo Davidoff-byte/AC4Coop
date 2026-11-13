@@ -76,8 +76,67 @@ void* World(void* e)
     __try { return *(void**)((char*)e + 0x5C); } __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }   // m_AssociatedWorld
 }
 
+// [Coop] SightProbe (default 0; live; read-only except the two faction getters, which S3 section 8.3 read as loads
+// and getter calls only). S3 section 8: the reaction is created only after CRLDetectParams CanReact (0x1076110), so
+// a puppet chosen as sight target but never detected stops at L (geometry / gate), S (stimulus) or R (faction /
+// alert state). At the retarget site, when this sensor's previous target was the puppet, the request's flags are the
+// result of that evaluation: req = *(los+0xF8), flags = u16 req+0x10: 0x001 cone, 0x002 VISIBLE (stimulus 8 sent),
+// 0x004 blocked, 0x020 evaluated, 0x040 async result arrived, 0x100 in range, 0x200 player request.
+// Puppet: kind/role = *(P+0x9C) &7 / >>3&0x3F; h = *(P+0xE8): byte h+0x28 (L2 gate), ai = *(h+0x1C) (L4).
+// Faction (R3), only on visible frames: sub_133A4C0(e) entity -> faction (cdecl, 1 arg), sub_17114C0(G, T) "T is an
+// enemy of G" (cdecl, 2 args) - both already have decomp units and are used in phase1.cpp.
+int g_spOn = 0; ULONGLONG g_spNext = 0;
+volatile LONG g_spN = 0, g_spCone = 0, g_spVis = 0, g_spBlk = 0, g_spEval = 0, g_spAsync = 0, g_spRange = 0, g_spPReq = 0,
+              g_spL2 = 0, g_spNoAi = 0, g_spHostP = 0, g_spHostPl = 0, g_spSameFac = 0, g_spAsOff = 0;
+struct SpSample { unsigned flags, kind, role, l2, ai, facP, facPl, as20; float dist; };
+SpSample g_spLast = {};
+void SightProbe(void* los, void* G, void* P, void* player)
+{
+    const ULONGLONG nowMs = GetTickCount64();
+    if (nowMs >= g_spNext) { g_spNext = nowMs + 2000; g_spOn = GetPrivateProfileIntA("Coop", "SightProbe", 0, Paths::Ini()) != 0; }
+    if (!g_spOn || !los) return;
+    __try {
+        const char* req = *(const char* const*)((const char*)los + 0xF8);
+        if (!req) return;
+        SpSample s = {};
+        s.flags = *(const uint16_t*)(req + 0x10);
+        InterlockedIncrement(&g_spN);
+        if (s.flags & 0x001) InterlockedIncrement(&g_spCone);
+        if (s.flags & 0x002) InterlockedIncrement(&g_spVis);
+        if (s.flags & 0x004) InterlockedIncrement(&g_spBlk);
+        if (s.flags & 0x020) InterlockedIncrement(&g_spEval);
+        if (s.flags & 0x040) InterlockedIncrement(&g_spAsync);
+        if (s.flags & 0x100) InterlockedIncrement(&g_spRange);
+        if (s.flags & 0x200) InterlockedIncrement(&g_spPReq);
+        const uint32_t k = *(const uint32_t*)((const char*)P + 0x9C);
+        s.kind = k & 7; s.role = (k >> 3) & 0x3F;
+        const char* h = *(const char* const*)((const char*)P + 0xE8);
+        s.l2 = h ? *(const uint8_t*)(h + 0x28) : 0xFF;
+        s.ai = h ? (unsigned)(uintptr_t)*(void* const*)(h + 0x1C) : 0;
+        if (s.l2 && s.l2 != 0xFF) InterlockedIncrement(&g_spL2);
+        if (!s.ai) InterlockedIncrement(&g_spNoAi);
+        const char* w = *(const char* const*)((const char*)G + 0x5C);
+        const char* as = w ? *(const char* const*)(w + 0x8E0) : nullptr;
+        s.as20 = as ? *(const uint8_t*)(as + 0x20) : 0xFF;
+        if (!as || !s.as20) InterlockedIncrement(&g_spAsOff);
+        float pg[3], pp[3];
+        if (Pos(G, pg) && Pos(P, pp)) s.dist = sqrtf(D2(pg, pp));
+        if (s.flags & 0x002) {
+            typedef void* (__cdecl* FacFn)(void*);
+            typedef BOOL (__cdecl* HostFn)(void*, void*);
+            s.facP  = (unsigned)(uintptr_t)((FacFn)0x0133A4C0)(P);
+            s.facPl = (unsigned)(uintptr_t)((FacFn)0x0133A4C0)(player);
+            if (s.facP && s.facP == s.facPl) InterlockedIncrement(&g_spSameFac);
+            if (((HostFn)0x017114C0)(G, P)) InterlockedIncrement(&g_spHostP);
+            if (((HostFn)0x017114C0)(G, player)) InterlockedIncrement(&g_spHostPl);
+        }
+        g_spLast = s;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
 // mode 0 = request create, 1 = per-update retarget (decides), 2 = detection start (reads)
-void* __cdecl Choose(void* obs, void* player, int mode)
+void* __cdecl Choose(void* obs, void* player, int mode, void* los)
 {
     InterlockedIncrement(&g_calls[mode]);
     const ULONGLONG nowMs = GetTickCount64();
@@ -95,6 +154,11 @@ void* __cdecl Choose(void* obs, void* player, int mode)
     }
     int pick = 0;
     if (slot >= 0) pick = g_tab[slot].puppet;
+    if (mode == 1 && pick) {                  // previous target was the puppet: its evaluation result is in req
+        ReleaseSRWLockExclusive(&g_lock);
+        SightProbe(los, obs, pup, player);
+        AcquireSRWLockExclusive(&g_lock);
+    }
     if (mode != 2) {
         const float dp = D2(po, pp), dq = D2(po, pq);
         const bool puppetNearer = dq < dp;
@@ -120,11 +184,12 @@ __declspec(naked) void StubCreate()
     __asm {
         mov  eax, 0x0070E810
         call eax                    // eax = local player (real GetPlayer, ecx = World*)
+        push 0                      // los (not probed here)
         push 0
         push eax
         push dword ptr [edi + 78h]
         call Choose
-        add  esp, 12
+        add  esp, 16
         ret
     }
 }
@@ -134,11 +199,12 @@ __declspec(naked) void StubRetarget()
     __asm {
         mov  eax, 0x0070E810
         call eax
+        push esi                    // los = CSLineOfSight (SightProbe)
         push 1
         push eax
         push dword ptr [esi + 78h]
         call Choose
-        add  esp, 12
+        add  esp, 16
         ret
     }
 }
@@ -150,11 +216,12 @@ __declspec(naked) void StubDetect()
         mov  eax, 0x0070E810
         call eax
         pop  edx
+        push 0                      // los (not probed here)
         push 2
         push eax
         push edx
         call Choose
-        add  esp, 12
+        add  esp, 16
         ret
     }
 }
@@ -192,9 +259,22 @@ void GuardSight::Init()
 int GuardSight::FormatReport(char* out, int cap)
 {
     if (!g_installed || cap < 64) return 0;
-    return _snprintf_s(out, cap, _TRUNCATE, "[Sight] on=%d host=%d puppet=%p | calls create=%ld retarget=%ld detect=%ld | puppetPicks=%ld switches=%ld",
+    int n = _snprintf_s(out, cap, _TRUNCATE, "[Sight] on=%d host=%d puppet=%p | calls create=%ld retarget=%ld detect=%ld | puppetPicks=%ld switches=%ld",
                        g_on, Phase1_IsEntityHost() ? 1 : 0, Phase1_PuppetEntity(),
                        InterlockedExchange(&g_calls[0], 0), InterlockedExchange(&g_calls[1], 0),
                        InterlockedExchange(&g_calls[2], 0), InterlockedExchange(&g_puppetPicks, 0),
                        InterlockedExchange(&g_switches, 0));
+    if (g_spOn && n > 0 && n < cap - 200) {
+        const SpSample s = g_spLast;
+        n += _snprintf_s(out + n, cap - n, _TRUNCATE,
+            " | probe n=%ld cone=%ld VIS=%ld blocked=%ld eval=%ld async=%ld range=%ld playerReq=%ld L2=%ld noAi=%ld asOff=%ld"
+            " | onVis: sameFac=%ld hostile(G,P)=%ld hostile(G,player)=%ld | last flags=%03X kind=%u role=%u l2=%u ai=%08X as20=%u d=%.1fm facP=%08X facPl=%08X",
+            InterlockedExchange(&g_spN, 0), InterlockedExchange(&g_spCone, 0), InterlockedExchange(&g_spVis, 0),
+            InterlockedExchange(&g_spBlk, 0), InterlockedExchange(&g_spEval, 0), InterlockedExchange(&g_spAsync, 0),
+            InterlockedExchange(&g_spRange, 0), InterlockedExchange(&g_spPReq, 0), InterlockedExchange(&g_spL2, 0),
+            InterlockedExchange(&g_spNoAi, 0), InterlockedExchange(&g_spAsOff, 0), InterlockedExchange(&g_spSameFac, 0),
+            InterlockedExchange(&g_spHostP, 0), InterlockedExchange(&g_spHostPl, 0),
+            s.flags, s.kind, s.role, s.l2, s.ai, s.as20, s.dist, s.facP, s.facPl);
+    }
+    return n > 0 ? n : 0;
 }
