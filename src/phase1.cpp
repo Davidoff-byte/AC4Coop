@@ -8,6 +8,7 @@
 #include "action_writer.h"
 #include "guard_sight.h"
 #include "event_probe.h"
+#include "puppet_stim.h"
 #include <windows.h>
 #include <cstdint>
 #include <cstdio>
@@ -6572,6 +6573,7 @@ static void OwnDrain(Human* h) {
             if (d > 0.02f) OwnNoteMove(false, d);
             if (OwnPuppetOn()) { e->SetGlobalMatrixInternal(&m, false); InterlockedIncrement(&s_pWrites); }
         }
+        if (e) PuppetStim::OnPuppetUpdate(e);   // [Coop] PuppetStimSeq (host test; no-op unless the key changes)
         return;
     }
     // ---- mirrored guards ----
@@ -10924,7 +10926,7 @@ static void DumpConfigOnce()
         { "Coop", "FloatProbe", 0 }, { "Coop", "FootOffsetFix", 0 }, { "Coop", "GuardActionGate", 0 }, { "Coop", "GuardExtrapMs", 100 },
         { "Coop", "GuardInterpBuffer", 0 }, { "Coop", "GuardInterpDelayMs", 120 }, { "Coop", "GuardPhaseLock", 0 },
         { "Coop", "GuardSeesPuppet", 0 }, { "Coop", "PuppetActionReassert", 0 }, { "Coop", "PuppetHostTime", 0 },
-        { "Coop", "EventProbe", 0 }, { "Coop", "SightProbe", 0 }, { "Coop", "StateProbe", 0 }, { "Coop", "StuckProbe", 0 },
+        { "Coop", "EventProbe", 0 }, { "Coop", "PuppetStimMode", 1 }, { "Coop", "PuppetStimSeq", 0 }, { "Coop", "SightProbe", 0 }, { "Coop", "StateProbe", 0 }, { "Coop", "StuckProbe", 0 },
         { "Coop", "StageLog", 0 }, { "Coop", "SyncEnemiesOnly", 1 }, { "Coop", "SyncMaxEntities", 32 },
         { "Coop", "SyncRadiusM", 60 }, { "Coop", "TransformProbe", 0 }, { "Coop", "VPadEnable", 0 },
         { "Coop", "VPadTest", 0 }, { "Coop", "WatchDeadBit", 0 }, { "Coop", "WatchTarget", 0 },

@@ -28,6 +28,7 @@
 #include <cstring>
 
 void Phase1_LogLine(const char* s);
+void* Phase1_PuppetEntity();
 
 namespace {
 
@@ -52,6 +53,7 @@ SRWLOCK g_lock = SRWLOCK_INIT;
 const int ID_MAX = 256;
 volatile LONG g_plStim[ID_MAX];       // stimulus id -> count with the local player as source (window)
 volatile LONG g_stimAll = 0, g_stimPl = 0, g_posts = 0;
+LONG      g_pupLines = 0;
 ULONGLONG g_occLast[ID_MAX];          // per id: when the occurrence log last wrote (GetTickCount64)
 int       g_occN[ID_MAX];
 
@@ -125,6 +127,16 @@ void __cdecl OnPost(void* ev, void* recv, uintptr_t ret)
                             NowMs(), id, g_occN[id], d[2], d[3], d[5], recv, (unsigned)ret);
                 Phase1_LogLine(line);
             }
+        }
+        // Puppet as source ([Coop] PuppetStimSeq test): every such stimulus, <= 300 lines - the receivers show
+        // whether the engine broadcast a template posted to the puppet (from=013410BA) or our mode-2 copies arrived.
+        void* pup = Phase1_PuppetEntity();
+        if (pup && src && src == *(const uintptr_t*)((const char*)pup + 0xC8) && g_pupLines < 300) {
+            ++g_pupLines;
+            char line[160];
+            _snprintf_s(line, sizeof(line), _TRUNCATE, "[EvtPup] t=%llu id=%u dst=%08X recv=%p from=%08X\n",
+                        NowMs(), id, *(const uint32_t*)((const char*)ev + 0x0C), recv, (unsigned)ret);
+            Phase1_LogLine(line);
         }
         FirstSight(vt, ret, id, pl, src, recv);
     } __except (EXCEPTION_EXECUTE_HANDLER) {

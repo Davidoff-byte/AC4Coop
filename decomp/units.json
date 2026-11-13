@@ -161,6 +161,15 @@
    "size": 421,
    "status": "claimed"
   },
+  "0064A020": {
+   "addr": "0064A020",
+   "claimed_at": null,
+   "name": "EventPost",
+   "owner": null,
+   "receipts": [],
+   "size": 41,
+   "status": "unknown"
+  },
   "00657BE0": {
    "addr": "00657BE0",
    "claimed_at": "2026-11-08T12:12:53Z",
@@ -386,6 +395,15 @@
    "size": 16,
    "status": "claimed"
   },
+  "00A094D0": {
+   "addr": "00A094D0",
+   "claimed_at": null,
+   "name": "HandlePoolRelease",
+   "owner": null,
+   "receipts": [],
+   "size": 45,
+   "status": "unknown"
+  },
   "00A0BDE0": {
    "addr": "00A0BDE0",
    "claimed_at": "2026-11-08T12:12:55Z",
@@ -471,6 +489,24 @@
    "owner": null,
    "receipts": [],
    "size": 88,
+   "status": "unknown"
+  },
+  "00FA3260": {
+   "addr": "00FA3260",
+   "claimed_at": null,
+   "name": "NewStimulusEvent",
+   "owner": null,
+   "receipts": [],
+   "size": 152,
+   "status": "unknown"
+  },
+  "00FA3300": {
+   "addr": "00FA3300",
+   "claimed_at": null,
+   "name": "NewStimulusTemplateEvent",
+   "owner": null,
+   "receipts": [],
+   "size": 152,
    "status": "unknown"
   },
   "00FB3220": {
