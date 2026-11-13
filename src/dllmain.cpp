@@ -32,6 +32,7 @@
 #include "puppet_stim.h"
 #include "react_probe.h"
 #include "guard_poi.h"
+#include "fight_probe.h"
 #include "action_guard.h"
 #include "deref_guard.h"
 #include "combat_observe.h"
@@ -593,6 +594,9 @@ BOOL APIENTRY DllMain(HMODULE hMod, DWORD reason, LPVOID)
 
         // Host: per-guard player of interest (0x6F6010, 0x65A688) and the world-conflict null guard (0x15DB19C).
         GuardPoi::Init();
+
+        // Which path removes the puppet's fighter record (sub_161F420). [Coop] FightProbe, default 0.
+        FightProbe::Init();
 
         // Stage 2A combat observer (E2-combat.md §1.2). OBSERVATION ONLY, installed as a byte-patch
         // hook: four whole-instruction prologues are detoured into private stubs that log the call
