@@ -123,11 +123,11 @@ __declspec(naked) void Detour()
     }
 }
 
-BYTE* BuildTrampoline(uintptr_t resume)
+BYTE* BuildTrampoline(const BYTE* stolen, uintptr_t resume)
 {
     BYTE* t = (BYTE*)VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (!t) return nullptr;
-    memcpy(t, kPrologue, STEAL_LEN);
+    memcpy(t, stolen, STEAL_LEN);
     t[STEAL_LEN] = 0x68;                                       // push imm32; ret = absolute jump
     *reinterpret_cast<DWORD*>(t + STEAL_LEN + 1) = (DWORD)resume;
     t[STEAL_LEN + 5] = 0xC3;
@@ -135,17 +135,90 @@ BYTE* BuildTrampoline(uintptr_t resume)
     return t;
 }
 
+// ---- [Coop] GuardActionGate ---------------------------------------------------------------------------------
+// Hook site: SetTargetAction, int __thiscall sub_6625D0(ActionComponent* this, int alias, int, int, int, int)
+//   0x006625D0  55 8B EC 8B 41 08   push ebp / mov ebp,esp / mov eax,[ecx+8]   <- 6 bytes stolen
+//   0x006625D6  cmp eax, dword_2AC1408 ; jz 0x6625F9 (pop ebp; retn 14h)          <- engine's own no-op path
+// The ActionWriterProbe run (2026-11-13, build 5F58215C) showed every switch that took a mirrored guard away from the
+// host alias came through here (return 0x006625F9 into sub_65DCB0 -> sub_658CA0 -> sub_651C20), called from AI
+// context-state code (e.g. sub_1D178B0, sub_1D138C0, sub_1D15690, sub_194FC90; one passes alias 93469659 literally).
+// When on, such a call - target body is one we drive, not our own write, alias != host alias - takes the engine's
+// no-op exit instead (eax = [ecx+8]; ret 14h), the same result the function returns when this[2] == dword_2AC1408.
+const uintptr_t VA_SETTARGET = 0x006625D0;
+const BYTE kStaPrologue[STEAL_LEN] = { 0x55, 0x8B, 0xEC, 0x8B, 0x41, 0x08 };
+DWORD g_staTramp = 0;
+bool  g_gateInstalled = false;
+volatile LONG g_gateBlocked = 0, g_gatePassed = 0;
+int       g_gateOn = 0;
+ULONGLONG g_gateNextMs = 0;
+
+int __cdecl GateShouldBlock(void* ac, uint32_t alias)
+{
+    __try {
+        const ULONGLONG nowMs = GetTickCount64();
+        if (nowMs >= g_gateNextMs) {
+            g_gateNextMs = nowMs + 2000;
+            g_gateOn = GetPrivateProfileIntA("Coop", "GuardActionGate", 0, Paths::Ini()) != 0;
+        }
+        if (!g_gateOn || t_own) return 0;
+        const uintptr_t a = (uintptr_t)ac;
+        for (int i = 0; i < MIR_MAX; ++i) {
+            if (g_mirAc[i] != a) continue;
+            if (nowMs - g_mirMs[i] > 1000) return 0;
+            if (alias == g_mirAlias[i]) { InterlockedIncrement(&g_gatePassed); return 0; }
+            InterlockedIncrement(&g_gateBlocked);
+            return 1;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    return 0;
+}
+
+// Entry: ECX = this, [esp] = return address, [esp+4] = alias.
+__declspec(naked) void GateDetour()
+{
+    __asm {
+        pushad                      // original esp+4 (alias) is now at esp+36
+        mov  eax, [esp + 36]
+        push eax                    // arg 2: alias
+        push ecx                    // arg 1: this
+        call GateShouldBlock
+        add  esp, 8
+        test eax, eax               // flags survive popad
+        popad
+        jnz  blocked
+        jmp  dword ptr [g_staTramp]
+    blocked:
+        mov  eax, [ecx + 8]         // the engine's own no-op result (sub_6625D0 when this[2] == dword_2AC1408)
+        ret  14h
+    }
+}
+
 }  // namespace
 
 void ActionWriter::Init()
 {
+    // The gate hook is installed when the key is present with any value (it is re-read live, so a run can flip it
+    // 0 <-> 1); the probe hook only with ActionWriterProbe=1.
+    if (GetPrivateProfileIntA("Coop", "GuardActionGate", -1, Paths::Ini()) >= 0) {
+        const uintptr_t sta = GameModuleBase + (VA_SETTARGET - 0x00400000);
+        if (memcmp((const void*)sta, kStaPrologue, STEAL_LEN) == 0) {
+            BYTE* t = BuildTrampoline(kStaPrologue, sta + STEAL_LEN);
+            if (t) {
+                g_staTramp = (DWORD)(uintptr_t)t;
+                if (Hook::DetourFunc((BYTE*)sta, (DWORD)(uintptr_t)&GateDetour, (DWORD)STEAL_LEN)) g_gateInstalled = true;
+            }
+        } else {
+            OutputDebugStringA("[ActWriter] prologue mismatch at 0x6625D0 - gate not installed\n");
+        }
+    }
     if (!GetPrivateProfileIntA("Coop", "ActionWriterProbe", 0, Paths::Ini())) return;
     const uintptr_t site = GameModuleBase + (VA_SWITCH - 0x00400000);
     if (memcmp((const void*)site, kPrologue, STEAL_LEN) != 0) {
         OutputDebugStringA("[ActWriter] prologue mismatch at 0x651C20 - not installed\n");
         return;
     }
-    BYTE* t = BuildTrampoline(site + STEAL_LEN);
+    BYTE* t = BuildTrampoline(kPrologue, site + STEAL_LEN);
     if (!t) return;
     g_tramp = (DWORD)(uintptr_t)t;
     if (!Hook::DetourFunc((BYTE*)site, (DWORD)(uintptr_t)&Detour, (DWORD)STEAL_LEN)) return;
@@ -153,11 +226,11 @@ void ActionWriter::Init()
     OutputDebugStringA("[ActWriter] installed at 0x651C20\n");
 }
 
-bool ActionWriter::Installed() { return g_installed; }
+bool ActionWriter::Installed() { return g_installed || g_gateInstalled; }
 
 void ActionWriter::NoteMirrored(void* ac, uint32_t hostAlias)
 {
-    if (!g_installed || !ac) return;
+    if ((!g_installed && !g_gateInstalled) || !ac) return;
     const uintptr_t a = (uintptr_t)ac;
     const ULONGLONG nowMs = GetTickCount64();
     AcquireSRWLockExclusive(&g_mirLock);
@@ -175,7 +248,7 @@ void ActionWriter::SetOwn(bool on) { t_own = on ? 1 : 0; }
 
 int ActionWriter::FormatReport(char* out, int cap)
 {
-    if (!g_installed || cap < 64) return 0;
+    if ((!g_installed && !g_gateInstalled) || cap < 64) return 0;
     Site top[6] = {}; int nTop = 0; LONG drop = 0;
     AcquireSRWLockExclusive(&g_siteLock);
     for (int i = 0; i < g_nSite; ++i) {
@@ -188,7 +261,8 @@ int ActionWriter::FormatReport(char* out, int cap)
     }
     g_nSite = 0; drop = g_siteDrop; g_siteDrop = 0;
     ReleaseSRWLockExclusive(&g_siteLock);
-    int n = _snprintf_s(out, cap, _TRUNCATE, "[ActWriter] mirrored switches=%ld toHost=%ld other=%ld own=%ld sitesDropped=%ld |",
+    int n = _snprintf_s(out, cap, _TRUNCATE, "[ActWriter] gate=%d/%d blocked=%ld passed=%ld | mirrored switches=%ld toHost=%ld other=%ld own=%ld sitesDropped=%ld |",
+                        g_gateInstalled ? 1 : 0, g_gateOn, InterlockedExchange(&g_gateBlocked, 0), InterlockedExchange(&g_gatePassed, 0),
                         InterlockedExchange(&g_switch, 0), InterlockedExchange(&g_toHost, 0),
                         InterlockedExchange(&g_other, 0), InterlockedExchange(&g_own, 0), drop);
     for (int i = 0; i < nTop && n > 0 && n < cap - 80; ++i)
