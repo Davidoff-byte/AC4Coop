@@ -5864,6 +5864,16 @@ static int s_gbfOn = 0; static uint64_t s_gbfNext = 0;
 static bool GuardBlendFixOn() { return OwnFlag("GuardBlendFix", &s_gbfOn, &s_gbfNext) != 0; }
 static volatile LONG s_gaFaults = 0, s_gaBanned = 0;
 static volatile LONG s_phFrames = 0, s_phOk = 0;
+// [Coop] GuardPhaseLock (default 0; live). The guard is seeked to the host's phase only on an action switch, so a body
+// already playing the host's alias is never aligned and drift after a switch is never corrected; and hostRatio is
+// the received sample, not extrapolated. With the flag on, while the body plays the host's alias: host phase is
+// extrapolated by the body's measured ratio rate (divided by our own nudge, so it is the rate at the host's time
+// scale), an error > 0.15 is seeked (at most every 500 ms), a smaller one is closed over ~0.5 s by scaling the time
+// scale within [0.75, 1.25]. Never across the end of the clip (hostRatio + extrapolation >= 1: one-shot clips).
+// The `px` probe (extrapolated |error| < 0.05) runs with the flag off too, so off vs on is an A/B. UNVERIFIED live.
+static int s_plOn = 0; static uint64_t s_plNext = 0;
+static bool GuardPhaseLockOn() { return OwnFlag("GuardPhaseLock", &s_plOn, &s_plNext) != 0; }
+static volatile LONG s_pxFrames = 0, s_pxOk = 0, s_plSeeks = 0, s_plNudged = 0;
 
 // [Coop] OwnPhysicsMs (default 0 = render-only writes, physics only on placement / >5 m jumps): in own-update
 // mode, also move the body's physics (SetGlobalMatrixInternal updatePhysics=true) at most every N ms; 1 = every
@@ -5915,6 +5925,8 @@ struct GaState {
     uint32_t bfAlias; float bfLen, bfSfe, bfTgt; uint16_t bfFlags; uint8_t bfWait;   // blend-in fix, as the puppet's
     uint8_t  zeroSlots[BLEND_MAX];              // slots we set non-zero last time (zeroed when they drop out)
     uint8_t  banned;                            // a fault happened inside the apply for this body: never again
+    // [Coop] GuardPhaseLock: measured playback rate (ratio/s at the host's time scale) of the current alias
+    uint32_t rateAlias; float rate, lastR, nudge; uint64_t lastRUs, seekUs;
 };
 struct OwnBody {
     unsigned int human, ent;
@@ -6090,6 +6102,46 @@ static void GuardAnimApply(Human* h, OwnBody& o, uint64_t now, volatile int* ste
         void* ev = ac->GetCurrentEvaluator(0, ACTLAYER_PRIMARY);
         const bool evNew = ev != st.lastEv;
         st.lastEv = ev;
+        // ---- phase lock / extrapolated phase probe ----
+        *step = 9;
+        const bool plOn = GuardPhaseLockOn();
+        float tsMul = 1.0f;
+        {
+            const float r = ac->GetCurrentActionRatio(0, ACTLAYER_PRIMARY);
+            if (st.rateAlias != o.alias) { st.rateAlias = o.alias; st.rate = 0.0f; st.lastRUs = 0; st.nudge = 1.0f; }
+            if (st.lastRUs) {
+                const float dt = (now - st.lastRUs) / 1e6f;
+                float dr = r - st.lastR;
+                if (dr < -0.5f) dr += 1.0f;
+                if (dt > 0.004f && dt < 0.1f && dr > 0.0f && dr < 0.5f) {
+                    const float base = (dr / dt) / (st.nudge > 0.05f ? st.nudge : 1.0f);
+                    st.rate = st.rate > 0.0f ? st.rate + 0.2f * (base - st.rate) : base;
+                }
+            }
+            st.lastR = r; st.lastRUs = now;
+            const float age = (now - o.animUs) / 1e6f;
+            const float adv = st.rate * age;
+            if (st.rate > 0.0f && age < 0.25f && hostRatio > 0.0f && hostRatio < 1.0f && hostRatio + adv < 1.0f) {
+                const float hostNow = hostRatio + adv;
+                float e = hostNow - r;
+                if (e > 0.5f) e -= 1.0f; else if (e < -0.5f) e += 1.0f;
+                const float ae = e < 0.0f ? -e : e;
+                InterlockedIncrement(&s_pxFrames);
+                if (ae < 0.05f) InterlockedIncrement(&s_pxOk);
+                if (plOn) {
+                    if (ae > 0.15f && now - st.seekUs > 500000) {
+                        ac->SetCurrentActionRatio(hostNow, 0, false, false, ACTLAYER_PRIMARY);
+                        st.seekUs = now; st.lastRUs = 0;      // the seek is not playback: skip the next rate sample
+                        InterlockedIncrement(&s_plSeeks);
+                    } else {
+                        const float m = 1.0f + (e / 0.5f) / st.rate;
+                        tsMul = m < 0.75f ? 0.75f : (m > 1.25f ? 1.25f : m);
+                        if (tsMul != 1.0f) InterlockedIncrement(&s_plNudged);
+                    }
+                }
+            }
+        }
+        bool tsWritten = false;
         // Every frame for a new evaluator or a changed block, else every 4th frame (re-assert against the body's
         // own blend-tree update).
         if (evNew || o.animUs > st.factorUs || (st.frameN & 3) == 0) {
@@ -6113,10 +6165,22 @@ static void GuardAnimApply(Human* h, OwnBody& o, uint64_t now, volatile int* ste
             *step = 7;
             if (ts > 0.01f) {
                 ac->SetTimeScalePersistence(ACTPERSIST_ALWAYS, 0, ACTLAYER_PRIMARY);
-                ac->SetTimeScale(ts, 0, ACTLAYER_PRIMARY, false);
+                ac->SetTimeScale(ts * tsMul, 0, ACTLAYER_PRIMARY, false);
+                tsWritten = true;
             }
             InterlockedIncrement(&s_gaFactorWrites);
             st.factorUs = now;
+        }
+        // Phase lock: the nudged time scale every frame (the block above runs every 4th frame).
+        {
+            const float ts = g.timeScaleQ / 256.0f;
+            if (plOn && ts > 0.01f && !tsWritten) {
+                *step = 10;
+                ac->SetTimeScalePersistence(ACTPERSIST_ALWAYS, 0, ACTLAYER_PRIMARY);
+                ac->SetTimeScale(ts * tsMul, 0, ACTLAYER_PRIMARY, false);
+                tsWritten = true;
+            }
+            st.nudge = tsWritten ? tsMul : (plOn ? st.nudge : 1.0f);
         }
         // O2 phase probe: only within 60 ms of the host sample (the ratio moves while it ages)
         if (now - o.animUs < 60000) {
@@ -6325,10 +6389,12 @@ static void OwnReport() {
         const LONG sw = InterlockedExchange(&s_gaSwitch, 0), ra = InterlockedExchange(&s_gaReassert, 0);
         const LONG bf = InterlockedExchange(&s_gaBlendFix, 0), fw = InterlockedExchange(&s_gaFactorWrites, 0);
         const LONG phf = InterlockedExchange(&s_phFrames, 0), pho = InterlockedExchange(&s_phOk, 0);
+        const LONG pxf = InterlockedExchange(&s_pxFrames, 0), pxo = InterlockedExchange(&s_pxOk, 0);
         L("[GuardAnim] full=%d blendFixOn=%d switches=%ld reassert=%ld blendFix=%ld factorWrites=%ld faults=%ld bannedTotal=%ld | phase frames=%ld ok=%ld (%.1f%%)"
-          " | pupBlendSafe=%d mapped=%ld skip5=%ld\n",
+          " | pupBlendSafe=%d mapped=%ld skip5=%ld | lock=%d px frames=%ld ok=%ld (%.1f%%) seeks=%ld nudged=%ld\n",
           s_gaOn, s_gbfOn, sw, ra, bf, fw, InterlockedExchange(&s_gaFaults, 0), (long)s_gaBanned, phf, pho, phf ? 100.0 * pho / phf : 0.0,
-          g_blendTypeSafe, InterlockedExchange(&g_blendTypeMapped, 0), InterlockedExchange(&g_blendTypeSkipped, 0));
+          g_blendTypeSafe, InterlockedExchange(&g_blendTypeMapped, 0), InterlockedExchange(&g_blendTypeSkipped, 0),
+          s_plOn, pxf, pxo, pxf ? 100.0 * pxo / pxf : 0.0, InterlockedExchange(&s_plSeeks, 0), InterlockedExchange(&s_plNudged, 0));
     }
     L("[OwnAir] physMs=%d physWrites=%ld | ctx frames=%ld ground=%ld air=%ld (%.1f%%) other=%ld (last id %ld) | moving frames=%ld "
       "actMatch=%ld actMis=%ld (%.1f%%) top body<-host:%s\n",
