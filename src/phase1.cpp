@@ -6465,6 +6465,86 @@ void* Phase1_PuppetEntity() {
     return e;
 }
 bool Phase1_IsEntityHost() { return g_entHost == 1; }
+
+// ---- [Coop] StateProbe (default 0; live; read-only; <= 4000 lines per process) ----------------------------------
+// docs/evidence/guard-statechart-2026-11-13.md: the second writer on mirrored guards is the Human context
+// statechart. Human::m_ActorTrackList[5] at +8 (stride 0x30, current context at track+0x14), main track byte +0x100
+// (sub_52C220 / sub_52DFF0, o21-o22). For the context class with vtable 0x026E8AE8 the active-state stack is a u16
+// array at *(ctx+0x118) with its count u16 at ctx+0x11E, root first (event dispatch sub_1D65BB0, o24). The stack
+// layout of OTHER context classes differs (sub_103B420 uses +0x4C/+0x52), so it is read only for 0x026E8AE8.
+// Logs a line when a guard's (main track, context id on track 1, context vptr, state path) changes, on the host for
+// captured guards (slot via EntObjIdLast + s_syncSlot) and on the guest for mirrored bodies (slot via s_guestSlot).
+// Compare the two logs per slot offline. UNVERIFIED until a run: that the path is stable enough to compare, and
+// that this class is the one guards use.
+static int s_spbOn = 0; static uint64_t s_spbNext = 0; static volatile LONG s_spbLines = 0;
+static volatile LONG s_spbSeen = 0, s_spbKnown = 0, s_spbOther = 0, s_spbOtherVt = 0;
+static const unsigned STATECTX_VT_644 = 0x026E8AE8;   // context class with 644 states (o25)
+struct StSnap { int cx, main; unsigned vt; uint16_t depth, path[6]; };
+static uint32_t s_spbSig[SYNC_SLOT_MAX];               // last logged signature per slot and side
+static uint32_t StateSig(const StSnap& s) {
+    uint32_t h = 2166136261u;
+    const unsigned char* p = (const unsigned char*)&s;
+    for (size_t i = 0; i < sizeof(s); ++i) { h ^= p[i]; h *= 16777619u; }
+    return h ? h : 1;
+}
+static bool StateRead(Human* h, StSnap& s) {
+    memset(&s, 0, sizeof(s));
+    const char* hb = (const char*)h;
+    if (!readable(hb, 0x110)) return false;
+    s.cx = h->GetCurrentContextID(MAIN_AI_TRACK);
+    s.main = *(const uint8_t*)(hb + 0x100);
+    if (s.main < 0 || s.main > 4) return false;
+    const char* ctx = *(const char* const*)(hb + 8 + 0x30 * s.main + 0x14);
+    if (!readable(ctx, 0x120)) return true;
+    s.vt = *(const unsigned*)ctx;
+    if (s.vt != STATECTX_VT_644) return true;
+    const uint16_t n = *(const uint16_t*)(ctx + 0x11E);
+    const uint16_t* arr = *(const uint16_t* const*)(ctx + 0x118);
+    s.depth = n;
+    if (n && readable(arr, (size_t)n * 2)) {
+        const int k = n < 6 ? n : 6;              // the deepest 6 (leaf last)
+        for (int i = 0; i < k; ++i) s.path[i] = arr[n - k + i];
+    }
+    return true;
+}
+static void StateProbeNote(Human* h, int slot, bool host) {
+    if (slot < 0 || slot >= SYNC_SLOT_MAX) return;
+    StSnap s;
+    __try { if (!StateRead(h, s)) return; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+    InterlockedIncrement(&s_spbSeen);
+    if (s.vt == STATECTX_VT_644) InterlockedIncrement(&s_spbKnown);
+    else { InterlockedIncrement(&s_spbOther); InterlockedExchange(&s_spbOtherVt, (LONG)s.vt); }
+    const uint32_t sig = StateSig(s);
+    if (s_spbSig[slot] == sig) return;
+    s_spbSig[slot] = sig;
+    if (InterlockedIncrement(&s_spbLines) > 4000) return;
+    LARGE_INTEGER c, f; QueryPerformanceCounter(&c); QueryPerformanceFrequency(&f);
+    const unsigned long long ms = (unsigned long long)((c.QuadPart / f.QuadPart) * 1000ull + (c.QuadPart % f.QuadPart) * 1000ull / f.QuadPart);
+    L("[State] %s slot=%d t=%llu main=%d cx=%d ctx=%08X d=%u path=%u/%u/%u/%u/%u/%u\n", host ? "H" : "G", slot, ms,
+      s.main, s.cx, s.vt, (unsigned)s.depth, s.path[0], s.path[1], s.path[2], s.path[3], s.path[4], s.path[5]);
+}
+static bool StateProbeOn() { return OwnFlag("StateProbe", &s_spbOn, &s_spbNext) != 0; }
+// Host side, from the frame hook: only Humans whose entity is a captured guard (EntObjIdLast is filled by
+// EmitGuardEntity) are logged.
+static void StateProbeHost(Human* h) {
+    if (g_entHost != 1 || !StateProbeOn()) return;
+    __try {
+        AIActorData* d = h->m_AIActorDataPtr;
+        if (!readable(d, 8)) return;
+        const uint64_t id = EntObjIdLast((unsigned int)d->m_ActorEntity);
+        if (!id) return;
+        for (int i = 0; i < SYNC_SLOT_MAX; ++i)
+            if (s_syncSlot[i].used && s_syncSlot[i].objId == id) { StateProbeNote(h, i, true); return; }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+static int StateProbeHb(char* out, int cap) {
+    if (!s_spbOn) return 0;
+    return _snprintf_s(out, cap, _TRUNCATE, "[StateHB] seen=%ld ctx644=%ld other=%ld lastOtherVt=%08X lines=%ld\n",
+                       InterlockedExchange(&s_spbSeen, 0), InterlockedExchange(&s_spbKnown, 0),
+                       InterlockedExchange(&s_spbOther, 0), (unsigned)s_spbOtherVt, s_spbLines);
+}
+
 static void PuppetOwnClear() {
     InterlockedExchange(&s_pupHumanKey, 0);
     AcquireSRWLockExclusive(&s_pupLock);
@@ -6526,6 +6606,10 @@ static void OwnDrain(Human* h) {
         if (cx == 2) InterlockedIncrement(&s_cxGround);
         else if (cx == 6) InterlockedIncrement(&s_cxAir);
         else { InterlockedIncrement(&s_cxOther); InterlockedExchange(&s_cxOtherId, cx); }
+    }
+    if (StateProbeOn()) {                      // [Coop] StateProbe, guest side: slot of this mirrored body
+        for (int si = 0; si < SYNC_SLOT_MAX; ++si)
+            if (s_guestSlot[si].used && s_guestSlot[si].ent == o.ent) { StateProbeNote(h, si, false); break; }
     }
     // what is this body playing (needed by both probes below)
     uint32_t curAlias = 0; bool haveCur = false;
@@ -10768,6 +10852,7 @@ static void OnFrameInner(Human* updatedHuman);
 // the process down. Crashes that follow from engine state we already corrupted will still happen, but a
 // bad pointer in our own code no longer kills the game - and the log names the frame instead of ending.
 static void __cdecl OnFrame(Human* updatedHuman) {
+    StateProbeHost(updatedHuman);                // [Coop] StateProbe host side (no-op unless on and host)
     __try { OwnDrain(updatedHuman); }            // puppet / mirrored guard: probe, and write in own-update mode
     __except (EXCEPTION_EXECUTE_HANDLER) {
         static int s_on = 0;
@@ -10831,6 +10916,11 @@ static void DumpConfigOnce()
         { "Coop", "ShipGhost", 0 }, { "Coop", "ShipGhostSelfTest", 0 }, { "Coop", "ShipHPSync", 0 },
         { "Coop", "ShipPassenger", 0 }, { "Coop", "ShipRelevanceRadiusM", 1000 }, { "Coop", "ShipSync", 1 },
         { "Coop", "ShipTest", 0 }, { "Coop", "ShipTestFracPct", 45 }, { "Coop", "ShipTestRadiusM", 250 },
+        { "Coop", "ActionWriterProbe", 0 }, { "Coop", "BlendTypeSafe", 0 }, { "Coop", "EntityFrameCadence", 0 },
+        { "Coop", "FloatProbe", 0 }, { "Coop", "FootOffsetFix", 0 }, { "Coop", "GuardActionGate", 0 }, { "Coop", "GuardExtrapMs", 100 },
+        { "Coop", "GuardInterpBuffer", 0 }, { "Coop", "GuardInterpDelayMs", 120 }, { "Coop", "GuardPhaseLock", 0 },
+        { "Coop", "GuardSeesPuppet", 0 }, { "Coop", "PuppetActionReassert", 0 }, { "Coop", "PuppetHostTime", 0 },
+        { "Coop", "SightProbe", 0 }, { "Coop", "StateProbe", 0 }, { "Coop", "StuckProbe", 0 },
         { "Coop", "StageLog", 0 }, { "Coop", "SyncEnemiesOnly", 1 }, { "Coop", "SyncMaxEntities", 32 },
         { "Coop", "SyncRadiusM", 60 }, { "Coop", "TransformProbe", 0 }, { "Coop", "VPadEnable", 0 },
         { "Coop", "VPadTest", 0 }, { "Coop", "WatchDeadBit", 0 }, { "Coop", "WatchTarget", 0 },
@@ -11201,6 +11291,8 @@ static void OnFrameInner(Human* updatedHuman) {
             s_sightNext = hbNow + 5000;
             char sb[256];
             if (GuardSight::FormatReport(sb, sizeof(sb)) > 0) L("%s\n", sb);
+            char stb[160];
+            if (StateProbeHb(stb, sizeof(stb)) > 0) L("%s", stb);   // [Coop] StateProbe counters (both roles)
         }
     }
     // F8 live test (no-op unless [Coop] BoardableTest=1). Must sit ABOVE the Net::Enabled() block: that block always
