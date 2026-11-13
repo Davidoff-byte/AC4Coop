@@ -423,6 +423,7 @@ namespace {
     }
 
     DecodeReason DecodeEntityChunk(const uint8_t* in, size_t len, EntityPacket& out, DecodeReason* why);
+    bool SelfTestIntent();   // proto 15 intention lane, defined after the lane below
     bool SelfTestWire() {
         // Static: sizeof(EntityPacket) is ~16 KB at proto 13 and five of them are used here.
         static EntityPacket a, b, c, d, f;
@@ -534,7 +535,8 @@ namespace {
                   ok3 ? "PASS" : "FAIL", ok5 ? "PASS" : "FAIL", ok6 ? "PASS" : "FAIL", okS ? "PASS" : "FAIL",
                   (unsigned)n1, (unsigned)nr, (unsigned)n2, (unsigned)n3, (unsigned)n4, (unsigned)n5, (unsigned)n6);
         dbg(m);
-        return ok && okR && ok2 && ok3 && ok4 && ok5 && ok6 && okS;
+        const bool okI = SelfTestIntent();   // proto 15: golden, parse, ack, dedup, reorder, 30% loss, rejoin replay
+        return ok && okR && ok2 && ok3 && ok4 && ok5 && ok6 && okS && okI;
     }
 
     bool DecodeEntityPacket(const uint8_t* in, size_t len, EntityPacket& out, DecodeReason* why) {
@@ -724,7 +726,616 @@ namespace {
         return DEC_PENDING;
     }
 
-    // ---- reject observability (X4/X18) -----------------------------------------------------------
+    // ---- proto 15: intention lane (docs/design/intention-lane.md) ----------------------------------
+    // One IntentLane is this process's end of the lane: its incarnation, the persisted last value per
+    // (guard, channel), the per-peer state (outbox, ack window, receive order) and the delivery queue.
+    // The link has one peer today, so the lane holds one IntentPeer; everything a second peer would need
+    // to own (outbox, msgId space, ack window, base flags, receive order) is inside that struct.
+    // Not thread-safe by itself: the live instance is guarded by g_intentLock, the selftest instances are
+    // used single-threaded. Time is passed in (ms), so the selftest runs on a virtual clock.
+    static const int      INTENT_KEYS        = 512;    // persisted (guard, channel) values (128 guards x 4)
+    static const int      INTENT_OUTBOX      = 1024;   // unacked msgIds per peer (must be > INTENT_KEYS)
+    static const int      INTENT_RXKEYS      = 1024;   // receive order state per (guard, channel)
+    static const int      INTENT_PENDING     = 256;    // out-of-order messages held until their gap fills
+    static const int      INTENT_DELIVERQ    = 1024;   // delivered, not yet polled
+    static const uint32_t INTENT_ACKWIN      = 2048;   // msgIds tracked above ackCum (bitmap)
+    static const uint32_t INTENT_RESEND_MS   = 100;    // resend an unacked message after this ...
+    static const uint32_t INTENT_RESEND_IDLE_MS = 1000;//   ... or this while the peer has been silent
+    static const uint32_t INTENT_SILENT_MS   = 2000;   //   for longer than this
+    static const uint32_t INTENT_HELLO_MS    = 250;    // header-only datagram while the peer's incarnation is unknown
+    static const uint32_t INTENT_KEEPALIVE_MS = 1000;  // header-only datagram when nothing else went out
+    static const int      INTENT_PUMP_DGRAMS = 4;      // datagrams per pump at most
+    static_assert(INTENT_OUTBOX > INTENT_KEYS, "a resync must fit every persisted value in the outbox");
+    static_assert((INTENT_KEYS & (INTENT_KEYS - 1)) == 0 && (INTENT_RXKEYS & (INTENT_RXKEYS - 1)) == 0, "power of 2");
+    static_assert(INTENT_ACKWIN % 8 == 0, "bitmap");
+
+    enum IntentDec : uint8_t {
+        ID_OK = 0, ID_SHORT, ID_MAGIC, ID_PROTO, ID_MALFORMED,
+        ID_FOREIGN,   // well-formed, but addressed to another incarnation of this process: acks/messages ignored
+    };
+
+    struct IntentRec {          // one message as the lane stores it (wire fields + msgId)
+        uint32_t msgId;
+        uint32_t slot;
+        uint64_t wireId;
+        uint8_t  ch, flags, len, _pad;
+        uint32_t seq;
+        uint32_t hostMs;
+        uint8_t  pl[INTENT_PAYLOAD_MAX];
+    };
+
+    inline uint64_t IntentIdentity(uint32_t slot, uint64_t wireId) {
+        return wireId ? wireId : (0x8000000000000000ull | (uint64_t)slot);   // same convention as ShadowId
+    }
+    inline uint32_t IntentHash(uint64_t id, uint8_t ch) {
+        const uint64_t x = (id ^ ((uint64_t)ch << 56) ^ ch) * 0x9E3779B97F4A7C15ull;
+        return (uint32_t)(x >> 40);
+    }
+    // Open addressing with tombstones (state 0 empty, 1 used, 2 removed). T needs state, ch, id.
+    template <class T, int N>
+    int IntentFind(T (&tab)[N], uint64_t id, uint8_t ch, bool create, bool* created = nullptr) {
+        if (created) *created = false;
+        const uint32_t h = IntentHash(id, ch);
+        int tomb = -1;
+        for (int i = 0; i < N; ++i) {
+            const int s = (int)((h + (uint32_t)i) & (uint32_t)(N - 1));
+            T& e = tab[s];
+            if (e.state == 1 && e.id == id && e.ch == ch) return s;
+            if (e.state == 2 && tomb < 0) tomb = s;
+            if (e.state == 0) { if (tomb < 0) tomb = s; break; }
+        }
+        if (!create || tomb < 0) return -1;
+        std::memset(&tab[tomb], 0, sizeof(T));
+        tab[tomb].state = 1; tab[tomb].id = id; tab[tomb].ch = ch;
+        if (created) *created = true;
+        return tomb;
+    }
+
+    // ---- wire writers / reader (one place, shared by the lane and the golden-vector selftest) ----
+    size_t IntentPutHeader(uint8_t* o, uint32_t senderInc, uint32_t peerInc, uint32_t hostMs, uint32_t ackCum,
+                           uint8_t ranges, uint8_t msgs) {
+        IntentWireHeader h{};
+        h.magic = NET_INTENT_MAGIC; h.protoVer = NET_PROTO_VER; h.senderInc = senderInc; h.peerInc = peerInc;
+        h.hostMs = hostMs; h.ackCum = ackCum; h.ackRanges = ranges; h.msgCount = msgs; h.reserved = 0;
+        std::memcpy(o, &h, sizeof(h));
+        return sizeof(h);
+    }
+    size_t IntentPutRange(uint8_t* o, uint32_t first, uint16_t count) {
+        std::memcpy(o, &first, 4); std::memcpy(o + 4, &count, 2); return 6;
+    }
+    size_t IntentPutMsg(uint8_t* o, const IntentRec& r) {
+        std::memcpy(o, &r.msgId, 4); std::memcpy(o + 4, &r.slot, 4); std::memcpy(o + 8, &r.wireId, 8);
+        o[16] = r.ch; o[17] = r.flags; o[18] = r.len;
+        std::memcpy(o + 19, &r.seq, 4); std::memcpy(o + 23, &r.hostMs, 4);
+        std::memcpy(o + INTENT_MSG_FIXED, r.pl, r.len);
+        return (size_t)INTENT_MSG_FIXED + r.len;
+    }
+    // Parsed view of a datagram. Validation is complete before anything is applied, so a malformed
+    // datagram changes no state.
+    struct IntentParsed {
+        IntentWireHeader h;
+        uint32_t rFirst[INTENT_ACK_RANGES_MAX];
+        uint16_t rCount[INTENT_ACK_RANGES_MAX];
+        IntentRec m[INTENT_MSGS_MAX];
+    };
+    IntentDec IntentParse(const uint8_t* in, size_t len, IntentParsed& p) {
+        if (len < sizeof(IntentWireHeader)) return ID_SHORT;
+        std::memcpy(&p.h, in, sizeof(p.h));
+        if (p.h.magic != NET_INTENT_MAGIC) return ID_MAGIC;
+        if (p.h.protoVer != NET_PROTO_VER) return ID_PROTO;
+        if (p.h.senderInc == 0 || p.h.reserved != 0) return ID_MALFORMED;
+        if (p.h.ackRanges > INTENT_ACK_RANGES_MAX || p.h.msgCount > INTENT_MSGS_MAX) return ID_MALFORMED;
+        if (p.h.ackCum == 0 && p.h.ackRanges != 0) return ID_MALFORMED;   // runs without a base
+        size_t o = sizeof(IntentWireHeader);
+        for (uint8_t i = 0; i < p.h.ackRanges; ++i) {
+            if (o + 6 > len) return ID_MALFORMED;
+            std::memcpy(&p.rFirst[i], in + o, 4); std::memcpy(&p.rCount[i], in + o + 4, 2); o += 6;
+        }
+        for (uint8_t i = 0; i < p.h.msgCount; ++i) {
+            if (o + INTENT_MSG_FIXED > len) return ID_MALFORMED;
+            IntentRec& r = p.m[i];
+            std::memcpy(&r.msgId, in + o, 4); std::memcpy(&r.slot, in + o + 4, 4); std::memcpy(&r.wireId, in + o + 8, 8);
+            r.ch = in[o + 16]; r.flags = in[o + 17]; r.len = in[o + 18]; r._pad = 0;
+            std::memcpy(&r.seq, in + o + 19, 4); std::memcpy(&r.hostMs, in + o + 23, 4);
+            o += INTENT_MSG_FIXED;
+            if (r.msgId == 0) return ID_MALFORMED;
+            if (r.ch == IC_UNDEFINED || r.ch >= IC_LIMIT) return ID_MALFORMED;
+            if (r.flags & (uint8_t)~IF_BASE) return ID_MALFORMED;
+            if (r.len > INTENT_PAYLOAD_MAX || o + r.len > len) return ID_MALFORMED;
+            std::memset(r.pl, 0, sizeof(r.pl));
+            std::memcpy(r.pl, in + o, r.len); o += r.len;
+        }
+        if (o != len) return ID_MALFORMED;   // trailing bytes: not a datagram this build wrote
+        return ID_OK;
+    }
+
+    struct IntentPeer {
+        // ---- transmit side ----
+        uint32_t remoteInc;                 // the peer's incarnation; 0 = not heard from yet (send no messages)
+        uint32_t nextMsgId;                 // next msgId to assign (1 after a reset)
+        uint32_t outLow;                    // lowest msgId that may still be unacked
+        struct Out { uint8_t used; uint16_t sends; uint64_t lastSentMs; IntentRec rec; } out[INTENT_OUTBOX];  // by msgId % N
+        uint8_t  baseDone[INTENT_KEYS];     // per persisted index: a message of that key went into this peer's outbox
+        uint64_t lastTxMs, lastRxMs, lastHelloMs;
+        // ---- receive side ----
+        uint32_t ackCum;                    // every msgId < ackCum arrived (1 after a reset)
+        uint8_t  ackBits[INTENT_ACKWIN / 8];// bit (id % WIN): id arrived, for ackCum < id < ackCum + WIN
+        bool     ackOwed;                   // a message-bearing (or foreign) datagram arrived since our last send
+        struct RxKey { uint8_t state, ch, have, _p; uint32_t next; uint64_t id; } rxk[INTENT_RXKEYS];
+        struct Pend { uint8_t used; IntentRec rec; } pend[INTENT_PENDING];
+    };
+
+    struct IntentLane {
+        uint32_t myInc;
+        uint32_t seqHigh;                   // highest chanSeq ever assigned: a (re)created key starts above it
+        struct Persist { uint8_t state, ch, _p[2]; uint64_t id; IntentRec rec; } keys[INTENT_KEYS];
+        uint32_t persisted;
+        IntentPeer peer;
+        Net::IntentMsg dq[INTENT_DELIVERQ];
+        int      dqHead, dqCount;
+        bool     drainBlocked;
+        Net::IntentStats st;
+
+        void Init(uint32_t inc) {
+            std::memset(this, 0, sizeof(*this));
+            myInc = inc ? inc : 1u;
+            ResetPeer(0);
+        }
+        static bool SeqLess(uint32_t a, uint32_t b) { return SeqDiff(a, b) < 0; }
+        uint32_t Outstanding() const { return peer.nextMsgId - peer.outLow; }   // upper bound, exact after acks
+
+        // ---- transmit ----
+        // New peer incarnation (or none): its msgId space restarts, everything unacked is dropped, and every
+        // persisted value goes back into the outbox with IF_BASE so the peer starts each key at its current value.
+        void ResetPeer(uint64_t now) {
+            for (int i = 0; i < INTENT_OUTBOX; ++i) peer.out[i].used = 0;
+            std::memset(peer.baseDone, 0, sizeof(peer.baseDone));
+            peer.nextMsgId = 1; peer.outLow = 1;
+            peer.lastHelloMs = 0; (void)now;
+            if (peer.remoteInc) ReplayPersisted();
+        }
+        void ReplayPersisted() {
+            for (int k = 0; k < INTENT_KEYS; ++k) {
+                if (keys[k].state != 1) continue;
+                IntentRec r = keys[k].rec; r.flags = IF_BASE;
+                peer.baseDone[k] = 1;
+                EnqueueRaw(r);
+            }
+        }
+        bool EnqueueRaw(IntentRec r) {
+            if (peer.nextMsgId - peer.outLow >= (uint32_t)INTENT_OUTBOX) return false;
+            r.msgId = peer.nextMsgId++;
+            IntentPeer::Out& o = peer.out[r.msgId % INTENT_OUTBOX];
+            o.used = 1; o.sends = 0; o.lastSentMs = 0; o.rec = r;
+            return true;
+        }
+        // Outbox full (a peer that stopped acking): drop the backlog and resend only the current values.
+        void Resync() {
+            ++st.resyncs;
+            for (int i = 0; i < INTENT_OUTBOX; ++i) peer.out[i].used = 0;
+            peer.outLow = peer.nextMsgId;
+            ReplayPersisted();
+        }
+        bool Publish(uint32_t slot, uint64_t wireId, uint8_t ch, uint32_t hostMs, const void* pl, uint8_t len) {
+            if (ch == IC_UNDEFINED || ch >= IC_LIMIT || len > INTENT_PAYLOAD_MAX || (len && !pl)) return false;
+            bool created = false;
+            const int k = IntentFind(keys, IntentIdentity(slot, wireId), ch, true, &created);
+            if (k < 0) { ++st.persistFull; return false; }
+            IntentRec& r = keys[k].rec;
+            const uint32_t seq = created ? seqHigh + 1 : r.seq + 1;
+            if (created) { ++persisted; peer.baseDone[k] = 0; }
+            if (SeqDiff(seq, seqHigh) > 0) seqHigh = seq;
+            std::memset(&r, 0, sizeof(r));
+            r.slot = slot; r.wireId = wireId; r.ch = ch; r.len = len; r.seq = seq; r.hostMs = hostMs;
+            if (len) std::memcpy(r.pl, pl, len);
+            if (peer.remoteInc) {   // before the peer is known the persisted value is all it will get
+                IntentRec m = r;
+                m.flags = peer.baseDone[k] ? 0 : (uint8_t)IF_BASE;
+                peer.baseDone[k] = 1;
+                if (!EnqueueRaw(m)) Resync();   // the replay carries this value (already persisted)
+            }
+            return true;
+        }
+        void Forget(uint32_t slot, uint64_t wireId) {
+            const uint64_t id = IntentIdentity(slot, wireId);
+            for (uint8_t ch = 1; ch < IC_LIMIT; ++ch) {
+                const int k = IntentFind(keys, id, ch, false);
+                if (k >= 0) { keys[k].state = 2; peer.baseDone[k] = 0; --persisted; }
+                const int x = IntentFind(peer.rxk, id, ch, false);
+                if (x >= 0) peer.rxk[x].state = 2;
+            }
+            for (int i = 0; i < INTENT_PENDING; ++i)
+                if (peer.pend[i].used && IntentIdentity(peer.pend[i].rec.slot, peer.pend[i].rec.wireId) == id) peer.pend[i].used = 0;
+        }
+        void ApplyAcks(const IntentParsed& p) {
+            if (p.h.ackCum == 0) return;
+            uint32_t cum = p.h.ackCum;
+            if (SeqDiff(cum, peer.nextMsgId) > 0) cum = peer.nextMsgId;   // never ack what was not sent
+            auto ackOne = [this](uint32_t id) {
+                IntentPeer::Out& o = peer.out[id % INTENT_OUTBOX];
+                if (o.used && o.rec.msgId == id) o.used = 0;
+            };
+            for (uint32_t id = peer.outLow; SeqLess(id, cum); ++id) ackOne(id);
+            for (uint8_t i = 0; i < p.h.ackRanges; ++i) {
+                uint32_t a = p.rFirst[i], n = p.rCount[i];
+                if (SeqLess(a, peer.outLow)) { const uint32_t skip = peer.outLow - a; if (skip >= n) continue; a += skip; n -= skip; }
+                for (uint32_t j = 0; j < n && SeqLess(a + j, peer.nextMsgId); ++j) ackOne(a + j);
+            }
+            while (SeqLess(peer.outLow, peer.nextMsgId) && !peer.out[peer.outLow % INTENT_OUTBOX].used) ++peer.outLow;
+        }
+        // One datagram of what is due. 0 = nothing to send.
+        size_t Build(uint8_t* out, size_t cap, uint64_t now) {
+            if (cap < sizeof(IntentWireHeader) + 6u * INTENT_ACK_RANGES_MAX) return 0;
+            const bool known = peer.remoteInc != 0;
+            const uint32_t rto = (peer.lastRxMs && now - peer.lastRxMs > INTENT_SILENT_MS) ? INTENT_RESEND_IDLE_MS : INTENT_RESEND_MS;
+            size_t o = sizeof(IntentWireHeader);
+            uint8_t nr = 0;
+            if (known) {   // SACK runs above ackCum
+                uint32_t id = peer.ackCum + 1;
+                const uint32_t end = peer.ackCum + INTENT_ACKWIN;
+                while (SeqLess(id, end) && nr < INTENT_ACK_RANGES_MAX) {
+                    if (!(peer.ackBits[(id % INTENT_ACKWIN) / 8] & (1u << (id % 8)))) { ++id; continue; }
+                    const uint32_t a = id; uint32_t n = 0;
+                    while (SeqLess(id, end) && n < 0xFFFFu && (peer.ackBits[(id % INTENT_ACKWIN) / 8] & (1u << (id % 8)))) { ++id; ++n; }
+                    o += IntentPutRange(out + o, a, (uint16_t)n); ++nr;
+                }
+            }
+            uint8_t nm = 0;
+            if (known) {
+                for (uint32_t id = peer.outLow; SeqLess(id, peer.nextMsgId) && nm < INTENT_MSGS_MAX; ++id) {
+                    IntentPeer::Out& ob = peer.out[id % INTENT_OUTBOX];
+                    if (!ob.used || ob.rec.msgId != id) continue;
+                    if (ob.sends && now - ob.lastSentMs < rto) continue;
+                    if (o + INTENT_MSG_FIXED + ob.rec.len > cap) break;
+                    o += IntentPutMsg(out + o, ob.rec);
+                    if (ob.sends) ++st.txResends;
+                    if (ob.sends < 0xFFFF) ++ob.sends;
+                    ob.lastSentMs = now; ++nm;
+                }
+            }
+            const bool hello = !known && (peer.lastHelloMs == 0 || now - peer.lastHelloMs >= INTENT_HELLO_MS);
+            const bool keepalive = peer.lastTxMs == 0 || now - peer.lastTxMs >= INTENT_KEEPALIVE_MS;
+            if (nm == 0 && !peer.ackOwed && !hello && !keepalive) return 0;
+            IntentPutHeader(out, myInc, peer.remoteInc, (uint32_t)now, known ? peer.ackCum : 0u, nr, nm);
+            peer.ackOwed = false; peer.lastTxMs = now;
+            if (!known) peer.lastHelloMs = now;
+            ++st.txDgrams; st.txMsgs += nm;
+            return o;
+        }
+
+        // ---- receive ----
+        void ResetRx() {
+            peer.ackCum = 1; std::memset(peer.ackBits, 0, sizeof(peer.ackBits));
+            std::memset(peer.rxk, 0, sizeof(peer.rxk));
+            for (int i = 0; i < INTENT_PENDING; ++i) peer.pend[i].used = 0;
+        }
+        bool Deliver(const IntentRec& r) {
+            if (dqCount == INTENT_DELIVERQ) { drainBlocked = true; return false; }
+            Net::IntentMsg& m = dq[(dqHead + dqCount) % INTENT_DELIVERQ];
+            m.slot = r.slot; m.wireId = r.wireId; m.channel = r.ch; m.flags = r.flags; m.len = r.len;
+            m.seq = r.seq; m.hostMs = r.hostMs; std::memcpy(m.payload, r.pl, sizeof(m.payload));
+            ++dqCount; ++st.delivered;
+            return true;
+        }
+        void DrainKey(IntentPeer::RxKey& k) {
+            for (bool again = true; again; ) {
+                again = false;
+                for (int i = 0; i < INTENT_PENDING; ++i) {
+                    IntentPeer::Pend& p = peer.pend[i];
+                    if (!p.used || p.rec.ch != k.ch || IntentIdentity(p.rec.slot, p.rec.wireId) != k.id) continue;
+                    if (SeqLess(p.rec.seq, k.next)) { p.used = 0; continue; }            // superseded by a base
+                    if (p.rec.seq != k.next) continue;
+                    if (!Deliver(p.rec)) return;                                         // retried from Poll
+                    p.used = 0; ++k.next; again = true;
+                }
+            }
+        }
+        // False = no room to hold it (not acked, so the sender resends it).
+        bool Buffer(const IntentRec& r) {
+            int freeIx = -1;
+            for (int i = 0; i < INTENT_PENDING; ++i) {
+                const IntentPeer::Pend& p = peer.pend[i];
+                if (!p.used) { if (freeIx < 0) freeIx = i; continue; }
+                if (p.rec.ch == r.ch && p.rec.seq == r.seq && p.rec.wireId == r.wireId && p.rec.slot == r.slot) { ++st.dupDropped; return true; }
+            }
+            if (freeIx < 0) { ++st.refused; return false; }
+            peer.pend[freeIx].used = 1; peer.pend[freeIx].rec = r; ++st.buffered;
+            return true;
+        }
+        bool RxMessage(const IntentRec& r) {
+            const int x = IntentFind(peer.rxk, IntentIdentity(r.slot, r.wireId), r.ch, true);
+            if (x < 0) { ++st.refused; return false; }
+            IntentPeer::RxKey& k = peer.rxk[x];
+            const bool base = (r.flags & IF_BASE) != 0;
+            if (k.have && SeqLess(r.seq, k.next)) { ++st.dupDropped; return true; }   // already delivered (or rebased past)
+            if (base || (k.have && r.seq == k.next)) {
+                if (!Deliver(r)) return false;
+                k.have = 1; k.next = r.seq + 1;
+                DrainKey(k);
+                return true;
+            }
+            return Buffer(r);   // a gap before it, or no base for this key yet
+        }
+        IntentDec Receive(const uint8_t* in, size_t len, uint64_t now) {
+            static IntentParsed p;   // ~4.5 KB; one receiving thread per lane (selftest instances run on one thread too)
+            const IntentDec d = IntentParse(in, len, p);
+            if (d != ID_OK) { ++st.malformed; return d; }
+            ++st.rxDgrams;
+            if (p.h.senderInc != peer.remoteInc) {   // new peer, or the peer process restarted: start over both ways
+                peer.remoteInc = p.h.senderInc;
+                ++st.peerResets;
+                ResetRx();
+                ResetPeer(now);
+            }
+            peer.lastRxMs = now;
+            if (p.h.peerInc != myInc) {   // written for an older incarnation of us (or before it knew us)
+                peer.ackOwed = true;      // answer, so it learns this incarnation
+                if (p.h.msgCount || p.h.ackCum) ++st.foreign;
+                return ID_FOREIGN;
+            }
+            ApplyAcks(p);
+            for (uint8_t i = 0; i < p.h.msgCount; ++i) {
+                const IntentRec& r = p.m[i];
+                ++st.rxMsgs;
+                const int32_t dm = SeqDiff(r.msgId, peer.ackCum);
+                if (dm < 0) { ++st.dupDropped; continue; }                    // a resend of something acked
+                if ((uint32_t)dm >= INTENT_ACKWIN) continue;                    // beyond the window: resent later
+                uint8_t& byte = peer.ackBits[(r.msgId % INTENT_ACKWIN) / 8];
+                const uint8_t bit = (uint8_t)(1u << (r.msgId % 8));
+                if (dm > 0 && (byte & bit)) { ++st.dupDropped; continue; }   // msgId already arrived
+                if (!RxMessage(r)) continue;                                    // no room: leave it unacked
+                if (dm == 0) {
+                    ++peer.ackCum;
+                    while (peer.ackBits[(peer.ackCum % INTENT_ACKWIN) / 8] & (1u << (peer.ackCum % 8))) {
+                        peer.ackBits[(peer.ackCum % INTENT_ACKWIN) / 8] &= (uint8_t)~(1u << (peer.ackCum % 8));
+                        ++peer.ackCum;
+                    }
+                } else {
+                    byte |= bit;
+                }
+            }
+            if (p.h.msgCount) peer.ackOwed = true;
+            return ID_OK;
+        }
+        bool Poll(Net::IntentMsg& out) {
+            if (drainBlocked && dqCount < INTENT_DELIVERQ) {
+                drainBlocked = false;
+                for (int i = 0; i < INTENT_RXKEYS; ++i) if (peer.rxk[i].state == 1 && peer.rxk[i].have) DrainKey(peer.rxk[i]);
+            }
+            if (dqCount == 0) return false;
+            out = dq[dqHead];
+            dqHead = (dqHead + 1) % INTENT_DELIVERQ; --dqCount;
+            return true;
+        }
+        void Stats(Net::IntentStats& o) const {
+            o = st;
+            uint32_t n = 0;
+            for (int i = 0; i < INTENT_OUTBOX; ++i) n += peer.out[i].used ? 1u : 0u;
+            o.outstanding = n; o.persisted = persisted; o.myInc = myInc; o.peerInc = peer.remoteInc;
+        }
+    };
+
+    // The live lane ([Coop] IntentLane). Static storage: ~260 KB.
+    IntentLane       g_intent;
+    bool             g_intentOn = false;
+    CRITICAL_SECTION g_intentLock;
+    uint8_t          g_intentTx[INTENT_PUMP_DGRAMS][INTENT_DGRAM_MAX];   // game thread only (PumpIntents)
+
+    uint32_t MakeIntentIncarnation() {
+        LARGE_INTEGER q; QueryPerformanceCounter(&q);
+        uint64_t x = (uint64_t)q.QuadPart ^ ((uint64_t)GetCurrentProcessId() << 32) ^ GetTickCount64();
+        x ^= x >> 33; x *= 0xFF51AFD7ED558CCDull; x ^= x >> 33; x *= 0xC4CEB9FE1A85EC53ull; x ^= x >> 33;
+        const uint32_t v = (uint32_t)x;
+        return v ? v : 1u;
+    }
+
+    // ---- proto 15 selftest (called from SelfTestWire) ---------------------------------------------
+    // Two lanes on a virtual clock, connected by a simulated link that can drop and delay datagrams.
+    struct IntentSim {   // xorshift32: deterministic loss / reorder
+        uint32_t s;
+        uint32_t Next() { s ^= s << 13; s ^= s >> 17; s ^= s << 5; return s; }
+        bool Chance(uint32_t pct) { return Next() % 100u < pct; }
+    };
+    IntentLane s_ia, s_ib;
+    uint8_t    s_idg[INTENT_DGRAM_MAX];
+    struct IntentFlight { uint8_t used, toB; uint16_t len; uint32_t due; uint8_t b[INTENT_DGRAM_MAX]; };
+    IntentFlight s_ifl[128];
+
+    // Lossless exchange: every due datagram from src is received by dst at `now`.
+    int IntentPump(IntentLane& src, IntentLane& dst, uint64_t now) {
+        int sent = 0;
+        for (int i = 0; i < INTENT_PUMP_DGRAMS; ++i) {
+            const size_t n = src.Build(s_idg, sizeof(s_idg), now);
+            if (!n) break;
+            ++sent; dst.Receive(s_idg, n, now);
+        }
+        return sent;
+    }
+    uint8_t IntentMsgCount(const uint8_t* d, size_t n) { return n >= sizeof(IntentWireHeader) ? d[25] : 0; }
+
+    bool SelfTestIntent() {
+        IntentLane& A = s_ia;
+        IntentLane& B = s_ib;
+        Net::IntentMsg q{};
+        static uint8_t d1[INTENT_DGRAM_MAX], d2[INTENT_DGRAM_MAX];
+
+        // (0) golden vector: the byte layout tools/lobby_peer.py packs (INTENT_GOLDEN_HEX there). Proto 15.
+        static_assert(NET_PROTO_VER == 15, "re-derive the intent golden vector (and lobby_peer.py) for the new protoVer");
+        static const uint8_t kGolden[64] = {
+            0x41,0x43,0x34,0x49, 0x0F,0x00,0x00,0x00, 0x44,0x33,0x22,0x11, 0x88,0x77,0x66,0x55,
+            0x04,0x03,0x02,0x01, 0x07,0x00,0x00,0x00, 0x01, 0x01, 0x00,0x00,
+            0x09,0x00,0x00,0x00, 0x02,0x00,
+            0x05,0x00,0x00,0x00, 0x03,0x00,0x00,0x00, 0x08,0x07,0x06,0x05,0x04,0x03,0x02,0x01,
+            0x01, 0x01, 0x03, 0x0D,0x0C,0x0B,0x0A, 0x11,0x10,0x0F,0x0E, 0x78,0x79,0x7A };
+        uint8_t gv[64];
+        IntentRec gr{}; gr.msgId = 5; gr.slot = 3; gr.wireId = 0x0102030405060708ull; gr.ch = IC_ACTION; gr.flags = IF_BASE;
+        gr.len = 3; gr.seq = 0x0A0B0C0D; gr.hostMs = 0x0E0F1011; gr.pl[0] = 'x'; gr.pl[1] = 'y'; gr.pl[2] = 'z';
+        size_t go = IntentPutHeader(gv, 0x11223344u, 0x55667788u, 0x01020304u, 7, 1, 1);
+        go += IntentPutRange(gv + go, 9, 2);
+        go += IntentPutMsg(gv + go, gr);
+        static IntentParsed gp;
+        bool okGolden = go == sizeof(kGolden) && std::memcmp(gv, kGolden, sizeof(kGolden)) == 0
+                        && IntentParse(kGolden, sizeof(kGolden), gp) == ID_OK && gp.h.ackCum == 7 && gp.rFirst[0] == 9
+                        && gp.rCount[0] == 2 && gp.m[0].wireId == gr.wireId && gp.m[0].seq == gr.seq && gp.m[0].pl[2] == 'z';
+
+        // (1) parse negatives: every malformed shape is rejected before anything is applied.
+        uint8_t bad[80];
+        auto mut = [&](int at, uint8_t v) { std::memcpy(bad, kGolden, 64); bad[at] = v; return IntentParse(bad, 64, gp); };
+        bool okParse = mut(4, 14) == ID_PROTO                     // protoVer 14
+                    && mut(0, 0x42) == ID_MAGIC
+                    && mut(50, 0) == ID_MALFORMED                 // channel 0 (reserved)
+                    && mut(50, 16) == ID_MALFORMED                // channel >= IC_LIMIT
+                    && mut(51, 0x02) == ID_MALFORMED              // reserved flag bit
+                    && mut(52, 33) == ID_MALFORMED                // payload len > 32
+                    && mut(26, 1) == ID_MALFORMED                 // reserved header bytes
+                    && mut(8, 0) == ID_OK;                        // positive control: senderInc 0x11223300 is still legal
+        std::memcpy(bad, kGolden, 64); std::memset(bad + 8, 0, 4);
+        okParse = okParse && IntentParse(bad, 64, gp) == ID_MALFORMED;        // senderInc 0
+        okParse = okParse && IntentParse(kGolden, 63, gp) == ID_MALFORMED     // truncated payload
+                          && IntentParse(kGolden, 20, gp) == ID_SHORT;
+        std::memcpy(bad, kGolden, 64); bad[64] = 0;
+        okParse = okParse && IntentParse(bad, 65, gp) == ID_MALFORMED;        // trailing byte
+
+        // (2) handshake, delivery, ack. Negative control: without the ack the message is resent after the RTO.
+        A.Init(0xA11CE001u); B.Init(0xB0B00001u);
+        uint64_t t = 1000;
+        IntentPump(A, B, t); IntentPump(B, A, t); IntentPump(A, B, t);
+        const bool okHs = A.peer.remoteInc == B.myInc && B.peer.remoteInc == A.myInc;
+        A.Publish(3, 0x1111, IC_ACTION, 500, "a1", 2);
+        const size_t n1 = A.Build(d1, sizeof(d1), t);
+        B.Receive(d1, n1, t);
+        bool okDeliver = IntentMsgCount(d1, n1) == 1 && B.Poll(q) && q.slot == 3 && q.wireId == 0x1111 && q.channel == IC_ACTION
+                         && (q.flags & IF_BASE) && q.len == 2 && q.payload[0] == 'a' && q.payload[1] == '1' && q.hostMs == 500
+                         && !B.Poll(q);
+        const uint32_t seq1 = q.seq;
+        // dedup: the same datagram again delivers nothing
+        const uint32_t dup0 = B.st.dupDropped;
+        B.Receive(d1, n1, t);
+        const bool okDedup = !B.Poll(q) && B.st.dupDropped == dup0 + 1;
+        // negative control: no ack reached A -> resent once the RTO passed, not before
+        const size_t nEarly = A.Build(d2, sizeof(d2), t + INTENT_RESEND_MS - 1);
+        t += INTENT_RESEND_MS + 5;
+        const size_t nRe = A.Build(d2, sizeof(d2), t);
+        bool okAck = IntentMsgCount(d2, nEarly) == 0 && IntentMsgCount(d2, nRe) == 1 && A.st.txResends == 1;
+        B.Receive(d2, nRe, t);                 // the resend is a duplicate for B
+        okAck = okAck && !B.Poll(q);
+        IntentPump(B, A, t);                   // B's ack
+        Net::IntentStats sa{}; A.Stats(sa);
+        t += INTENT_RESEND_MS + 5;
+        const size_t nAfter = A.Build(d2, sizeof(d2), t);
+        okAck = okAck && sa.outstanding == 0 && IntentMsgCount(d2, nAfter) == 0;
+
+        // (3) reorder: seq+2 arrives before seq+1, both are delivered in order
+        A.Publish(3, 0x1111, IC_ACTION, 510, "a2", 2);
+        const size_t na2 = A.Build(d1, sizeof(d1), t);
+        A.Publish(3, 0x1111, IC_ACTION, 520, "a3", 2);
+        const size_t na3 = A.Build(d2, sizeof(d2), t);
+        B.Receive(d2, na3, t);
+        bool okReorder = IntentMsgCount(d1, na2) == 1 && IntentMsgCount(d2, na3) == 1 && !B.Poll(q);   // held for the gap
+        B.Receive(d1, na2, t);
+        Net::IntentMsg q2{}, q3{};
+        okReorder = okReorder && B.Poll(q2) && B.Poll(q3) && !B.Poll(q) && q2.seq == seq1 + 1 && q3.seq == seq1 + 2
+                    && q2.payload[1] == '2' && q3.payload[1] == '3' && q2.flags == 0 && q3.flags == 0;
+        IntentPump(B, A, t);
+
+        // (4) 30% loss both ways + 0-2 tick delay (reordering): 10 guards x 4 channels x 5 updates = 200 messages.
+        // Every one must arrive exactly once, in per-channel order, intact, and the sender's outbox must drain.
+        A.Init(0xA11CE002u); B.Init(0xB0B00002u);
+        t = 50000;
+        IntentPump(A, B, t); IntentPump(B, A, t); IntentPump(A, B, t);
+        std::memset(s_ifl, 0, sizeof(s_ifl));
+        IntentSim sim{ 0x12345678u };
+        int lastU[10][5]; uint32_t lastSeq[10][5];
+        for (int g = 0; g < 10; ++g) for (int c = 0; c < 5; ++c) { lastU[g][c] = -1; lastSeq[g][c] = 0; }
+        uint32_t got = 0, bad4 = 0, tick = 0, published = 0;
+        auto payloadLen = [](int g) { return (uint8_t)(4 + (g % 3) * 8); };
+        for (tick = 0; tick < 5000; ++tick) {
+            t += 16;
+            if (tick % 5 == 0 && tick / 5 < 5) {
+                const int u = (int)(tick / 5);
+                for (int g = 0; g < 10; ++g) for (int c = 1; c <= 4; ++c) {
+                    uint8_t pl[INTENT_PAYLOAD_MAX] = { (uint8_t)g, (uint8_t)c, (uint8_t)u, 0xA5 };
+                    for (int k = 4; k < payloadLen(g); ++k) pl[k] = (uint8_t)(g + c + u + k);
+                    A.Publish(20u + g, g == 9 ? 0 : 0x7000u + g, (uint8_t)c, (uint32_t)t, pl, payloadLen(g));
+                    ++published;
+                }
+            }
+            for (int dir = 0; dir < 2; ++dir) {   // send: drop 30%, delay the rest by 0-2 ticks
+                IntentLane& src = dir ? B : A;
+                for (int i = 0; i < INTENT_PUMP_DGRAMS; ++i) {
+                    const size_t n = src.Build(s_idg, sizeof(s_idg), t);
+                    if (!n) break;
+                    if (sim.Chance(30)) continue;
+                    for (int f = 0; f < 128; ++f) if (!s_ifl[f].used) {
+                        s_ifl[f].used = 1; s_ifl[f].toB = (uint8_t)(dir == 0); s_ifl[f].len = (uint16_t)n;
+                        s_ifl[f].due = tick + sim.Next() % 3u; std::memcpy(s_ifl[f].b, s_idg, n); break;
+                    }
+                }
+            }
+            for (int f = 0; f < 128; ++f) {       // arrivals in slot order, which differs from send order
+                IntentFlight& fl = s_ifl[f];
+                if (!fl.used || fl.due > tick) continue;
+                (fl.toB ? B : A).Receive(fl.b, fl.len, t);
+                fl.used = 0;
+            }
+            while (B.Poll(q)) {
+                ++got;
+                const int g = q.payload[0], c = q.payload[1], u = q.payload[2];
+                bool good = g < 10 && c >= 1 && c <= 4 && q.channel == c && q.payload[3] == 0xA5 && q.len == payloadLen(g)
+                            && q.slot == 20u + g && q.wireId == (g == 9 ? 0 : 0x7000u + g) && u == lastU[g][c] + 1
+                            && (u == 0 ? (q.flags & IF_BASE) != 0 : (q.flags == 0 && q.seq == lastSeq[g][c] + 1));
+                for (int k = 4; good && k < q.len; ++k) good = q.payload[k] == (uint8_t)(g + c + u + k);
+                if (!good) { ++bad4; continue; }
+                lastU[g][c] = u; lastSeq[g][c] = q.seq;
+            }
+            bool inFlight = false;
+            for (int f = 0; f < 128; ++f) inFlight |= s_ifl[f].used != 0;
+            A.Stats(sa);
+            if (published == 200 && sa.outstanding == 0 && !inFlight && got >= 200) break;
+        }
+        Net::IntentStats sb{}; B.Stats(sb); A.Stats(sa);
+        const bool okLoss = got == 200 && bad4 == 0 && sa.outstanding == 0 && sb.malformed == 0 && sa.txResends > 0
+                            && sa.resyncs == 0 && sb.refused == 0;
+        const uint32_t lossTicks = tick, lossResends = sa.txResends, lossDups = sb.dupDropped, lossBuf = sb.buffered;
+
+        // (5) rejoin: the guest process restarts (new incarnation). A must replay the LAST value of every key,
+        // flagged IF_BASE, and nothing older; B2 delivers each exactly once.
+        B.Init(0xB0B00003u);
+        const uint32_t resets0 = A.st.peerResets;
+        uint32_t replayed = 0, badR = 0;
+        t += 16;
+        const size_t nh = B.Build(d1, sizeof(d1), t);   // B2's hello: peerInc 0, i.e. not addressed to A's incarnation
+        const bool okForeign = nh > 0 && IntentMsgCount(d1, nh) == 0 && A.Receive(d1, nh, t) == ID_FOREIGN
+                               && A.peer.remoteInc == B.myInc;
+        for (int i = 0; i < 20; ++i) {
+            t += 16;
+            IntentPump(B, A, t); IntentPump(A, B, t);
+            while (B.Poll(q)) {
+                ++replayed;
+                const int g = q.payload[0], c = q.payload[1];
+                const bool good = g < 10 && c >= 1 && c <= 4 && (q.flags & IF_BASE) && q.payload[2] == 4 && q.seq == lastSeq[g][c];
+                if (!good) ++badR;
+            }
+        }
+        A.Stats(sa);
+        const bool okRejoin = okForeign && replayed == 40 && badR == 0 && sa.outstanding == 0 && A.st.peerResets == resets0 + 1;
+
+        const bool all = okGolden && okParse && okHs && okDeliver && okDedup && okAck && okReorder && okLoss && okRejoin;
+        char m[400];
+        _snprintf(m, sizeof(m), "[Net] intent lane selftest: %s golden=%s parse=%s handshake=%s deliver=%s ack=%s dedup=%s"
+                     " reorder=%s loss30=%s rejoin=%s (loss: %u msgs in %u ticks, resends=%u dups=%u buffered=%u bad=%u;"
+                     " rejoin replayed=%u bad=%u)\n",
+                  all ? "PASS" : "FAIL", okGolden ? "PASS" : "FAIL", okParse ? "PASS" : "FAIL", okHs ? "PASS" : "FAIL",
+                  okDeliver ? "PASS" : "FAIL", okAck ? "PASS" : "FAIL", okDedup ? "PASS" : "FAIL",
+                  okReorder ? "PASS" : "FAIL", okLoss ? "PASS" : "FAIL", okRejoin ? "PASS" : "FAIL",
+                  (unsigned)got, (unsigned)lossTicks, (unsigned)lossResends, (unsigned)lossDups, (unsigned)lossBuf,
+                  (unsigned)bad4, (unsigned)replayed, (unsigned)badR);
+        m[sizeof(m) - 1] = 0;
+        dbg(m);
+        return all;
+    }
+
+    // ---- reject observability (X4/X18)-----------------------------------------------------------
     // A version mismatch or a malformed packet used to be dropped with no trace: rxPackets climbed,
     // so a mis-versioned peer looked alive while every one of its snapshots was discarded. One line
     // per process per lane - a mismatched peer sends at SnapshotHz, so per-packet logging would flood
@@ -1438,6 +2049,35 @@ namespace {
                     InterlockedIncrement(&g_rxSizeMismatch);
                     LogSizeMismatch(n, haveProto, peerProto);
                 }
+                // proto 15 intention lane: its own datagram type, same source gate as the other game lanes.
+                // It never refreshes g_lastRecvMs (liveness stays defined by the player/entity lanes).
+                if (magic == NET_INTENT_MAGIC) {
+                    if (g_strictPeer && from.sin_addr.s_addr != peer.sin_addr.s_addr) continue;
+                    InterlockedIncrement(&g_rxPackets);
+                    InterlockedAdd(&g_rxBytes, (LONG)n);
+                    if (!g_intentOn) {   // flag off: recognised, ignored, not a reject
+                        EnterCriticalSection(&g_intentLock); ++g_intent.st.ignoredOff; LeaveCriticalSection(&g_intentLock);
+                        continue;
+                    }
+                    EnterCriticalSection(&g_intentLock);
+                    const IntentDec d = g_intent.Receive((const uint8_t*)buf, (size_t)n, GetTickCount64());
+                    LeaveCriticalSection(&g_intentLock);
+                    if (d == ID_PROTO || d == ID_SHORT || d == ID_MALFORMED) {
+                        if (d == ID_PROTO) InterlockedIncrement(&g_rxProtoMismatch);
+                        const LONG rejects = InterlockedIncrement(&g_rxRejects);
+                        if (rejects == 1 || (rejects % 256) == 0) LogRejectSummary(rejects);
+                        static int s_logs = 0;
+                        if (s_logs < 4) {
+                            ++s_logs;
+                            uint32_t got = 0; if (n >= 8) std::memcpy(&got, buf + 4, 4);
+                            char m[128];
+                            wsprintfA(m, "[Net] intent datagram REJECTED reason=%u n=%d protoVer=%u expected=%u\n",
+                                      (unsigned)d, n, (unsigned)got, (unsigned)NET_PROTO_VER);
+                            dbg(m);
+                        }
+                    }
+                    continue;
+                }
                 bool playerPkt = (magic == NET_MAGIC        && n == (int)sizeof(PlayerState));
                 bool entityPkt = (magic == NET_ENTITY_MAGIC && n >= ENTITY_WIRE_HEADER_SIZE);
                 if (playerPkt || entityPkt) {
@@ -1751,6 +2391,12 @@ bool Init() {
     PeerSet(peer);
 
     InitializeCriticalSection(&g_lock);
+    // proto 15 intention lane: [Coop] IntentLane=1 turns it on (default 0 = idle; received 'AC4I' datagrams are ignored).
+    InitializeCriticalSection(&g_intentLock);
+    g_intentOn = GetPrivateProfileIntA("Coop", "IntentLane", 0, Paths::Ini()) != 0;
+    g_intent.Init(MakeIntentIncarnation());
+    { char m[96]; wsprintfA(m, "[Net] intent lane %s (proto %u, inc=%08x)\n", g_intentOn ? "ON" : "off",
+                            (unsigned)NET_PROTO_VER, (unsigned)g_intent.myInc); dbg(m); }
 
     g_enabled = true;
     g_lastRecvMs = 0;   // no packet accepted yet
@@ -1871,6 +2517,7 @@ void Send(const PlayerState& s) {
     SendRaw(&s, (int)sizeof(s), peer, slot);   // direct, or DATA through the relay
     InterlockedIncrement(&g_txPackets);
     InterlockedAdd(&g_txBytes, (LONG)sizeof(s));
+    PumpIntents();                             // proto 15: no-op unless [Coop] IntentLane=1
 }
 
 bool GetRemote(PlayerState& out) {
@@ -1927,6 +2574,7 @@ void SendEntities(const EntityPacket& p) {
         InterlockedAdd(&g_txBytes, (LONG)(hdr + len));   // actual bytes on the wire (per chunk)
     }
     InterlockedAdd(&g_txEnts, (LONG)g_wireRecs);
+    PumpIntents();                             // proto 15: no-op unless [Coop] IntentLane=1
     static uint32_t s_logCounter = 0;
     if ((++s_logCounter % 60) == 0) {
         char m[160];
@@ -2042,4 +2690,69 @@ void ResetStats() {
     InterlockedExchange(&g_rxStaleChunks,   0);
 }
 
+// ---- proto 15: intention lane (docs/design/intention-lane.md) ------------------------------------
+bool IntentLaneOn() { return g_enabled && g_intentOn; }
+
+bool PublishIntent(uint32_t slot, uint64_t wireId, uint8_t channel, uint32_t hostMs, const void* payload, uint8_t len) {
+    if (!IntentLaneOn()) return false;
+    EnterCriticalSection(&g_intentLock);
+    const bool ok = g_intent.Publish(slot, wireId, channel, hostMs, payload, len);
+    LeaveCriticalSection(&g_intentLock);
+    return ok;
+}
+
+bool PollIntent(IntentMsg& out) {
+    if (!IntentLaneOn()) return false;
+    EnterCriticalSection(&g_intentLock);
+    const bool ok = g_intent.Poll(out);
+    LeaveCriticalSection(&g_intentLock);
+    return ok;
+}
+
+void ForgetIntents(uint32_t slot, uint64_t wireId) {
+    if (!IntentLaneOn()) return;
+    EnterCriticalSection(&g_intentLock);
+    g_intent.Forget(slot, wireId);
+    LeaveCriticalSection(&g_intentLock);
+}
+
+void PumpIntents() {
+    if (!IntentLaneOn() || InterlockedCompareExchange(&g_peerReady, 0, 0) == 0) return;
+    size_t len[INTENT_PUMP_DGRAMS] = {0};
+    int n = 0;
+    const uint64_t now = GetTickCount64();
+    EnterCriticalSection(&g_intentLock);
+    for (; n < INTENT_PUMP_DGRAMS; ++n) {
+        len[n] = g_intent.Build(g_intentTx[n], sizeof(g_intentTx[n]), now);
+        if (!len[n]) break;
+    }
+    LeaveCriticalSection(&g_intentLock);
+    if (!n) return;
+    uint16_t slot = 0;
+    const sockaddr_in peer = PeerCopy(&slot);
+    for (int i = 0; i < n; ++i) {
+        SendRaw(g_intentTx[i], (int)len[i], peer, slot);
+        InterlockedIncrement(&g_txPackets);
+        InterlockedAdd(&g_txBytes, (LONG)len[i]);
+    }
+}
+
+void GetIntentStats(IntentStats& out) {
+    std::memset(&out, 0, sizeof(out));
+    if (!g_enabled) return;
+    EnterCriticalSection(&g_intentLock);
+    g_intent.Stats(out);
+    LeaveCriticalSection(&g_intentLock);
+}
+
 } // namespace Net
+
+#ifdef AC4COOP_NET_SELFTEST_MAIN
+// Offline gate (tools/net_selftest.py): build net.cpp + its link deps into a console exe and run the codec
+// selftests without the game. Never part of the ASI build.
+int main() {
+    const bool ok = SelfTestWire();
+    printf("[selftest] SelfTestWire %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+#endif
