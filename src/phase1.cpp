@@ -89,6 +89,17 @@ bool     g_casActivated = false;         // whether the current puppet's Charact
 int      g_hybridLoco = 1;
 int      g_seekOnSwitch = 1;   // [Coop] SeekOnSwitch: seek a newly targeted action to the peer's phase
 float    g_minBlendIn = 0.1f;   // [Coop] MinBlendInMs: blend used when the peer's switch had none (0 = off)
+// [Coop] BlendTypeSafe (default 0, read at load). Before the puppet's blend-in fix stores a blend type, it maps the
+// type so the engine allocates the node's blend object itself. sub_685360 (IDA decompile; node = evaluator+0xE0,
+// node+0xFC = evaluator+0x1DC flags, node+0x104 = evaluator+0x1E4):
+// - types 1 and 6 are rewritten to 2, and 3 to 4; that path tests node+0x104 and allocates it with sub_69D440 when NULL;
+// - types 2, 4 and 5 read [[node+0x104]+0x90] with no NULL test (0x006855C8 / 0x006855D1).
+// The host captures the node after 1->2, so copying 2 onto a fresh node (+0x104 NULL) faults at 0x006855D1
+// (crashctx 7792_1, 2026-11-13 10:49:46, build cd4e6808: node flags 0x0602, +0x104 = 0, stack through
+// SetTargetAction 0x006625F9 called from the puppet action switch). With the flag on and +0x104 NULL:
+// 2 -> 1, 4 -> 3, 5 -> no write (no pre-type for 5 is known).
+int           g_blendTypeSafe = 0;
+volatile LONG g_blendTypeMapped = 0, g_blendTypeSkipped = 0;
 int      g_bhvState   = -1;              // current puppet behavior-enable state: -1 unknown, 0 disabled, 1 enabled
 int      g_switchCd   = 0;               // frames to suppress OUR action writes after a behavior toggle, so the
                                          // game's worker-thread action update can quiesce and never overlap ours
@@ -1917,11 +1928,26 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
                 // controller's cached evaluator between the fetch above and here, and writing a freed or
                 // recycled evaluator is what crashes AC4BFSP (0xc0000005). Require it is still the SAME
                 // live, non-transition evaluator; otherwise skip this fix (the blend just stays as-is).
+                const char* mapTag = "";
                 if (write && t < len) {
                     char* evNow = readable(ac, 0x40) ? (char*)ac->GetCurrentEvaluator(0, ACTLAYER_PRIMARY) : nullptr;
                     if (evNow != ev || !readable(ev, 0x2C0) || *(uint8_t*)(ev + 0x258) != 0) {
                         write = false;
                     } else {
+                        // [Coop] BlendTypeSafe: see g_blendTypeSafe. node+0x104 == evaluator+0x1E4 (inside the
+                        // 0x2C0 span validated just above).
+                        if (g_blendTypeSafe && *(void**)(ev + 0x1E4) == nullptr) {
+                            const unsigned ty = fl & 7;
+                            if (ty == 2 || ty == 4) {
+                                fl = (uint16_t)((fl & ~7) | (ty - 1)); mapTag = " [safe:pre-type]";
+                                InterlockedIncrement(&g_blendTypeMapped);
+                            } else if (ty == 5) {
+                                write = false; mapTag = " [safe:skip5]";
+                                InterlockedIncrement(&g_blendTypeSkipped);
+                            }
+                        }
+                    }
+                    if (write) {
                         *(float*)(ev + 0x1C8)    = len;
                         *(float*)(ev + 0x1CC)    = g_blendFixStartFromEnd;
                         *(float*)(ev + 0x1D0)    = g_blendFixTargetStart;
@@ -1931,8 +1957,9 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
                 } else {
                     write = false;
                 }
-                L("[Net] blendIn fix alias=%u len %.2f -> %.2f type %u -> %u (t=%.2f)%s\n",
-                  g_blendFixAlias, was, len, (unsigned)(wasFl & 7), (unsigned)(fl & 7), t, write ? "" : " [kept]");
+                L("[Net] blendIn fix alias=%u len %.2f -> %.2f type %u -> %u (t=%.2f)%s%s\n",
+                  g_blendFixAlias, was, len, (unsigned)(wasFl & 7), (unsigned)(fl & 7), t, write ? "" : " [kept]",
+                  mapTag);
                 g_blendFixWait = 0;
             } else {
                 --g_blendFixWait;
@@ -6298,8 +6325,10 @@ static void OwnReport() {
         const LONG sw = InterlockedExchange(&s_gaSwitch, 0), ra = InterlockedExchange(&s_gaReassert, 0);
         const LONG bf = InterlockedExchange(&s_gaBlendFix, 0), fw = InterlockedExchange(&s_gaFactorWrites, 0);
         const LONG phf = InterlockedExchange(&s_phFrames, 0), pho = InterlockedExchange(&s_phOk, 0);
-        L("[GuardAnim] full=%d blendFixOn=%d switches=%ld reassert=%ld blendFix=%ld factorWrites=%ld faults=%ld bannedTotal=%ld | phase frames=%ld ok=%ld (%.1f%%)\n",
-          s_gaOn, s_gbfOn, sw, ra, bf, fw, InterlockedExchange(&s_gaFaults, 0), (long)s_gaBanned, phf, pho, phf ? 100.0 * pho / phf : 0.0);
+        L("[GuardAnim] full=%d blendFixOn=%d switches=%ld reassert=%ld blendFix=%ld factorWrites=%ld faults=%ld bannedTotal=%ld | phase frames=%ld ok=%ld (%.1f%%)"
+          " | pupBlendSafe=%d mapped=%ld skip5=%ld\n",
+          s_gaOn, s_gbfOn, sw, ra, bf, fw, InterlockedExchange(&s_gaFaults, 0), (long)s_gaBanned, phf, pho, phf ? 100.0 * pho / phf : 0.0,
+          g_blendTypeSafe, InterlockedExchange(&g_blendTypeMapped, 0), InterlockedExchange(&g_blendTypeSkipped, 0));
     }
     L("[OwnAir] physMs=%d physWrites=%ld | ctx frames=%ld ground=%ld air=%ld (%.1f%%) other=%ld (last id %ld) | moving frames=%ld "
       "actMatch=%ld actMis=%ld (%.1f%%) top body<-host:%s\n",
@@ -11457,6 +11486,7 @@ void Phase1::InstallFrameHook() {
     g_krLog = GetPrivateProfileIntA("Coop", "KrLog", 0, Paths::Ini());
     g_seekOnSwitch = GetPrivateProfileIntA("Coop", "SeekOnSwitch", 1, Paths::Ini());
     g_minBlendIn = GetPrivateProfileIntA("Coop", "MinBlendInMs", 100, Paths::Ini()) / 1000.0f;
+    g_blendTypeSafe = GetPrivateProfileIntA("Coop", "BlendTypeSafe", 0, Paths::Ini());
     // DriveContextMask: read as a string so hex ("0x440") or decimal both parse. Empty -> keep the safe
     // default (InAir+Swim). strtoul base 0 auto-detects the 0x prefix.
     {
