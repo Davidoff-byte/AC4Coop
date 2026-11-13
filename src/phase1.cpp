@@ -1862,7 +1862,14 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
         // re-forcing a target action that's already current re-runs its transition and intermittently CRASHES
         // (our tracked g_lastActionAlias resets on spawn/despawn, which is when a redundant re-force happened).
         // Checking the puppet's real current action is the reliable guard.
-        if (writeActions && s.actionAlias != 0 && s.actionAlias != g_lastActionAlias) {
+        // [Coop] PuppetActionReassert (default 0, load-time): also re-check while the peer's alias is unchanged, at most
+        // every 250 ms, so an action the engine switched the puppet to on its own is corrected (the current-action check
+        // below still prevents re-forcing an action that is already current).
+        static int s_pupReassert = -1; static uint64_t s_pupIssueMs = 0;
+        if (s_pupReassert < 0) s_pupReassert = GetPrivateProfileIntA("Coop", "PuppetActionReassert", 0, Paths::Ini());
+        const bool reassertDue = s_pupReassert && s.actionAlias == g_lastActionAlias && GetTickCount64() - s_pupIssueMs > 250;
+        if (writeActions && s.actionAlias != 0 && (s.actionAlias != g_lastActionAlias || reassertDue)) {
+            if (reassertDue) s_pupIssueMs = GetTickCount64();
             ActionComponent* ac = h->GetActionComponent();
             if (readable(ac, 0x40)) {
                 unsigned char mir = 0;
@@ -5918,6 +5925,7 @@ static int OwnPhysMs() {
 // Probe counters (guards, own-update hook): AI context of the body, and moving frames vs the action it plays.
 static volatile LONG s_cxFrames = 0, s_cxGround = 0, s_cxAir = 0, s_cxOther = 0, s_cxOtherId = 0;
 static volatile LONG s_mvFrames = 0, s_mvActMatch = 0, s_mvActMis = 0, s_physWrites = 0;
+static volatile LONG s_o1Frames = 0, s_o1Mis = 0, s_o5Frames = 0, s_o5Bad = 0;
 struct OwnPair { uint32_t body, host; LONG n; };
 static OwnPair s_mvPairs[12]; static SRWLOCK s_mvPairLock = SRWLOCK_INIT;
 static void OwnNotePair(uint32_t body, uint32_t host) {
@@ -5969,6 +5977,7 @@ struct OwnBody {
     float lastWrite[3]; bool haveWrite, snap;
     uint32_t alias;
     GuardAnim anim; uint64_t animUs;            // proto 13: host animation block and when it last changed
+    float vEma;                                 // O5: running average speed of what we wrote
     GaState ga;
 };
 static const int OWN_MAX = 128;
@@ -6477,6 +6486,7 @@ static void OwnDrain(Human* h) {
         ReleaseSRWLockExclusive(&s_ownLock);
     }
     float pos[3], quat[4]; OwnSample(o, now, pos, quat);
+    float vEmaNew = o.vEma;
     // moving probe: speed of the position we are about to give it, against the action it plays
     if (o.haveWrite && o.lastWriteUs && now > o.lastWriteUs && haveCur) {
         const float dx = pos[0] - o.lastWrite[0], dy = pos[1] - o.lastWrite[1], dz = pos[2] - o.lastWrite[2];
@@ -6485,7 +6495,19 @@ static void OwnDrain(Human* h) {
             InterlockedIncrement(&s_mvFrames);
             if (curAlias == o.alias) InterlockedIncrement(&s_mvActMatch);
             else { InterlockedIncrement(&s_mvActMis); OwnNotePair(curAlias, o.alias); }
+            // O1 with a switch grace: only once the host alias has been stable for 300 ms
+            if (now - o.aliasSinceUs > 300000) {
+                InterlockedIncrement(&s_o1Frames);
+                if (curAlias != o.alias) InterlockedIncrement(&s_o1Mis);
+            }
         }
+        // O5: speed of this frame's step against the body's running average speed
+        if (o.vEma > 0.3f) {
+            InterlockedIncrement(&s_o5Frames);
+            const float dv = v - o.vEma;
+            if ((dv < 0.0f ? -dv : dv) > 0.5f * o.vEma) InterlockedIncrement(&s_o5Bad);
+        }
+        vEmaNew = o.vEma > 0.0f ? o.vEma + 0.2f * (v - o.vEma) : v;
     }
     if (!OwnGuardsOn()) return;
     HookMath::Quaternion q; q.x = quat[0]; q.y = quat[1]; q.z = quat[2]; q.w = quat[3];
@@ -6500,7 +6522,7 @@ static void OwnDrain(Human* h) {
     const int j = OwnFind(key);
     if (j >= 0) {
         for (int k = 0; k < 3; ++k) s_own[j].lastWrite[k] = pos[k];
-        s_own[j].haveWrite = true; s_own[j].lastWriteUs = now;
+        s_own[j].haveWrite = true; s_own[j].lastWriteUs = now; s_own[j].vEma = vEmaNew;
         if (o.snap) s_own[j].snap = false;
         if (phys) s_own[j].lastPhysUs = now;
     }
@@ -6570,6 +6592,12 @@ static void OwnReport() {
           InterlockedExchange(&s_phRate[0], 0), InterlockedExchange(&s_phRate[1], 0), InterlockedExchange(&s_phRate[2], 0));
     }
     { char aw[1024]; if (ActionWriter::FormatReport(aw, sizeof(aw)) > 0) L("%s\n", aw); }
+    {   // O1 (action, host alias stable >= 300 ms, moving frames) and O5 (step speed > 50% off the body's average)
+        const LONG f1 = InterlockedExchange(&s_o1Frames, 0), m1 = InterlockedExchange(&s_o1Mis, 0);
+        const LONG f5 = InterlockedExchange(&s_o5Frames, 0), b5 = InterlockedExchange(&s_o5Bad, 0);
+        L("[O5] buffer=%d O1 frames=%ld mis=%ld (agree %.1f%%) | O5 frames=%ld jitter=%ld (%.2f%%)\n",
+          s_gibOn, f1, m1, f1 ? 100.0 * (f1 - m1) / f1 : 0.0, f5, b5, f5 ? 100.0 * b5 / f5 : 0.0);
+    }
     L("[OwnAir] physMs=%d physWrites=%ld | ctx frames=%ld ground=%ld air=%ld (%.1f%%) other=%ld (last id %ld) | moving frames=%ld "
       "actMatch=%ld actMis=%ld (%.1f%%) top body<-host:%s\n",
       s_ownPhysMs, pw2, cf, cg, ca, cf ? 100.0 * ca / cf : 0.0, co, (long)s_cxOtherId, mf, mm, mi, mf ? 100.0 * mi / mf : 0.0, pairs);
@@ -9790,7 +9818,27 @@ static void lerpState(const PlayerState& a, const PlayerState& b, float t, Playe
 // Append a freshly-received packet. Dedupes by seq; a duplicated seq is ignored, and a single
 // reordered packet is dropped without touching the buffer (UDP reorders routinely). Only a seq that
 // jumps backwards by more than 1000 is treated as a peer restart and wipes the history.
+// [Coop] PuppetHostTime (default 0, load-time): stamp each puppet snapshot with the peer's capture time mapped onto
+// this clock (min-tracked offset over 2 s windows, as the guard buffer does) instead of this frame's time. Every
+// packet drained in one frame used to get the same stamp (zero-length segments = one-frame jumps, `eqT`), and the
+// peer's frame-time jitter and the network's went straight into the timeline as uneven speed.
+static int      s_pupHostTime = -1;
+static uint32_t s_pupBaseMs = 0; static bool s_pupBaseSet = false;
+static int64_t  s_pupOffCur = INT64_MAX, s_pupOffPrev = INT64_MAX; static uint64_t s_pupOffWinUs = 0;
+static uint64_t PuppetStampUs(const PlayerState& s, uint64_t nowUs) {
+    if (s_pupHostTime < 0) s_pupHostTime = GetPrivateProfileIntA("Coop", "PuppetHostTime", 0, Paths::Ini());
+    if (!s_pupHostTime || !s.hostTimeMs) return nowUs;
+    if (!s_pupBaseSet) { s_pupBaseMs = s.hostTimeMs; s_pupBaseSet = true; }
+    const int64_t hostUs = (int64_t)(int32_t)(s.hostTimeMs - s_pupBaseMs) * 1000;
+    if (nowUs - s_pupOffWinUs > 2000000) { s_pupOffPrev = s_pupOffCur; s_pupOffCur = INT64_MAX; s_pupOffWinUs = nowUs; }
+    const int64_t off = (int64_t)nowUs - hostUs;
+    if (off < s_pupOffCur) s_pupOffCur = off;
+    const int64_t best = s_pupOffCur < s_pupOffPrev ? s_pupOffCur : s_pupOffPrev;
+    const int64_t t = hostUs + best;
+    return t > 0 ? (uint64_t)t : nowUs;
+}
 static void PushSnapshot(const PlayerState& s, uint64_t nowUs) {
+    nowUs = PuppetStampUs(s, nowUs);
     if (g_haveSnapSeq) {
         if (s.seq == g_lastSnapSeq) return;            // duplicate of the newest — GetRemote holds it
         if (s.seq <  g_lastSnapSeq) {
@@ -11035,7 +11083,11 @@ static void OnFrameInner(Human* updatedHuman) {
         static int      despawnGrace = 0;   // frames the puppet has wanted removal
         PlayerState local;
         bool localOk = Phase1::CaptureLocalState(local);
-        if (localOk) { static uint32_t seq = 0; local.seq = ++seq; Net::Send(local); if (stable < 100000) ++stable; }
+        if (localOk) {
+            static uint32_t seq = 0; local.seq = ++seq;
+            local.hostTimeMs = (uint32_t)(OwnNowUs() / 1000);   // proto 14: capture time (QPC ms) for the peer's buffer
+            Net::Send(local); if (stable < 100000) ++stable;
+        }
         else stable = 0;
 
         uint64_t now = GetTickCount64();

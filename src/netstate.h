@@ -126,6 +126,8 @@ struct PlayerState {
                            // proxy match the peer's class EXACTLY instead of by nearest hull tier.
 
     uint8_t  valid;                 // 1 = a live player was captured
+    uint32_t hostTimeMs;            // proto 14 (+565, inside the tail pad): sender's capture time, QPC ms; 0 = unset.
+                                    // The receiver interpolates the puppet on it ([Coop] PuppetHostTime).
 };
 #pragma pack(pop)
 // Machine-checked wire-layout guard: pack(1) caps natural alignment at 1, but the align(16) members
@@ -138,8 +140,8 @@ static_assert(sizeof(PlayerState) == 576, "PlayerState wire size changed - updat
 static const uint32_t NET_MAGIC = 0x43344341; // 'AC4C'
 // Wire/struct-layout version. PlayerState is #pragma pack(1): adding a field shifts every following
 // offset, so both peers MUST run the same build. Bump this whenever the layout changes.
-static const uint32_t NET_PROTO_VER = 14;  // 14: entity header += u32 hostMs (36 B); PlayerState, LobbyPacket and
-                                           //     the record format unchanged
+static const uint32_t NET_PROTO_VER = 14;  // 14: entity header += u32 hostMs (36 B); PlayerState += u32 hostTimeMs
+                                           //     at +565 (tail pad, still 576 B); LobbyPacket and records unchanged
                                            // 13: guard animation block (EF_ANIM, GuardAnim) on the entity lane;
                                            //     PlayerState and LobbyPacket unchanged
                                            // 12: lobby handshake (LobbyPacket below); PlayerState/entity layouts unchanged

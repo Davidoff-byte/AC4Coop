@@ -333,6 +333,9 @@ def cmd_replay(a):
                     for dd in rechunk_as_14(pend.pop(seq_), int(time.monotonic() * 1000)):
                         sock.sendto(dd, peer); sent += 1
                     continue
+                if a.as_proto >= 14 and k == "player" and not struct.unpack_from("<I", d, 565)[0]:
+                    # proto 14 PlayerState.hostTimeMs (+565, tail pad): the replay's send clock
+                    d = d[:565] + struct.pack("<I", int(time.monotonic() * 1000) & 0xFFFFFFFF) + d[569:]
                 if a.as_proto and k in ("player", "entity"):
                     d = d[:4] + struct.pack("<I", a.as_proto) + d[8:]
                 sock.sendto(d, peer); sent += 1
