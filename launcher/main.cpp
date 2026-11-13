@@ -202,6 +202,19 @@ bool WriteGameIni(const PartyNet::State& s) {
     };
     g_iniWritten.clear();
     for (auto& p : kv) { WritePrivateProfileStringA("Net", p[0], p[1], ini.c_str()); g_iniWritten += std::string(p[0]) + "=" + p[1] + " "; }
+    // Co-op sync profile (test-ready build, user's request 2026-11-13). The role decides who owns the world; every
+    // sync feature listed here has run live on the replay rig with 0 faults (builds D219B303 .. 5F58215C,
+    // docs/evidence/action-writers-2026-11-13.md and the run notes in the commits). GuardActionGate is NOT listed until
+    // its own run. The plugin's code defaults stay 0; this is the only place that turns them on.
+    const char* coop[][2] = {
+        { "EntityHost", s.isHost ? "1" : "0" }, { "EntitySync", "1" }, { "EntityFrameCadence", "1" },
+        { "OwnUpdateGuards", "1" }, { "OwnUpdatePuppet", "1" }, { "OwnPhysicsMs", "1" },
+        { "MirrorActions", "1" }, { "MirrorActionsDeferred", "1" }, { "GuardStaleReturn", "1" },
+        { "GuardAnimFull", "1" }, { "GuardBlendFix", "1" }, { "BlendTypeSafe", "1" },
+        { "GuardPhaseLock", "1" }, { "GuardInterpBuffer", "1" }, { "GuardInterpDelayMs", "120" },
+        { "PuppetHostTime", "1" }, { "PuppetActionReassert", "1" }, { "BindRadiusM", "60" }, { "CrashContext", "1" },
+    };
+    for (auto& p : coop) { WritePrivateProfileStringA("Coop", p[0], p[1], ini.c_str()); g_iniWritten += std::string(p[0]) + "=" + p[1] + " "; }
     return true;
 }
 bool LaunchGame() {
