@@ -88,3 +88,33 @@ User's observation in run 23688, with the puppet on a roof: the guards spotted t
   - the puppet was on a roof the guards cannot path to;
   - the fight system needs target data the puppet lacks;
   - `FightSkipPuppet` also removes something the guards' attack depends on.
+
+## Session 1 (2026-11-13 17:30, build f352057, asi fbd05f19): chase still absent; the puppet has no FightDataItem
+
+| item | oracle | result |
+|---|---|---|
+| M1 AutoContinue | `[AC] ... press-start` + `continue` lines, in world with no input | **FAIL**: both detours installed (pids 33068, 1108), neither fired; the user had to load manually. Cause not yet established |
+| F7 chase | guards chase/search the puppet out of sight; `[Poi] lentPuppet>0` | **FAIL** (user: "they just stand"). `[Poi]` lent the puppet 0-4 times per 5 s window out of about 1,600 lookups |
+| crash | none | **crash** at 17:37: `0x010D4BAD` read `[eax+6Ch]`, eax = 0 (`AC4Coop_crashctx_20588_1.txt`) |
+
+### Crash root cause (static)
+
+- **Chain:** `sub_11DA9F0` → `sub_10D4AA0(e)` → `sub_133EFB0(e)` returned 0, then `cmp byte [eax+6Ch],0` faulted.
+- **The lookup:** `sub_133EFB0(e)` = `sub_133BBF0(e)` searches the entity's AI object for an item of class id `0x9BEE81DB`:
+  - AI object = `*(*(e+0xE8)+0x1C)`, via `sub_6F5F70`;
+  - item array at `ai+0x5C`, u16 count at `ai+0x62`;
+  - item class tested with `sub_A1D0D0`;
+  - class id `0x9BEE81DB` = **FightDataItem** (class map: vtable `0x02695368`, class info `0x028C0678`, size `0x70`).
+- **Scope:** `sub_133EFB0` has **165** callers. The player's stack in run 7164 shows a FightDataItem (`0x42A21460`); the puppet's lookup returns null. So the puppet lacks a FightDataItem, and every fight-code caller that assumes one can fault.
+- **Same pattern, earlier crashes** (puppet lacking player-side data):
+  - `0x01780657`: CSrvNavigation `+0x84→+0x14`;
+  - `0x015DB19C`: AIComponent `+0x94`.
+  
+  Guarding sites one at a time is not a fix (165 callers).
+- **Construction:**
+  - The puppet is built from the player's own EntityBuilder + selector (`phase1.cpp:550-609`).
+  - FightDataItem's ctor is `sub_10DF7B0`. It is reached only through `0x010EA380`, a jump with no code xrefs, i.e. the reflection create function.
+  - The vtable's slot 0 is `sub_10EA390`, a clone, which calls `sub_10DFB00`.
+  - **Not yet found:** who attaches a FightDataItem to the player's AI item array, and why the build path leaves the puppet without it.
+
+Next (static): writers of `ai+0x5C/+0x62` that store a FightDataItem (reflection instance `0x028C0678`, clone `sub_10EA390`).
