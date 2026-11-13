@@ -72,3 +72,19 @@ Ids in order of first appearance, with radius (m) from the live table and the ca
 
 - Log every template (`0x026E4798`) occurrence with its id, `+8`, `+0xC` and the poster's return address.
 - Add the player's current action alias to each occurrence line, so each id is tied to the action being played.
+
+## Result: the puppet's gunshot alerts the host's guards (2026-11-13)
+
+| pid | build | test | result |
+|---|---|---|---|
+| 7164 | b2ad941 (asi 16a4ba46) | `PuppetStimMode=1`: templates 48, 49 posted to the puppet's own entity | posted 2; **no broadcast** (no 48/49 copy with the puppet as source reached anyone): the puppet entity does not turn templates into broadcasts |
+| 7164 | b2ad941 | `PuppetStimMode=2`: one stimulus per NPC in radius (48: 3 receivers, 49: 50 of 102) | the engine generated its own follow-up stimuli with the puppet as source (49 relayed by `sub_1654F40`, 116 by `sub_1562640`), then **crashed**. Fault at `0x01780657`: the fight-member loop `sub_161BD30` → `sub_13F22E0(puppet)` → CSrvNavigation `sub_1780610` read `*(*(nav+0x84)+0x14)` = null (`AC4Coop_crashctx_7164_1.txt`) |
+| 23688 | 7936a75 (asi 219507ce), `FightSkipPuppet=1` | mode 2 (48: 3, 49: 55 of 103) | **no crash**; 1 fight order for the puppet skipped; two guards then sent stimuli 8 + 95 about the puppet continuously (~30 each in 10 s) |
+
+User's observation in run 23688, with the puppet on a roof: the guards spotted the puppet and tracked it. They went to full alert / combat state, facing the puppet's direction, **without moving or attacking**.
+
+- Oracle level: 4 (the user looked at it) plus the log counts above.
+- Not established: why they neither moved nor attacked. Candidates, all UNVERIFIED:
+  - the puppet was on a roof the guards cannot path to;
+  - the fight system needs target data the puppet lacks;
+  - `FightSkipPuppet` also removes something the guards' attack depends on.
