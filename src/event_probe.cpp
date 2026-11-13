@@ -52,6 +52,8 @@ SRWLOCK g_lock = SRWLOCK_INIT;
 const int ID_MAX = 256;
 volatile LONG g_plStim[ID_MAX];       // stimulus id -> count with the local player as source (window)
 volatile LONG g_stimAll = 0, g_stimPl = 0, g_posts = 0;
+ULONGLONG g_occLast[ID_MAX];          // per id: when the occurrence log last wrote (GetTickCount64)
+int       g_occN[ID_MAX];
 
 ULONGLONG NowMs()
 {
@@ -109,6 +111,21 @@ void __cdecl OnPost(void* ev, void* recv, uintptr_t ret)
         const uint8_t pl = (ph && src == ph) ? 1 : 0;
         InterlockedIncrement(&g_stimAll);
         if (pl) { InterlockedIncrement(&g_stimPl); if (id < ID_MAX) InterlockedIncrement(&g_plStim[id]); }
+        // Occurrence log (v2): a player-source stimulus other than sight (8) is logged with all its fields when the
+        // same id was last logged > 2 s ago (one broadcast reaches many receivers within the same frame), <= 12
+        // lines per id. Separates repeated actions (3 shots 15 s apart = 3 lines of the shot's ids).
+        if (pl && id != 8 && id < ID_MAX) {
+            const ULONGLONG now = GetTickCount64();
+            if (now - g_occLast[id] > 2000 && g_occN[id] < 12) {
+                g_occLast[id] = now; ++g_occN[id];
+                const uint32_t* d = (const uint32_t*)ev;
+                char line[200];
+                _snprintf_s(line, sizeof(line), _TRUNCATE,
+                            "[EvtOcc] t=%llu id=%u n=%d src=%08X dst=%08X flags=%08X recv=%p from=%08X\n",
+                            NowMs(), id, g_occN[id], d[2], d[3], d[5], recv, (unsigned)ret);
+                Phase1_LogLine(line);
+            }
+        }
         FirstSight(vt, ret, id, pl, src, recv);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
     }
