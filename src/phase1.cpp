@@ -11295,7 +11295,7 @@ static void OnFrameInner(Human* updatedHuman) {
         static uint64_t s_sightNext = 0;
         if (hbNow >= s_sightNext) {
             s_sightNext = hbNow + 5000;
-            char sb[256];
+            char sb[1024];   // the SightProbe tail needs ~450 more bytes; FormatReport only appends it when 200+ remain
             if (GuardSight::FormatReport(sb, sizeof(sb)) > 0) L("%s\n", sb);
             char stb[160];
             if (StateProbeHb(stb, sizeof(stb)) > 0) L("%s", stb);   // [Coop] StateProbe counters (both roles)
