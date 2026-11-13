@@ -203,7 +203,7 @@ also log `footIK+4`, `+6` (bit 0 = contact this frame), `+0x14`, `+0x20` (weight
 |---|---|---|---|
 | H1 | Clear `comp+0x336` bit 1 on mirrored bodies (after M3 / after borrowing) | `0x4424A0` then takes the reset path every frame and `0x453904` has already zeroed `comp+0x2C0`, so no root offset is applied | static only; something may set bit 1 again (writers §4 not attributed) — re-clear per frame in the existing per-Human hook, or verify with the probe |
 | H1 alt | After each drive step, do what the engine's reset does: `sub_42E6C0(comp+0x260, &entityPos, &up)` (Hex-Rays shows `__thiscall(this, point*, normal*)`; *the exact convention and stack cleanup are UNVERIFIED — read the epilogue before calling it*) | same state as the engine's own reset | static only |
-| H2 | When we take over a body or teleport it: zero `footIK+0x750` and set `footIK+4 |= 0xA00` | `0xA00` is the engine's own "moved too far" reset (`sub_4CF4A0`); the zero offset makes the no-contact fallback equal to the entity position | static only; the full meaning of 0xA00 inside the sub-steps is not decoded |
+| H2 | Zero `footIK+0x750` while `footIK+6 & 1 == 0` (see §9.5) | the no-contact branch `0x4BBBFA..0x4BBC1C` then computes ground = entity position | static only. *Correction (§9.5):* `footIK+4 |= 0xA00`, suggested here in the first version, does **not** reset `+0x750`; it only sets 0x800 and zeroes `+0x28` that frame |
 | H2 strong | Set `comp+0x337 |= 0x10` on mirrored bodies | `0x4538AB` then skips `sub_4CF4A0` for every kind | **risk:** the last IK pose may stay frozen in the pose buffer (not checked) |
 | either | Not recommended: patch `EngineOptions+0x63/+0x64` | global; it changes every NPC and the local player | — |
 
@@ -226,3 +226,111 @@ written for this pass: `strsearch.py` (regex over strings + xrefs), `dwscan.py` 
 segments), `typename.py` (type handle → descriptor → name at `desc+0xC`) and `rdis.py` (range disasm for
 undefined bands). Every script sets `DBFL_KILL`. Copies are in the shared side-session notes folder under
 `humanik-s2-scripts/`.
+
+## 9. Probe spec for `src/phase1.cpp` (read-only; added 2026-11-13 at the plan session's request)
+
+Target: a borrowed guard body `Entity* e` whose matrix the plugin writes in `OwnDrain` (hook `0x016FAACD`).
+Take the reads in `OwnDrain`, after the plugin's own `SetGlobalMatrixInternal`, and log one line per guard per
+N frames. Also log the same line for one **non-borrowed** guard as the control. Use `readable()` on every pointer.
+
+### 9.1 Reaching the objects (no engine calls needed)
+
+| Object | Chain | Evidence |
+|---|---|---|
+| `comp` (SkeletonComponent) | `FindComponentByVtable(e, 0x01E41E58)`, the existing helper in phase1.cpp (walks `e+0x60`, count `u16 e+0x66`) | vt slot 5 `0x423310`; M1 already checks this vtable live; class map row `0x01E41E58 → desc 0x02749420 SkeletonComponent` |
+| `cc` (CharacterController) | `FindComponentByVtable(e, 0x01E6EE10)` | vt `0x1E6EE10` slot 5 = `0x7AA8E0` = the class getter used by `sub_4375D0` in Branch B (`mov eax, off_27B2B6C`; `*0x27B2B6C` = desc `0x27B4E40` "CharacterController") |
+| `fik` (BipedFootIK2) | `*(void**)(comp+0x4C)`; valid if non-null **and** `*(u32*)fik == 0x01E46BB4` | ctor `sub_4BB6E0` writes vt `0x1E46BB4` (`0x4BB6F4`); stored at `comp+0x4C` by `sub_431B70`; body reads it at `0x45389A`/`0x4538F5` |
+| `opt` (EngineOptions) | `*(u8**)0x02ABEC08` | getter `sub_45BE80`; read at `0x4538A5`/`0x4538D9` |
+| kind | `*(u32*)(e+0x9C) & 7` | `0x4538B4..0x4538C4` |
+
+Cross-check worth logging once: `*(void**)(fik+0xC) == cc`. That tests the §3.2 UNVERIFIED claim that
+`fik+0xC` is the CharacterController.
+
+### 9.2 Fields
+
+All offsets are from the object named. f32 = 4-byte float; v4 = 16-byte-aligned float4 (x,y,z,w).
+
+| # | Field | Type | Meaning | Writer / reader (VA) |
+|---|---|---|---|---|
+| S1 | `comp+0x4C` | ptr | ≠0 ⇒ **Branch A** (foot IK); 0 ⇒ **Branch B** | `0x45389A`, `0x4538FD` |
+| S2 | `comp+0x336` | u8 | bit 0x01 = Branch B adaptation enabled; 0x40 = phase (foot IK inactive); 0x10 = slope align | `0x4424A0`, `0x455590`, `sub_425C40` |
+| S3 | `comp+0x337` | u8 | bit 0x10 = foot IK skipped for this body | `0x4538AB` |
+| S4 | `comp+0x88` | u16 | `(v & 0x38)` < 8 ⇒ Branch B reset (LOD); `v & 0x1000` blocks foot-IK allocation | `0x4424A9`, `sub_431B70` |
+| S5 | `comp+0x2C0` | f32 | **Branch B root Z offset applied this frame** (zeroed at `0x453904`, set at `0x4426CC`/`0x442720`; applied when \|v\| > 0.003, `0x442769`) | — |
+| S6 | `comp+0x2A0` | f32 | Branch B spring value (plane Z) | reset `0x42E6FF`; spring step `sub_4287E0` with `ecx = plane+0x40` (`lea ecx,[esi+40h]` @`0x43E268`, call @`0x43E29F`) |
+| S7 | `comp+0x2A4` | f32 | Branch B spring velocity (`this[1]` of `sub_4287E0`) | `0x42E6EC` zeroes it |
+| S8 | `comp+0x2B0` | v4 | Branch B plane point (z at `+0x2B8`) | `0x42E6E2`; `sub_43E190` end |
+| S9 | `comp+0xF0`, `+0xF4`, `+0xF8` | f32 ×3 | §2 step 1: target, current, rate. Root Z += `+0xF4` when either of the first two ≠ 0 | `0x45380D` writes `+0xF4` |
+| A1 | `fik+0x4` | u16 | bit 0x40 = foot IK enabled (else `sub_4CF4A0` returns at once); 0x200/0x800 = per-frame reset bits | `0x4CF4BC`, `0x4CF4D7` |
+| A2 | `fik+0x6` | u8 | bit 0x01 = **a ground contact was found this frame** | set `0x4BBB1B`, cleared `0x4BBC23` |
+| A3 | `fik+0x14`, `fik+0x20` | f32 ×2 | solve weights; `sub_4CEF30` runs only if both > 5e-4 | `sub_4CF4A0` tail |
+| A4 | `fik+0x740` | v4 | foot-IK ground reference point | `0x4BBBA6` (contact) / `0x4BBC1C` (no contact) |
+| A5 | `fik+0x750` | v4 | **stored offset contact − entityPos**; kept on no-contact frames | `0x4BBBB9` (contact), `0x4BBC00` (zeroed only if `fik+0x19`) |
+| A6 | `fik+0x760` | u32 | contact body id; 0 on no-contact frames | `0x4BBBEB`, `0x4BBC27` |
+| A7 | `fik+0x19` | u8 | when set: offset zeroed on no-contact frames, and `sub_4CF4A0` re-inits leg state (`0x4CF882`) | ctor zeroes it |
+| C1 | `cc+0x90` | u32 | `& 0x3F`; `== 0x15` ⇒ Branch B reset (state value name unknown) | `0x4424EC..0x4424F8` |
+| C2 | `cc+0x18` (ptr), `cc+0x1E` (u16 count) | contact array, stride 64 B, flags u32 at `entry+0x28` | Branch B looks for an entry with flag & 1, else any nonzero flag (`sub_625DE0`, `ecx=cc+0x18` @`0x442558`) | — |
+| C3 | `cc+0xA0` | v4 | velocity (xy magnitude sets the Branch B spring rate) | `sub_442460` |
+| E1 | `opt+0x63`, `opt+0x64` | u8 ×2 | foot IK global off / foot IK only for kind 1 | `0x4538A5`, `0x4538D9` |
+| E2 | entity world Z | f32 | `e` matrix translation z (what we wrote) | `sub_413460` |
+
+### 9.3 Decision rule (evaluate on the floating guard; the control should show "none")
+
+1. `S1 == 0` (Branch B):
+   * `S2 & 1` set **and** `|S5| ≥ 0.05` **and** `S5 ≈` the visible float (sign: S5 > 0 ⇒ drawn above) ⇒ **H1**.
+     Expected signature: S5 is nonzero right after our Z steps and decays toward 0 when the guard stands still.
+     `S6 − E2 ≈ S5`.
+   * `S2 & 1` clear, or `S4 & 0x38 < 8`, or `C1&0x3F == 0x15` ⇒ the engine resets every frame, S5 must be 0 ⇒ H1 ruled out.
+2. `S1 != 0` (Branch A; S5 is always 0 here):
+   * `A1 & 0x40` clear, or `E1[0x63] != 0`, or `S3 & 0x10`, or (`E1[0x64] != 0` and kind ≠ 1) ⇒ foot IK not running ⇒ H2 ruled out.
+   * otherwise `A2 & 1 == 0` (no contact) for most frames **and** `|A5.z| ≥ 0.05` **and** `A5.z ≈` the visible
+     float, steady while standing ⇒ **H2**. Also expect `A4.z − E2 ≈ A5.z` and `A6 == 0`.
+   * `A2 & 1 == 1` with `A5.z ≈ 0` ⇒ contacts are live ⇒ H2 ruled out.
+3. `S9`: `|+0xF4| ≥ 0.05` ⇒ a third offset source, not H1 or H2.
+4. All of the above zero but the guard still floats ⇒ not this pass. Next suspects: the 20 `sub_4CEF30` sub-steps
+   (UNREAD), or the animation itself.
+
+The 0.05 m threshold is a suggestion to sit above noise. It is not derived from the binary.
+
+### 9.4 When it is safe to read
+
+* **UNVERIFIED:** whether the skeleton job graph (`sub_587F70` jobs, scheduled from `sub_729130`) runs on the
+  same thread as, and strictly after or before, the Human update `sub_16FA7D0` (reached only through the data
+  xref `0x26EBBE8`). Not established statically.
+* Consequences:
+  * 4-byte aligned scalars (S1–S7, S9, A1–A3, A6, C1, E1) are single `mov`/`movss` writes in the code above.
+    A read cannot tear, but may be one frame old.
+  * v4 fields (S8, A4, A5, C3) are written with `movaps`. Read them as four separate floats and treat a single
+    sample as approximate. **Decide on several consecutive frames, never on one.**
+  * Pointers (S1, `cc`, `fik`) change only on build/attach (`sub_431B70`, M4). They are stable while the body exists.
+* Read-only reads from `OwnDrain` therefore cannot corrupt engine state. The worst case is a stale or mixed vector sample.
+
+### 9.5 Fix seams (none implemented; each must be checked with the probe first)
+
+**H1: yes, two seams.**
+* (a) Reset the spring right after we place the body:
+  `((void(__thiscall*)(void* plane, const float* point16, const float* normal16))0x0042E6C0)(comp+0x260, pos, up)`.
+  Evidence: the engine does exactly this in its own reset path (`0x442519` get position → `0x442525 call`, `ecx = comp+0x260`).
+  The callee ends `retn 8` (`0x42E727`), so it is callee-clean. Arg 1 is the point (it goes to `+0x50`; z to
+  `+0x40/+0x48`). Arg 2 is the normal (goes to `+0x00/+0x20`). It also zeroes the velocities `+0x10/+0x30/+0x44/+0x4C`.
+  **Both pointers must be 16-byte aligned** (`movaps` at `0x42E6DC`/`0x42E709`). `pos` = the matrix translation we
+  just wrote, w = 0. `up` = `(0,0,1,0)`, the same value the engine passes (`xmmword_1E40AE0`, bytes dumped:
+  `00000000 00000000 3F800000 00000000`).
+* (b) Clear `comp+0x336 & 1` every frame. `0x4424A0` then takes the engine's own reset, and `0x453904` has
+  already zeroed `+0x2C0`. One byte write. *Writers that set bit 1 again are not attributed (§4)*, so it must
+  be re-applied each frame.
+* Thread caveat (§9.4): if the IK job runs concurrently with `OwnDrain`, (a) can race the spring update. (b) is a
+  single-byte write and the safer choice.
+
+**H2: yes, one seam with evidence and one that is riskier.**
+* (a) While `fik+6 & 1 == 0`, write `fik+0x750 = (0,0,0,0)`. The no-contact branch then sets
+  `fik+0x740 = entityPos + 0` (`0x4BBC07..0x4BBC1C`). Evidence: the engine's own zeroing of this field under
+  `fik+0x19` (`0x4BBBFA..0x4BBC00`). **UNVERIFIED:** that `fik+0x740` is what the foot solve uses as ground
+  (its consumers in the 20 sub-steps are unread).
+* (b) Set `fik+0x19 = 1`. The engine then zeroes the offset itself and `sub_4CF4A0` re-inits the leg state every
+  frame (`0x4CF882`, decompile `if (v36 || fik+0x25) {… reset block …}`). Nothing seen clears it. **Risk:** foot IK
+  is effectively reset every frame. Use (a) first.
+* Correction to §7: `fik+4 |= 0xA00` does **not** reset `fik+0x750`. 0x200 forces 0x800 and `fik+0x28 = 0`,
+  and 0x200 is cleared at the end of `sub_4CF4A0`.
+* Blunt fallback for either branch on mirrored bodies: `comp+0x337 |= 0x10` skips foot IK (`0x4538AB`). It does not
+  stop Branch B. Risk: a frozen last IK pose (unchecked).
