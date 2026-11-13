@@ -118,3 +118,21 @@ User's observation in run 23688, with the puppet on a roof: the guards spotted t
   - **Not yet found:** who attaches a FightDataItem to the player's AI item array, and why the build path leaves the puppet without it.
 
 Next (static): writers of `ai+0x5C/+0x62` that store a FightDataItem (reflection instance `0x028C0678`, clone `sub_10EA390`).
+
+### CORRECTION (session 2, 2026-11-13 17:51): the FightDataItem lookup in crash 20588 was on the PLAYER, not the puppet
+
+- **Who `esi` was.** In `AC4Coop_crashctx_20588_1.txt`, `esi = 49636A70`. The same log names that pointer as the
+  player at the time: `[Phase1] AddEntity issued; GetPlayer now = 49636A70 (orig=49636A70 new=44D99AF0)`. So
+  `sub_133EFB0` returned null for the **player** entity. The claim above that "the puppet lacks a FightDataItem" was
+  wrong: it attributed the entity from the stack layout instead of reading the pointer against the log.
+- **Differential** (`ops/tools/aiitems.py`, read-only ReadProcessMemory, pid 5452, player `40295B70` vs puppet
+  `3402EE20`):
+  - Both AI objects are CharacterAI (vtable `0x026D3CD8`) with exactly **one** item, the same class (vtable
+    `0x0272D18C`, not in the class map).
+  - Neither has a FightDataItem.
+  - The puppet's `AIComponent+0x94` is non-null (`419D7F80`).
+  - A 1 s sampler through the user's fight in step 3 recorded **no change** to the player's list.
+- **So FightDataItem is not on the player's AI item list even in a fight.** Which entity normally carries one, and
+  why `sub_10D4AA0` reached the player with the path `14098E0 = true, 14B7FE0 = false`, are both open.
+- **Not established.** Why the conflict object's +0x304 handle resolved to the player at that moment, after the
+  puppet's handle was recycled across a scene change (the fired puppet handle `34582EFC` later pointed at `49636A70`).
