@@ -164,10 +164,52 @@ __declspec(naked) void FmDetour()
     }
 }
 
+// ---- [Coop] NavNullGuard --------------------------------------------------------------------------------------
+// The narrow alternative to FightSkipPuppet: let the fight order reach the puppet, and only stop the read that
+// faulted. In sub_1780610 (CSrvNavigation, thiscall, 4 args, retn 10h):
+//   0x01780647  8B 8E 84 00 00 00   mov ecx,[esi+84h]     <- 6 bytes stolen
+//   0x0178064D  53 / 57 / 8B 79 14  push ebx / push edi / mov edi,[ecx+14h]
+//   0x01780657  39 57 0C            cmp [edi+0Ch],edx     <- run 7164 fault (edi = 0)
+// At 0x01780647 the frame holds only the pushed ebp and esi - the same depth as the function's own early exit at
+// 0x01780640 (xor al,al / pop esi / pop ebp / retn 10h), which this guard takes when [esi+84h] or its +0x14 is null.
+const uintptr_t VA_NAV = 0x01780647;
+const uintptr_t NAV_STEAL = 6;
+const BYTE kNavBytes[NAV_STEAL] = { 0x8B, 0x8E, 0x84, 0x00, 0x00, 0x00 };
+DWORD g_navResume = 0;
+volatile LONG g_navGuarded = 0;
+LONG g_navLogged = 0;
+
+__declspec(naked) void NavDetour()
+{
+    __asm {
+        mov  ecx, [esi + 84h]
+        test ecx, ecx
+        jz   bad
+        cmp  dword ptr [ecx + 14h], 0
+        jz   bad
+        jmp  dword ptr [g_navResume]
+    bad:
+        lock inc dword ptr [g_navGuarded]
+        xor  al, al
+        pop  esi
+        pop  ebp
+        ret  10h
+    }
+}
+
 }  // namespace
 
 void PuppetStim::Init()
 {
+    if (GetPrivateProfileIntA("Coop", "NavNullGuard", 0, Paths::Ini()) == 1) {
+        const uintptr_t nav = GameModuleBase + (VA_NAV - 0x00400000);
+        if (memcmp((const void*)nav, kNavBytes, NAV_STEAL) == 0) {
+            g_navResume = (DWORD)(nav + NAV_STEAL);
+            Hook::DetourFunc((BYTE*)nav, (DWORD)(uintptr_t)&NavDetour, (DWORD)NAV_STEAL);
+        } else {
+            OutputDebugStringA("[PupStim] bytes mismatch at 0x1780647 - NavNullGuard not installed\n");
+        }
+    }
     if (GetPrivateProfileIntA("Coop", "FightSkipPuppet", -1, Paths::Ini()) < 0) return;   // key absent: no hook
     const uintptr_t site = GameModuleBase + (VA_FIGHTMEMBER - 0x00400000);
     if (memcmp((const void*)site, kFmPrologue, FM_STEAL) != 0) { OutputDebugStringA("[PupStim] prologue mismatch at 0x13F22E0\n"); return; }
@@ -185,6 +227,8 @@ void PuppetStim::Init()
 void PuppetStim::OnPuppetUpdate(void* pup)
 {
     if (!pup || !Phase1_IsEntityHost()) return;
+    const LONG ng = g_navGuarded;
+    if (ng != g_navLogged && g_navLogged < 50) { g_navLogged = ng; Log("[PupStim] NavNullGuard took the null exit %ld time(s)\n", ng); }
     const ULONGLONG now = GetTickCount64();
     if (now >= g_nextMs) {
         g_nextMs = now + 1000;
