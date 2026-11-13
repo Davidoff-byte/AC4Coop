@@ -9,7 +9,7 @@ BUILD  : branch re/guard-spawn-probe (worktree ref/AC4Coop-guardspawn), base cad
          bin/AC4Coop.asi 486,912 B, sha256 E012AC0C...C475 from the uncommitted tree (stamp tree=dirty). Rebuilding
          at the commit changes the embedded stamp and so the hash; record the [Build] line of the run, not this one.
          py tools\spine_gate.py -> VERDICT: OK. py tools\verify_signatures.py -> ORACLE: PASS.
-LIVE   : NONE. Nothing here has run in the game yet. Every runtime claim below is marked UNVERIFIED until the run in section 6.
+LIVE   : one run, 2026-11-13 pid 7792, ASI a3de755 (= e9c5e75 + probe) sha256 CD4E6808...D352 - see section 8.
 ```
 
 ## 0. Answer
@@ -236,3 +236,55 @@ get_wide_dword 0x27AF834 -> 0x27B0BD0; +0x18 = 0x4C; name "RowSelector"
 disasm 0x16FA7D0 (22), 0x16FAACD context, 0x46D8E0 (50), 0x46D6F0 (150)
 idapro.close_database(False)
 ```
+
+## 8. Live run 1 - 2026-11-13, pid 7792 (log `AC4Coop_gsp_7792.txt`, 22,877 B, 149 lines)
+
+```
+BUILD  : [Build] asi=cd4e680849511f7477198443165a3bb3d7b4263b75dbefa11feabd5ae19cd352 commit=a3de755 tree=clean
+GAME   : [BG] sha256=bc11ad79...ab5150 verdict=KNOWN. Session was a LINKED co-op run as guest ([Net] Mode=join, peer link up,
+         puppet shown, [Coop] GuardAnimFull switched 0->1 by the other session at 10:43), not the solo run section 6 planned.
+INI    : GuardSpawnProbe=1 GuardSpawnProbeCycles=20 GuardSpawnProbeDelayS=30 (hold 3000 ms, gap 1500 ms, dist 6 m)
+```
+
+**Oracle line, verbatim:**
+`[GSP] RESULT cycles=20/20 built=20 added=20 skel=20 bhv=20 hp=20 sameArch=20 sameComps=14 removed=20 notLoaded=0 exc=0 verdict=FAIL`
+
+| check | result |
+|---|---|
+| `selHcIsBuilder` (RowSelector+0x10 is the builder) | **1 on all 25 first-seen builds with a real handle.** The one 0 is `builderId=0`, `selHc=04DD5F8C` (the engine's invalid-handle sentinel), on the player's 32-component builder |
+| every logged build via 0x5FAC00 has builder vtable `0x01E57790` | yes, 26/26 |
+| NPC types captured (skeleton + BhvGenericNPC at build time) | 17 builder ids, arch `35F7`/`318C`/`31EC`/`3594`, 16-20 components, every `Duplicate` ok=1 |
+| clone of capture #0 (builder `00000006'12CECF74`, arch 35F7, 19 comps) | 20/20 built (rc=0), added, held 3 s, removed. Every one had a skeleton, BhvGenericNPC, arch 35F7 and a CSrvNPCHealth service reading 36/36 |
+| same component list as the source | **14/20.** Cycles 5, 9, 10, 14, 15 and 19 built with **18** components instead of 19, both at build and at hold. This is the only reason the verdict is FAIL |
+| exceptions in the probe | 0 (`exc=0`, `buildExc=0` in all 61 census windows) |
+| game survived | yes. It ran about 8 minutes after the last cycle and was closed by the user |
+
+**Reading (measured, not interpreted further):**
+- U2 is answered for this area. Ambient NPCs are built through 0x5FAC00. After the 20 s load window the census shows
+  `npcBuilds` == `newNpc` or close to it in most windows (e.g. #7: 11 / 9, #21: 14 / 14), and 150 NPC builds in the
+  first loaded window.
+- **No soldier was seen.** `soldier=0` in every census window (about 97 NPCs live) and in every capture, so the cloned type
+  is a generic NPC, **not a guard**. This run cannot say whether there were no soldiers nearby or the soldier test
+  (WeaponComponent `0x027106A8` / MapIconBehaviorGuard `0x0269E9D0`) is wrong: the independent census in phase1
+  (`[Sync] kindrole`) runs only on the host and read n=0 here. **The guard-type claim is still UNVERIFIED.**
+- The 18-vs-19 components: one builder produces two component sets across builds. That fits the row picker `0x7A8860`
+  choosing a different row, which means the `sel+4` seed lead (section 2) does **not** pin the variant. Which component
+  differs is not known, because the log does not print the vtable list.
+- **Placement does not hold.** In 14/20 cycles the position at hold was not the position written before AddEntity, up
+  to 50 m away. Cycles 3 and 4, two different entities, both sat at exactly (27.4,-120.9,3.6). A raw `m_GlobalMatrix`
+  write before AddEntity is not enough to place the clone (UNVERIFIED cause). Placement needs a write after the add
+  takes effect, e.g. SetGlobalMatrixInternal as the puppet drive does.
+- Visual check: not done (the user did not report on looks).
+
+**Crash-context record in the same run** (`AC4Coop_crashctx_7792_1.txt`, 10:49:46, about t=483 s in world, about 6 min after the
+last clone was removed). A read fault the game survived: `eip=006855D1` in `sub_685360` (`mov ecx,[esi+104h]` -> ecx=0 ->
+`cmp [ecx+90h], eax`), esi=`2FEE5AE0`. `edi=4644B860` is the **puppet's CharacterActionSet** (`phase1_log_7792.txt:434`:
+`CAS set from local player (pac=4644B860 ...)`). None of the probe's 58 pointers (20 clone entities, 20 cycle selectors,
+17 captured selectors, the source's) appears anywhere in the record. Not attributed to the probe; not attributed to
+anything else either. The stack scan lists ASI-range values, but this Release build has no map file to resolve them.
+
+**Probe defect found by this run:** the log was opened with `fopen_s`, which denies all sharing, so it could not be read
+while the game ran. Fixed in `5347330` (`_fsopen(..., _SH_DENYWR)`), not yet installed.
+
+**Next run, to close O12:** at a fort or guarded area (soldiers present), with the vtable list printed for differing cycles
+and placement done after the add. Then repeat for a soldier capture.
