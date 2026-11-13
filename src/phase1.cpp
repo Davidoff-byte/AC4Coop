@@ -5874,6 +5874,23 @@ static volatile LONG s_phFrames = 0, s_phOk = 0;
 static int s_plOn = 0; static uint64_t s_plNext = 0;
 static bool GuardPhaseLockOn() { return OwnFlag("GuardPhaseLock", &s_plOn, &s_plNext) != 0; }
 static volatile LONG s_pxFrames = 0, s_pxOk = 0, s_plSeeks = 0, s_plNudged = 0;
+// Phase-lock tuning, live (re-read every 2 s): seek above GuardPhaseSeekPct/100 of the clip, at most every
+// GuardPhaseSeekMs; otherwise close the gap over GuardPhaseCloseMs with the time scale clamped to +-GuardPhaseNudgePct.
+static int OwnInt(const char* key, int def, int* cache, uint64_t* next) {
+    const uint64_t now = GetTickCount64();
+    if (now >= *next) {
+        *next = now + 2000;
+        const int v = (int)GetPrivateProfileIntA("Coop", key, def, Paths::Ini());
+        if (v != *cache) L("[Own] %s=%d (was %d)\n", key, v, *cache);
+        *cache = v;
+    }
+    return *cache;
+}
+static int s_plSeekPct = 15, s_plSeekMs = 500, s_plCloseMs = 500, s_plNudgePct = 25;
+static uint64_t s_plSeekPctN = 0, s_plSeekMsN = 0, s_plCloseMsN = 0, s_plNudgePctN = 0;
+// [Phase] histogram (every px frame): |error| buckets <.05 <.10 <.15 <.25 >=.25; misses (>= .05) by sign and by the
+// clip's measured rate (ratio/s: <0.5 = clip longer than 2 s, 0.5-1.5, >1.5).
+static volatile LONG s_phB[5] = {}, s_phAhead = 0, s_phBehind = 0, s_phRate[3] = {};
 
 // [Coop] OwnPhysicsMs (default 0 = render-only writes, physics only on placement / >5 m jumps): in own-update
 // mode, also move the body's physics (SetGlobalMatrixInternal updatePhysics=true) at most every N ms; 1 = every
@@ -6128,14 +6145,25 @@ static void GuardAnimApply(Human* h, OwnBody& o, uint64_t now, volatile int* ste
                 const float ae = e < 0.0f ? -e : e;
                 InterlockedIncrement(&s_pxFrames);
                 if (ae < 0.05f) InterlockedIncrement(&s_pxOk);
+                InterlockedIncrement(&s_phB[ae < 0.05f ? 0 : ae < 0.10f ? 1 : ae < 0.15f ? 2 : ae < 0.25f ? 3 : 4]);
+                if (ae >= 0.05f) {
+                    InterlockedIncrement(e > 0.0f ? &s_phBehind : &s_phAhead);   // e > 0: body behind the host
+                    InterlockedIncrement(&s_phRate[st.rate < 0.5f ? 0 : st.rate < 1.5f ? 1 : 2]);
+                }
                 if (plOn) {
-                    if (ae > 0.15f && now - st.seekUs > 500000) {
+                    const float seekAt  = OwnInt("GuardPhaseSeekPct", 15, &s_plSeekPct, &s_plSeekPctN) / 100.0f;
+                    const uint64_t seekGap = (uint64_t)OwnInt("GuardPhaseSeekMs", 500, &s_plSeekMs, &s_plSeekMsN) * 1000;
+                    int closeMs = OwnInt("GuardPhaseCloseMs", 500, &s_plCloseMs, &s_plCloseMsN);
+                    if (closeMs < 50) closeMs = 50;
+                    const float nud = OwnInt("GuardPhaseNudgePct", 25, &s_plNudgePct, &s_plNudgePctN) / 100.0f;
+                    if (ae > seekAt && now - st.seekUs > seekGap) {
                         ac->SetCurrentActionRatio(hostNow, 0, false, false, ACTLAYER_PRIMARY);
                         st.seekUs = now; st.lastRUs = 0;      // the seek is not playback: skip the next rate sample
                         InterlockedIncrement(&s_plSeeks);
                     } else {
-                        const float m = 1.0f + (e / 0.5f) / st.rate;
-                        tsMul = m < 0.75f ? 0.75f : (m > 1.25f ? 1.25f : m);
+                        const float m = 1.0f + (e / (closeMs / 1000.0f)) / st.rate;
+                        const float lo = 1.0f - nud, hi = 1.0f + nud;
+                        tsMul = m < lo ? lo : (m > hi ? hi : m);
                         if (tsMul != 1.0f) InterlockedIncrement(&s_plNudged);
                     }
                 }
@@ -6395,6 +6423,13 @@ static void OwnReport() {
           s_gaOn, s_gbfOn, sw, ra, bf, fw, InterlockedExchange(&s_gaFaults, 0), (long)s_gaBanned, phf, pho, phf ? 100.0 * pho / phf : 0.0,
           g_blendTypeSafe, InterlockedExchange(&g_blendTypeMapped, 0), InterlockedExchange(&g_blendTypeSkipped, 0),
           s_plOn, pxf, pxo, pxf ? 100.0 * pxo / pxf : 0.0, InterlockedExchange(&s_plSeeks, 0), InterlockedExchange(&s_plNudged, 0));
+        L("[Phase] lock=%d seekPct=%d seekMs=%d closeMs=%d nudgePct=%d | err <.05=%ld <.10=%ld <.15=%ld <.25=%ld >=.25=%ld"
+          " | miss behind=%ld ahead=%ld | miss rate <0.5=%ld 0.5-1.5=%ld >1.5=%ld\n",
+          s_plOn, s_plSeekPct, s_plSeekMs, s_plCloseMs, s_plNudgePct,
+          InterlockedExchange(&s_phB[0], 0), InterlockedExchange(&s_phB[1], 0), InterlockedExchange(&s_phB[2], 0),
+          InterlockedExchange(&s_phB[3], 0), InterlockedExchange(&s_phB[4], 0),
+          InterlockedExchange(&s_phBehind, 0), InterlockedExchange(&s_phAhead, 0),
+          InterlockedExchange(&s_phRate[0], 0), InterlockedExchange(&s_phRate[1], 0), InterlockedExchange(&s_phRate[2], 0));
     }
     L("[OwnAir] physMs=%d physWrites=%ld | ctx frames=%ld ground=%ld air=%ld (%.1f%%) other=%ld (last id %ld) | moving frames=%ld "
       "actMatch=%ld actMis=%ld (%.1f%%) top body<-host:%s\n",
