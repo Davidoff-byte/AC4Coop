@@ -5944,6 +5944,26 @@ static void OwnAtomicMax(volatile LONG* t, LONG v);
 static int OwnFlag(const char* key, int* cache, uint64_t* next);
 static bool FloatProbeOn() { return OwnFlag("FloatProbe", &s_fpOn, &s_fpNext) != 0; }
 static bool StuckProbeOn() { return OwnFlag("StuckProbe", &s_stOn, &s_stNext) != 0; }
+// [Coop] FootOffsetFix (default 0; live). FloatProbe run 2026-11-13 (build 744BF2F3, pid 25904): every borrowed
+// guard runs BipedFootIK2 (branch A, foot IK on); in most 5 s windows some frames had no ground contact (fik+6 bit 1
+// clear) while the stored contact offset fik+0x750 was 5 cm .. 6.77 m - the S2 H2 mechanism (no-contact branch sets
+// the ground reference fik+0x740 = entityPos + fik+0x750, 0x4BBC07..0x4BBC1C; the engine itself zeroes +0x750 there
+// when fik+0x19 is set, 0x4BBBFA..0x4BBC00). Seam H2(a) from the S2 doc section 9.5: on a no-contact frame, zero the
+// offset (four 4-byte stores; the IK job may read it in between, S2 9.4). Branch B / bodies without a foot IK
+// object are untouched.
+static int s_fofOn = 0; static uint64_t s_fofNext = 0; static volatile LONG s_fofWrites = 0;
+static bool FootOffsetFixOn() { return OwnFlag("FootOffsetFix", &s_fofOn, &s_fofNext) != 0; }
+static void FootOffsetFix(Entity* e) {
+    void* comp = FindComponentByVtable(e, 0x01E41E58u);
+    if (!comp) return;
+    __try {
+        char* fik = *(char**)((char*)comp + 0x4C);
+        if (!fik || *(const uint32_t*)fik != 0x01E46BB4u || (fik[6] & 1)) return;
+        volatile uint32_t* off = (volatile uint32_t*)(fik + 0x750);
+        if (off[0] | off[1] | off[2]) { off[0] = 0; off[1] = 0; off[2] = 0; off[3] = 0; InterlockedIncrement(&s_fofWrites); }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
 static volatile LONG s_fpFrames = 0, s_fpBrA = 0, s_fpBrB = 0, s_fpBOn = 0, s_fpH1 = 0, s_fpAOn = 0, s_fpContact = 0,
                      s_fpH2 = 0, s_fpF4 = 0, s_fpCc15 = 0, s_fpS5MaxMm = 0, s_fpA5MaxMm = 0;
 static void FloatProbe(Entity* e) {
@@ -6605,6 +6625,7 @@ static void OwnDrain(Human* h) {
     e->SetGlobalMatrixInternal(&m, phys);
     InterlockedIncrement(&s_gWrites);
     if (FloatProbeOn()) FloatProbe(e);
+    if (FootOffsetFixOn()) FootOffsetFix(e);
     if (phys) InterlockedIncrement(&s_physWrites);
     AcquireSRWLockExclusive(&s_ownLock);
     const int j = OwnFind(key);
@@ -6695,12 +6716,13 @@ static void OwnReport() {
         unsigned o63 = 255, o64 = 255;
         __try { if (opt) { o63 = opt[0x63]; o64 = opt[0x64]; } } __except (EXCEPTION_EXECUTE_HANDLER) {}
         L("[Float] frames=%ld | branchB=%ld adaptOn=%ld H1cand=%ld maxS5=%.3fm | branchA=%ld footIkOn=%ld contact=%ld H2cand=%ld"
-          " maxA5z=%.3fm | F4>=5cm=%ld ccReset=%ld | opt63=%u opt64=%u\n",
+          " maxA5z=%.3fm | F4>=5cm=%ld ccReset=%ld | opt63=%u opt64=%u | fix=%d zeroed=%ld\n",
           InterlockedExchange(&s_fpFrames, 0), InterlockedExchange(&s_fpBrB, 0), InterlockedExchange(&s_fpBOn, 0),
           InterlockedExchange(&s_fpH1, 0), InterlockedExchange(&s_fpS5MaxMm, 0) / 1000.0,
           InterlockedExchange(&s_fpBrA, 0), InterlockedExchange(&s_fpAOn, 0), InterlockedExchange(&s_fpContact, 0),
           InterlockedExchange(&s_fpH2, 0), InterlockedExchange(&s_fpA5MaxMm, 0) / 1000.0,
-          InterlockedExchange(&s_fpF4, 0), InterlockedExchange(&s_fpCc15, 0), o63, o64);
+          InterlockedExchange(&s_fpF4, 0), InterlockedExchange(&s_fpCc15, 0), o63, o64,
+          s_fofOn, InterlockedExchange(&s_fofWrites, 0));
     }
     L("[OwnAir] physMs=%d physWrites=%ld | ctx frames=%ld ground=%ld air=%ld (%.1f%%) other=%ld (last id %ld) | moving frames=%ld "
       "actMatch=%ld actMis=%ld (%.1f%%) top body<-host:%s\n",
