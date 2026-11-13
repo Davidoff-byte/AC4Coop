@@ -282,6 +282,13 @@ def cmd_replay(a):
     c = lp.Counter(); sent = 0; t_begin = time.monotonic()
     rec_worlds = sorted(w for w in summarize(recs)["worlds"] if w)
     live_world = [0]; warned = [False]
+    rec_out = []; rec_next = [time.monotonic() + 30.0]   # --record-out: what the live peer sends us
+
+    def save_out(final=False):
+        if a.record_out and (final or time.monotonic() >= rec_next[0]):
+            rec_next[0] = time.monotonic() + 30.0
+            tap_write(a.record_out, rec_out, {"role": a.role, "proto": a.proto, "recorded": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                              "note": "received during replay"})
 
     def note_world(data):   # the live game's worldId (PlayerState +12): the entity decoder drops other worlds
         if kind(data) != "player" or not data[564]:
@@ -306,6 +313,8 @@ def cmd_replay(a):
                         data, src = sock.recvfrom(16384)
                         if src == peer and not answer_hello(sock, data, src, peer, a.proto):
                             c.add(data); note_world(data)
+                            if a.record_out:
+                                rec_out.append((time.monotonic() - t_begin, data)); save_out()
                     except (BlockingIOError, ConnectionResetError):
                         pass
                     dt = (t - first) / a.speed - (time.monotonic() - t_pass)
@@ -347,6 +356,9 @@ def cmd_replay(a):
             print(f"[tap] pass {passes} done: sent {sent}, received {c}", flush=True)
     except KeyboardInterrupt:
         pass
+    save_out(True)
+    if a.record_out:
+        print(f"[tap] record-out {a.record_out}: " + fmt_summary(summarize(rec_out)))
     print(f"[tap] RESULT replay=OK passes={passes} sent={sent} {c}")
     return 0
 
@@ -406,6 +418,7 @@ def main(argv):
         if name == "replay":
             p.add_argument("--loops", type=int, default=1000); p.add_argument("--speed", type=float, default=1.0)
             p.add_argument("--adopt-world", action="store_true", help="rewrite the recording's worldId to the live game's")
+            p.add_argument("--record-out", default="", help="also save what the live peer sends (tap format; rewritten every 30 s)")
             p.add_argument("--player-only", action="store_true", help="send only PlayerState datagrams (no entity/kill lane): "
                            "replaying a host recording into a host game, where recorded kills would kill real guards")
             p.add_argument("--as-proto", type=int, default=0, help="rewrite each datagram's protoVer (play an older recording "
