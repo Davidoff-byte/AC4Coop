@@ -31,6 +31,7 @@
 #include "event_probe.h"
 #include "puppet_stim.h"
 #include "react_probe.h"
+#include "guard_poi.h"
 #include "action_guard.h"
 #include "deref_guard.h"
 #include "combat_observe.h"
@@ -589,6 +590,9 @@ BOOL APIENTRY DllMain(HMODULE hMod, DWORD reason, LPVOID)
 
         // CanReact entry + R5 call-site probe (host), and the AlertQueryAsPlayer seam. [Coop] ReactProbe, default 0.
         ReactProbe::Init();
+
+        // Host: per-guard player of interest (0x6F6010, 0x65A688) and the world-conflict null guard (0x15DB19C).
+        GuardPoi::Init();
 
         // Stage 2A combat observer (E2-combat.md §1.2). OBSERVATION ONLY, installed as a byte-patch
         // hook: four whole-instruction prologues are detoured into private stubs that log the call

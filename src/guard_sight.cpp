@@ -44,7 +44,7 @@ bool g_installed = false;
 int  g_on = 0; ULONGLONG g_nextMs = 0;
 
 const int SLOTS = 256;
-struct Choice { uintptr_t obs; int puppet; ULONGLONG sinceMs; };
+struct Choice { uintptr_t obs; int puppet; ULONGLONG sinceMs; ULONGLONG seenMs; };   // seenMs: last Choose for obs
 Choice  g_tab[SLOTS];
 SRWLOCK g_lock = SRWLOCK_INIT;
 volatile LONG g_calls[3] = {}, g_puppetPicks = 0, g_switches = 0;
@@ -190,6 +190,7 @@ void* __cdecl Choose(void* obs, void* player, int mode, void* los)
             if (want != pick) { pick = want; g_tab[slot].puppet = pick; g_tab[slot].sinceMs = nowMs; InterlockedIncrement(&g_switches); }
         }
     }
+    if (slot >= 0 && g_tab[slot].obs == (uintptr_t)obs) g_tab[slot].seenMs = nowMs;
     ReleaseSRWLockExclusive(&g_lock);
     if (pick) { InterlockedIncrement(&g_puppetPicks); return pup; }
     return player;
@@ -271,6 +272,20 @@ void GuardSight::Init()
     for (int i = 0; i < 3; ++i) PatchCall(kSites[i].va, kSites[i].orig, stubs[i]);
     g_installed = true;
     OutputDebugStringA("[Sight] installed at 0x103D61D, 0x103D7A1, 0x131EFD5\n");
+}
+
+// For guard_poi.cpp ([Coop] GuardPlayerOfInterest): true when this guard's sight sensor currently tracks the
+// puppet (its entry picked the puppet and was refreshed by a Choose call within the last 3 s).
+bool GuardSight::TracksPuppet(const void* guard)
+{
+    if (!g_installed || !guard) return false;
+    const ULONGLONG nowMs = GetTickCount64();
+    bool r = false;
+    AcquireSRWLockShared(&g_lock);
+    for (int i = 0; i < SLOTS; ++i)
+        if (g_tab[i].obs == (uintptr_t)guard) { r = g_tab[i].puppet && nowMs - g_tab[i].seenMs < 3000; break; }
+    ReleaseSRWLockShared(&g_lock);
+    return r;
 }
 
 int GuardSight::FormatReport(char* out, int cap)
