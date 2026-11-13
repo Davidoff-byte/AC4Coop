@@ -9,6 +9,7 @@
 #include <cstdarg>
 #include <cstring>
 #include <cstdlib>
+#include <share.h>
 #include "Scimitar/World.h"
 #include "Scimitar/EntityBuilder.h"
 #include "Scimitar/RowSelector.h"
@@ -510,7 +511,8 @@ void GuardSpawnProbe::Init() {
     InitializeCriticalSection(&g_capCs);
     char leaf[64];
     _snprintf_s(leaf, sizeof(leaf), _TRUNCATE, "AC4Coop_gsp_%lu.txt", GetCurrentProcessId());
-    fopen_s(&g_log, Paths::LogPath(leaf), "w");
+    // _SH_DENYWR like the other logs: fopen_s denies all sharing, so the log could not be read while the game ran.
+    g_log = _fsopen(Paths::LogPath(leaf), "w", _SH_DENYWR);
 
     g_cycles  = GetPrivateProfileIntA("Coop", "GuardSpawnProbeCycles", 20, Paths::Ini());
     g_delayMs = GetPrivateProfileIntA("Coop", "GuardSpawnProbeDelayS", 30, Paths::Ini()) * 1000;
