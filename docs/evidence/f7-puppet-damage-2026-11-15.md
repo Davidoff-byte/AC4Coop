@@ -33,3 +33,17 @@ So a hit on a player-type Human is applied by `sub_11488D0` (no direct xrefs; it
   object with 0 components for these bodies; `entity+0x70` is not the component array for an Entity).
 - Design note (not a finding): the co-op rule "replicate intentions, no logic on replicas" means a hit on the puppet should
   reach the guest's real body over the wire, not damage the replica; that lane does not exist yet.
+
+## Trace: where the chain stops (same run 22156, gunshot 4)
+- `FightDamageEvent` class: name string 0x026FDD9C, descriptor 0x02A23C2C (base id 0x67F2E868 = DamageEvent, own id
+  0x13F3BE59, size 0x170, ctor slot -> 0x018D2E70 -> 0x018C9470 which writes **vtable 0x02700720**; both functions had no
+  boundary in the idb and were defined with the prologue scan). DamageEvent: descriptor 0x02A920CC, size 0x28.
+- The event post `sub_64A020` calls `event->vt[+0x24](receiver)`; for both damage classes that slot is the shared
+  `0x0064A080`. A `[Probe]` hook there with an 16-byte snapshot of the event (vtable) recorded, in a window with 19 guard
+  attacks on the puppet (ftask: NormalAttack 13 + 5 + 1): **102 posts of FightDamageEvent (vt 0x02700720) with receiver =
+  the puppet (0x31A8FF50)**, all with the same event object (0x0A960010); and no health write (section above).
+- So the guards' hits **land and post damage events to the puppet**; the chain stops at the receiver. The repeated post of
+  one event object is consistent with an event the receiver never consumes (UNVERIFIED reading).
+- Not completed: the per-hit event count on Edward (two control attempts: the first had no hit on Edward in the window,
+  the second lost the fight reset after Edward died). The handler that applies a FightDamageEvent to a player (receiver
+  side) is not traced; the known tail is event id dword_4E20518 -> sub_11488D0 -> 0x1C08EE0 -> 0x115ACC0.
