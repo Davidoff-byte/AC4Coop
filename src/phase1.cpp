@@ -431,14 +431,19 @@ void Phase1::ToggleVirtualPad() {
     s_contEnt = g_padGatePuppet;
     s_contSamples = 10;                 // 10 samples x 60 frames = ~10 s
     s_posProbeFrames = 120;
-    World* world = World::GetCurrentWorld();
-    Entity* player = world ? world->GetPlayer() : nullptr;
-    if (player && readable(player, 4)) {
-        s_p0Start[0] = player->m_GlobalMatrix.M41;
-        s_p0Start[1] = player->m_GlobalMatrix.M42;
-        s_p0Start[2] = player->m_GlobalMatrix.M43;
-        L("[VPad] player start (%.2f,%.2f,%.2f)\n", s_p0Start[0], s_p0Start[1], s_p0Start[2]);
-    }
+    // Runs on the input-poll thread (dllmain.cpp): the world/player reads are SEH-guarded like dllmain's sampleOnce
+    // (review 2026-11-14, part 1 finding 2).
+    Entity* player = nullptr;
+    __try {
+        World* world = World::GetCurrentWorld();
+        player = world ? world->GetPlayer() : nullptr;
+        if (player && readable(player, 4)) {
+            s_p0Start[0] = player->m_GlobalMatrix.M41;
+            s_p0Start[1] = player->m_GlobalMatrix.M42;
+            s_p0Start[2] = player->m_GlobalMatrix.M43;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { player = nullptr; }
+    if (player) L("[VPad] player start (%.2f,%.2f,%.2f)\n", s_p0Start[0], s_p0Start[1], s_p0Start[2]);
     if (g_padGatePuppet && readable(g_padGatePuppet, 4)) {
         Entity* pe = (Entity*)g_padGatePuppet;
         s_ppStart[0] = pe->m_GlobalMatrix.M41;
@@ -1744,7 +1749,7 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
             if (readable(ac, 0x160)) *((unsigned char*)ac + 0x159) = 1;
         }
 
-        if (locoNow) {   // feed HumanGroundData so the puppet's (enabled) FSM locomotes at the peer's gait
+        if (locoNow && bok) {   // feed HumanGroundData so the puppet's (enabled) FSM locomotes at the peer's gait (review 2026-11-14: only when the bundle is readable)
         qB->m_GroundData.m_CurSpeedRatio = s.curSpeed;
         qB->m_GroundData.m_DestSpeedRatio = s.destSpeed;
         qB->m_GroundData.m_DestHeading = s.heading;
@@ -5799,11 +5804,13 @@ static void MirrorActDrain(Human* h) {
     const LONG key = (LONG)(uintptr_t)h;
     for (int i = 0; i < 64; ++i) {
         if (s_maq[i].human != key) continue;
+        // Copy the request BEFORE releasing the slot: once human is 0, MirrorActQueue may claim this slot for another
+        // Human and overwrite the fields (review 2026-11-14, part 1 finding 3).
+        const uint32_t alias = s_maq[i].alias;
+        const unsigned int ent = s_maq[i].ent; const uint64_t objId = s_maq[i].objId; const uint64_t qms = s_maq[i].ms;
         if (InterlockedCompareExchange(&s_maq[i].human, 0, key) != key) continue;   // taken back by the writer
         InterlockedDecrement(&s_maqCount);
-        const uint32_t alias = s_maq[i].alias;
-        const unsigned int ent = s_maq[i].ent; const uint64_t objId = s_maq[i].objId;
-        if (GetTickCount64() - s_maq[i].ms > 1000) { InterlockedIncrement(&s_maqExpired); return; }
+        if (GetTickCount64() - qms > 1000) { InterlockedIncrement(&s_maqExpired); return; }
         if (!readable(h, 4)) return;
         ActionComponent* ac = h->GetActionComponent();
         if (!ac || !readable(ac, 0x40)) return;

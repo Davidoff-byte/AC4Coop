@@ -383,8 +383,11 @@ static unsigned __stdcall PollThread(void*)
         LobbyUi::Tick();
 
         // V (edge-triggered): toggle the pad-1 test stick and compare player vs puppet movement.
+        // Debug hotkey: only with [Coop] VPadTest != 0 (default 0), so a V press in normal play no longer toggles the
+        // puppet drive test (review 2026-11-14, part 1 finding 2).
         static bool vprev = false;
-        bool v = (GetAsyncKeyState('V') & 0x8000) != 0;
+        static const int s_vpadKey = GetPrivateProfileIntA("Coop", "VPadTest", 0, Paths::Ini());
+        bool v = s_vpadKey != 0 && (GetAsyncKeyState('V') & 0x8000) != 0;
         if (v && !vprev) { logline("[AC4Coop] V -> toggle virtual pad stick\n"); Phase1::ToggleVirtualPad(); }
         vprev = v;
 
