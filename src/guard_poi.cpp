@@ -327,6 +327,29 @@ void GuardPoi::Init()
     g_poiInstalled = true;
 }
 
+// [Coop] DespawnLeaveFight - crash run 20524 (build 4f202f7, AC4Coop_crashctx_20524_1.txt): after the replay ended and
+// the puppet despawned while it was still the FightManager's target, read fault eip=0x0047A9A8 (ecx = 0) with a
+// return into 0x01622D2D (sub_1622B40, called from the FightManager update sub_1626AB0) and the puppet / FightManager
+// pointers on the stack: the target record's handle no longer resolves. RemoveFighter (sub_161F420, thiscall,
+// 1 arg = record, retn 4; it reads the record's entity, so it must run while the puppet still exists) is called for
+// the puppet's own record before the removal is queued. The record is the puppet's fight data *(*(e+0xE8)+0x98) (live
+// 2026-11-14: equal to fm+0x304 in runs 21832 and 20524); fm = *(*(e+0x5C)+0x8DC) (as sub_13F22E0 reads it).
+// RemoveFighter takes the FightManager's own lock (this+0x66C, sub_D587F0 / sub_AC6580), the same one the update holds.
+void GuardPoi::LeaveFightBeforeDespawn(void* puppet)
+{
+    if (!puppet || GetPrivateProfileIntA("Coop", "DespawnLeaveFight", 0, Paths::Ini()) == 0) return;
+    __try {
+        const char* e = (const char*)puppet;
+        const char* w = *(const char* const*)(e + 0x5C);
+        char* fm = w ? *(char* const*)(w + 0x8DC) : nullptr;
+        const char* ai = *(const char* const*)(e + 0xE8);
+        const char* rec = ai ? *(const char* const*)(ai + 0x98) : nullptr;
+        if (!fm || !rec || EntOf(rec) != puppet) return;
+        Hook::CallClassMethod<void, char*, const char*>((unsigned long)Va(0x0161F420), fm, rec);
+        OutputDebugStringA("[Poi] DespawnLeaveFight: RemoveFighter(puppet record) before despawn\n");
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
 int GuardPoi::FormatReport(char* out, int cap)
 {
     if ((!g_poiInstalled && !g_cfInstalled && !g_ckInstalled && !g_foInstalled) || cap < 64) return 0;

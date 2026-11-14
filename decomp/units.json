@@ -707,6 +707,15 @@
    "size": 335,
    "status": "unknown"
   },
+  "0161F420": {
+   "addr": "0161F420",
+   "claimed_at": null,
+   "name": "FightRemoveFighter",
+   "owner": null,
+   "receipts": [],
+   "size": 1074,
+   "status": "unknown"
+  },
   "01626AB0": {
    "addr": "01626AB0",
    "claimed_at": null,

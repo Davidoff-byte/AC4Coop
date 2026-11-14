@@ -8,4 +8,6 @@ namespace GuardPoi
 {
     void Init();
     int  FormatReport(char* out, int cap);
+    // [Coop] DespawnLeaveFight (default 0, live): call on the main thread BEFORE World::RemoveEntity(puppet).
+    void LeaveFightBeforeDespawn(void* puppet);
 }
