@@ -21,6 +21,7 @@
 #include "paths.h"
 #include "Hook.h"
 #include "Scimitar/Entity.h"
+#include "Scimitar/World.h"
 
 #include <windows.h>
 #include <cmath>
@@ -240,9 +241,20 @@ void PuppetStim::OnPuppetUpdate(void* pup)
     }
     if (!g_pending) return;
     g_pending = 0;
+    // [Coop] PuppetStimSource (default 0, read per fire): 1 = emit from the LOCAL PLAYER instead of the puppet, as the
+    // positive control for F7 (guards fighting the real player vs. the puppet, same stimulus ids and receiver rule).
+    // The player is World::GetCurrentWorld()->GetPlayer() (as fight_probe.cpp reads it); handle *(e+0xC8) as above.
+    void* src = pup;
+    const int source = GetPrivateProfileIntA("Coop", "PuppetStimSource", 0, Paths::Ini());
+    if (source == 1) {
+        World* w = World::GetCurrentWorld();
+        void* pl = w ? (void*)w->GetPlayer() : nullptr;
+        if (!pl) { Log("[PupStim] source=player but no player\n"); return; }
+        src = pl;
+    }
     int posted = -1;
-    __try { posted = Fire(pup); }
+    __try { posted = Fire(src); }
     __except (EXCEPTION_EXECUTE_HANDLER) { Log("[PupStim] EXCEPTION 0x%08X (nothing more posted)\n", GetExceptionCode()); }
-    Log("[PupStim] fired seq=%d mode=%d ids=%s posted=%d puppet=%p handle=%08X\n", g_seq, g_mode, g_ids, posted, pup,
-        (unsigned)*(uintptr_t*)((char*)pup + 0xC8));
+    Log("[PupStim] fired seq=%d mode=%d ids=%s posted=%d source=%s src=%p handle=%08X\n", g_seq, g_mode, g_ids, posted,
+        source == 1 ? "PLAYER" : "puppet", src, (unsigned)*(uintptr_t*)((char*)src + 0xC8));
 }
