@@ -1,6 +1,6 @@
 # Pilot: drive Edward and read his surroundings without touching the desktop
 
-Status: **builds** (2026-11-15). Live verification pending; see the end.
+Status: **solo-tested** (2026-11-15, build 04b314b): see docs/evidence/pilot-live-2026-11-15.md.
 
 ## Why
 Solo tests need the game in the Havana save, Edward moved to a spot, and a read of who is around him. Until now that
@@ -28,4 +28,4 @@ equivalent, written independently (AU-RW has no license).
 
 ## Verification
 - Builds: Release x86 v143; `spine_gate.py` VERDICT OK; `verify_signatures.py` ORACLE PASS. No new engine call.
-- Live: not yet.
+- Live: solo-tested, run 24540: boot to Havana with 2 A presses, scan, stick, goto (both within 1 m), memory dump.
