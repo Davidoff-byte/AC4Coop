@@ -49,3 +49,30 @@ Read-only `fgroup.py` (layout from `sub_16090C0` / `sub_15F0390` / `sub_15DABC0`
   never chase or attack.**
 - NavNullGuard took its null exit 0 times. The puppet's AIComponent+0x94 is non-null (aiitems.py).
   `fm+0x6D4..` holds a unit direction, not a position (an earlier hypothesis "stale target position" is withdrawn).
+
+## Run 20524 (build 4f202f7, asi 21885279): why enlisted guards never move (measured + static, not fixed)
+- **`[Coop] GuardPoiFightTarget=1`: NEGATIVE.** `byFightTarget=0` in every report. The fighting guards do not
+  call `sub_6F6010` / `sub_65A660`, so the chase does not read "the player" through them. Flag stays default 0.
+- **Test scenario confound (fixed for the test):** in `host-p13-1.tap` the puppet stands 9 m up (z = 12) for most of
+  the loop, and the sight vertical limit (L7) hides it. `holdtap.py` (scratch) built `hold-guards-58.tap`: the
+  walk-in from t = 54-63.5 s, then the puppet holds at (58.4, -73.4, 3.2) among the guards.
+  - With the puppet held there, sight works: `cone=10 VIS=10`, hostile(G,P) = 10 of 10.
+- **Behaviour order:** AIComponent+0x94 is the NPC behaviour controller (vt 0x026F4B70).
+  - Its slot 16 is `sub_1780610(order, ...)`. It maps the order through `sub_649410`: identity for a normal soldier.
+    The current order is at `*(*(svc+0x84)+0x14)+0xC` (`sub_624360`).
+  - `fstates.py` (read-only, 100 ms): each guard that joins the puppet's fight group goes 0 → **7** within 0.2 s and
+    stays at 7. Its position is unchanged.
+- **Who issues orders** (`ordscan2.py`, encoding family `mov r,[r+40h]; push 0 x3; push N; call r` only; other
+  encodings NOT covered):
+  - order 2: `0x013F2366`, `0x013F23C8` (both in `sub_13F22E0`; positive control);
+  - order 7: `0x0192068F` (`sub_1920680`, a statechart action that also posts `dword_4E23154`) and `0x01943962`
+    (`sub_19438E0`).
+- **Order 2 comes from:**
+  - `sub_14B6CC0`, the fight behaviour's enter (vtable `0x026CB0xx`, whose update is `sub_14C3FC0`), which calls
+    `sub_13F22E0(entity)`;
+  - `sub_161BD30` (FightManager: for each member with record+0x2C == 1, only when its computed value +0x8C8 changes).
+- **Conclusion (static reading + live state 7):** the guards sit in the reaction order 7 and never enter the fight
+  behaviour. `sub_14B6CC0` → `sub_13F22E0` → order 2 is never reached for them.
+- **Next step (UNVERIFIED):** find what moves a guard from the reaction statechart into the fight behaviour (the
+  escalation after `dword_4E23154`). Test seam: call `sub_13F22E0(member)` from the FightManager update for members
+  whose fight target is the puppet, and watch whether order 2 makes them fight.
