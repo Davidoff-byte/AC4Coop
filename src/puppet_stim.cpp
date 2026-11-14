@@ -198,6 +198,56 @@ __declspec(naked) void NavDetour()
     }
 }
 
+// ---- [Coop] PuppetNavService (default 0, read live) ---------------------------------------------------------------
+// F7 root cause (ops/evidence/guard-ai/combat-nav.md "ROOT CAUSE", run 26404): the puppet's CSrvNavigation (vt
+// 0x026F4B70, *(*(e+0xE8)+0x94)) was never started because the mod disables the puppet's behaviour component:
+// +0x88 = 0, +0x100 = -1, +0x10C = garbage, u16 +0xA = 0, order -2 (player: valid). Every guard reachability test on
+// the target reads these (C1 0x019285B8 / C2 0x005121B7 need +0xA != 0; CLConflict rule sub_129B510 path-queries the
+// target's nav location), so guards pick status 2 / order 7 (intercept, no goal) instead of status 1 / order 2.
+// Engine calls (IDA o109/o110, all thiscall ecx = svc, no args, plain retn):
+//   sub_A011D0  statechart start: svc slot 8 sub_1792F10 (owner +0x88, entity +0x7C, combat obj +0x80, child services),
+//               then pushes the root state (+0x4/+0xA). Called once per service.
+//   sub_179CDF0 svc slot 45 UpdateNavLocation: +0x10C..+0x114 position from +0x7C, +0x100/+0x104 via sub_1793290;
+//               called each puppet update, as the engine's teleport helper sub_196ED20 does after a transform write.
+// UNVERIFIED: that the started service's idle order-0 state never moves the puppet on its own.
+const unsigned  NAVSVC_VT = 0x026F4B70;
+const uintptr_t VA_NAVSVC_START = 0x00A011D0;
+const uintptr_t VA_NAVSVC_LOCATE = 0x0179CDF0;
+int g_nsOn = 0; ULONGLONG g_nsNext = 0; void* g_nsStarted = nullptr; LONG g_nsTicks = 0, g_nsFaults = 0;
+
+void NavServiceTick(void* pup)
+{
+    const ULONGLONG now = GetTickCount64();
+    if (now >= g_nsNext) { g_nsNext = now + 2000; g_nsOn = GetPrivateProfileIntA("Coop", "PuppetNavService", 0, Paths::Ini()) != 0; }
+    if (!g_nsOn) return;
+    __try {
+        char* aic = *(char**)((char*)pup + 0xE8);
+        char* svc = aic ? *(char**)(aic + 0x94) : nullptr;
+        if (!svc || *(const unsigned*)svc != NAVSVC_VT) return;
+        if (*(const uintptr_t*)(*(const char* const*)svc + 45 * 4) != VA_NAVSVC_LOCATE) return;
+        if (g_nsStarted != svc) {
+            g_nsStarted = svc;
+            if (*(const uint16_t*)(svc + 0xA) == 0 && *(void* const*)(svc + 0x88) == nullptr) {
+                Hook::CallClassMethod<int, char*>(VA_NAVSVC_START, svc);
+                const char* ctx = *(const char* const*)(svc + 0x84);
+                Log("[PupNav] started svc=%p: +0xA=%u +0x88=%p +0x7C=%p +0x80=%p order=%d\n", svc,
+                    (unsigned)*(const uint16_t*)(svc + 0xA), *(void* const*)(svc + 0x88), *(void* const*)(svc + 0x7C),
+                    *(void* const*)(svc + 0x80), ctx ? *(const int*)(ctx + 0x20) : -9);
+            } else {
+                Log("[PupNav] svc=%p already started (+0xA=%u)\n", svc, (unsigned)*(const uint16_t*)(svc + 0xA));
+            }
+        }
+        Hook::CallClassMethod<void, char*>(VA_NAVSVC_LOCATE, svc);
+        if ((++g_nsTicks % 600) == 1) {
+            const float* p = (const float*)(svc + 0x10C);
+            Log("[PupNav] tick=%ld +0xA=%u +0x100=%08X +0x104=%08X pos=(%.1f,%.1f,%.1f)\n", g_nsTicks,
+                (unsigned)*(const uint16_t*)(svc + 0xA), *(const unsigned*)(svc + 0x100), *(const unsigned*)(svc + 0x104), p[0], p[1], p[2]);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        if (++g_nsFaults <= 10) Log("[PupNav] EXCEPTION 0x%08X\n", GetExceptionCode());
+    }
+}
+
 }  // namespace
 
 void PuppetStim::Init()
@@ -228,6 +278,7 @@ void PuppetStim::Init()
 void PuppetStim::OnPuppetUpdate(void* pup)
 {
     if (!pup || !Phase1_IsEntityHost()) return;
+    NavServiceTick(pup);   // [Coop] PuppetNavService (default 0)
     const LONG ng = g_navGuarded;
     if (ng != g_navLogged && g_navLogged < 50) { g_navLogged = ng; Log("[PupStim] NavNullGuard took the null exit %ld time(s)\n", ng); }
     const ULONGLONG now = GetTickCount64();

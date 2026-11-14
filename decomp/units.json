@@ -395,6 +395,15 @@
    "size": 16,
    "status": "claimed"
   },
+  "00A011D0": {
+   "addr": "00A011D0",
+   "claimed_at": null,
+   "name": "NavStatechartStart",
+   "owner": null,
+   "receipts": [],
+   "size": 211,
+   "status": "unknown"
+  },
   "00A094D0": {
    "addr": "00A094D0",
    "claimed_at": null,
@@ -816,6 +825,15 @@
    "owner": null,
    "receipts": [],
    "size": 40,
+   "status": "unknown"
+  },
+  "0179CDF0": {
+   "addr": "0179CDF0",
+   "claimed_at": null,
+   "name": "NavUpdateLocation",
+   "owner": null,
+   "receipts": [],
+   "size": 916,
    "status": "unknown"
   },
   "018B9EA0": {
