@@ -5637,6 +5637,13 @@ static void ApplyRelayedHealth(uint64_t objId, Entity* e, const EntityState& es)
 // that already stands where a host guard stands is never handed to another one. The choice is recorded in the
 // objId table; ApplyGuards' existing sticky path then drives it. UNVERIFIED in game until a guest run says so.
 // The value is re-read every 2 s so a live test can change it without a relaunch.
+static unsigned s_bindArchWait = 0;            // [Coop] BindRequireArch: records that waited for their archetype
+static int s_braOn = 0; static uint64_t s_braNext = 0;
+static bool BindRequireArchOn() {
+    const uint64_t now = GetTickCount64();
+    if (now >= s_braNext) { s_braNext = now + 2000; s_braOn = GetPrivateProfileIntA("Coop", "BindRequireArch", 0, Paths::Ini()) != 0; }
+    return s_braOn != 0;
+}
 static float WideBindRadiusM() {
     static float s_r = 0.0f; static uint64_t s_next = 0;
     const uint64_t now = GetTickCount64();
@@ -6924,10 +6931,17 @@ static void ApplyGuards(const EntityPacket& pkt) {
                     }
                 }
             }
+            // [Coop] BindRequireArch (default 0, live; review 2026-11-14 part 2, finding 4): a record decoded on a fresh
+            // shadow after a lost first record carries arch = 0 until the next epoch (~3 s, net.cpp EPOCH_PACKETS), and
+            // arch = 0 disables the class check below - a NEW binding made in that window is sticky, so a guard can keep a
+            // body of another class. With the flag on, no new binding is made while the archetype is unknown; an existing
+            // sticky binding (slot) is unaffected.
+            const bool archUnknownNoBind = BindRequireArchOn() && !es.arch && !best;
+            if (archUnknownNoBind) ++s_bindArchWait;
             // [IdRes] Primary path: ask the engine's registry for the id directly. Purely additive - when
             // the resolver is off, misses, or the object fails validation, the legacy scan below runs
             // exactly as before, so the previous behaviour cannot regress.
-            if (g_idResolver && es.objId) {
+            if (g_idResolver && es.objId && !archUnknownNoBind) {
                 Entity* re = ResolveEntityById(es.objId);
                 Component* rb = re ? MirrorCandidateBhv(re, player) : nullptr;
                 // Wide bind: a host-minted id can also exist in this process and name a DIFFERENT entity. Trust a
@@ -6946,7 +6960,7 @@ static void ApplyGuards(const EntityPacket& pkt) {
                     L("[IdRes] id=%016llX miss -> scan\n", (unsigned long long)es.objId);
                 }
             }
-            const int scanN = best ? 0 : nobj;               // a resolver hit skips the legacy scan
+            const int scanN = (best || archUnknownNoBind) ? 0 : nobj;   // a resolver hit (or an unknown arch, flag on) skips the scan
             s_bindScanN += (unsigned)scanN;
             for (int j = 0; j < scanN; ++j) {
                 Reference* ref = ents.GetElement(j);
@@ -10960,7 +10974,7 @@ static void DumpConfigOnce()
 
     struct K { const char* s; const char* k; int d; };
     static const K keys[] = {
-        { "Coop", "ActionDeathLog", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "CombatObserve", 0 },
+        { "Coop", "ActionDeathLog", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "CombatObserve", 0 },
         { "Coop", "CombatTest", 0 }, { "Coop", "CrashContext", 0 }, { "Coop", "CorpseKeepSec", 30 }, { "Coop", "CrowdProbeIntegrate", 1 },
         { "Coop", "CrowdProbeLiveKeys", 1 }, { "Coop", "DamageRelay", 0 }, { "Coop", "Diag", 0 },
         { "Coop", "DisableCrowd", 0 }, { "Coop", "DisablePuppetAI", 1 }, { "Coop", "DisableSpawns", 0 },
