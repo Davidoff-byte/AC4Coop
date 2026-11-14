@@ -64,7 +64,19 @@ volatile LONG g_evCount = 0, g_dropped = 0;
 
 struct Shadow { u32 ret, hook, esp, ecx, args[kArgs]; };
 struct ShadowStack { u32 n; Shadow e[kShadow]; };
-__declspec(thread) ShadowStack t_shadow;
+// Explicit TLS, never __declspec(thread): an implicit-TLS read from a thread the loader did not set up for this
+// module faults, and inside a vectored handler that fault recurses until the stack overflows (0xC00000FD at game
+// start, run 10292, build 9ec7dfc). TlsGetValue returns null instead.
+DWORD g_tlsShadow = TLS_OUT_OF_INDEXES, g_tlsRearm = TLS_OUT_OF_INDEXES;
+ShadowStack* ThreadShadow()
+{
+    ShadowStack* ss = (ShadowStack*)TlsGetValue(g_tlsShadow);
+    if (!ss) {
+        ss = (ShadowStack*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(ShadowStack));
+        if (ss) TlsSetValue(g_tlsShadow, ss);
+    }
+    return ss;
+}
 
 extern "C" void __cdecl ProbeOnEnter(Regs* r);
 extern "C" u32 __cdecl ProbeOnExit(ExitRegs* r);
@@ -146,8 +158,9 @@ extern "C" void __cdecl ProbeOnEnter(Regs* r)
     InterlockedIncrement(&h.entries);
     u32 entryEsp = (u32)(uintptr_t)&r->ret;
     Record(id, 0, r->ecx, r->edx, r->eax, r->eflags, entryEsp, r->ret, r->args);
-    if (h.exitWanted && h.active) {
-        ShadowStack& ss = t_shadow;
+    ShadowStack* ssp = (h.exitWanted && h.active) ? ThreadShadow() : nullptr;
+    if (ssp) {
+        ShadowStack& ss = *ssp;
         if (ss.n < kShadow) {
             Shadow& s = ss.e[ss.n++];
             s.ret = r->ret; s.hook = id; s.esp = entryEsp; s.ecx = r->ecx;
@@ -162,7 +175,12 @@ extern "C" u32 __cdecl ProbeOnExit(ExitRegs* r)
 {
     // esp after the callee's `ret N` = entryEsp + 4 + N. Pick the newest shadow entry consistent with that; entries
     // above it belong to frames that were unwound by an exception and never returned.
-    ShadowStack& ss = t_shadow;
+    ShadowStack* ssp = (ShadowStack*)TlsGetValue(g_tlsShadow);
+    if (!ssp) {
+        Log("[Probe] FATAL: exit thunk without a shadow stack (tid %lu)\n", GetCurrentThreadId());
+        TerminateProcess(GetCurrentProcess(), 0xDEAD);
+    }
+    ShadowStack& ss = *ssp;
     u32 now = (u32)(uintptr_t)(&r->slot + 1);
     while (ss.n > 0) {
         Shadow& s = ss.e[ss.n - 1];
@@ -191,14 +209,17 @@ u32 g_everPages[64]; volatile LONG g_everN = 0;
 enum { kWHits = 65536 };
 WHit* g_whits = nullptr; volatile LONG g_whitN = 0;
 volatile LONG g_wactive = 0, g_wstopping = 0;
-__declspec(thread) u32 t_rearm = 0;
+volatile LONG g_vehInstalled = 0;
 
 LONG CALLBACK WriteVeh(EXCEPTION_POINTERS* x)
 {
+    if (!g_everN) return EXCEPTION_CONTINUE_SEARCH;          // nothing was ever watched
     EXCEPTION_RECORD* er = x->ExceptionRecord;
-    if (er->ExceptionCode == EXCEPTION_SINGLE_STEP && t_rearm) {
-        if (!g_wstopping && g_wactive) { DWORD old; VirtualProtect((void*)(uintptr_t)t_rearm, 0x1000, PAGE_READONLY, &old); }
-        t_rearm = 0; return EXCEPTION_CONTINUE_EXECUTION;
+    if (er->ExceptionCode == EXCEPTION_SINGLE_STEP) {
+        u32 rearm = (u32)(uintptr_t)TlsGetValue(g_tlsRearm);
+        if (!rearm) return EXCEPTION_CONTINUE_SEARCH;
+        if (!g_wstopping && g_wactive) { DWORD old; VirtualProtect((void*)(uintptr_t)rearm, 0x1000, PAGE_READONLY, &old); }
+        TlsSetValue(g_tlsRearm, nullptr); return EXCEPTION_CONTINUE_EXECUTION;
     }
     if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2 && er->ExceptionInformation[0] == 1) {
         u32 a = (u32)er->ExceptionInformation[1], page = a & ~0xFFFu;
@@ -222,7 +243,7 @@ LONG CALLBACK WriteVeh(EXCEPTION_POINTERS* x)
         }
         DWORD old; VirtualProtect((void*)(uintptr_t)page, 0x1000, PAGE_READWRITE, &old);
         if (!recording) return EXCEPTION_CONTINUE_EXECUTION;
-        t_rearm = page; x->ContextRecord->EFlags |= 0x100; return EXCEPTION_CONTINUE_EXECUTION;
+        TlsSetValue(g_tlsRearm, (void*)(uintptr_t)page); x->ContextRecord->EFlags |= 0x100; return EXCEPTION_CONTINUE_EXECUTION;
     }
     return EXCEPTION_CONTINUE_SEARCH;
 }
@@ -369,6 +390,7 @@ std::string Handle(const std::string& line)
         u32 a; u32 l = strtoul(t[2].c_str(), nullptr, 10);
         if (!ParseHex(t[1], &a) || !Plausible(a) || l < 1 || l > 4096 || g_wwN >= 8 || g_wpageN >= 8) return "{\"ok\":false,\"error\":\"args\"}";
         if (!g_whits) g_whits = (WHit*)VirtualAlloc(nullptr, sizeof(WHit) * kWHits, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!InterlockedExchange(&g_vehInstalled, 1)) AddVectoredExceptionHandler(1, WriteVeh);   // only once tracing is used
         u32 page = a & ~0xFFFu; bool known = false;
         for (int i = 0; i < g_wpageN; ++i) known |= g_wpages[i] == page;
         g_ww[g_wwN++] = { a, l };
@@ -435,7 +457,8 @@ void ProbeServer::Init()
     g_ring = (Ev*)VirtualAlloc(nullptr, sizeof(Ev) * kRing, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     MH_STATUS st = MH_Initialize();
     if (!g_stubs || !g_ring || (st != MH_OK && st != MH_ERROR_ALREADY_INITIALIZED)) { Log("[Probe] init failed (MinHook %d)\n", (int)st); return; }
-    AddVectoredExceptionHandler(1, WriteVeh);
+    g_tlsShadow = TlsAlloc(); g_tlsRearm = TlsAlloc();
+    if (g_tlsShadow == TLS_OUT_OF_INDEXES || g_tlsRearm == TLS_OUT_OF_INDEXES) { Log("[Probe] TlsAlloc failed\n"); return; }
     HANDLE th = CreateThread(nullptr, 0, PipeThread, nullptr, 0, nullptr);
     if (th) CloseHandle(th);
     Log("[Probe] on: pipe \\\\.\\pipe\\ac4probe-%lu, ring %u events x %u bytes\n", GetCurrentProcessId(), (unsigned)kRing, (unsigned)sizeof(Ev));
