@@ -238,10 +238,25 @@ void NavServiceTick(void* pup)
             }
         }
         Hook::CallClassMethod<void, char*>(VA_NAVSVC_LOCATE, svc);
-        if ((++g_nsTicks % 600) == 1) {
+        if ((++g_nsTicks % 300) == 1) {
             const float* p = (const float*)(svc + 0x10C);
-            Log("[PupNav] tick=%ld +0xA=%u +0x100=%08X +0x104=%08X pos=(%.1f,%.1f,%.1f)\n", g_nsTicks,
-                (unsigned)*(const uint16_t*)(svc + 0xA), *(const unsigned*)(svc + 0x100), *(const unsigned*)(svc + 0x104), p[0], p[1], p[2]);
+            // Attack-token gate (fightmanager.md: sub_161ED30): target C17 state. Same calls as sub_13E23E0 (o111):
+            // obj = sub_6F5FF0(e) = *(AIC+0x24); c17 = obj->vt[72](obj, 17); state = c17->vt[1200](c17);
+            // fight stance: sub_13DB790(state) || state in {9,10,11,33,69,70,72,74} (sub_13E2230).
+            auto stance = [](void* e) -> int {
+                char* o = *(char**)(*(char**)((char*)e + 0xE8) + 0x24);
+                if (!o) return -1;
+                char* c17 = reinterpret_cast<char*(__thiscall*)(char*, int)>(*(uintptr_t*)(*(char**)o + 72))(o, 17);
+                if (!c17) return -2;
+                return reinterpret_cast<int(__thiscall*)(char*)>(*(uintptr_t*)(*(char**)c17 + 1200))(c17);
+            };
+            World* w = World::GetCurrentWorld();
+            void* pl = w ? (void*)w->GetPlayer() : nullptr;
+            const int sp = stance(pup), sl = pl ? stance(pl) : -9;
+            Log("[PupNav] tick=%ld +0xA=%u +0x100=%08X pos=(%.1f,%.1f,%.1f) | C17 stance puppet=%d player=%d | tokGate puppet=%d/%d player=%d/%d\n",
+                g_nsTicks, (unsigned)*(const uint16_t*)(svc + 0xA), *(const unsigned*)(svc + 0x100), p[0], p[1], p[2], sp, sl,
+                (int)Hook::CallCdeclMethod<char, void*>(0x013E23E0, pup), (int)Hook::CallCdeclMethod<bool, void*>(0x013E2230, pup),
+                pl ? (int)Hook::CallCdeclMethod<char, void*>(0x013E23E0, pl) : -9, pl ? (int)Hook::CallCdeclMethod<bool, void*>(0x013E2230, pl) : -9);
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         if (++g_nsFaults <= 10) Log("[PupNav] EXCEPTION 0x%08X\n", GetExceptionCode());

@@ -683,6 +683,24 @@
    "size": 58,
    "status": "unknown"
   },
+  "013E2230": {
+   "addr": "013E2230",
+   "claimed_at": null,
+   "name": "TargetInFightStanceB",
+   "owner": null,
+   "receipts": [],
+   "size": 114,
+   "status": "unknown"
+  },
+  "013E23E0": {
+   "addr": "013E23E0",
+   "claimed_at": null,
+   "name": "TargetInFightStanceA",
+   "owner": null,
+   "receipts": [],
+   "size": 73,
+   "status": "unknown"
+  },
   "013F22E0": {
    "addr": "013F22E0",
    "claimed_at": null,
