@@ -523,18 +523,36 @@ namespace {
             okS = okS && DecodeEntityChunk(buf, s3, c, &w) == DEC_OK;
             g_rxHaveDone = false; g_rxDoneSeq = 0;
         }
+        // Restart inside the window: marker at seq 1000 / epoch 10, then a restarted sender (epoch 1, seq 5) must be
+        // accepted; negative control: the same seq one epoch behind (a late datagram) stays DEC_STALE.
+        bool okT;
+        {
+            DecodeReason w = DEC_OK;
+            auto one = [&buf]() { const uint16_t ci = 0, ct = 1; std::memcpy(buf + 28, &ci, 2); std::memcpy(buf + 30, &ct, 2); };
+            g_rxHaveDone = true; g_rxDoneSeq = 1000; g_rxEpoch = 10;
+            g_txEpoch = 9; g_txSinceReset = 0; a.seq = 5; a.ents[0].anim.ratioQ = 44000;
+            const size_t t1 = EncodeEntityPacket(a, buf, sizeof(buf));
+            one();
+            okT = DecodeEntityChunk(buf, t1, c, &w) == DEC_STALE;                 // one epoch behind: stale
+            g_rxHaveDone = true; g_rxDoneSeq = 1000; g_rxEpoch = 10;
+            g_txEpoch = 1; g_txSinceReset = 0; a.seq = 5; a.ents[0].anim.ratioQ = 44500;
+            const size_t t2 = EncodeEntityPacket(a, buf, sizeof(buf));
+            one();
+            okT = okT && DecodeEntityChunk(buf, t2, c, &w) == DEC_OK;            // restarted sender: accepted
+            g_rxHaveDone = false; g_rxDoneSeq = 0;
+        }
         // Both peers must start from an empty shadow.
         std::memset(g_txShadow, 0, sizeof(g_txShadow));
         std::memset(g_rxShadow, 0, sizeof(g_rxShadow));
         g_txEpoch = g_rxEpoch = 1; g_txSinceReset = 0;
         char m[256];
         wsprintfA(m, "[Net] wire codec selftest: roundtrip=%s resend=%s nochange=%s deaddelta=%s resurrect=%s halfdead=%s anim=%s"
-                     " stale=%s (full=%u B, resend=%u B, repeat=%u B, res=%u B, idle=%u B, half=%u B, anim=%u B)\n",
+                     " stale=%s restart=%s (full=%u B, resend=%u B, repeat=%u B, res=%u B, idle=%u B, half=%u B, anim=%u B)\n",
                   ok ? "PASS" : "FAIL", okR ? "PASS" : "FAIL", ok4 ? "PASS" : "FAIL", ok2 ? "PASS" : "FAIL",
-                  ok3 ? "PASS" : "FAIL", ok5 ? "PASS" : "FAIL", ok6 ? "PASS" : "FAIL", okS ? "PASS" : "FAIL",
+                  ok3 ? "PASS" : "FAIL", ok5 ? "PASS" : "FAIL", ok6 ? "PASS" : "FAIL", okS ? "PASS" : "FAIL", okT ? "PASS" : "FAIL",
                   (unsigned)n1, (unsigned)nr, (unsigned)n2, (unsigned)n3, (unsigned)n4, (unsigned)n5, (unsigned)n6);
         dbg(m);
-        return ok && okR && ok2 && ok3 && ok4 && ok5 && ok6 && okS;
+        return ok && okR && ok2 && ok3 && ok4 && ok5 && ok6 && okS && okT;
     }
 
     bool DecodeEntityPacket(const uint8_t* in, size_t len, EntityPacket& out, DecodeReason* why) {
@@ -655,6 +673,11 @@ namespace {
         // GetTickCount as seq (another domain) and a restarted host starts again near 0 - both are far
         // outside the window, pass, and do not move the marker (see SnapshotDone).
         static const int32_t STALE_WINDOW = 4096;
+        // Review 2026-11-14 part 2: a host that restarts within STALE_WINDOW snapshots of its last session starts again
+        // at a seq INSIDE the window below the marker, so every new snapshot read as stale for up to ~205 s. A restarted
+        // sender also restarts its epoch at 1 (g_txEpoch); a late datagram is at most one epoch behind. An epoch that
+        // moves back by 2 or more is therefore a restart: forget the marker.
+        if (g_rxHaveDone && h.epoch + 2u <= g_rxEpoch) { g_rxHaveDone = false; g_rxDoneSeq = 0; }
         if (g_rxHaveDone) {
             const int32_t d = SeqDiff(h.seq, g_rxDoneSeq);
             if (d <= 0 && d > -STALE_WINDOW) return fail(DEC_STALE);
