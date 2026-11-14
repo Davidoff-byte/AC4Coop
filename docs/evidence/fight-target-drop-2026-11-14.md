@@ -76,3 +76,37 @@ Read-only `fgroup.py` (layout from `sub_16090C0` / `sub_15F0390` / `sub_15DABC0`
 - **Next step (UNVERIFIED):** find what moves a guard from the reaction statechart into the fight behaviour (the
   escalation after `dword_4E23154`). Test seam: call `sub_13F22E0(member)` from the FightManager update for members
   whose fight target is the puppet, and watch whether order 2 makes them fight.
+
+## 2026-11-14 evening: fixes and the live differential (builds 964fd09 .. d3c1095)
+- **`DespawnLeaveFight` (964fd09): VERIFIED live, two despawns.**
+  - Run 26952: the puppet was despawned while it was the FightManager target. The game survived 15+ s with no
+    crashctx file, and `fightmgr.py` read `targetRec=0`.
+  - Run 23828: the same with a puppet record that was not the target.
+  - Control: run 20524 crashed (`AC4Coop_crashctx_20524_1.txt`).
+- **`FightKeepOnConflictEnd` (b97a303): solo-tested.**
+  - Run 23828: no `[FightRm]` for the puppet over 60 s plus 90 s of sampling. Before it, run 26820 dropped the puppet
+    about 12 s after the shot through a second E50 poster.
+- **Single target slot is a real co-op gap.** When the player ran into the guards, fm+0x304 became the PLAYER
+  record; when that fight ended the slot was cleared. The puppet's group survived without the target: SetTarget runs
+  only in the fighter ctor, so nothing restores it.
+- **`FightOrderPuppet` (952fad0):**
+  - Run 26952: the guard went 7 → 2 within 1.2 s and held 2 for 30+ s, but did not move (15.8 m from the puppet).
+  - Run 23828 (fresh puppet): the engine itself gave order 2 (`ordered=0`) and the guards still did not move.
+- **Navigation-service differential, same guard 43F3CA90, same svc 0x38CFF5F0:**
+  - vs PUPPET: order 2, svc memory static.
+  - vs PLAYER: order 2, ctx+0x14 advances, and the moving fields (0xF4, 0xFC, 0x144, 0x14C, 0x2E8...) change while the
+    guard moves 48 → 44.
+  - The nav service is not where the decision is made; it receives no move request in the puppet case.
+- **`FightStateProbe` (d3c1095), run 26404:**
+  - Guard 401EEDE0, vs puppet at 6.8 m: orders 0 → 7 → 6 → 7, never 2.
+  - The same guard vs the player at 3.7 m (owner ran in): 7 → 2 in 0.1 s, then fought.
+  - Puppet held 2.0-2.2 m from guard 42F561C0 (`hold-guard-near.tap`): 9 → 7 → 6 → 7, never 2. So the trigger is not
+    distance.
+  - The track-1 context stack read (vt 0x026E8AE8) is empty (n=0) or garbage in both cases: not usable as is.
+- **sight/detection:** CanReact and the CRLDetect start (`detect=0`) are never reached while a fight is already active,
+  for the puppet AND for the player. The perception chain is not the divergence in this state.
+- **Order-2 issuers outside the FightManager** (callers of `sub_13F22E0`, IDA o107):
+  - `sub_FE1950` (vtable data ref 0x0268763C) and `sub_1B036B0` (called from `sub_1B084D0`): actions on an owner
+    with a handle at +0x5C;
+  - `sub_1BE16C0` (from `sub_1BF89B0`): retargets a list.
+  - Under full RE (ops/evidence/guard-ai/).
