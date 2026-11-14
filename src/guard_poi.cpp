@@ -173,6 +173,76 @@ __declspec(naked) void ConflictDetour()
 
 uintptr_t Va(uintptr_t va) { return GameModuleBase + (va - 0x00400000); }
 
+// ---- [Coop] FightOrderPuppet (default 0; installed when the key is present; read live) ---------------------------
+// Test seam, F7 chase layer (docs/evidence/fight-target-drop-2026-11-14.md, run 20524): guards enlisted in the puppet's
+// fight group sit at behaviour order 7 (reaction) and never get order 2, which the engine gives in sub_13F22E0
+// (cdecl, 1 arg = entity, plain retn; 0x013F22E0 `55 8B EC 51 8B 55 08`) from the fight behaviour's enter sub_14B6CC0
+// and from sub_161BD30. This wraps the FightManager update sub_1626AB0 (thiscall, plain retn; its ONLY reference is
+// vtable slot 0x026DB734 - full-image abs + E8/E9 scan 2026-11-14) and, after the original update, calls
+// sub_13F22E0(member) for each member of the target record's group whose own fight target is the puppet and whose
+// current order is not 2. Layouts (IDA o79/o84/o90/o98): group = *(rec+0x10); arr *(grp+0x10), n u16 grp+0x16;
+// sub arr *(sub+8), n u16 sub+0xE; record entity = handle *(rec+0x14); order = *(*(*(*(e+0xE8)+0x94)+0x84)+0x20)
+// (0x0178063B cmp [ecx+20h], eax with ecx = [esi+84h]). UNVERIFIED: that order 2 makes the guards fight the puppet
+// (this flag is the test).
+const uintptr_t VA_FM_SLOT = 0x026DB734;
+const uintptr_t VA_FM_UPDATE = 0x01626AB0;
+const uintptr_t VA_GIVE_ORDER = 0x013F22E0;
+bool g_foInstalled = false; int g_foOn = 0; ULONGLONG g_foNext = 0;
+volatile LONG g_foTicks = 0, g_foMembers = 0, g_foOrdered = 0, g_foLastOrder = -1;
+
+const void* EntOf(const char* rec)
+{
+    const int* h = *(const int* const*)(rec + 0x14);
+    return h ? (const void*)(uintptr_t)((h[2] >> 31) & h[0]) : nullptr;
+}
+
+void FightOrderAfterUpdate(char* fm)
+{
+    const ULONGLONG now = GetTickCount64();
+    if (now >= g_foNext) { g_foNext = now + 2000; g_foOn = GetPrivateProfileIntA("Coop", "FightOrderPuppet", 0, Paths::Ini()) != 0; }
+    if (!g_foOn || !Phase1_IsEntityHost()) return;
+    void* pup = Phase1_PuppetEntity();
+    if (!pup) return;
+    __try {
+        const char* rec = *(const char* const*)(fm + 0x304);
+        if (!rec || EntOf(rec) != pup) return;
+        InterlockedIncrement(&g_foTicks);
+        const char* grp = *(const char* const*)(rec + 0x10);
+        if (!grp) return;
+        const uint16_t ns = *(const uint16_t*)(grp + 0x16);
+        const char* const* subs = *(const char* const* const*)(grp + 0x10);
+        for (uint16_t i = 0; i < ns && i < 64; ++i) {
+            const char* sub = subs[i];
+            if (!sub) continue;
+            const uint16_t nr = *(const uint16_t*)(sub + 0xE);
+            const char* const* recs = *(const char* const* const*)(sub + 8);
+            for (uint16_t j = 0; j < nr && j < 64; ++j) {
+                const char* r = recs[j];
+                if (!r) continue;
+                const void* e = EntOf(r);
+                if (!e || e == pup || !FightTargetIs(e, pup)) continue;
+                InterlockedIncrement(&g_foMembers);
+                const char* ai = *(const char* const*)((const char*)e + 0xE8);
+                const char* svc = ai ? *(const char* const*)(ai + 0x94) : nullptr;
+                const char* ctx = svc ? *(const char* const*)(svc + 0x84) : nullptr;
+                if (!ctx) continue;
+                const int order = *(const int*)(ctx + 0x20);
+                InterlockedExchange(&g_foLastOrder, order);
+                if (order == 2) continue;
+                Hook::CallCdeclMethod<void, const void*>((unsigned long)Va(VA_GIVE_ORDER), e);
+                InterlockedIncrement(&g_foOrdered);
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+DWORD g_fmOrig = 0;
+void __fastcall FmUpdateWrap(char* fm, void* /*edx*/)
+{
+    reinterpret_cast<void(__thiscall*)(char*)>(g_fmOrig)(fm);
+    FightOrderAfterUpdate(fm);
+}
+
 // Replaces `call sub_1608F70` at 0x017C013B. __fastcall with an unused edx = the callee's thiscall frame: ecx = fm,
 // one stack argument (the player), callee pops 4 bytes; the caller only tests al.
 char __fastcall KeepPuppetStub(void* fm, void* /*edx*/, void* ent)
@@ -220,6 +290,18 @@ void GuardPoi::Init()
             g_cfInstalled = Hook::DetourFunc((BYTE*)s, (DWORD)(uintptr_t)&ConflictDetour, 5) != 0;
         } else OutputDebugStringA("[Poi] bytes mismatch at 0x15DB19C\n");
     }
+    if (GetPrivateProfileIntA("Coop", "FightOrderPuppet", -1, Paths::Ini()) >= 0) {   // key present: install, read live
+        DWORD* slot = (DWORD*)Va(VA_FM_SLOT);
+        if (*slot == (DWORD)Va(VA_FM_UPDATE)) {
+            DWORD old = 0;
+            if (VirtualProtect(slot, 4, PAGE_READWRITE, &old)) {
+                g_fmOrig = *slot;
+                *slot = (DWORD)(uintptr_t)&FmUpdateWrap;
+                VirtualProtect(slot, 4, old, &old);
+                g_foInstalled = true;
+            }
+        } else OutputDebugStringA("[Poi] vtable slot 0x26DB734 mismatch - FightOrderPuppet not installed\n");
+    }
     if (GetPrivateProfileIntA("Coop", "ConflictKeepPuppet", -1, Paths::Ini()) >= 0) {   // key present: install, read live
         const uintptr_t c = Va(VA_ANYTGT_CALL);
         if (memcmp((const void*)c, kAnyTgtCall, 5) == 0) g_ckInstalled = PatchCall(c, (void*)&KeepPuppetStub);
@@ -247,12 +329,18 @@ void GuardPoi::Init()
 
 int GuardPoi::FormatReport(char* out, int cap)
 {
-    if ((!g_poiInstalled && !g_cfInstalled && !g_ckInstalled) || cap < 64) return 0;
+    if ((!g_poiInstalled && !g_cfInstalled && !g_ckInstalled && !g_foInstalled) || cap < 64) return 0;
     const int n = _snprintf_s(out, cap, _TRUNCATE,
                               "[Poi] on=%d lookups=%ld lentPuppet=%ld (byFightTarget=%ld ft=%d) | conflictNullSkips=%ld | keepPuppet on=%d tests=%ld kept=%ld",
                               g_on, InterlockedExchange(&g_calls, 0), InterlockedExchange(&g_lent, 0),
                               InterlockedExchange(&g_lentFight, 0), g_ftOn,
                               InterlockedExchange(&g_cfSkipped, 0), g_ckOn, InterlockedExchange(&g_ckCalls, 0),
                               InterlockedExchange(&g_ckKept, 0));
+    if (n > 0 && g_foInstalled && n < cap - 96) {
+        const int m = _snprintf_s(out + n, cap - n, _TRUNCATE, " | fightOrder on=%d ticks=%ld members=%ld ordered=%ld lastOrder=%ld",
+                                  g_foOn, InterlockedExchange(&g_foTicks, 0), InterlockedExchange(&g_foMembers, 0),
+                                  InterlockedExchange(&g_foOrdered, 0), g_foLastOrder);
+        return m > 0 ? n + m : n;
+    }
     return n > 0 ? n : 0;
 }

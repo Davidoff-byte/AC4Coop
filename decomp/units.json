@@ -665,6 +665,15 @@
    "size": 80,
    "status": "claimed"
   },
+  "013F22E0": {
+   "addr": "013F22E0",
+   "claimed_at": null,
+   "name": "FightGiveMemberOrder",
+   "owner": null,
+   "receipts": [],
+   "size": 254,
+   "status": "unknown"
+  },
   "01406C70": {
    "addr": "01406C70",
    "claimed_at": "2026-11-08T12:43:51Z",
@@ -696,6 +705,15 @@
    "owner": null,
    "receipts": [],
    "size": 335,
+   "status": "unknown"
+  },
+  "01626AB0": {
+   "addr": "01626AB0",
+   "claimed_at": null,
+   "name": "FightManagerUpdate",
+   "owner": null,
+   "receipts": [],
+   "size": 1362,
    "status": "unknown"
   },
   "017106C0": {
