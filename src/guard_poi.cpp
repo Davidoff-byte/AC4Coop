@@ -47,13 +47,17 @@
 #include "Hook.h"
 #include "paths.h"
 
+#include "Scimitar/Entity.h"
+
 #include <windows.h>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
 
 void* Phase1_PuppetEntity();
 bool  Phase1_IsEntityHost();
+void  Phase1_LogLine(const char* s);
 
 namespace {
 
@@ -268,11 +272,88 @@ void __cdecl DropActionWrap(void* a1, void* a2)
     Hook::CallCdeclMethod<void, void*, void*>((unsigned long)Va(VA_DROP_ACTION), a1, a2);
 }
 
+// ---- [Coop] FightStateProbe (default 0, live, read-only; needs the FightOrderPuppet key present for the wrap) -------
+// Execution differential for F7: for every member of the FightManager target's group, log the member's Human context
+// statechart path when it changes, tagged with the target (PUPPET / PLAYER = role 7 not the puppet). Human* =
+// AIEntityHelper::GetHuman = sub_13905A0 (cdecl entity; o105). Context layout as StateProbe (phase1.cpp): main track
+// byte H+0x100, ctx = *(H+8+0x30*main+0x14); for ctx vt 0x026E8AE8 the active-state stack is u16 *(ctx+0x118),
+// count u16 ctx+0x11E (root first). Behaviour order = *(*(*(*(e+0xE8)+0x94)+0x84)+0x20) (0x0178063B).
+const uintptr_t VA_GETHUMAN = 0x013905A0;
+int g_fsOn = 0; ULONGLONG g_fsNext = 0; volatile LONG g_fsLines = 0;
+struct FsSlot { const void* e; uint32_t sig; };
+FsSlot g_fs[64];
+
+void FightStateAfterUpdate(char* fm)
+{
+    const ULONGLONG now = GetTickCount64();
+    if (now >= g_fsNext) { g_fsNext = now + 2000; g_fsOn = GetPrivateProfileIntA("Coop", "FightStateProbe", 0, Paths::Ini()) != 0; }
+    if (!g_fsOn || g_fsLines > 3000) return;
+    __try {
+        const char* rec = *(const char* const*)(fm + 0x304);
+        if (!rec) return;
+        const void* tgt = EntOf(rec);
+        if (!tgt) return;
+        const void* pup = Phase1_PuppetEntity();
+        const char* tag = tgt == pup ? "PUPPET" : (*(const int*)(rec + 0x18) == 7 ? "PLAYER" : "OTHER");
+        const Entity* te = (const Entity*)tgt;
+        const char* grp = *(const char* const*)(rec + 0x10);
+        if (!grp) return;
+        const uint16_t ns = *(const uint16_t*)(grp + 0x16);
+        const char* const* subs = *(const char* const* const*)(grp + 0x10);
+        for (uint16_t i = 0; i < ns && i < 16; ++i) {
+            const char* sub = subs[i];
+            if (!sub) continue;
+            const uint16_t nr = *(const uint16_t*)(sub + 0xE);
+            const char* const* recs = *(const char* const* const*)(sub + 8);
+            for (uint16_t j = 0; j < nr && j < 32; ++j) {
+                const void* e = recs[j] ? EntOf(recs[j]) : nullptr;
+                if (!e || e == tgt) continue;
+                const char* h = Hook::CallCdeclMethod<char*, const void*>((unsigned long)Va(VA_GETHUMAN), e);
+                if (!h) continue;
+                const int main = *(const uint8_t*)(h + 0x100);
+                if (main < 0 || main > 4) continue;
+                const char* ctx = *(const char* const*)(h + 8 + 0x30 * main + 0x14);
+                const unsigned vt = ctx ? *(const unsigned*)ctx : 0;
+                uint16_t path[8] = {}; uint16_t n = 0;
+                if (vt == 0x026E8AE8) {
+                    n = *(const uint16_t*)(ctx + 0x11E);
+                    const uint16_t* arr = *(const uint16_t* const*)(ctx + 0x118);
+                    const int k = n < 8 ? n : 8;
+                    for (int q = 0; q < k; ++q) path[q] = arr[n - k + q];
+                }
+                const char* ai = *(const char* const*)((const char*)e + 0xE8);
+                const char* svc = ai ? *(const char* const*)(ai + 0x94) : nullptr;
+                const char* nctx = svc ? *(const char* const*)(svc + 0x84) : nullptr;
+                const int order = nctx ? *(const int*)(nctx + 0x20) : -9;
+                uint32_t sig = 2166136261u;
+                auto mix = [&sig](uint32_t v) { sig ^= v; sig *= 16777619u; };
+                mix((uint32_t)main); mix(vt); mix(n); mix((uint32_t)order); mix((uint32_t)(uintptr_t)tgt);
+                for (int q = 0; q < 8; ++q) mix(path[q]);
+                int slot = -1, freeSlot = -1;
+                for (int s = 0; s < 64; ++s) { if (g_fs[s].e == e) { slot = s; break; } if (!g_fs[s].e && freeSlot < 0) freeSlot = s; }
+                if (slot < 0) { if (freeSlot < 0) continue; slot = freeSlot; g_fs[slot].e = e; g_fs[slot].sig = 0; }
+                if (g_fs[slot].sig == sig) continue;
+                g_fs[slot].sig = sig;
+                const Entity* me = (const Entity*)e;
+                const float dx = me->m_GlobalMatrix.M41 - te->m_GlobalMatrix.M41, dy = me->m_GlobalMatrix.M42 - te->m_GlobalMatrix.M42;
+                char line[240];
+                _snprintf_s(line, sizeof(line), _TRUNCATE,
+                            "[FightState] t=%llu tgt=%s e=%p d=%.1f order=%d main=%d ctx=%08X n=%u path=%u/%u/%u/%u/%u/%u/%u/%u\n",
+                            (unsigned long long)now, tag, e, sqrtf(dx * dx + dy * dy), order, main, vt, (unsigned)n,
+                            path[0], path[1], path[2], path[3], path[4], path[5], path[6], path[7]);
+                InterlockedIncrement(&g_fsLines);
+                Phase1_LogLine(line);
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
 DWORD g_fmOrig = 0;
 void __fastcall FmUpdateWrap(char* fm, void* /*edx*/)
 {
     reinterpret_cast<void(__thiscall*)(char*)>(g_fmOrig)(fm);
     FightOrderAfterUpdate(fm);
+    FightStateAfterUpdate(fm);
 }
 
 // Replaces `call sub_1608F70` at 0x017C013B. __fastcall with an unused edx = the callee's thiscall frame: ecx = fm,
