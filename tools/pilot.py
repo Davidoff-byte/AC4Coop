@@ -292,10 +292,20 @@ def plan_route(p, start, goal, z, step=3.0, margin=9.0, budget=600):
     return out
 
 
+def plan_route_retry(p, start, goal, z):
+    """The lattice is anchored at the start; an awkward start (next to a stall) can wall it in. Retry finer and wider
+    (live 2026-11-15: NO ROUTE from (77.4,-75.5), a 6-leg route from (76.3,-74.3) to the same goal)."""
+    for step, margin, budget in ((3.0, 9.0, 600), (2.0, 14.0, 900), (1.5, 18.0, 1200)):
+        r = plan_route(p, start, goal, z, step=step, margin=margin, budget=budget)
+        if r is not None:
+            return r
+    return None
+
+
 def cmd_route(p, a):
     s = p.read(); pos = s['pos']
     t0 = time.time()
-    r = plan_route(p, (pos[0], pos[1]), (a.x, a.y), pos[2])
+    r = plan_route_retry(p, (pos[0], pos[1]), (a.x, a.y), pos[2])
     print(f'planned in {time.time() - t0:.1f}s from ({pos[0]:.1f},{pos[1]:.1f}): ' +
           ('NO ROUTE' if r is None else ' -> '.join(f'({w[0]:.1f},{w[1]:.1f})' for w in r)))
     return 0 if r else 1
@@ -348,7 +358,7 @@ def cmd_intent(p, a):
 def cmd_goto(p, a):
     if a.route:
         pos = p.read()['pos']
-        r = plan_route(p, (pos[0], pos[1]), (a.x, a.y), pos[2])
+        r = plan_route_retry(p, (pos[0], pos[1]), (a.x, a.y), pos[2])
         if r is None:
             print('NO ROUTE on the navmesh'); return 3
         print('route: ' + ' -> '.join(f'({w[0]:.1f},{w[1]:.1f})' for w in r))

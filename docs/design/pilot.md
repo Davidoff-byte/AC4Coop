@@ -21,9 +21,20 @@ equivalent, written independently (AU-RW has no license).
 - Client: `status`, `scan`, `tap`, `stick`, `goto` (closed loop; learns the camera yaw from Edward's motion),
   `boot` (A presses only, never moves a cursor; pair with `[Coop] AutoContinue=1`), `mem` (read-only dump), `watch`.
 
+## Added after the first slice (2026-11-15)
+- `[Probe]`: x86 port of the AU-RW tap (src/probe_server.*, tools/probe.py): hooks with exit capture, snapshots, write
+  tracing. Evidence: docs/evidence/probe-teleport-fps-2026-11-15.md.
+- Teleport and a frame cap (boot sets 60). Same evidence file.
+- World queries on the game thread (src/pilot_world.cpp): ray, ground, navmesh point/line, climbable edges, ray fan;
+  navmesh route planner (A* over the engine's straight-line check). Evidence: docs/evidence/pilot-world-2026-11-15.md.
+- World-space intent (IHumanGround slots 0/1) and in-process goto: steering no longer depends on the camera.
+  Evidence: docs/evidence/pilot-intent-2026-11-15.md.
+
 ## Not done (next slices)
-- Parkour/traversal decisions (the ACU work decoded the candidate selection); AC4 needs its own RE.
-- Camera yaw read from the camera object instead of learned from motion.
+- Climbing decisions: the edge scan lists candidates; which edge Edward picks (and how to make him climb a chosen one)
+  is not found (bf-coop ops/evidence/pilot/world-queries.md section 3d).
+- Driving the co-op puppet through the same IHumanGround slots (replicated intentions).
+- Synchronous engine path query (not found); the A* planner substitutes for it.
 - Keyboard injection (DirectInput) for prompts that have no pad binding.
 
 ## Verification
