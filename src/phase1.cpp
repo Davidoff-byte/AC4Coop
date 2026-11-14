@@ -10621,7 +10621,9 @@ static int g_identityBand = -1;   // ini [Coop] IdentityBand (read once, with th
 static uint64_t IdentityIdOf(void* obj) {
     if (!obj || !readable(obj, 8)) return 0;
     __try {
-        return Hook::CallClassMethod<uint64_t, void*>(0x9F0B50, obj, 0u);
+        // 0x9F0B50 takes only ECX and ends in a plain `retn` (IDA 2026-11-14): pass no stack argument, or every call
+        // leaves the stack 4 bytes off (review 2026-11-14 part 2, finding 1).
+        return Hook::CallClassMethod<uint64_t, void*>(0x9F0B50, obj);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return 0;
     }
@@ -11551,6 +11553,7 @@ static void OnFrameInner(Human* updatedHuman) {
             if (!puppetAlive) {                          // entity was freed (world change / teardown)
                 L("[Net] puppet entity gone -> drop ref\n");
                 g_puppet = nullptr; g_blockReg = nullptr; g_puppetWorldId = 0; g_puppetVtbl = nullptr;
+                PuppetOwnClear();                        // as DespawnPuppet does: stop OwnDrain / Phase1_PuppetEntity using the freed body (review 2026-11-14 part 2)
                 g_lastRemoteCtx = -1;                    // fresh puppet next time -> re-apply first context
                 g_lastActionAlias = 0xFFFFFFFF;
                 g_bhvState = -1; g_switchCd = 0;
