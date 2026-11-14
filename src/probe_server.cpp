@@ -323,11 +323,26 @@ std::string Handle(const std::string& line)
         for (size_t i = 0; i < n; ++i)
             if (cur[i] != (u8)(HexV(ex[2 * i]) << 4 | HexV(ex[2 * i + 1])))
                 return "{\"ok\":false,\"error\":\"byte guard mismatch\",\"live\":\"" + HexBytes(cur, n) + "\"}";
+        HookInfo& h = g_hooks[id];
+        // UNHOOK only disables (threads may still be inside the trampoline), so MinHook still owns an earlier hook of
+        // this VA: reuse it - point its stub at the new id (one aligned 4-byte store) and enable it again.
+        for (int j = 0; j < kHooks; ++j) {
+            if (j == id || g_hooks[j].active || g_hooks[j].va != va || !g_hooks[j].tramp) continue;
+            u8* old = g_stubs + 16 * j;
+            InterlockedExchange((volatile LONG*)(old + 1), (LONG)id);   // push imm32 -> new id
+            h.va = va; h.tramp = g_hooks[j].tramp; h.entries = h.exits = 0; h.log = 1; h.exitWanted = (t.size() > 5 && t[5] == "exit");
+            strncpy_s(h.label, t[4].c_str(), _TRUNCATE);
+            g_hooks[j].va = 0; g_hooks[j].tramp = 0;                    // the MinHook entry now belongs to `id`
+            InterlockedExchange(&h.active, 1);
+            MH_STATUS re = MH_EnableHook((void*)(uintptr_t)va);
+            if (re != MH_OK) { InterlockedExchange(&h.active, 0); o << "{\"ok\":false,\"error\":\"MH_EnableHook " << MH_StatusToString(re) << "\"}"; return o.str(); }
+            Log("[Probe] HOOK %d at 0x%08X %s (re-enabled entry of id %d)\n", id, va, h.label, j);
+            o << "{\"ok\":true,\"id\":" << id << ",\"va\":" << Hex(va) << ",\"trampoline\":" << Hex(h.tramp) << ",\"reused\":" << j << "}"; return o.str();
+        }
         u8* s = g_stubs + 16 * id;
         s[0] = 0x68; *(u32*)(s + 1) = (u32)id;                                             // push id
         s[5] = 0xE9; *(int32_t*)(s + 6) = (int32_t)((u8*)&EntryThunk - (s + 10));          // jmp EntryThunk
         FlushInstructionCache(GetCurrentProcess(), s, 16);
-        HookInfo& h = g_hooks[id];
         h.va = va; h.entries = h.exits = 0; h.log = 1; h.exitWanted = (t.size() > 5 && t[5] == "exit");
         strncpy_s(h.label, t[4].c_str(), _TRUNCATE);
         void* tramp = nullptr;
