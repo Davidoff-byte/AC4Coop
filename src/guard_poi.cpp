@@ -236,6 +236,38 @@ void FightOrderAfterUpdate(char* fm)
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
+// ---- [Coop] FightKeepOnConflictEnd (default 0; installed when the key is present; read live) ---------------------
+// Run 26820 (build 2017a3a, ConflictKeepPuppet=1): the puppet was still dropped ~12 s after the shot through the same
+// action (FightProbe `from=0161F870 <00A00EB0 <00A0105A`): E50 has other posters than the call site ConflictKeepPuppet
+// patches (sub_17BFF50's timer branch -> sub_17A9FE0, sub_17AF5F0, sub_17BFD10; IDA o77-o79). All of them end in the
+// one transition action sub_17895F0 (cdecl; 0x017895F0 `55 8B EC 8B 45 08`: fm = ((a1+0xC)->+0x70)->+0x8DC, then
+// jmp 0x0161F860 = drop fm+0x304), referenced ONLY by the descriptor dword at .data 0x029ED63C (full-image scan).
+// sub_A00470 calls descriptor actions as cdecl (obj, event). The wrapper skips the drop while the FightManager's target
+// record is the live puppet, and otherwise calls the original. The conflict statechart still leaves its state (v97 ->
+// v95), so the player's conflict HUD ends; only the FightManager keeps the puppet. UNVERIFIED: that guards keep fighting.
+const uintptr_t VA_DROP_ACTION_PTR = 0x029ED63C;
+const uintptr_t VA_DROP_ACTION = 0x017895F0;
+bool g_kcInstalled = false; int g_kcOn = 0; ULONGLONG g_kcNext = 0;
+volatile LONG g_kcCalls = 0, g_kcSkipped = 0;
+
+void __cdecl DropActionWrap(void* a1, void* a2)
+{
+    InterlockedIncrement(&g_kcCalls);
+    __try {
+        const ULONGLONG now = GetTickCount64();
+        if (now >= g_kcNext) { g_kcNext = now + 2000; g_kcOn = GetPrivateProfileIntA("Coop", "FightKeepOnConflictEnd", 0, Paths::Ini()) != 0; }
+        if (g_kcOn && a1 && Phase1_IsEntityHost()) {
+            void* pup = Phase1_PuppetEntity();
+            const char* own = *(const char* const*)((const char*)a1 + 0xC);
+            const char* w = own ? *(const char* const*)(own + 0x70) : nullptr;
+            const char* fm = w ? *(const char* const*)(w + 0x8DC) : nullptr;
+            const char* rec = fm ? *(const char* const*)(fm + 0x304) : nullptr;
+            if (pup && rec && EntOf(rec) == pup) { InterlockedIncrement(&g_kcSkipped); return; }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    Hook::CallCdeclMethod<void, void*, void*>((unsigned long)Va(VA_DROP_ACTION), a1, a2);
+}
+
 DWORD g_fmOrig = 0;
 void __fastcall FmUpdateWrap(char* fm, void* /*edx*/)
 {
@@ -289,6 +321,17 @@ void GuardPoi::Init()
             g_cfExit = (DWORD)Va(VA_CONFLICT_EXIT);
             g_cfInstalled = Hook::DetourFunc((BYTE*)s, (DWORD)(uintptr_t)&ConflictDetour, 5) != 0;
         } else OutputDebugStringA("[Poi] bytes mismatch at 0x15DB19C\n");
+    }
+    if (GetPrivateProfileIntA("Coop", "FightKeepOnConflictEnd", -1, Paths::Ini()) >= 0) {   // key present: install, read live
+        DWORD* p = (DWORD*)Va(VA_DROP_ACTION_PTR);
+        if (*p == (DWORD)Va(VA_DROP_ACTION)) {
+            DWORD old = 0;
+            if (VirtualProtect(p, 4, PAGE_READWRITE, &old)) {
+                *p = (DWORD)(uintptr_t)&DropActionWrap;
+                VirtualProtect(p, 4, old, &old);
+                g_kcInstalled = true;
+            }
+        } else OutputDebugStringA("[Poi] descriptor 0x29ED63C mismatch - FightKeepOnConflictEnd not installed\n");
     }
     if (GetPrivateProfileIntA("Coop", "FightOrderPuppet", -1, Paths::Ini()) >= 0) {   // key present: install, read live
         DWORD* slot = (DWORD*)Va(VA_FM_SLOT);

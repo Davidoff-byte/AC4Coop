@@ -800,6 +800,15 @@
    "size": 76,
    "status": "claimed"
   },
+  "017895F0": {
+   "addr": "017895F0",
+   "claimed_at": null,
+   "name": "FightDropTargetAction",
+   "owner": null,
+   "receipts": [],
+   "size": 40,
+   "status": "unknown"
+  },
   "018B9EA0": {
    "addr": "018B9EA0",
    "claimed_at": "2026-11-08T12:12:51Z",
