@@ -11,6 +11,8 @@ written into the game's own shared section Local\\ac4pilot-pad-<pid>, read by th
     py -3.14 tools/pilot.py boot [--pulses 6]            # menus -> world with A presses (pair with [Coop] AutoContinue=1)
     py -3.14 tools/pilot.py mem player 0x200             # hex dump (read-only); target = player | hex address
     py -3.14 tools/pilot.py watch [--sec 30]             # position + nearest characters, once a second
+    py -3.14 tools/pilot.py teleport X Y Z [--yaw DEG]   # game thread, Entity::SetGlobalMatrixInternal
+    py -3.14 tools/pilot.py fps [N]                      # show / set the frame cap (0 = off)
 
 --pid defaults to the AC4BFSP.exe whose phase1_log_<pid>.txt is newest in AC4_GAME_DIR (tools/paths.py).
 Stick directions are camera-relative in the game, so `goto` learns the camera's yaw from Edward's own motion
@@ -36,9 +38,10 @@ k.OpenProcess.restype = W.HANDLE
 PAD_FMT = '<IIIHBBhhhh4I'            # PilotPad, 40 bytes (pack 1)
 CHAR_FMT = '<III3fIiiI'              # PilotChar, 40 bytes
 HDR_FMT = '<IIIII III 16f II IIII'   # PilotState header, 120 bytes
+CTL_FMT = '<IIIIi8fIIII8I'          # PilotCtl, 100 bytes
 MAX_CHARS = 256
 STATE_SIZE = struct.calcsize(HDR_FMT) + MAX_CHARS * struct.calcsize(CHAR_FMT)
-assert struct.calcsize(PAD_FMT) == 40 and struct.calcsize(CHAR_FMT) == 40 and STATE_SIZE == 10360
+assert struct.calcsize(CTL_FMT) == 100 and struct.calcsize(PAD_FMT) == 40 and struct.calcsize(CHAR_FMT) == 40 and STATE_SIZE == 10360
 
 BUTTONS = {'UP': 0x1, 'DOWN': 0x2, 'LEFT': 0x4, 'RIGHT': 0x8, 'START': 0x10, 'BACK': 0x20, 'LS': 0x40, 'RS': 0x80,
            'LB': 0x100, 'RB': 0x200, 'A': 0x1000, 'B': 0x2000, 'X': 0x4000, 'Y': 0x8000}
@@ -75,6 +78,7 @@ class Pilot:
         self.pid = pid
         self.pad = self._map('pad', 40)
         self.state = self._map('state', STATE_SIZE)
+        self.ctl = self._map('ctl', 100)
         self.h = k.OpenProcess(0x0010 | 0x0400, False, pid)
         self.seq = 0
 
@@ -108,6 +112,25 @@ class Pilot:
         st['chars'] = chars
         st['pos'] = st['m'][12:15]
         return st
+
+    # ---- control ---------------------------------------------------------------------------------------------------
+    def ctl_read(self):
+        c = struct.unpack_from(CTL_FMT, ctypes.string_at(self.ctl, 100))
+        return dict(magic=c[0], req=c[1], done=c[2], cmd=c[3], status=c[4], f=c[5:13], fpsCap=c[13], presents=c[14], fps=c[15],
+                    presentPatched=c[16])
+
+    def ctl_send(self, cmd, floats, timeout=5.0):
+        """Fill cmd/f, bump req, wait for done == req (the game runs it on the player frame or the poll thread)."""
+        fl = list(floats) + [float('nan')] * (8 - len(floats))
+        ctypes.memmove(self.ctl + 12, struct.pack('<Ii8f', cmd, 0, *fl), 40)
+        req = (ctypes.c_uint32.from_address(self.ctl + 4).value + 1) & 0xFFFFFFFF
+        ctypes.c_uint32.from_address(self.ctl + 4).value = req
+        end = time.time() + timeout
+        while time.time() < end:
+            if ctypes.c_uint32.from_address(self.ctl + 8).value == req:
+                return ctypes.c_int32.from_address(self.ctl + 16).value
+            time.sleep(0.02)
+        return None
 
     # ---- pad ---------------------------------------------------------------------------------------------------
     def set_pad(self, buttons=0, lx=0.0, ly=0.0, rx=0.0, ry=0.0, lt=0, rt=0, enabled=1):
@@ -230,6 +253,9 @@ def cmd_goto(p, a):
 def cmd_boot(p, a):
     """Press A until the world is up. Never moves a menu cursor (no d-pad / stick), so it only ever confirms what the
     game or [Coop] AutoContinue highlighted: the single-player tile, then the save slot."""
+    if a.fps:
+        st = p.ctl_send(2, [a.fps])
+        print(f'frame cap {a.fps}: status {st}')
     last = p.read()['frame']
     for i in range(a.pulses):
         time.sleep(a.wait)
@@ -249,6 +275,31 @@ def cmd_boot(p, a):
         last = s['frame']
     print('not in world yet')
     return 1
+
+
+def cmd_teleport(p, a):
+    before = p.read()['pos']
+    yaw = math.radians(a.yaw) if a.yaw is not None else float('nan')
+    st = p.ctl_send(1, [a.x, a.y, a.z, yaw])
+    time.sleep(0.5)
+    after = p.read()['pos']
+    time.sleep(1.5)
+    later = p.read()['pos']
+    print(f'teleport status={st} (0 ok, -1 no player, -2 exception, None = not executed: in a menu?)')
+    print(f'  before ({before[0]:.2f},{before[1]:.2f},{before[2]:.2f}) -> 0.5 s ({after[0]:.2f},{after[1]:.2f},{after[2]:.2f})'
+          f' -> 2 s ({later[0]:.2f},{later[1]:.2f},{later[2]:.2f}); target ({a.x:.2f},{a.y:.2f},{a.z:.2f})')
+    held = math.sqrt(dist2(later, (a.x, a.y))) < 1.0
+    print('  RESULT: ' + ('held at the target' if held else 'did NOT hold (snapped back or moved)'))
+    return 0 if held else 1
+
+
+def cmd_fps(p, a):
+    if a.n is not None:
+        st = p.ctl_send(2, [a.n])
+        print(f'set cap {a.n}: status {st} (-4 = Present not patched)')
+        time.sleep(2.2)
+    c = p.ctl_read()
+    print(f"cap={c['fpsCap']} measured={c['fps']} fps presents={c['presents']} presentPatched={c['presentPatched']}")
 
 
 def cmd_mem(p, a):
@@ -288,7 +339,10 @@ def main():
     x.add_argument('--tol', type=float, default=1.5); x.add_argument('--run', action='store_true')
     x.add_argument('--timeout', type=float, default=60); x.add_argument('--stuck', type=float, default=4)
     x = sub.add_parser('boot'); x.add_argument('--pulses', type=int, default=6); x.add_argument('--wait', type=float, default=5)
-    x.add_argument('--settle', type=float, default=60)
+    x.add_argument('--settle', type=float, default=60); x.add_argument('--fps', type=float, default=60)
+    x = sub.add_parser('teleport'); x.add_argument('x', type=float); x.add_argument('y', type=float); x.add_argument('z', type=float)
+    x.add_argument('--yaw', type=float)
+    x = sub.add_parser('fps'); x.add_argument('n', type=float, nargs='?')
     x = sub.add_parser('mem'); x.add_argument('target'); x.add_argument('length', nargs='?', default='0x100')
     x = sub.add_parser('watch'); x.add_argument('--sec', type=float, default=30)
     a = ap.parse_args()

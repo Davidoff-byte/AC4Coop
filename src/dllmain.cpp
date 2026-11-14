@@ -31,6 +31,7 @@
 #include "event_probe.h"
 #include "puppet_stim.h"
 #include "pilot.h"
+#include "probe_server.h"
 #include "react_probe.h"
 #include "guard_poi.h"
 #include "fight_probe.h"
@@ -620,6 +621,9 @@ BOOL APIENTRY DllMain(HMODULE hMod, DWORD reason, LPVOID)
 
         // Drive Edward from a client (virtual pad, focus keeper, per-frame state). [Pilot] Enabled, default 0.
         Pilot::Init();
+
+        // Runtime probes over a local pipe (x86 port of the AU-RW tap). [Probe] Enabled, default 0.
+        ProbeServer::Init();
 
         // Front B (peer-to-peer UDP link) is started on the first in-world frame instead of at
         // DLL attach. The game's launch chain (Steam -> Ubisoft -> DRM -> real game) starts more

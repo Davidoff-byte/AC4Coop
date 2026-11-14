@@ -1,0 +1,2 @@
+MinHook (BSD-2, Tsuda Kageyu), vendored from github.com/TsudaKageyu/minhook at commit 8af6b4a
+(copied from the AU-RW checkout). Only the x86 sources are compiled (hde32).

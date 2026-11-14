@@ -13,7 +13,11 @@
 //  - State: on every PLAYER Human frame (game thread, phase1 OnFrameInner) the player entity, its world matrix and
 //    every entity of World::m_CharacterList (position, +0x9C kind/role word, AI component, fighter record status/role)
 //    are written to Local\ac4pilot-state-<pid> (PilotState) under a sequence lock.
-// Client: tools/pilot.py (status, pad, boot, goto, scan, mem).
+//  - Control (Local\ac4pilot-ctl-<pid>, PilotCtl): teleport the player (game thread, Entity::SetGlobalMatrixInternal)
+//    and set a frame cap. The cap paces IDXGISwapChain::Present (vtable slot 8 of the swap-chain class, found through a
+//    throwaway swap chain, as in AU-RW's ACU focus shim); [Pilot] FpsCap=N (default 0 = off). A background run without a
+//    cap stalled the owner's PC in ACU (AU-RW README), so the client's boot sets one.
+// Client: tools/pilot.py (status, pad, boot, goto, scan, mem, teleport, fps).
 #include <cstdint>
 
 namespace Pilot
@@ -54,9 +58,24 @@ namespace Pilot
         uint32_t padPolls, padServed, padIndex, focusDrops;
         PilotChar chars[kMaxChars];
     };
+    // Commands from the client, executed by the game (Local\ac4pilot-ctl-<pid>). The client fills cmd/f[] and then bumps
+    // `req`; the game sets status and copies req into `done` when finished.
+    enum { kCmdTeleport = 1, kCmdFpsCap = 2 };
+    struct PilotCtl
+    {
+        uint32_t magic;           // 'AC4C' = 0x43344341
+        volatile uint32_t req, done;
+        uint32_t cmd;
+        int32_t  status;          // 0 ok, -1 no player/world, -2 exception, -3 unknown command, -4 not available
+        float    f[8];            // teleport: x, y, z, yaw (radians, NaN = keep); fps cap: f[0]
+        uint32_t fpsCap;          // current cap (0 = off), [Pilot] FpsCap at start
+        volatile uint32_t presents, fps;   // IDXGISwapChain::Present calls / measured rate (when the Present patch is in)
+        uint32_t presentPatched;
+        uint32_t reserved[8];
+    };
 #pragma pack(pop)
 
-    void Init();                         // DllMain attach, after the build gate
+    void Init();                        // DllMain attach, after the build gate
     void Poll();                         // poll thread, ~20 Hz: retries the IAT patch and the window subclass
     void OnPlayerFrame(void* human);     // game thread, once per player Human update
 }
