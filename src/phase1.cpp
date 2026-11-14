@@ -3501,6 +3501,193 @@ static Entity* FindLocalShipByObjId(void* mgr, int n, uint64_t objId) {
     return nullptr;
 }
 
+// ---- ShipMirror v2: build each proxy through the engine's own instantiate path ------------------------------
+// [Coop] ShipMirrorV2 (default 0; only consulted when ShipMirror=1). v1 (DuplicateShip) stays the default.
+// Static root cause of the v1 crash: docs/evidence/shipmirror-crash-static-2026-11-13.md (commit 5741a31).
+// Every engine fact below was read in IDA 9.3 on AC4BFSP.exe md5 2058342866688f780c8b34526a65bc35 (2026-11-14):
+//   sub_527BA0 [0x527BA0..0x527C15], __thiscall(template, Entity** out), `retn 4`:
+//     0x527BA4 push 1 / 0x527BA6 push 0 / 0x527BAA call sub_A2D5A0   = DuplicationManager Begin(0,1)
+//     0x527BB7 push 0 / 0x527BB9 push 0 / 0x527BBD call [vt+0Ch]     = template->vt[3](0,0)
+//     0x527BC1 call sub_A2F320                                       = End (sub_A2E820 remap, sub_A2D660)
+//     0x527BC9 mov [eax],esi                                         = *out = copy
+//     0x527BCE/D2/D6 or [esi+50h], 4 / 8 / 0x800000                  = activation flags
+//     0x527C0B call sub_522610(copy, 0, scale^2)                     = LOD level (scale from [copy+5Ch]+728h)
+//   Begin's 2nd arg is frame byte +0xED (sub_A2D5A0: *(v6+237)=a2). It gates sub_A2B630 (src->copy pair, called from
+//   sub_9F0B10, which both the entity copy sub_647120 and the component copy sub_717D40 call), sub_A2B6C0 (pointer
+//   fixup record) and sub_A2E820 (End: sort + sub_A2C250 rewrite; a pointer with no registered pair keeps its value).
+//   Engine use of exactly this sequence + World::AddEntity: sub_11227A0 (0x11227DF call sub_527BA0, 0x112283F call
+//   sub_70E860) and sub_1122850 (0x112288F / 0x11228EF).
+//   Ship vt 0x01E4A128 slot 3 (dword at 0x1E4A134) = 0x00503600 = EntityGroup copy; it calls sub_52A980 (entity copy:
+//   sub_647120 -> sub_9F0B10 registers the entity; sub_A27550 copies each component through its own vt[3]).
+//   ActionComponent: vt 0x01E5CD10, class-info 0x02786A08 (dword at 0x278480C, read by its copy sub_65DAE0 at 0x65DAEB).
+//     copy sub_65DAE0 copies +0x24 with sub_A2B6C0(v4+36, src+36, 0) -> remapped only when +0xED=1 and the pointee was
+//     copied in the same scope. OnAttach (slot 19) sub_671330: 0x67134F mov [esi+24h], eax with
+//     eax = sub_5200C0(entity, sub_423310()).
+//   SkeletonComponent: vt 0x01E41E58, class-info 0x02749420 (sub_423310: `mov eax, off_274787C`; dword 0x274787C =
+//     0x02749420). sub_5200C0 = Entity::GetComponentByType (array +0x60, u16 count +0x66; class range +0x2C/+0x2E).
+//   EntityGroup sub-entities: +0x140 array of handle-container pointers, u16 count +0x146 (sub_503600 -> sub_4F9870;
+//     element resolves as (hc[+8] >> 31) & hc[0], the handleDeref shape).
+//   Component::SetEnabled sub_7130C0 = interlocked set/clear 0x4000000 at this+4. RigidBodyComponent descriptor getter
+//   sub_7357E0 = `mov eax, off_27A43F0` (dword = 0x027A6D10, class map: RigidBodyComponent).
+// NOT verified (static or live): that vt[3](0,0) on a LIVE in-world ship (engine callers pass a template resolved from a
+// handle) behaves like a template instantiate; when the Init jobs queued by sub_A2DAE0 run; whether anything re-binds
+// AC+0x24 after AddEntity; whether +0xE8 is populated on the copy. The C1 log line below is what decides AC+0x24 live.
+static int ShipMirrorV2Enabled() {
+    static int s = -1;
+    if (s < 0) s = GetPrivateProfileIntA("Coop", "ShipMirrorV2", 0, Paths::Ini()) != 0 ? 1 : 0;
+    return s;
+}
+
+static const uint32_t SMV2_SHIP_VT   = 0x01E4A128u;   // ship EntityGroup vtable (slot 3 = 0x503600)
+static const uintptr_t SMV2_SKEL_CI  = 0x02749420u;   // SkeletonComponent class-info (sub_423310 -> off_274787C)
+static const uintptr_t SMV2_ACT_CI   = 0x02786A08u;   // ActionComponent class-info (sub_65DAE0 -> off_278480C)
+static const int SMV2_MAX_ENTS = 24;                  // proxy + one level of sub-entities walked by the C1 log
+
+// Entity plus its +0x140 sub-entities (one level), each resolved through its handle container. Read-only.
+static int ShipV2CollectEnts(void* root, void** out, int max, int* unresolved) {
+    int n = 0;
+    if (!root || !readable(root, 0x148) || max <= 0) return 0;
+    out[n++] = root;
+    void* arr = *(void**)((char*)root + 0x140);
+    int cnt = *(uint16_t*)((char*)root + 0x146);
+    if (!arr || cnt <= 0 || cnt > 256 || !readable(arr, cnt * 4)) return n;
+    for (int i = 0; i < cnt && n < max; ++i) {
+        void* e = handleDeref(*(void**)((char*)arr + i * 4));
+        if (e && (uintptr_t)e != 0x04DD5F8Cu && readable(e, 0x68)) out[n++] = e;
+        else if (unresolved) ++*unresolved;
+    }
+    return n;
+}
+
+static Component* ShipV2CompOf(void* ent, uintptr_t classInfo) {
+    if (!ent || !readable(ent, 0x68)) return nullptr;
+    return ((Entity*)ent)->GetComponentByType((ClassDescriptor*)classInfo);   // sub_5200C0, the OnAttach binder
+}
+
+// SkeletonComponents of the source tree, captured at create so later lines compare values without dereferencing it.
+struct ShipV2SrcSkels { int n; void* skel[SMV2_MAX_ENTS]; };
+static void ShipV2CaptureSrc(void* src, ShipV2SrcSkels* s) {
+    s->n = 0;
+    __try {
+        void* ents[SMV2_MAX_ENTS]; int unres = 0;
+        const int ne = ShipV2CollectEnts(src, ents, SMV2_MAX_ENTS, &unres);
+        for (int i = 0; i < ne; ++i) {
+            Component* sk = ShipV2CompOf(ents[i], SMV2_SKEL_CI);
+            if (sk) s->skel[s->n++] = sk;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+// C1 discriminator (read-only): for every ActionComponent in the proxy tree, does AC+0x24 point at the SkeletonComponent
+// of the entity that holds the AC (OWN, what OnAttach sub_671330 binds) or at one of the source's (SRC, the v1 crash
+// shape)? Also counts AC+0x08 == holder (owner pointer remapped) and reads OWN skeleton +0x134 (the rig pointer the
+// displacement job dereferences; 0 = not built yet, the C3 shape). Nothing is written.
+static void ShipV2LogC1(const char* when, void* proxy, const ShipV2SrcSkels* src, uint64_t hostId) {
+    int ents = 0, acs = 0, own = 0, srcHit = 0, other = 0, nul = 0, owner8 = 0, unres = 0;
+    void* ac0 = nullptr; void* ac24 = nullptr; void* ownSk0 = nullptr; void* rig0 = nullptr;
+    __try {
+        void* e[SMV2_MAX_ENTS];
+        ents = ShipV2CollectEnts(proxy, e, SMV2_MAX_ENTS, &unres);
+        for (int i = 0; i < ents; ++i) {
+            Component* ac = ShipV2CompOf(e[i], SMV2_ACT_CI);
+            if (!ac || !readable(ac, 0x28)) continue;
+            ++acs;
+            void* p24 = *(void**)((char*)ac + 0x24);
+            void* p08 = *(void**)((char*)ac + 0x08);
+            Component* ownSk = ShipV2CompOf(e[i], SMV2_SKEL_CI);
+            if (p08 == e[i]) ++owner8;
+            bool isSrc = false;
+            for (int k = 0; k < src->n; ++k) if (src->skel[k] == p24) { isSrc = true; break; }
+            if (!p24) ++nul;
+            else if (ownSk && p24 == (void*)ownSk) ++own;
+            else if (isSrc) ++srcHit;
+            else ++other;
+            if (!ac0) {
+                ac0 = ac; ac24 = p24; ownSk0 = ownSk;
+                rig0 = (ownSk && readable((char*)ownSk + 0x134, 4)) ? *(void**)((char*)ownSk + 0x134) : nullptr;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        L("[ShipMirrorV2] c1 when=%s proxy=%p walk EXCEPTION 0x%08X\n", when, proxy, GetExceptionCode());
+        return;
+    }
+    const char* verdict = acs == 0 ? "no-ac" : (own == acs ? "OWN" : (srcHit ? "SRC" : (nul == acs ? "NULL" : "MIXED")));
+    L("[ShipMirrorV2] c1 when=%s host=%llu proxy=%p verdict=%s ents=%d unresolved=%d acs=%d own=%d src=%d other=%d null=%d "
+      "owner8=%d srcSkels=%d ac=%p ac24=%p ownSkel=%p ownSkel134=%p\n",
+      when, (unsigned long long)hostId, proxy, verdict, ents, unres, acs, own, srcHit, other, nul, owner8, src->n,
+      ac0, ac24, ownSk0, rig0);
+    L("[E] ev=shipmirror-c1 when=%s verdict=%s acs=%d own=%d src=%d\n", when, verdict, acs, own, srcHit);
+}
+
+// Build one proxy: sub_527BA0(template=src, &out), then World::AddEntity (0x70E860), the sub_11227A0 order.
+// After that, two guarded proxy-only steps, each taken ONLY when the read says the object belongs to the proxy:
+//   - RigidBody: if the proxy's hkpRigidBody pointer equals the source's (shared), give the proxy the v1 keyframed
+//     ghost body (ConstructGhostBody) so driving it never moves the source; if it is its own, it is left alone.
+//   - +0xE8 (v1's AIComponent slot): disabled only when non-null, different from the source's, and its +0x08 is the
+//     proxy; otherwise untouched and logged.
+static bool s_v2Latched = false;    // a fault inside sub_527BA0 may leave its Begin scope open: stop calling it
+static void* InstantiateShipV2(void* src, ShipV2SrcSkels* srcSkels) {
+    srcSkels->n = 0;
+    if (s_v2Latched) return nullptr;
+    World* world = World::GetCurrentWorld();
+    if (!world || !src || !readable(src, 0x150) || *(uint32_t*)src != SMV2_SHIP_VT) return nullptr;
+    ShipV2CaptureSrc(src, srcSkels);
+    void* proxy = nullptr;
+    __try {
+        typedef int (__thiscall *EngineInstantiateFn)(void* tmpl, void** out);
+        ((EngineInstantiateFn)0x00527BA0)(src, &proxy);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        s_v2Latched = true;
+        L("[ShipMirrorV2] instantiate EXCEPTION 0x%08X src=%p - v2 latched off for this session\n", GetExceptionCode(), src);
+        return nullptr;
+    }
+    if (!proxy || !readable(proxy, 0x150)) {
+        L("[ShipMirrorV2] instantiate returned %p for src=%p\n", proxy, src);
+        return nullptr;
+    }
+    const uint32_t pvt = *(uint32_t*)proxy;
+    __try {
+        world->AddEntity((Entity*)proxy);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        L("[ShipMirrorV2] AddEntity EXCEPTION 0x%08X proxy=%p\n", GetExceptionCode(), proxy);
+        return nullptr;
+    }
+
+    const char* rbState = "none"; const char* aiState = "none";
+    __try {
+        ClassDescriptor* rbDesc = RigidBodyComponent::GetStaticClassDescriptor();
+        Component* prb = ((Entity*)proxy)->GetComponentByType(rbDesc);
+        Component* srb = ((Entity*)src)->GetComponentByType(rbDesc);
+        if (prb && readable(prb, sizeof(RigidBodyComponent))) {
+            RigidBodyComponent* p = (RigidBodyComponent*)prb;
+            void* pBody = p->m_RigidBody.m_HKRigidBody;
+            void* sBody = (srb && readable(srb, sizeof(RigidBodyComponent))) ? ((RigidBodyComponent*)srb)->m_RigidBody.m_HKRigidBody : nullptr;
+            if (!pBody) rbState = "proxy-null";
+            else if (pBody != sBody) rbState = "own";
+            else {
+                void* nb = ConstructGhostBody(sBody, ((BaseEntity*)src)->m_GlobalMatrix);
+                p->m_RigidBody.m_HKRigidBody = nb;
+                p->m_DriveEntity = false;
+                if (nb) { *(void**)((char*)nb + 0x0C) = p; rbState = "shared->ghostbody"; }
+                else    { p->SetEnabled(false); rbState = "shared->disabled"; }
+            }
+        }
+        void* pAI = *(void**)((char*)proxy + 0xE8);
+        void* sAI = *(void**)((char*)src + 0xE8);
+        if (!pAI) aiState = "null";
+        else if (pAI == sAI) aiState = "shared-untouched";
+        else if (readable(pAI, 0x0C) && *(void**)((char*)pAI + 0x08) == proxy) { ((Component*)pAI)->SetEnabled(false); aiState = "own-disabled"; }
+        else aiState = "foreign-untouched";
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        L("[ShipMirrorV2] post-step EXCEPTION 0x%08X proxy=%p rb=%s ai=%s\n", GetExceptionCode(), proxy, rbState, aiState);
+    }
+    GhostSuppressPlayerMarker(proxy);   // same post-step as v1 DuplicateShip (Coop:GhostMarkerSuppress)
+    L("[ShipMirrorV2] built proxy=%p vt=%08X src=%p flags50=%08X world5C=%p rb=%s ai=%s\n", proxy, pvt, src,
+      readable((char*)proxy + 0x50, 4) ? *(uint32_t*)((char*)proxy + 0x50) : 0u,
+      readable((char*)proxy + 0x5C, 4) ? *(void**)((char*)proxy + 0x5C) : nullptr, rbState, aiState);
+    return proxy;
+}
+
 // ---- ShipMirror guest side: pooled proxies keyed by the host's object id ------------------------------------
 // Constraints read from this file: proxies are DuplicateShip clones (a local ship is the source); clones are never
 // World::RemoveEntity'd (SHIP-RE C11 erase crash) - they are parked at y=-100000 like DespawnGhostShip and REUSED.
@@ -3508,7 +3695,9 @@ static Entity* FindLocalShipByObjId(void* mgr, int n, uint64_t objId) {
 // Drive: SetGlobalMatrixInternal(&m, true) like the ghost; Z = local water height (authority C4) when known.
 // Hull: WriteShipHullHPRaw (the slot-0x12C setter faults on clones) = max * permille / 1000.
 // [Coop] ShipMirrorForceProxy=1 skips local matching (solo EntitySelfTest: every record becomes a proxy).
-struct MirrorSlot { uint64_t hostId; void* proxy; uint32_t cls; uint64_t seenMs; uint16_t hpApplied; bool live; };
+// v2/createdMs/c1Settled/srcSkels: ShipMirrorV2 bookkeeping for the C1 log (create + one settled line >= 3 s later).
+struct MirrorSlot { uint64_t hostId; void* proxy; uint32_t cls; uint64_t seenMs; uint16_t hpApplied; bool live;
+                    bool v2; bool c1Settled; uint64_t createdMs; ShipV2SrcSkels srcSkels; };
 static const int MIRROR_MAX = 8;
 static MirrorSlot g_mirror[MIRROR_MAX];
 static int g_mirrorN = 0;
@@ -3553,19 +3742,28 @@ static float MirrorApply(void* mgr, int n, const EntityState& es, int* created, 
             s_nextCreateMs = now + 500;
             bool miss = false;
             Entity* src = MirrorPickSource(mgr, n, es.arch, &miss);
-            void* dup = src ? DuplicateShip(src) : nullptr;
-            if (!dup) { L("[ShipMirror] create FAILED host=%llu cls=%u src=%p\n", (unsigned long long)es.objId, (unsigned)es.arch, src); return -1.0f; }
+            // [Coop] ShipMirrorV2=1: engine instantiate path (sub_527BA0 + AddEntity); 0 (default): v1 DuplicateShip.
+            const bool useV2 = ShipMirrorV2Enabled() != 0;
+            ShipV2SrcSkels skels; skels.n = 0;
+            void* dup = src ? (useV2 ? InstantiateShipV2(src, &skels) : DuplicateShip(src)) : nullptr;
+            if (!dup) { L("[ShipMirror] create FAILED host=%llu cls=%u src=%p mode=%s\n", (unsigned long long)es.objId, (unsigned)es.arch, src, useV2 ? "v2" : "v1"); return -1.0f; }
             MirrorSlot& m = g_mirror[g_mirrorN++];
             m.proxy = dup; m.cls = miss ? 0 : es.arch; m.hpApplied = 0xFFFF;
+            m.v2 = useV2; m.c1Settled = !useV2; m.createdMs = now; m.srcSkels = skels;
             slot = &m; ++*created; if (miss) ++*classMisses;
-            L("[ShipMirror] created proxy=%p for host=%llu cls=%u src=%p classMiss=%d pool=%d\n",
-              dup, (unsigned long long)es.objId, (unsigned)es.arch, src, miss ? 1 : 0, g_mirrorN);
+            L("[ShipMirror] created proxy=%p for host=%llu cls=%u src=%p classMiss=%d pool=%d mode=%s\n",
+              dup, (unsigned long long)es.objId, (unsigned)es.arch, src, miss ? 1 : 0, g_mirrorN, useV2 ? "v2" : "v1");
+            if (useV2) ShipV2LogC1("create", dup, &m.srcSkels, es.objId);
             L("[E] ev=shipmirror-create host=%llu cls=%u classMiss=%d\n", (unsigned long long)es.objId, (unsigned)es.arch, miss ? 1 : 0);
         }
         if (!slot) return -1.0f;
         slot->hostId = es.objId; slot->live = true; slot->hpApplied = 0xFFFF;
     }
     slot->seenMs = now;
+    if (slot->v2 && !slot->c1Settled && now - slot->createdMs >= 3000) {
+        slot->c1Settled = true;   // once per proxy: after AddEntity's deferred work and the Init jobs had frames to run
+        ShipV2LogC1("settled", slot->proxy, &slot->srcSkels, slot->hostId);
+    }
     float err = -1.0f;
     __try {
         HookMath::Quaternion q; q.x = es.quat[0]; q.y = es.quat[1]; q.z = es.quat[2]; q.w = es.quat[3];
@@ -9740,7 +9938,7 @@ static void DumpConfigOnce()
 
     struct K { const char* s; const char* k; int d; };
     static const K keys[] = {
-        { "Coop", "ActionDeathLog", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "CombatObserve", 0 },
+        { "Coop", "ActionDeathLog", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ShipMirrorV2", 0 }, { "Coop", "CombatObserve", 0 },
         { "Coop", "CombatTest", 0 }, { "Coop", "CorpseKeepSec", 30 }, { "Coop", "CrowdProbeIntegrate", 1 },
         { "Coop", "CrowdProbeLiveKeys", 1 }, { "Coop", "DamageRelay", 0 }, { "Coop", "Diag", 0 },
         { "Coop", "DisableCrowd", 0 }, { "Coop", "DisablePuppetAI", 1 }, { "Coop", "DisableSpawns", 0 },
