@@ -1174,7 +1174,13 @@ namespace {
         } else {
             dbg("[Lobby] join: RelayForce=1 - using the relay\n");
         }
-        PeerSet(g_relaySrv, Relay::kHostSlot);
+        // Review 2026-11-14 part 2: a WELCOME handled between the alive() check above and this switch used to be
+        // overwritten by an unconditional PeerSet(relay) (dead link: both ends drop each other). Switch to the relay only
+        // while the join is still undecided, under the peer lock the WELCOME handler's PeerSet also takes.
+        AcquireSRWLockExclusive(&g_peerLock);
+        if (alive()) { g_peer = g_relaySrv; g_peerSlot = Relay::kHostSlot; }
+        ReleaseSRWLockExclusive(&g_peerLock);
+        if (!alive()) return 0;   // WELCOMEd in the gap: keep the path that answered
         t0 = GetTickCount64();
         int sent = 0; bool slowLogged = false;
         while (alive()) {
