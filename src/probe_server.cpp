@@ -327,12 +327,13 @@ std::string Handle(const std::string& line)
         // UNHOOK only disables (threads may still be inside the trampoline), so MinHook still owns an earlier hook of
         // this VA: reuse it - point its stub at the new id (one aligned 4-byte store) and enable it again.
         for (int j = 0; j < kHooks; ++j) {
-            if (j == id || g_hooks[j].active || g_hooks[j].va != va || !g_hooks[j].tramp) continue;
+            if (g_hooks[j].active || g_hooks[j].va != va || !g_hooks[j].tramp) continue;   // j == id: same slot again
             u8* old = g_stubs + 16 * j;
-            InterlockedExchange((volatile LONG*)(old + 1), (LONG)id);   // push imm32 -> new id
-            h.va = va; h.tramp = g_hooks[j].tramp; h.entries = h.exits = 0; h.log = 1; h.exitWanted = (t.size() > 5 && t[5] == "exit");
+            InterlockedExchange((volatile LONG*)(old + 1), (LONG)id);   // push imm32 -> new id (no-op when j == id)
+            u32 tramp = g_hooks[j].tramp;
+            if (j != id) { g_hooks[j].va = 0; g_hooks[j].tramp = 0; }  // the MinHook entry now belongs to `id`
+            h.va = va; h.tramp = tramp; h.entries = h.exits = 0; h.log = 1; h.exitWanted = (t.size() > 5 && t[5] == "exit");
             strncpy_s(h.label, t[4].c_str(), _TRUNCATE);
-            g_hooks[j].va = 0; g_hooks[j].tramp = 0;                    // the MinHook entry now belongs to `id`
             InterlockedExchange(&h.active, 1);
             MH_STATUS re = MH_EnableHook((void*)(uintptr_t)va);
             if (re != MH_OK) { InterlockedExchange(&h.active, 0); o << "{\"ok\":false,\"error\":\"MH_EnableHook " << MH_StatusToString(re) << "\"}"; return o.str(); }
