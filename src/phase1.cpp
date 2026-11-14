@@ -9,6 +9,7 @@
 #include "guard_sight.h"
 #include "event_probe.h"
 #include "puppet_stim.h"
+#include "pilot.h"
 #include "react_probe.h"
 #include "guard_poi.h"
 #include <windows.h>
@@ -11032,6 +11033,7 @@ static void OnFrameInner(Human* updatedHuman) {
     if (!isPlayerUpdate(base(), updatedHuman)) { HumanUpdateThreadProbe(false); OwnOverlapNote(updatedHuman); return; }
     HumanUpdateThreadProbe(true);
     InterlockedExchange(&s_playerWorkTid, (LONG)GetCurrentThreadId());
+    Pilot::OnPlayerFrame(updatedHuman);   // [Pilot] Enabled only: publish the player + m_CharacterList
 
     ProbeIdentityOnce();
 

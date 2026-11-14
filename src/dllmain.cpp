@@ -30,6 +30,7 @@
 #include "guard_sight.h"
 #include "event_probe.h"
 #include "puppet_stim.h"
+#include "pilot.h"
 #include "react_probe.h"
 #include "guard_poi.h"
 #include "fight_probe.h"
@@ -336,6 +337,7 @@ static unsigned __stdcall PollThread(void*)
     while (g_run)
     {
         Phase1::InstallVirtualPadHook();   // retry until xinput1_3.dll is loaded
+        Pilot::Poll();                     // [Pilot] Enabled only: import patch + window subclass retries
         Sleep(50); // ~20 Hz
         ++ticks;
 
@@ -615,6 +617,9 @@ BOOL APIENTRY DllMain(HMODULE hMod, DWORD reason, LPVOID)
 
         // Boot straight into the world: accept "press start" and pick the save slot. [Coop] AutoContinue, default 0.
         AutoContinue::Init();
+
+        // Drive Edward from a client (virtual pad, focus keeper, per-frame state). [Pilot] Enabled, default 0.
+        Pilot::Init();
 
         // Front B (peer-to-peer UDP link) is started on the first in-world frame instead of at
         // DLL attach. The game's launch chain (Steam -> Ubisoft -> DRM -> real game) starts more
