@@ -368,7 +368,8 @@ def cmd_edges(p, a):
     st = p.ctl_send(7, [a.r, a.zmin, a.zmax, float(a.mask)])
     n, rows = p.results(32, 8)
     me = p.read()['pos']
-    print(f'status {st}: {n} climbable edges in +/-{a.r} m, z {a.zmin}..{a.zmax} around ({me[0]:.1f},{me[1]:.1f},{me[2]:.1f})')
+    tot = int(rows[0][7]) if rows else 0
+    print(f'status {st}: {n} nearest of {tot} climbable edges in +/-{a.r} m, z {a.zmin}..{a.zmax} around ({me[0]:.1f},{me[1]:.1f},{me[2]:.1f})')
     for r in sorted(rows, key=lambda r: min(dist2(r[0:3], me), dist2(r[3:6], me))):
         sub = int(r[6])
         print(f'  {GSUB.get(sub, sub)!s:18} A=({r[0]:.2f},{r[1]:.2f},{r[2]:.2f}) B=({r[3]:.2f},{r[4]:.2f},{r[5]:.2f}) '

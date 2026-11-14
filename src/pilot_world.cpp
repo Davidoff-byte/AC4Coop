@@ -85,7 +85,9 @@ int RunWorldCommand(PilotCtl* c, void* player)
         if (!nav) return -4;
         alignas(16) V4 a = { c->f[0], c->f[1], c->f[2], 0 }, b = { c->f[3], c->f[4], c->f[5], 0 };
         uint32_t err[3] = { 0, 0, 0 };
-        int code = Hook::CallClassMethod<int>(0x0047EA80, nav, 0, &a, &b, (void*)nullptr, (void*)nullptr, (void*)err, 0, 0.5f, 0, 0);
+        // Returns a byte: the game's call site tests only al (0x015E4ADD test al,al; jz -> clear). Live run 26452 showed
+        // garbage in the upper bits when read as int.
+        int code = (unsigned char)Hook::CallClassMethod<char>(0x0047EA80, nav, 0, &a, &b, (void*)nullptr, (void*)nullptr, (void*)err, 0, 0.5f, 0, 0);
         ((int32_t*)r)[0] = code; ((uint32_t*)r)[1] = err[0]; ((uint32_t*)r)[2] = err[1]; ((uint32_t*)r)[3] = err[2];
         c->rcount = 1;
         return 0;
@@ -105,14 +107,25 @@ int RunWorldCommand(PilotCtl* c, void* player)
         Hook::CallClassMethod<bool>(0x0061D270, (void*)zone, (void*)rep, (void*)w, (void*)nullptr, 1, mask, true);
         unsigned short n = *(unsigned short*)(rep + 6);
         const unsigned char* items = *(unsigned char* const*)rep;
-        uint32_t k = 0;
-        for (unsigned short i = 0; i < n && k < kResMax / 8; ++i) {
+        // Keep the kResMax/8 edges nearest to Edward (distance of the closer end point), not the first ones returned.
+        uint32_t k = 0, cap = kResMax / 8;
+        float d2[kResMax / 8];
+        for (unsigned short i = 0; i < n; ++i) {
             const unsigned char* it = items + 112 * i;
-            float* o = r + 8 * k++;
-            memcpy(o, it + 0x10, 12);                                              // A
-            memcpy(o + 3, it + 0x20, 12);                                          // B
+            const float* pa = (const float*)(it + 0x10); const float* pb = (const float*)(it + 0x20);
+            float da = (pa[0] - m.M41) * (pa[0] - m.M41) + (pa[1] - m.M42) * (pa[1] - m.M42) + (pa[2] - m.M43) * (pa[2] - m.M43);
+            float db = (pb[0] - m.M41) * (pb[0] - m.M41) + (pb[1] - m.M42) * (pb[1] - m.M42) + (pb[2] - m.M43) * (pb[2] - m.M43);
+            float d = da < db ? da : db;
+            uint32_t slot = k;
+            if (k == cap) {                                                        // replace the farthest kept edge
+                slot = 0; for (uint32_t j = 1; j < cap; ++j) if (d2[j] > d2[slot]) slot = j;
+                if (d >= d2[slot]) continue;
+            } else ++k;
+            float* o = r + 8 * slot;
+            memcpy(o, pa, 12); memcpy(o + 3, pb, 12);                              // A, B
             o[6] = (float)(it[0x60] & 0x3F);                                       // subtype
-            o[7] = 0;
+            o[7] = (float)n;                                                       // total edges the scan returned
+            d2[slot] = d;
         }
         c->rcount = k;
         Hook::CallClassMethod<void>(0x0059F9D0, (void*)rep);
