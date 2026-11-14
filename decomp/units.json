@@ -689,6 +689,15 @@
    "size": 59,
    "status": "unknown"
   },
+  "01608F70": {
+   "addr": "01608F70",
+   "claimed_at": null,
+   "name": "FightAnyFighterTargets",
+   "owner": null,
+   "receipts": [],
+   "size": 335,
+   "status": "unknown"
+  },
   "017106C0": {
    "addr": "017106C0",
    "claimed_at": "2026-11-08T12:12:51Z",
