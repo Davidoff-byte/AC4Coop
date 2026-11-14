@@ -7,7 +7,8 @@ written into the game's own shared section Local\\ac4pilot-pad-<pid>, read by th
     py -3.14 tools/pilot.py scan [--r 40]                # characters around Edward (kind/role, fighter status)
     py -3.14 tools/pilot.py tap A [--sec 0.15]           # press and release a button
     py -3.14 tools/pilot.py stick 0 1 --sec 2 [--run]    # left stick (x right, y forward), optional RT held
-    py -3.14 tools/pilot.py goto X Y [--tol 1.5] [--run] [--timeout 60]
+    py -3.14 tools/pilot.py goto X Y [--tol 1.5] [--run] [--timeout 60] [--route]   # --route: navmesh waypoints first
+    py -3.14 tools/pilot.py route X Y                    # plan only (navmesh straight-line checks, no screen)
     py -3.14 tools/pilot.py boot [--pulses 6]            # menus -> world with A presses (pair with [Coop] AutoContinue=1)
     py -3.14 tools/pilot.py mem player 0x200             # hex dump (read-only); target = player | hex address
     py -3.14 tools/pilot.py watch [--sec 30]             # position + nearest characters, once a second
@@ -220,10 +221,106 @@ def wrap(x):
     return (x + math.pi) % (2 * math.pi) - math.pi
 
 
+def nav_clear(p, a, b, z):
+    """Engine navmesh straight-line check (sub_47EA80): True when walkable in a straight line on HumanGround."""
+    st = p.ctl_send(6, [a[0], a[1], z, b[0], b[1], z])
+    return st == 0 and (p.results_u32()[0] & 0xFF) == 0      # byte return (al); low byte also right on build c0daf16
+
+
+def plan_route(p, start, goal, z, step=3.0, margin=9.0, budget=600):
+    """A* on a step-metre lattice around start/goal; an edge exists when the engine's navmesh straight-line check
+    (sub_47EA80) is clear. Edges are tested lazily and cached; `budget` caps the number of checks. The path is then
+    shortened by skipping to the farthest waypoint with a clear straight line. Returns waypoints (goal last) or None."""
+    import heapq
+    if nav_clear(p, start, goal, z):
+        return [goal]
+    ox, oy = start
+    def pt(n):
+        return (ox + n[0] * step, oy + n[1] * step)
+    gx, gy = round((goal[0] - ox) / step), round((goal[1] - oy) / step)
+    lo_x = min(0, gx) - int(margin / step); hi_x = max(0, gx) + int(margin / step)
+    lo_y = min(0, gy) - int(margin / step); hi_y = max(0, gy) + int(margin / step)
+    cache, checks = {}, [0]
+    def edge(a, b):
+        key = (a, b) if a < b else (b, a)
+        if key not in cache:
+            if checks[0] >= budget:
+                return False
+            checks[0] += 1
+            cache[key] = nav_clear(p, pt(a), pt(b), z)
+        return cache[key]
+    h = lambda n: math.dist(pt(n), goal)
+    s0 = (0, 0)
+    openq = [(h(s0), 0.0, s0)]
+    came, gbest = {s0: None}, {s0: 0.0}
+    found = None
+    while openq:
+        f, g, n = heapq.heappop(openq)
+        if g > gbest.get(n, 1e9) + 1e-6:
+            continue
+        if math.dist(pt(n), goal) < step * 1.5 and nav_clear(p, pt(n), goal, z):
+            found = n; break
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                if not dx and not dy:
+                    continue
+                m = (n[0] + dx, n[1] + dy)
+                if not (lo_x <= m[0] <= hi_x and lo_y <= m[1] <= hi_y):
+                    continue
+                ng = g + step * math.hypot(dx, dy)
+                if ng >= gbest.get(m, 1e9) or not edge(n, m):
+                    continue
+                gbest[m] = ng; came[m] = n
+                heapq.heappush(openq, (ng + h(m), ng, m))
+        if checks[0] >= budget:
+            break
+    if found is None:
+        return None
+    path = []
+    n = found
+    while n is not None:
+        path.append(pt(n)); n = came[n]
+    path = path[::-1] + [goal]
+    out, i = [], 0                                       # string pulling: farthest clear waypoint from each point
+    while i < len(path) - 1:
+        j = len(path) - 1
+        while j > i + 1 and not nav_clear(p, path[i], path[j], z):
+            j -= 1
+        out.append(path[j]); i = j
+    return out
+
+
+def cmd_route(p, a):
+    s = p.read(); pos = s['pos']
+    t0 = time.time()
+    r = plan_route(p, (pos[0], pos[1]), (a.x, a.y), pos[2])
+    print(f'planned in {time.time() - t0:.1f}s from ({pos[0]:.1f},{pos[1]:.1f}): ' +
+          ('NO ROUTE' if r is None else ' -> '.join(f'({w[0]:.1f},{w[1]:.1f})' for w in r)))
+    return 0 if r else 1
+
+
 def cmd_goto(p, a):
-    target = (a.x, a.y)
-    offset = 0.0                    # world angle = stick angle + offset (camera yaw, learned)
-    learned = False
+    if a.route:
+        pos = p.read()['pos']
+        r = plan_route(p, (pos[0], pos[1]), (a.x, a.y), pos[2])
+        if r is None:
+            print('NO ROUTE on the navmesh'); return 3
+        print('route: ' + ' -> '.join(f'({w[0]:.1f},{w[1]:.1f})' for w in r))
+        for i, w in enumerate(r):
+            last = i == len(r) - 1
+            rc = drive_to(p, w, a.tol if last else max(a.tol, 1.5), a)
+            if rc:
+                return rc
+        return 0
+    return drive_to(p, (a.x, a.y), a.tol, a)
+
+
+DRIVE = {'offset': 0.0, 'learned': False}   # camera yaw estimate shared across legs of one goto
+
+
+def drive_to(p, target, tol, a):
+    offset = DRIVE['offset']        # world angle = stick angle + offset (camera yaw, learned)
+    learned = DRIVE['learned']
     hist = []                       # (t, pos, commanded world angle)
     t0 = time.time()
     best = float('inf'); best_t = t0
@@ -232,7 +329,8 @@ def cmd_goto(p, a):
             s = p.read()
             pos = s['pos']
             d = math.sqrt(dist2(pos, target))
-            if d < a.tol:
+            if d < tol:
+                DRIVE['offset'], DRIVE['learned'] = offset, learned
                 p.neutral()
                 print(f'arrived: ({pos[0]:.2f},{pos[1]:.2f},{pos[2]:.2f}) d={d:.2f} m after {time.time() - t0:.1f}s '
                       f'(camera offset {math.degrees(offset):.0f} deg)')
@@ -360,7 +458,7 @@ def cmd_navline(p, a):
     bx, by = (a.x2, a.y2) if a.x2 is not None else (a.x, a.y)
     st = p.ctl_send(6, [ax, ay, pos[2], bx, by, pos[2]])
     u = p.results_u32()
-    code = ctypes.c_int32(u[0]).value
+    code = u[0] & 0xFF                                 # byte return (al), see pilot_world.cpp
     print(f'status {st}: ({ax:.1f},{ay:.1f}) -> ({bx:.1f},{by:.1f}) ' + ('CLEAR' if code == 0 else f'BLOCKED code={code} err={u[1]} {u[2]} {u[3]}'))
 
 
@@ -422,6 +520,8 @@ def main():
     x = sub.add_parser('goto'); x.add_argument('x', type=float); x.add_argument('y', type=float)
     x.add_argument('--tol', type=float, default=1.5); x.add_argument('--run', action='store_true')
     x.add_argument('--timeout', type=float, default=60); x.add_argument('--stuck', type=float, default=4)
+    x.add_argument('--route', action='store_true', help='plan waypoints on the navmesh first')
+    x = sub.add_parser('route'); x.add_argument('x', type=float); x.add_argument('y', type=float)
     x = sub.add_parser('boot'); x.add_argument('--pulses', type=int, default=6); x.add_argument('--wait', type=float, default=5)
     x.add_argument('--settle', type=float, default=60); x.add_argument('--fps', type=float, default=60)
     x = sub.add_parser('teleport'); x.add_argument('x', type=float); x.add_argument('y', type=float); x.add_argument('z', type=float)

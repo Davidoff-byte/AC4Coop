@@ -16,3 +16,15 @@ edge scan; navmesh line fixed after this run (see below), not re-run yet.
 
 Follow-ups in the same commit: the edge scan now keeps the 32 edges nearest to Edward (was: the first 32 the engine
 returned) and reports the total.
+
+## Navmesh route planner (tools/pilot.py `route`, `goto --route`), same run 26452, build c0daf16
+A* on a 3 m lattice, edges = the engine's straight-line check (client masks the byte return, so it also works on
+c0daf16), then shortcutting. Results:
+- `route 76 -60`: NO ROUTE. Correct: `nav 76 -60` finds no HumanGround triangle and `ground` gives z = -3.12 (harbour
+  water). The first greedy planner also said NO ROUTE for a reachable goal, so it was replaced by A*.
+- `route 93 -75`: direct (0.0 s). `route 56 -76.4`: (58,-74) -> goal (0.7 s). `route 90.5 -52.3`: 5 legs (2.7 s).
+- `goto 90.5 -52.3 --route`: legs 1-3 arrived (7.8 s, 5.3 s, 5.3 s, within 1.5 m); leg 4 STUCK 3.3 m short at
+  (93.27,-56.27). `sense` showed nothing at waist height; `edges` showed LedgeGrab edges at foot height across the path;
+  screenshot: Edward at the side edge of a wooden pier over water. The stick goto learns the camera yaw from motion and,
+  stalled at an edge, steered sideways. Known limit of the camera-relative actuator; the world-space intention drive
+  (part A) replaces it.
