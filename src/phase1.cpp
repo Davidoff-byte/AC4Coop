@@ -1583,6 +1583,214 @@ static void LogPuppetMode() {
 
 // Apply a remote peer's state to the puppet (absolute position — shared world coords, no offset).
 // Never nulls g_puppet on a transient fault (that would trigger endless respawns).
+// ---- puppet action block (CharacterActionSet once, SetTargetAction, blend-in fix, blend factors / time scale) ----
+// Moved verbatim out of ApplyRemoteState (2026-11-14) so it can run either inline (default) or from the puppet's own
+// update ([Coop] PuppetActionsOwnUpdate). h = the puppet's Human, s = the peer's state, writeActions as computed there.
+static SRWLOCK      s_pabLock = SRWLOCK_INIT;
+static PlayerState  s_pabState;
+static Human*       s_pabHuman = nullptr;
+static bool         s_pabWrite = false;
+static volatile LONG s_pabPending = 0, s_pabApplied = 0;
+static int s_pabOnCache = 0; static uint64_t s_pabNext = 0;
+static bool PabOn() {
+    const uint64_t now = GetTickCount64();
+    if (now >= s_pabNext) {
+        s_pabNext = now + 2000;
+        const int v = GetPrivateProfileIntA("Coop", "PuppetActionsOwnUpdate", 0, Paths::Ini()) != 0 ? 1 : 0;
+        if (v != s_pabOnCache) L("[PupAct] PuppetActionsOwnUpdate=%d (was %d)\n", v, s_pabOnCache);
+        s_pabOnCache = v;
+    }
+    return s_pabOnCache != 0;
+}
+static void PuppetActionBlock(Human* h, const PlayerState& s, bool writeActions) {
+        // Give the puppet the local player's CharacterActionSet ONCE so its actions resolve to the right
+        // character's clip overrides (both are Edward on this machine) instead of the generic base. The
+        // gameplay path that normally sets it is disabled on the puppet. One-shot: re-setting it every frame
+        // resets the action to idle. The CAS reference lives at ActionComponent+0x18.
+        if (writeActions && !g_casActivated) {
+            ActionComponent* pac = h->GetActionComponent();
+            World* casWorld = World::GetCurrentWorld();
+            Entity* casLp = casWorld ? casWorld->GetPlayer() : nullptr;
+            Human*  casLph = casLp ? AIEntityHelper::GetHuman(casLp) : nullptr;
+            ActionComponent* lac = casLph ? casLph->GetActionComponent() : nullptr;
+            if (readable(pac, 0x40) && readable(lac, 0x40)) {
+                pac->ActivateCharacterActionSet((char*)lac + 0x18);
+                g_casActivated = true;
+                L("[Net] CAS set from local player (pac=%p lac=%p)\n", pac, lac);
+            }
+        }
+
+        // Universal animation sync: play the peer's current action (anim clip) on the puppet via
+        // SetTargetAction. Only issue when the peer's alias changed AND the puppet isn't ALREADY playing it:
+        // re-forcing a target action that's already current re-runs its transition and intermittently CRASHES
+        // (our tracked g_lastActionAlias resets on spawn/despawn, which is when a redundant re-force happened).
+        // Checking the puppet's real current action is the reliable guard.
+        // [Coop] PuppetActionReassert (default 0, load-time): also re-check while the peer's alias is unchanged, at most
+        // every 250 ms, so an action the engine switched the puppet to on its own is corrected (the current-action check
+        // below still prevents re-forcing an action that is already current).
+        static int s_pupReassert = -1; static uint64_t s_pupIssueMs = 0;
+        if (s_pupReassert < 0) s_pupReassert = GetPrivateProfileIntA("Coop", "PuppetActionReassert", 0, Paths::Ini());
+        const bool reassertDue = s_pupReassert && s.actionAlias == g_lastActionAlias && GetTickCount64() - s_pupIssueMs > 250;
+        if (writeActions && s.actionAlias != 0 && (s.actionAlias != g_lastActionAlias || reassertDue)) {
+            if (reassertDue) s_pupIssueMs = GetTickCount64();
+            ActionComponent* ac = h->GetActionComponent();
+            if (readable(ac, 0x40)) {
+                unsigned char mir = 0;
+                void* cur = ac->GetCurrentAction(&mir, 0, s.actionLayer);
+                uint32_t curAlias = readable(cur, 0x0C) ? *(uint32_t*)((char*)cur + 8) : 0;
+                if (curAlias != s.actionAlias) {
+                    // Pass the peer's real channel + layer (not 0xFFFF / a hardcoded layer) so the
+                    // CharacterActionSetManager doesn't take the kit-lookup path that bails and drops the CAS
+                    // override (-> base/Connor clip).
+                    ac->SetTargetAction((int)s.actionAlias, 0, 0, (int)s.actionChannel, (int)s.actionLayer);
+                    // Start the new clip at the peer's phase instead of frame 0 — the game does the same right
+                    // after its own SetTargetAction calls. Without it every swap pops. processDisplacement=0
+                    // (we own position), processEvents=0 (don't fire the skipped span's anim events).
+                    if (g_seekOnSwitch && s.actionRatio > 0.0f && s.actionRatio < 1.0f)
+                        ac->SetCurrentActionRatio(s.actionRatio, 0, false, false, ACTLAYER_PRIMARY);
+                    if (s.blendInLen >= 0.0f) {
+                        g_blendFixAlias = s.actionAlias;
+                        g_blendFixLen   = s.blendInLen;
+                        g_blendFixStartFromEnd = s.blendInStartFromEnd;
+                        g_blendFixTargetStart  = s.blendInTargetStart;
+                        g_blendFixFlags = s.blendInFlags;
+                        g_blendFixWait  = 10;
+                    }
+                    L("[Net] action -> %u ch=%u ly=%d ratio=%.2f blendIn=%.2f (puppet, cur was %u)\n", s.actionAlias, s.actionChannel, s.actionLayer, s.actionRatio, s.blendInLen, curAlias);
+                }
+                g_lastActionAlias = s.actionAlias;
+            }
+        }
+
+        // Blend-in override: once the puppet's current evaluator IS the action we just targeted, give its
+        // blend-in the peer's real length (stored ActionBlend, used if Start() hasn't run yet, AND the runtime
+        // length, used if it has). Only while the blend is still in progress, so we never rewind a finished one.
+        if (writeActions && g_blendFixWait > 0) {
+            ActionComponent* ac = h->GetActionComponent();
+            char* ev = readable(ac, 0x40) ? (char*)ac->GetCurrentEvaluator(0, ACTLAYER_PRIMARY) : nullptr;
+            // 0x2C0 (not 0x2B0): the descriptor we write reaches +0x1DC, and the engine mirrors it into
+            // m_InitialBlendFactors at +0x2BC - validate the whole span we can touch.
+            void* evAct = (readable(ev, 0x2C0) && *(uint8_t*)(ev + 0xD4) == 4) ? *(void**)(ev + 0x2A8) : nullptr;
+            // +0x258 == m_IsTransitionAction: never rewrite the blend of a mid-transition evaluator - its
+            // descriptor is being handed off to its target (README names this as the corruption source).
+            if (readable(evAct, 0x0C) && *(uint32_t*)((char*)evAct + 8) == g_blendFixAlias
+                && *(uint8_t*)(ev + 0x258) == 0) {
+                // Blend-in descriptor = m_BlendInEvaluator (+0xE0).m_ActionBlend (+0x1C8): m_Length, +0x1CC
+                // m_StartTimeFromEnd, +0x1D0 m_TargetStartTime, +0x1D4 ratio keys (array - NOT copied), +0x1DC
+                // u16 m_Flags (bits 0-2 m_BlendType). Copy the peer's whole descriptor: without a found transition
+                // the engine uses flags 0x600 = ACTBLENDTYPE_NONE, a hard cut whatever the length says.
+                // ACTBLENDTYPE_AROLLBROLL_WITHRATIO (6) needs the ratio keys we don't copy -> plain AROLLBROLL (1).
+                float    t       = *(float*)(ev + 0xE0);
+                float    was     = *(float*)(ev + 0xE4);
+                uint16_t wasFl   = *(uint16_t*)(ev + 0x1DC);
+                uint16_t fl      = g_blendFixFlags;
+                float    len     = g_blendFixLen;
+                if ((fl & 7) == 6) fl = (uint16_t)((fl & ~7) | 1);
+                bool write = true;
+                if ((fl & 7) == 0) {
+                    // Peer cut with NO blend — typically a transition clip handing off to its target, seamless on
+                    // the peer because the clip ends on the target's start pose. Our switch lands whenever the
+                    // packet does, so that match isn't guaranteed: never downgrade a blend the puppet found itself,
+                    // and otherwise use a short AROLLBROLL (MinBlendIn) to hide the timing seam.
+                    if ((wasFl & 7) != 0 || g_minBlendIn <= 0.0f) write = false;
+                    else { fl = (uint16_t)((fl & ~7) | 1); len = g_minBlendIn; }
+                }
+                // Re-validate immediately before the store: a rapid action-switch burst can replace the
+                // controller's cached evaluator between the fetch above and here, and writing a freed or
+                // recycled evaluator is what crashes AC4BFSP (0xc0000005). Require it is still the SAME
+                // live, non-transition evaluator; otherwise skip this fix (the blend just stays as-is).
+                const char* mapTag = "";
+                if (write && t < len) {
+                    char* evNow = readable(ac, 0x40) ? (char*)ac->GetCurrentEvaluator(0, ACTLAYER_PRIMARY) : nullptr;
+                    if (evNow != ev || !readable(ev, 0x2C0) || *(uint8_t*)(ev + 0x258) != 0) {
+                        write = false;
+                    } else {
+                        // [Coop] BlendTypeSafe: see g_blendTypeSafe. node+0x104 == evaluator+0x1E4 (inside the
+                        // 0x2C0 span validated just above).
+                        if (g_blendTypeSafe && *(void**)(ev + 0x1E4) == nullptr) {
+                            const unsigned ty = fl & 7;
+                            if (ty == 2 || ty == 4) {
+                                fl = (uint16_t)((fl & ~7) | (ty - 1)); mapTag = " [safe:pre-type]";
+                                InterlockedIncrement(&g_blendTypeMapped);
+                            } else if (ty == 5) {
+                                write = false; mapTag = " [safe:skip5]";
+                                InterlockedIncrement(&g_blendTypeSkipped);
+                            }
+                        }
+                    }
+                    if (write) {
+                        *(float*)(ev + 0x1C8)    = len;
+                        *(float*)(ev + 0x1CC)    = g_blendFixStartFromEnd;
+                        *(float*)(ev + 0x1D0)    = g_blendFixTargetStart;
+                        *(uint16_t*)(ev + 0x1DC) = fl;
+                        *(float*)(ev + 0xE4)     = len;   // runtime length, in case Start() already ran
+                    }
+                } else {
+                    write = false;
+                }
+                L("[Net] blendIn fix alias=%u len %.2f -> %.2f type %u -> %u (t=%.2f)%s%s\n",
+                  g_blendFixAlias, was, len, (unsigned)(wasFl & 7), (unsigned)(fl & 7), t, write ? "" : " [kept]",
+                  mapTag);
+                g_blendFixWait = 0;
+            } else {
+                --g_blendFixWait;
+            }
+        }
+
+        // Blend factors (the walk/jog/run speed sub-blend within the current LOOP action) — set EVERY frame
+        // since they vary continuously with the peer's speed. Indexed on the primary CONTROLLER channel 0 +
+        // ACTLAYER_PRIMARY (same as the capture / the engine's own SetBlendFactor calls), NOT s.actionChannel
+        // (the body-part channel used for SetTargetAction routing).
+        // ROOT CAUSE of "always slowest walk": a plain SetBlendFactor is TRANSIENT — the puppet's action update
+        // resets it to the slot default before sampling the clip, so our value never took. Confirmed via log:
+        // the LOCAL capture reads real, varying blend factors (e.g. [0,0.04,0.95,0]) — the capture was fine;
+        // the write just didn't stick. Fix (mirrors the engine's own locomotion): mark each slot
+        // ACTPERSIST_ALWAYS(=4) so it survives the per-frame reset, THEN write the peer's factor. Done every
+        // frame because the controller/evaluator is recreated on each SetTargetAction (fresh default persistence).
+        if (writeActions && s.actionAlias != 0) {
+            ActionComponent* ac = h->GetActionComponent();
+            if (readable(ac, 0x40)) {
+                // Full array, bounded by BOTH the peer's slot count and the puppet's own controller size
+                // (sized per action; the engine drops writes past it anyway).
+                int n = s.blendCount;
+                if (n > BLEND_MAX) n = BLEND_MAX;
+                int pn = ac->GetBlendFactorCount(0, ACTLAYER_PRIMARY);
+                if (pn < n) n = pn;
+                for (int i = 0; i < n; ++i) {
+                    ac->SetBlendFactorPersistence((unsigned char)i, ACTPERSIST_ALWAYS, 0, ACTLAYER_PRIMARY);
+                    ac->SetBlendFactor((unsigned char)i, s.blendFactors[i], 0, ACTLAYER_PRIMARY);
+                }
+                // Playback time scale (clip speed) — the missing gait lever: read-back proved the action AND
+                // blend factors already match the peer, so the only remaining difference is how fast the clip
+                // plays. Persist it (like the blend) so the puppet's action update doesn't snap it back to 1.0.
+                // Guard against a bogus/zero wire value that would freeze the anim.
+                if (s.timeScale > 0.01f) {
+                    ac->SetTimeScalePersistence(ACTPERSIST_ALWAYS, 0, ACTLAYER_PRIMARY);
+                    ac->SetTimeScale(s.timeScale, 0, ACTLAYER_PRIMARY, false);
+                }
+                // DIAGNOSTIC: read back the puppet's OWN state right after we wrote it — (1) is it playing the
+                // action we sent (alias match), (2) did the blend stick (readback == sent), (3) did the time
+                // scale stick. One line tells us where the chain breaks.
+                static int rc = 0;
+                if ((++rc % 30) == 0) {
+                    unsigned char mir = 0;
+                    void* pcur = ac->GetCurrentAction(&mir, 0, ACTLAYER_PRIMARY);
+                    uint32_t pAlias = readable(pcur, 0x0C) ? *(uint32_t*)((char*)pcur + 8) : 0;
+                    float rb[BLEND_MAX] = {};
+                    int pn = ac->GetBlendFactorCount(0, ACTLAYER_PRIMARY);
+                    if (pn > BLEND_MAX) pn = BLEND_MAX;
+                    for (int i = 0; i < pn; ++i) rb[i] = ac->GetBlendFactor((unsigned char)i, 0, ACTLAYER_PRIMARY);
+                    float pupTS = ac->GetTimeScale(0, ACTLAYER_PRIMARY);
+                    char rxs[512], pus[512];
+                    FormatBlendSlots(s.blendFactors, s.blendCount, rxs, sizeof(rxs));
+                    FormatBlendSlots(rb, pn, pus, sizeof(pus));
+                    L("[Net] PUP act=%u (rx=%u) rxBlend(n=%u)={%s} pupBlend(n=%d)={%s} rxTS=%.2f pupTS=%.2f\n",
+                      pAlias, s.actionAlias, (unsigned)s.blendCount, rxs, pn, pus, s.timeScale, pupTS);
+                }
+            }
+        }
+}
+
 void Phase1::ApplyRemoteState(const PlayerState& s) {
     // [Relevance] Remember where the peer actually is; the host's entity capture filters by this.
     if (s.valid) {
@@ -1853,191 +2061,18 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
                   s.ctx.swim.aiSwim[0], s.ctx.swim.aiSwim[2], s.ctx.swim.aiSwim[3], s.ctx.swim.aiSwim[4], s.ctx.swim.aiSwim[6]);
         }
 
-        // Give the puppet the local player's CharacterActionSet ONCE so its actions resolve to the right
-        // character's clip overrides (both are Edward on this machine) instead of the generic base. The
-        // gameplay path that normally sets it is disabled on the puppet. One-shot: re-setting it every frame
-        // resets the action to idle. The CAS reference lives at ActionComponent+0x18.
-        if (writeActions && !g_casActivated) {
-            ActionComponent* pac = h->GetActionComponent();
-            World* casWorld = World::GetCurrentWorld();
-            Entity* casLp = casWorld ? casWorld->GetPlayer() : nullptr;
-            Human*  casLph = casLp ? AIEntityHelper::GetHuman(casLp) : nullptr;
-            ActionComponent* lac = casLph ? casLph->GetActionComponent() : nullptr;
-            if (readable(pac, 0x40) && readable(lac, 0x40)) {
-                pac->ActivateCharacterActionSet((char*)lac + 0x18);
-                g_casActivated = true;
-                L("[Net] CAS set from local player (pac=%p lac=%p)\n", pac, lac);
-            }
-        }
-
-        // Universal animation sync: play the peer's current action (anim clip) on the puppet via
-        // SetTargetAction. Only issue when the peer's alias changed AND the puppet isn't ALREADY playing it:
-        // re-forcing a target action that's already current re-runs its transition and intermittently CRASHES
-        // (our tracked g_lastActionAlias resets on spawn/despawn, which is when a redundant re-force happened).
-        // Checking the puppet's real current action is the reliable guard.
-        // [Coop] PuppetActionReassert (default 0, load-time): also re-check while the peer's alias is unchanged, at most
-        // every 250 ms, so an action the engine switched the puppet to on its own is corrected (the current-action check
-        // below still prevents re-forcing an action that is already current).
-        static int s_pupReassert = -1; static uint64_t s_pupIssueMs = 0;
-        if (s_pupReassert < 0) s_pupReassert = GetPrivateProfileIntA("Coop", "PuppetActionReassert", 0, Paths::Ini());
-        const bool reassertDue = s_pupReassert && s.actionAlias == g_lastActionAlias && GetTickCount64() - s_pupIssueMs > 250;
-        if (writeActions && s.actionAlias != 0 && (s.actionAlias != g_lastActionAlias || reassertDue)) {
-            if (reassertDue) s_pupIssueMs = GetTickCount64();
-            ActionComponent* ac = h->GetActionComponent();
-            if (readable(ac, 0x40)) {
-                unsigned char mir = 0;
-                void* cur = ac->GetCurrentAction(&mir, 0, s.actionLayer);
-                uint32_t curAlias = readable(cur, 0x0C) ? *(uint32_t*)((char*)cur + 8) : 0;
-                if (curAlias != s.actionAlias) {
-                    // Pass the peer's real channel + layer (not 0xFFFF / a hardcoded layer) so the
-                    // CharacterActionSetManager doesn't take the kit-lookup path that bails and drops the CAS
-                    // override (-> base/Connor clip).
-                    ac->SetTargetAction((int)s.actionAlias, 0, 0, (int)s.actionChannel, (int)s.actionLayer);
-                    // Start the new clip at the peer's phase instead of frame 0 — the game does the same right
-                    // after its own SetTargetAction calls. Without it every swap pops. processDisplacement=0
-                    // (we own position), processEvents=0 (don't fire the skipped span's anim events).
-                    if (g_seekOnSwitch && s.actionRatio > 0.0f && s.actionRatio < 1.0f)
-                        ac->SetCurrentActionRatio(s.actionRatio, 0, false, false, ACTLAYER_PRIMARY);
-                    if (s.blendInLen >= 0.0f) {
-                        g_blendFixAlias = s.actionAlias;
-                        g_blendFixLen   = s.blendInLen;
-                        g_blendFixStartFromEnd = s.blendInStartFromEnd;
-                        g_blendFixTargetStart  = s.blendInTargetStart;
-                        g_blendFixFlags = s.blendInFlags;
-                        g_blendFixWait  = 10;
-                    }
-                    L("[Net] action -> %u ch=%u ly=%d ratio=%.2f blendIn=%.2f (puppet, cur was %u)\n", s.actionAlias, s.actionChannel, s.actionLayer, s.actionRatio, s.blendInLen, curAlias);
-                }
-                g_lastActionAlias = s.actionAlias;
-            }
-        }
-
-        // Blend-in override: once the puppet's current evaluator IS the action we just targeted, give its
-        // blend-in the peer's real length (stored ActionBlend, used if Start() hasn't run yet, AND the runtime
-        // length, used if it has). Only while the blend is still in progress, so we never rewind a finished one.
-        if (writeActions && g_blendFixWait > 0) {
-            ActionComponent* ac = h->GetActionComponent();
-            char* ev = readable(ac, 0x40) ? (char*)ac->GetCurrentEvaluator(0, ACTLAYER_PRIMARY) : nullptr;
-            // 0x2C0 (not 0x2B0): the descriptor we write reaches +0x1DC, and the engine mirrors it into
-            // m_InitialBlendFactors at +0x2BC - validate the whole span we can touch.
-            void* evAct = (readable(ev, 0x2C0) && *(uint8_t*)(ev + 0xD4) == 4) ? *(void**)(ev + 0x2A8) : nullptr;
-            // +0x258 == m_IsTransitionAction: never rewrite the blend of a mid-transition evaluator - its
-            // descriptor is being handed off to its target (README names this as the corruption source).
-            if (readable(evAct, 0x0C) && *(uint32_t*)((char*)evAct + 8) == g_blendFixAlias
-                && *(uint8_t*)(ev + 0x258) == 0) {
-                // Blend-in descriptor = m_BlendInEvaluator (+0xE0).m_ActionBlend (+0x1C8): m_Length, +0x1CC
-                // m_StartTimeFromEnd, +0x1D0 m_TargetStartTime, +0x1D4 ratio keys (array - NOT copied), +0x1DC
-                // u16 m_Flags (bits 0-2 m_BlendType). Copy the peer's whole descriptor: without a found transition
-                // the engine uses flags 0x600 = ACTBLENDTYPE_NONE, a hard cut whatever the length says.
-                // ACTBLENDTYPE_AROLLBROLL_WITHRATIO (6) needs the ratio keys we don't copy -> plain AROLLBROLL (1).
-                float    t       = *(float*)(ev + 0xE0);
-                float    was     = *(float*)(ev + 0xE4);
-                uint16_t wasFl   = *(uint16_t*)(ev + 0x1DC);
-                uint16_t fl      = g_blendFixFlags;
-                float    len     = g_blendFixLen;
-                if ((fl & 7) == 6) fl = (uint16_t)((fl & ~7) | 1);
-                bool write = true;
-                if ((fl & 7) == 0) {
-                    // Peer cut with NO blend — typically a transition clip handing off to its target, seamless on
-                    // the peer because the clip ends on the target's start pose. Our switch lands whenever the
-                    // packet does, so that match isn't guaranteed: never downgrade a blend the puppet found itself,
-                    // and otherwise use a short AROLLBROLL (MinBlendIn) to hide the timing seam.
-                    if ((wasFl & 7) != 0 || g_minBlendIn <= 0.0f) write = false;
-                    else { fl = (uint16_t)((fl & ~7) | 1); len = g_minBlendIn; }
-                }
-                // Re-validate immediately before the store: a rapid action-switch burst can replace the
-                // controller's cached evaluator between the fetch above and here, and writing a freed or
-                // recycled evaluator is what crashes AC4BFSP (0xc0000005). Require it is still the SAME
-                // live, non-transition evaluator; otherwise skip this fix (the blend just stays as-is).
-                const char* mapTag = "";
-                if (write && t < len) {
-                    char* evNow = readable(ac, 0x40) ? (char*)ac->GetCurrentEvaluator(0, ACTLAYER_PRIMARY) : nullptr;
-                    if (evNow != ev || !readable(ev, 0x2C0) || *(uint8_t*)(ev + 0x258) != 0) {
-                        write = false;
-                    } else {
-                        // [Coop] BlendTypeSafe: see g_blendTypeSafe. node+0x104 == evaluator+0x1E4 (inside the
-                        // 0x2C0 span validated just above).
-                        if (g_blendTypeSafe && *(void**)(ev + 0x1E4) == nullptr) {
-                            const unsigned ty = fl & 7;
-                            if (ty == 2 || ty == 4) {
-                                fl = (uint16_t)((fl & ~7) | (ty - 1)); mapTag = " [safe:pre-type]";
-                                InterlockedIncrement(&g_blendTypeMapped);
-                            } else if (ty == 5) {
-                                write = false; mapTag = " [safe:skip5]";
-                                InterlockedIncrement(&g_blendTypeSkipped);
-                            }
-                        }
-                    }
-                    if (write) {
-                        *(float*)(ev + 0x1C8)    = len;
-                        *(float*)(ev + 0x1CC)    = g_blendFixStartFromEnd;
-                        *(float*)(ev + 0x1D0)    = g_blendFixTargetStart;
-                        *(uint16_t*)(ev + 0x1DC) = fl;
-                        *(float*)(ev + 0xE4)     = len;   // runtime length, in case Start() already ran
-                    }
-                } else {
-                    write = false;
-                }
-                L("[Net] blendIn fix alias=%u len %.2f -> %.2f type %u -> %u (t=%.2f)%s%s\n",
-                  g_blendFixAlias, was, len, (unsigned)(wasFl & 7), (unsigned)(fl & 7), t, write ? "" : " [kept]",
-                  mapTag);
-                g_blendFixWait = 0;
-            } else {
-                --g_blendFixWait;
-            }
-        }
-
-        // Blend factors (the walk/jog/run speed sub-blend within the current LOOP action) — set EVERY frame
-        // since they vary continuously with the peer's speed. Indexed on the primary CONTROLLER channel 0 +
-        // ACTLAYER_PRIMARY (same as the capture / the engine's own SetBlendFactor calls), NOT s.actionChannel
-        // (the body-part channel used for SetTargetAction routing).
-        // ROOT CAUSE of "always slowest walk": a plain SetBlendFactor is TRANSIENT — the puppet's action update
-        // resets it to the slot default before sampling the clip, so our value never took. Confirmed via log:
-        // the LOCAL capture reads real, varying blend factors (e.g. [0,0.04,0.95,0]) — the capture was fine;
-        // the write just didn't stick. Fix (mirrors the engine's own locomotion): mark each slot
-        // ACTPERSIST_ALWAYS(=4) so it survives the per-frame reset, THEN write the peer's factor. Done every
-        // frame because the controller/evaluator is recreated on each SetTargetAction (fresh default persistence).
-        if (writeActions && s.actionAlias != 0) {
-            ActionComponent* ac = h->GetActionComponent();
-            if (readable(ac, 0x40)) {
-                // Full array, bounded by BOTH the peer's slot count and the puppet's own controller size
-                // (sized per action; the engine drops writes past it anyway).
-                int n = s.blendCount;
-                if (n > BLEND_MAX) n = BLEND_MAX;
-                int pn = ac->GetBlendFactorCount(0, ACTLAYER_PRIMARY);
-                if (pn < n) n = pn;
-                for (int i = 0; i < n; ++i) {
-                    ac->SetBlendFactorPersistence((unsigned char)i, ACTPERSIST_ALWAYS, 0, ACTLAYER_PRIMARY);
-                    ac->SetBlendFactor((unsigned char)i, s.blendFactors[i], 0, ACTLAYER_PRIMARY);
-                }
-                // Playback time scale (clip speed) — the missing gait lever: read-back proved the action AND
-                // blend factors already match the peer, so the only remaining difference is how fast the clip
-                // plays. Persist it (like the blend) so the puppet's action update doesn't snap it back to 1.0.
-                // Guard against a bogus/zero wire value that would freeze the anim.
-                if (s.timeScale > 0.01f) {
-                    ac->SetTimeScalePersistence(ACTPERSIST_ALWAYS, 0, ACTLAYER_PRIMARY);
-                    ac->SetTimeScale(s.timeScale, 0, ACTLAYER_PRIMARY, false);
-                }
-                // DIAGNOSTIC: read back the puppet's OWN state right after we wrote it — (1) is it playing the
-                // action we sent (alias match), (2) did the blend stick (readback == sent), (3) did the time
-                // scale stick. One line tells us where the chain breaks.
-                static int rc = 0;
-                if ((++rc % 30) == 0) {
-                    unsigned char mir = 0;
-                    void* pcur = ac->GetCurrentAction(&mir, 0, ACTLAYER_PRIMARY);
-                    uint32_t pAlias = readable(pcur, 0x0C) ? *(uint32_t*)((char*)pcur + 8) : 0;
-                    float rb[BLEND_MAX] = {};
-                    int pn = ac->GetBlendFactorCount(0, ACTLAYER_PRIMARY);
-                    if (pn > BLEND_MAX) pn = BLEND_MAX;
-                    for (int i = 0; i < pn; ++i) rb[i] = ac->GetBlendFactor((unsigned char)i, 0, ACTLAYER_PRIMARY);
-                    float pupTS = ac->GetTimeScale(0, ACTLAYER_PRIMARY);
-                    char rxs[512], pus[512];
-                    FormatBlendSlots(s.blendFactors, s.blendCount, rxs, sizeof(rxs));
-                    FormatBlendSlots(rb, pn, pus, sizeof(pus));
-                    L("[Net] PUP act=%u (rx=%u) rxBlend(n=%u)={%s} pupBlend(n=%d)={%s} rxTS=%.2f pupTS=%.2f\n",
-                      pAlias, s.actionAlias, (unsigned)s.blendCount, rxs, pn, pus, s.timeScale, pupTS);
-                }
-            }
+        // [Coop] PuppetActionsOwnUpdate (default 0, live): review 2026-11-14 (part 1, finding 1). ApplyRemoteState runs in
+        // the PLAYER's Human update (OnFrameInner), so these writes into the puppet's ActionComponent can overlap the
+        // puppet's own update on another worker thread (s_ovlDriven measures exactly that). With the flag on, the latest
+        // state is queued and PuppetActionBlock runs from OwnDrain on the puppet's OWN update, like MirrorActionsDeferred
+        // does for guards. With it off, behaviour is unchanged (inline call).
+        if (PabOn()) {
+            AcquireSRWLockExclusive(&s_pabLock);
+            s_pabState = s; s_pabHuman = h; s_pabWrite = writeActions;
+            ReleaseSRWLockExclusive(&s_pabLock);
+            InterlockedExchange(&s_pabPending, 1);
+        } else {
+            PuppetActionBlock(h, s, writeActions);
         }
         static int lc = 0;
         if ((++lc % 30) == 0)
@@ -6582,6 +6617,18 @@ static void OwnDrain(Human* h) {
             if (d > 0.02f) OwnNoteMove(false, d);
             if (OwnPuppetOn()) { e->SetGlobalMatrixInternal(&m, false); InterlockedIncrement(&s_pWrites); }
         }
+        if (s_pabPending && InterlockedExchange(&s_pabPending, 0)) {   // [Coop] PuppetActionsOwnUpdate
+            static PlayerState ps; Human* ph = nullptr; bool pw = false;   // static: this branch runs for one Human only
+            AcquireSRWLockShared(&s_pabLock);
+            ps = s_pabState; ph = s_pabHuman; pw = s_pabWrite;
+            ReleaseSRWLockShared(&s_pabLock);
+            if (ph == h) {
+                __try { PuppetActionBlock(h, ps, pw); InterlockedIncrement(&s_pabApplied); }
+                __except (EXCEPTION_EXECUTE_HANDLER) {
+                    static int pe = 0; if (++pe <= 20) L("[PupAct] EXCEPTION 0x%08X in the puppet action block (skipped)\n", GetExceptionCode());
+                }
+            }
+        }
         if (e) PuppetStim::OnPuppetUpdate(e);   // [Coop] PuppetStimSeq (host test; no-op unless the key changes)
         return;
     }
@@ -10935,7 +10982,7 @@ static void DumpConfigOnce()
         { "Coop", "FloatProbe", 0 }, { "Coop", "FootOffsetFix", 0 }, { "Coop", "GuardActionGate", 0 }, { "Coop", "GuardExtrapMs", 100 },
         { "Coop", "GuardInterpBuffer", 0 }, { "Coop", "GuardInterpDelayMs", 120 }, { "Coop", "GuardPhaseLock", 0 },
         { "Coop", "GuardSeesPuppet", 0 }, { "Coop", "PuppetActionReassert", 0 }, { "Coop", "PuppetHostTime", 0 },
-        { "Coop", "AlertQueryAsPlayer", 0 }, { "Coop", "ConflictNullGuard", 0 }, { "Coop", "FightProbe", 0 }, { "Coop", "DetectKeepTarget", 0 }, { "Coop", "GuardPlayerOfInterest", 0 }, { "Coop", "EventProbe", 0 }, { "Coop", "ReactProbe", 0 }, { "Coop", "FightSkipPuppet", 0 }, { "Coop", "NavNullGuard", 0 }, { "Coop", "PuppetStimMode", 1 }, { "Coop", "PuppetStimSeq", 0 }, { "Coop", "SightProbe", 0 }, { "Coop", "StateProbe", 0 }, { "Coop", "StuckProbe", 0 },
+        { "Coop", "AlertQueryAsPlayer", 0 }, { "Coop", "ConflictNullGuard", 0 }, { "Coop", "FightProbe", 0 }, { "Coop", "PuppetActionsOwnUpdate", 0 }, { "Coop", "DetectKeepTarget", 0 }, { "Coop", "GuardPlayerOfInterest", 0 }, { "Coop", "EventProbe", 0 }, { "Coop", "ReactProbe", 0 }, { "Coop", "FightSkipPuppet", 0 }, { "Coop", "NavNullGuard", 0 }, { "Coop", "PuppetStimMode", 1 }, { "Coop", "PuppetStimSeq", 0 }, { "Coop", "SightProbe", 0 }, { "Coop", "StateProbe", 0 }, { "Coop", "StuckProbe", 0 },
         { "Coop", "StageLog", 0 }, { "Coop", "SyncEnemiesOnly", 1 }, { "Coop", "SyncMaxEntities", 32 },
         { "Coop", "SyncRadiusM", 60 }, { "Coop", "TransformProbe", 0 }, { "Coop", "VPadEnable", 0 },
         { "Coop", "VPadTest", 0 }, { "Coop", "WatchDeadBit", 0 }, { "Coop", "WatchTarget", 0 },
