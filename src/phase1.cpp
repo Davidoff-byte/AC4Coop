@@ -10984,7 +10984,7 @@ static void DumpConfigOnce()
         { "Coop", "FloatProbe", 0 }, { "Coop", "FootOffsetFix", 0 }, { "Coop", "GuardActionGate", 0 }, { "Coop", "GuardExtrapMs", 100 },
         { "Coop", "GuardInterpBuffer", 0 }, { "Coop", "GuardInterpDelayMs", 120 }, { "Coop", "GuardPhaseLock", 0 },
         { "Coop", "GuardSeesPuppet", 0 }, { "Coop", "PuppetActionReassert", 0 }, { "Coop", "PuppetHostTime", 0 },
-        { "Coop", "AlertQueryAsPlayer", 0 }, { "Coop", "ConflictNullGuard", 0 }, { "Coop", "FightProbe", 0 }, { "Coop", "PuppetActionsOwnUpdate", 0 }, { "Coop", "DetectKeepTarget", 0 }, { "Coop", "GuardPlayerOfInterest", 0 }, { "Coop", "EventProbe", 0 }, { "Coop", "ReactProbe", 0 }, { "Coop", "FightSkipPuppet", 0 }, { "Coop", "NavNullGuard", 0 }, { "Coop", "PuppetStimMode", 1 }, { "Coop", "PuppetStimSeq", 0 }, { "Coop", "SightProbe", 0 }, { "Coop", "StateProbe", 0 }, { "Coop", "StuckProbe", 0 },
+        { "Coop", "AlertQueryAsPlayer", 0 }, { "Coop", "ConflictNullGuard", 0 }, { "Coop", "FightProbe", 0 }, { "Coop", "PeerLastPacket", 0 }, { "Coop", "PuppetActionsOwnUpdate", 0 }, { "Coop", "DetectKeepTarget", 0 }, { "Coop", "GuardPlayerOfInterest", 0 }, { "Coop", "EventProbe", 0 }, { "Coop", "ReactProbe", 0 }, { "Coop", "FightSkipPuppet", 0 }, { "Coop", "NavNullGuard", 0 }, { "Coop", "PuppetStimMode", 1 }, { "Coop", "PuppetStimSeq", 0 }, { "Coop", "SightProbe", 0 }, { "Coop", "StateProbe", 0 }, { "Coop", "StuckProbe", 0 },
         { "Coop", "StageLog", 0 }, { "Coop", "SyncEnemiesOnly", 1 }, { "Coop", "SyncMaxEntities", 32 },
         { "Coop", "SyncRadiusM", 60 }, { "Coop", "TransformProbe", 0 }, { "Coop", "VPadEnable", 0 },
         { "Coop", "VPadTest", 0 }, { "Coop", "WatchDeadBit", 0 }, { "Coop", "WatchTarget", 0 },
@@ -11397,11 +11397,23 @@ static void OnFrameInner(Human* updatedHuman) {
         bool gotRaw = (nb > 0);
         if (gotRaw) raw = batch[nb - 1];
         if (gotRaw && !raw.valid) gotRaw = false;
+        // [Coop] PeerLastPacket (default 0, live; review 2026-11-14 part 2, finding 3): DrainRemote returns 0 on frames
+        // with no new packet (~2 of 3 frames at 60 fps vs 20 Hz), so with `gotRaw` alone rawSameWorld/peerPresent were
+        // false on those frames: the puppet was driven only on packet frames and link-up/link-down flapped (run 22628:
+        // 444 link-down / 445 link-up lines). With the flag on, the presence/drive checks use the LAST received packet
+        // (the old GetRemote meaning); freshness is still bounded by lastFreshMs and the receive timer. `gotRaw` keeps
+        // meaning "a packet arrived this frame" for the observed-key scene logic (D-017) and the snapshot feed.
+        static PlayerState s_lastRaw; static bool s_haveLastRaw = false;
+        static int s_plpOn = 0; static uint64_t s_plpNext = 0;
+        { const uint64_t t = GetTickCount64(); if (t >= s_plpNext) { s_plpNext = t + 2000; s_plpOn = GetPrivateProfileIntA("Coop", "PeerLastPacket", 0, Paths::Ini()) != 0; } }
+        if (gotRaw) { s_lastRaw = raw; s_haveLastRaw = true; }
+        const bool haveRaw = s_plpOn ? s_haveLastRaw : gotRaw;
+        if (!gotRaw && haveRaw) raw = s_lastRaw;
 
         // ---- Feature #3: protocol-version gate (NetStrictPeer / NetStrictPeer=0 disables the timer arm) ----
         // A peer from a different source has a different packed PlayerState layout: its fields decode as
         // garbage. Refuse to spawn/drive it at all rather than puppet a corrupt state.
-        bool protoOk = gotRaw && raw.protoVer == NET_PROTO_VER;
+        bool protoOk = haveRaw && raw.protoVer == NET_PROTO_VER;
         if (gotRaw && !protoOk) {
             static bool s_protoWarned = false;
             if (!s_protoWarned) {
@@ -11415,10 +11427,10 @@ static void OnFrameInner(Human* updatedHuman) {
         // A peer in a different world cell is treated as NOT here: no drive, and the despawnGrace path
         // removes any stale puppet. A 0 key on either side means "unknown" -> allow, so an unreadable
         // cell size can never wedge the co-op. SceneAware=0 restores the old world-id-only behaviour.
-        bool sceneKnown = gotRaw && localOk && raw.sceneKey != 0 && local.sceneKey != 0;
+        bool sceneKnown = haveRaw && localOk && raw.sceneKey != 0 && local.sceneKey != 0;
         bool sameScene  = (s_sceneAware == 0) || !sceneKnown || (raw.sceneKey == local.sceneKey);
 
-        bool rawSameWorld = gotRaw && localOk && raw.worldId == local.worldId && protoOk && sameScene;
+        bool rawSameWorld = haveRaw && localOk && raw.worldId == local.worldId && protoOk && sameScene;
         if (gotRaw && raw.seq != lastRawSeq) {
             lastRawSeq = raw.seq;
             if (rawSameWorld) lastFreshMs = now;        // a fresh same-world packet keeps the puppet alive
@@ -11614,7 +11626,7 @@ static void OnFrameInner(Human* updatedHuman) {
                 // Render a delayed, interpolated state; with interp off, use the raw latest packet.
                 PlayerState remote; bool haveRemote;
                 if (g_interpEnabled) haveRemote = ComputeInterpolated(nowUs, remote);
-                else { remote = raw; haveRemote = gotRaw; }
+                else { remote = raw; haveRemote = haveRaw; }
                 // Same world + same scene ONLY: never drive a puppet from a peer we've gated out
                 // (proto mismatch, different world cell, or unknown-and-disallowed).
                 bool remoteSceneOk = (s_sceneAware == 0) || remote.sceneKey == 0 || local.sceneKey == 0 ||
