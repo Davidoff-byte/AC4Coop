@@ -74,6 +74,25 @@ DWORD g_poiTramp = 0, g_getPlayer = 0, g_cfResume = 0, g_cfExit = 0;
 bool  g_poiInstalled = false, g_cfInstalled = false;
 int   g_on = 0; ULONGLONG g_next = 0;
 volatile LONG g_calls = 0, g_lent = 0, g_cfSkipped = 0;
+int   g_ftOn = 0; volatile LONG g_lentFight = 0;
+
+// [Coop] GuardPoiFightTarget (default 0, live; needs GuardPlayerOfInterest): also lend the puppet to a guard whose own
+// fight target is the puppet, even when its sight sensor currently prefers the nearer real player. Layout from
+// sub_15DABC0 (IDA 2026-11-14 o84): fd = *(*(e+0xE8)+0x98); rec = *(fd+0x40); target = entity of handle *(rec+0x14)
+// = h[0] & (h[2] >> 31). Run 21832: 5 guards had target = PUPPET (fgroup.py) while lentPuppet fell to 0-6 per 2 s
+// once the puppet was farther than the player. UNVERIFIED: that the guards' chase reads "the player" through
+// sub_6F6010 / sub_65A660 (this flag is the test).
+bool FightTargetIs(const void* e, const void* who)
+{
+    const char* ai = *(const char* const*)((const char*)e + 0xE8);
+    if (!ai) return false;
+    const char* fd = *(const char* const*)(ai + 0x98);
+    if (!fd) return false;
+    const char* rec = *(const char* const*)(fd + 0x40);
+    if (!rec) return false;
+    const int* h = *(const int* const*)(rec + 0x14);
+    return h && (const void*)(uintptr_t)((h[2] >> 31) & h[0]) == who;
+}
 bool  g_ckInstalled = false; int g_ckOn = 0; ULONGLONG g_ckNext = 0;
 volatile LONG g_ckCalls = 0, g_ckKept = 0;
 
@@ -82,11 +101,18 @@ void* __cdecl PoiFor(void* e)
     __try {
         InterlockedIncrement(&g_calls);
         const ULONGLONG now = GetTickCount64();
-        if (now >= g_next) { g_next = now + 2000; g_on = GetPrivateProfileIntA("Coop", "GuardPlayerOfInterest", 0, Paths::Ini()) != 0; }
+        if (now >= g_next) {
+            g_next = now + 2000;
+            g_on = GetPrivateProfileIntA("Coop", "GuardPlayerOfInterest", 0, Paths::Ini()) != 0;
+            g_ftOn = GetPrivateProfileIntA("Coop", "GuardPoiFightTarget", 0, Paths::Ini()) != 0;
+        }
         if (!g_on || !e || !Phase1_IsEntityHost()) return nullptr;
         void* pup = Phase1_PuppetEntity();
         if (!pup || e == pup) return nullptr;
-        if (!GuardSight::TracksPuppet(e)) return nullptr;
+        if (!GuardSight::TracksPuppet(e)) {
+            if (!g_ftOn || !FightTargetIs(e, pup)) return nullptr;
+            InterlockedIncrement(&g_lentFight);
+        }
         InterlockedIncrement(&g_lent);
         return pup;
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
@@ -223,8 +249,9 @@ int GuardPoi::FormatReport(char* out, int cap)
 {
     if ((!g_poiInstalled && !g_cfInstalled && !g_ckInstalled) || cap < 64) return 0;
     const int n = _snprintf_s(out, cap, _TRUNCATE,
-                              "[Poi] on=%d lookups=%ld lentPuppet=%ld | conflictNullSkips=%ld | keepPuppet on=%d tests=%ld kept=%ld",
+                              "[Poi] on=%d lookups=%ld lentPuppet=%ld (byFightTarget=%ld ft=%d) | conflictNullSkips=%ld | keepPuppet on=%d tests=%ld kept=%ld",
                               g_on, InterlockedExchange(&g_calls, 0), InterlockedExchange(&g_lent, 0),
+                              InterlockedExchange(&g_lentFight, 0), g_ftOn,
                               InterlockedExchange(&g_cfSkipped, 0), g_ckOn, InterlockedExchange(&g_ckCalls, 0),
                               InterlockedExchange(&g_ckKept, 0));
     return n > 0 ? n : 0;
