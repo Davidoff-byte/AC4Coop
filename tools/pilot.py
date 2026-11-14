@@ -7,7 +7,9 @@ written into the game's own shared section Local\\ac4pilot-pad-<pid>, read by th
     py -3.14 tools/pilot.py scan [--r 40]                # characters around Edward (kind/role, fighter status)
     py -3.14 tools/pilot.py tap A [--sec 0.15]           # press and release a button
     py -3.14 tools/pilot.py stick 0 1 --sec 2 [--run]    # left stick (x right, y forward), optional RT held
-    py -3.14 tools/pilot.py goto X Y [--tol 1.5] [--run] [--timeout 60] [--route]   # --route: navmesh waypoints first
+    py -3.14 tools/pilot.py goto X Y [--tol 1.5] [--speed 1] [--timeout 60] [--route] [--stick]
+                                  # in-process world-space intent (IHumanGround slots); --stick = old camera-relative pad
+    py -3.14 tools/pilot.py intent DX DY [--speed 1] [--sec 1]   # world-space push, renewed until --sec elapses
     py -3.14 tools/pilot.py route X Y                    # plan only (navmesh straight-line checks, no screen)
     py -3.14 tools/pilot.py boot [--pulses 6]            # menus -> world with A presses (pair with [Coop] AutoContinue=1)
     py -3.14 tools/pilot.py mem player 0x200             # hex dump (read-only); target = player | hex address
@@ -299,6 +301,50 @@ def cmd_route(p, a):
     return 0 if r else 1
 
 
+def goto_inproc(p, target, tol, a):
+    """Steered by the game every player frame (kCmdGoto); this only starts it and waits for arrived/stuck."""
+    st = p.ctl_send(10, [target[0], target[1], a.speed, tol, a.stuck])
+    if st != 0:
+        print(f'goto refused: status {st} (-4 = intent hooks not installed)'); return 4
+    t0 = time.time()
+    while time.time() - t0 < a.timeout:
+        time.sleep(0.05)
+        c = p.ctl_read()
+        state = struct.unpack_from('<I', ctypes.string_at(p.ctl + 68, 4))[0]
+        if state in (2, 3, 4):
+            pos = p.read()['pos']
+            d = struct.unpack_from('<f', ctypes.string_at(p.ctl + 72, 4))[0]
+            subs = struct.unpack_from('<II', ctypes.string_at(p.ctl + 76, 8))
+            name = {2: 'arrived', 3: 'STUCK', 4: 'stopped'}[state]
+            print(f'{name}: ({pos[0]:.2f},{pos[1]:.2f},{pos[2]:.2f}) d={d:.2f} m after {time.time() - t0:.1f}s '
+                  f'(substitutions dir={subs[0]} speed={subs[1]})')
+            return 0 if state == 2 else 2
+    p.ctl_send(11, [])
+    print(f'TIMEOUT after {a.timeout}s'); return 1
+
+
+def leg(p, target, tol, a):
+    return drive_to(p, target, tol, a) if a.stick else goto_inproc(p, target, tol, a)
+
+
+def cmd_intent(p, a):
+    before = p.read()['pos']
+    end = time.time() + a.sec
+    while time.time() < end:
+        st = p.ctl_send(9, [a.dx, a.dy, a.speed, 300])
+        if st != 0:
+            print(f'intent refused: status {st}'); return 4
+        time.sleep(0.1)
+    p.ctl_send(11, [])
+    time.sleep(0.3)
+    after = p.read()['pos']
+    v = (after[0] - before[0], after[1] - before[1])
+    ang = math.degrees(math.atan2(v[1], v[0])); want = math.degrees(math.atan2(a.dy, a.dx))
+    subs = struct.unpack_from('<II', ctypes.string_at(p.ctl + 76, 8))
+    print(f'moved {math.hypot(*v):.2f} m at {ang:.0f} deg (asked {want:.0f} deg) from ({before[0]:.2f},{before[1]:.2f}) to '
+          f'({after[0]:.2f},{after[1]:.2f}); substitutions dir={subs[0]} speed={subs[1]}')
+
+
 def cmd_goto(p, a):
     if a.route:
         pos = p.read()['pos']
@@ -308,11 +354,11 @@ def cmd_goto(p, a):
         print('route: ' + ' -> '.join(f'({w[0]:.1f},{w[1]:.1f})' for w in r))
         for i, w in enumerate(r):
             last = i == len(r) - 1
-            rc = drive_to(p, w, a.tol if last else max(a.tol, 1.5), a)
+            rc = leg(p, w, a.tol if last else max(a.tol, 1.5), a)
             if rc:
                 return rc
         return 0
-    return drive_to(p, (a.x, a.y), a.tol, a)
+    return leg(p, (a.x, a.y), a.tol, a)
 
 
 DRIVE = {'offset': 0.0, 'learned': False}   # camera yaw estimate shared across legs of one goto
@@ -521,6 +567,10 @@ def main():
     x.add_argument('--tol', type=float, default=1.5); x.add_argument('--run', action='store_true')
     x.add_argument('--timeout', type=float, default=60); x.add_argument('--stuck', type=float, default=4)
     x.add_argument('--route', action='store_true', help='plan waypoints on the navmesh first')
+    x.add_argument('--stick', action='store_true', help='old camera-relative virtual-pad controller')
+    x.add_argument('--speed', type=float, default=1.0)
+    x = sub.add_parser('intent'); x.add_argument('dx', type=float); x.add_argument('dy', type=float)
+    x.add_argument('--speed', type=float, default=1.0); x.add_argument('--sec', type=float, default=1.0)
     x = sub.add_parser('route'); x.add_argument('x', type=float); x.add_argument('y', type=float)
     x = sub.add_parser('boot'); x.add_argument('--pulses', type=int, default=6); x.add_argument('--wait', type=float, default=5)
     x.add_argument('--settle', type=float, default=60); x.add_argument('--fps', type=float, default=60)

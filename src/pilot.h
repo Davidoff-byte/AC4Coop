@@ -61,7 +61,15 @@ namespace Pilot
     // Commands from the client, executed by the game (Local\ac4pilot-ctl-<pid>). The client fills cmd/f[] and then bumps
     // `req`; the game sets status and copies req into `done` when finished.
     // 3..8: world queries (src/pilot_world.cpp), results in res[] (rcount items).
-    enum { kCmdTeleport = 1, kCmdFpsCap = 2, kCmdRay = 3, kCmdGround = 4, kCmdNavPoint = 5, kCmdNavLine = 6, kCmdEdges = 7, kCmdSense = 8 };
+    enum { kCmdTeleport = 1, kCmdFpsCap = 2, kCmdRay = 3, kCmdGround = 4, kCmdNavPoint = 5, kCmdNavLine = 6, kCmdEdges = 7, kCmdSense = 8,
+           kCmdIntent = 9, kCmdGoto = 10, kCmdStop = 11 };
+    // Intent (world-space locomotion, bf-coop ops/evidence/pilot/intention-seam.md seam 1): IHumanGround vtable 0x026E7DC0
+    // slot 0 SetDirection / slot 1 SetSpeedRatio are patched; for the player entity, while an intent is live, the
+    // direction/ratio the game computed from the camera-relative stick are replaced by the client's world direction.
+    // kCmdIntent: f0,f1 world direction (normalised here), f2 speed ratio 0..1, f3 hold ms (default 300, then lapses).
+    // kCmdGoto: f0,f1 target, f2 ratio, f3 tolerance m, f4 stuck seconds - steered every player frame in-process.
+    // Goto/intent status lives in reserved[]: [0] goto state (0 idle 1 running 2 arrived 3 stuck 4 stopped),
+    // [1] distance (float bits), [2] slot-0 substitutions, [3] slot-1 substitutions, [4] hooks installed (1/0).
     enum { kResMax = 256 };
     struct PilotCtl
     {

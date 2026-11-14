@@ -264,6 +264,101 @@ void TryPatchPresent()
         g_realPresent ? 1 : 0, (void*)g_realPresent, g_ctl ? g_ctl->fpsCap : 0);
 }
 
+// ---- world-space intent: IHumanGround slots 0/1 (intention-seam.md seam 1) ----------------------------------------------
+// vtable 0x026E7DC0: slot 0 = 0x01CB91B0 SetDirection(const Vector4*) (mov ecx,[ecx-4]; jmp sub_56BDD0: movaps [ecx+20h]),
+// slot 1 = 0x01D51690 SetSpeedRatio(float) (writes HumanGroundData+0x98, zeroes scope+0x5F8); both thiscall, retn 4.
+// Values re-read in db a3 (job k13: bytes B0 91 CB 01 / 90 16 D5 01, slot 1 decompiled). Entity of an IHumanGround* p:
+// [[[p-0xC]+0x108]+4]; HumanGroundData = [p-4], m_DestHeading at +0x20 (16-byte aligned in the game's own movaps store).
+struct alignas(16) V4i { float x, y, z, w; };
+typedef void (__thiscall* SetDir_t)(void*, const V4i*);
+typedef void (__thiscall* SetSpeed_t)(void*, float);
+SetDir_t   g_origSetDir = nullptr;
+SetSpeed_t g_origSetSpeed = nullptr;
+volatile uint32_t g_intentEntity = 0;       // the player entity, refreshed every player frame
+alignas(16) V4i g_intentDir = { 0, 1, 0, 0 };
+volatile float g_intentSpeed = 0.0f;
+volatile DWORD g_intentUntil = 0;           // GetTickCount() deadline; 0 = no intent
+
+bool IntentFor(void* ig)
+{
+    if (!g_intentUntil || (LONG)(GetTickCount() - g_intentUntil) > 0) return false;
+    uint32_t a = *(const uint32_t*)((const char*)ig - 0xC);
+    if (!a) return false;
+    uint32_t h = *(const uint32_t*)(uintptr_t)(a + 0x108);
+    return h && *(const uint32_t*)(uintptr_t)(h + 4) == g_intentEntity;
+}
+
+void __fastcall HookSetDir(void* ig, void* /*edx*/, const V4i* dir)
+{
+    if (IntentFor(ig)) {
+        alignas(16) V4i d = g_intentDir;
+        if (g_ctl) InterlockedIncrement((volatile LONG*)&g_ctl->reserved[2]);
+        g_origSetDir(ig, &d);
+        return;
+    }
+    g_origSetDir(ig, dir);
+}
+
+void __fastcall HookSetSpeed(void* ig, void* /*edx*/, float r)
+{
+    if (IntentFor(ig)) {
+        g_origSetSpeed(ig, g_intentSpeed);
+        // The handler calls SetDirection only when its own speed >= 0.01; with the stick idle it never would, so store
+        // the direction here exactly as slot 0 does (HumanGroundData = [p-4], m_DestHeading +0x20).
+        char* data = *(char**)((char*)ig - 4);
+        if (data) { alignas(16) V4i d = g_intentDir; memcpy(data + 0x20, &d, sizeof(d)); }
+        if (g_ctl) InterlockedIncrement((volatile LONG*)&g_ctl->reserved[3]);
+        return;
+    }
+    g_origSetSpeed(ig, r);
+}
+
+void InstallIntentHooks()
+{
+    uint32_t* slot = (uint32_t*)0x026E7DC0;
+    if (slot[0] != 0x01CB91B0u || slot[1] != 0x01D51690u) {
+        Log("[Pilot] intent hooks NOT installed: vtable 0x026E7DC0 holds %08X %08X (expected 01CB91B0 01D51690)\n", slot[0], slot[1]);
+        return;
+    }
+    DWORD old = 0;
+    if (!VirtualProtect(slot, 8, PAGE_READWRITE, &old)) { Log("[Pilot] intent hooks: VirtualProtect failed\n"); return; }
+    g_origSetDir = (SetDir_t)(uintptr_t)slot[0];
+    g_origSetSpeed = (SetSpeed_t)(uintptr_t)slot[1];
+    InterlockedExchange((volatile LONG*)&slot[0], (LONG)(uintptr_t)&HookSetDir);
+    InterlockedExchange((volatile LONG*)&slot[1], (LONG)(uintptr_t)&HookSetSpeed);
+    VirtualProtect(slot, 8, old, &old);
+    if (g_ctl) g_ctl->reserved[4] = 1;
+    Log("[Pilot] intent hooks installed on IHumanGround vtable 0x026E7DC0 slots 0/1\n");
+}
+
+void SetIntent(float dx, float dy, float speed, DWORD holdMs)
+{
+    float l = sqrtf(dx * dx + dy * dy);
+    if (l < 1e-4f) { g_intentUntil = 0; return; }
+    g_intentDir.x = dx / l; g_intentDir.y = dy / l; g_intentDir.z = 0; g_intentDir.w = 0;
+    g_intentSpeed = speed < 0 ? 0 : speed > 1 ? 1 : speed;
+    g_intentUntil = GetTickCount() + (holdMs ? holdMs : 1);
+}
+
+// In-process goto, steered on every player frame.
+struct GotoState { bool on; float tx, ty, speed, tol, stuckSec, best; DWORD bestTick; };
+GotoState g_goto = {};
+
+void GotoTick(Entity* pl)
+{
+    if (!g_goto.on || !pl || !g_ctl) return;
+    const HookMath::Transform& m = ((BaseEntity*)pl)->m_GlobalMatrix;
+    float dx = g_goto.tx - m.M41, dy = g_goto.ty - m.M42, d = sqrtf(dx * dx + dy * dy);
+    memcpy(&g_ctl->reserved[1], &d, 4);
+    if (d <= g_goto.tol) { g_goto.on = false; g_intentUntil = 0; g_ctl->reserved[0] = 2; return; }
+    DWORD now = GetTickCount();
+    if (d < g_goto.best - 0.3f) { g_goto.best = d; g_goto.bestTick = now; }
+    else if ((now - g_goto.bestTick) > (DWORD)(g_goto.stuckSec * 1000.0f)) { g_goto.on = false; g_intentUntil = 0; g_ctl->reserved[0] = 3; return; }
+    float sp = g_goto.speed;
+    if (d < 2.0f && sp > 0.5f) sp = 0.5f;                       // ease in to avoid overshoot
+    SetIntent(dx, dy, sp, 250);
+}
+
 // ---- commands executed on the game thread (player frame) ------------------------------------------------------------
 void RunCommand(Entity* pl)
 {
@@ -292,6 +387,19 @@ void RunCommand(Entity* pl)
         float v = c->f[0];
         c->fpsCap = (v <= 0.0f) ? 0u : (uint32_t)(v > 240.0f ? 240.0f : v);
         status = g_realPresent ? 0 : -4;
+    } else if (c->cmd == kCmdIntent) {
+        if (!g_origSetDir) status = -4;
+        else { g_goto.on = false; SetIntent(c->f[0], c->f[1], c->f[2], c->f[3] > 0 ? (DWORD)c->f[3] : 300); }
+    } else if (c->cmd == kCmdGoto) {
+        if (!g_origSetDir) status = -4;
+        else {
+            g_goto.on = true; g_goto.tx = c->f[0]; g_goto.ty = c->f[1];
+            g_goto.speed = c->f[2] > 0 ? c->f[2] : 1.0f; g_goto.tol = c->f[3] > 0 ? c->f[3] : 1.0f;
+            g_goto.stuckSec = c->f[4] > 0 ? c->f[4] : 3.0f; g_goto.best = 1e9f; g_goto.bestTick = GetTickCount();
+            c->reserved[0] = 1;
+        }
+    } else if (c->cmd == kCmdStop) {
+        g_goto.on = false; g_intentUntil = 0; if (c->reserved[0] == 1) c->reserved[0] = 4;
     } else if (c->cmd >= kCmdRay && c->cmd <= kCmdSense) {
         if (!pl) status = -1;
         else { __try { status = RunWorldCommand(c, pl); } __except (EXCEPTION_EXECUTE_HANDLER) { status = -2; } }
@@ -326,6 +434,7 @@ void Init()
     if (g_state) { g_state->magic = 0x53344341; g_state->version = 1; g_state->padIndex = (uint32_t)g_padIndex; }
     Log("[Pilot] on: pad section %p state section %p (sizeof state %u)\n", (void*)g_pad, (void*)g_state, (unsigned)sizeof(PilotState));
     TryPatchImports();
+    if (GetPrivateProfileIntA("Pilot", "Intent", 1, Paths::Ini())) InstallIntentHooks();   // [Pilot] Intent (default 1 under Enabled)
 }
 
 void Poll()
@@ -349,7 +458,9 @@ void OnPlayerFrame(void* human)
         s->world = (uint32_t)(uintptr_t)w;
         s->player = (uint32_t)(uintptr_t)pl;
         s->human = (uint32_t)(uintptr_t)human;
+        g_intentEntity = (uint32_t)(uintptr_t)pl;
         RunCommand(pl);
+        GotoTick(pl);
         if (pl) memcpy(s->m, &((BaseEntity*)pl)->m_GlobalMatrix, sizeof(s->m));
         uint32_t n = 0, total = 0;
         if (w) {
