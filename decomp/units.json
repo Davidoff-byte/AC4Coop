@@ -1,5 +1,14 @@
 {
  "units": {
+  "004212A0": {
+   "addr": "004212A0",
+   "claimed_at": null,
+   "name": "RayCastDtor",
+   "owner": null,
+   "receipts": [],
+   "size": 153,
+   "status": "unknown"
+  },
   "0045ABB0": {
    "addr": "0045ABB0",
    "claimed_at": null,
@@ -7,6 +16,51 @@
    "owner": null,
    "receipts": [],
    "size": 119,
+   "status": "unknown"
+  },
+  "0045DD20": {
+   "addr": "0045DD20",
+   "claimed_at": null,
+   "name": "NavWorldOfWorld",
+   "owner": null,
+   "receipts": [],
+   "size": 29,
+   "status": "unknown"
+  },
+  "0047A980": {
+   "addr": "0047A980",
+   "claimed_at": null,
+   "name": "NavTriangleAtPoint",
+   "owner": null,
+   "receipts": [],
+   "size": 613,
+   "status": "unknown"
+  },
+  "0047EA80": {
+   "addr": "0047EA80",
+   "claimed_at": null,
+   "name": "NavLineCheck",
+   "owner": null,
+   "receipts": [],
+   "size": 93,
+   "status": "unknown"
+  },
+  "0047EC30": {
+   "addr": "0047EC30",
+   "claimed_at": null,
+   "name": "GroundProbe",
+   "owner": null,
+   "receipts": [],
+   "size": 315,
+   "status": "unknown"
+  },
+  "004C6380": {
+   "addr": "004C6380",
+   "claimed_at": null,
+   "name": "RayCastCtor1Hit",
+   "owner": null,
+   "receipts": [],
+   "size": 110,
    "status": "unknown"
   },
   "00503330": {
@@ -101,6 +155,24 @@
    "size": 31,
    "status": "claimed"
   },
+  "0059F9D0": {
+   "addr": "0059F9D0",
+   "claimed_at": null,
+   "name": "GuidanceReportDtor",
+   "owner": null,
+   "receipts": [],
+   "size": 50,
+   "status": "unknown"
+  },
+  "0059FAA0": {
+   "addr": "0059FAA0",
+   "claimed_at": null,
+   "name": "GuidanceReportCtor",
+   "owner": null,
+   "receipts": [],
+   "size": 21,
+   "status": "unknown"
+  },
   "005FAC00": {
    "addr": "005FAC00",
    "claimed_at": "2026-11-08T12:06:27Z",
@@ -145,6 +217,33 @@
    ],
    "size": 95,
    "status": "claimed"
+  },
+  "0061D270": {
+   "addr": "0061D270",
+   "claimed_at": null,
+   "name": "GuidanceScan",
+   "owner": null,
+   "receipts": [],
+   "size": 205,
+   "status": "unknown"
+  },
+  "00620E40": {
+   "addr": "00620E40",
+   "claimed_at": null,
+   "name": "RayCastSetFilter",
+   "owner": null,
+   "receipts": [],
+   "size": 34,
+   "status": "unknown"
+  },
+  "00630600": {
+   "addr": "00630600",
+   "claimed_at": null,
+   "name": "RayCastWorld",
+   "owner": null,
+   "receipts": [],
+   "size": 739,
+   "status": "unknown"
   },
   "00636480": {
    "addr": "00636480",
@@ -289,6 +388,33 @@
    ],
    "size": 29,
    "status": "claimed"
+  },
+  "00703090": {
+   "addr": "00703090",
+   "claimed_at": null,
+   "name": "NavTriangleZ",
+   "owner": null,
+   "receipts": [],
+   "size": 123,
+   "status": "unknown"
+  },
+  "0070E440": {
+   "addr": "0070E440",
+   "claimed_at": null,
+   "name": "GuidanceZoneCtor",
+   "owner": null,
+   "receipts": [],
+   "size": 40,
+   "status": "unknown"
+  },
+  "0070E470": {
+   "addr": "0070E470",
+   "claimed_at": null,
+   "name": "GuidanceZoneDtor",
+   "owner": null,
+   "receipts": [],
+   "size": 11,
+   "status": "unknown"
   },
   "0070E810": {
    "addr": "0070E810",

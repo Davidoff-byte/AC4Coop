@@ -13,6 +13,11 @@ written into the game's own shared section Local\\ac4pilot-pad-<pid>, read by th
     py -3.14 tools/pilot.py watch [--sec 30]             # position + nearest characters, once a second
     py -3.14 tools/pilot.py teleport X Y Z [--yaw DEG]   # game thread, Entity::SetGlobalMatrixInternal
     py -3.14 tools/pilot.py fps [N]                      # show / set the frame cap (0 = off)
+    py -3.14 tools/pilot.py ray X Y Z X2 Y2 Z2 [--layer 11]   # engine ray cast (hit pos, normal, distance, type)
+    py -3.14 tools/pilot.py ground [X Y Z]               # ground height under a point (default: Edward)
+    py -3.14 tools/pilot.py nav [X Y Z] | navline X Y [X2 Y2]  # navmesh triangle / straight-line walkability
+    py -3.14 tools/pilot.py edges [--r 3] [--zmin -1] [--zmax 4]   # climbable edges (guidance) around Edward
+    py -3.14 tools/pilot.py sense [--range 8] [--h 1] [--rays 16]  # ray fan around Edward: what blocks each way
 
 --pid defaults to the AC4BFSP.exe whose phase1_log_<pid>.txt is newest in AC4_GAME_DIR (tools/paths.py).
 Stick directions are camera-relative in the game, so `goto` learns the camera's yaw from Edward's own motion
@@ -38,7 +43,8 @@ k.OpenProcess.restype = W.HANDLE
 PAD_FMT = '<IIIHBBhhhh4I'            # PilotPad, 40 bytes (pack 1)
 CHAR_FMT = '<III3fIiiI'              # PilotChar, 40 bytes
 HDR_FMT = '<IIIII III 16f II IIII'   # PilotState header, 120 bytes
-CTL_FMT = '<IIIIi8fIIII8I'          # PilotCtl, 100 bytes
+CTL_FMT = '<IIIIi8fIIII8I'          # PilotCtl header, 100 bytes; then u32 rcount, 3 pad, float res[256]
+CTL_SIZE = 1140
 MAX_CHARS = 256
 STATE_SIZE = struct.calcsize(HDR_FMT) + MAX_CHARS * struct.calcsize(CHAR_FMT)
 assert struct.calcsize(CTL_FMT) == 100 and struct.calcsize(PAD_FMT) == 40 and struct.calcsize(CHAR_FMT) == 40 and STATE_SIZE == 10360
@@ -78,7 +84,7 @@ class Pilot:
         self.pid = pid
         self.pad = self._map('pad', 40)
         self.state = self._map('state', STATE_SIZE)
-        self.ctl = self._map('ctl', 100)
+        self.ctl = self._map('ctl', CTL_SIZE)
         self.h = k.OpenProcess(0x0010 | 0x0400, False, pid)
         self.seq = 0
 
@@ -131,6 +137,15 @@ class Pilot:
                 return ctypes.c_int32.from_address(self.ctl + 16).value
             time.sleep(0.02)
         return None
+
+    def results(self, n, stride):
+        cnt = ctypes.c_uint32.from_address(self.ctl + 100).value
+        raw = ctypes.string_at(self.ctl + 116, 4 * 256)
+        vals = struct.unpack('<256f', raw)
+        return cnt, [vals[i * stride:(i + 1) * stride] for i in range(min(cnt, 256 // stride))]
+
+    def results_u32(self):
+        return struct.unpack('<256I', ctypes.string_at(self.ctl + 116, 4 * 256))
 
     # ---- pad ---------------------------------------------------------------------------------------------------
     def set_pad(self, buttons=0, lx=0.0, ly=0.0, rx=0.0, ry=0.0, lt=0, rt=0, enabled=1):
@@ -302,6 +317,74 @@ def cmd_fps(p, a):
     print(f"cap={c['fpsCap']} measured={c['fps']} fps presents={c['presents']} presentPatched={c['presentPatched']}")
 
 
+CTYPE = {1: 'ground', 2: 'slope', 4: 'wall', 8: 'ceiling'}
+GSUB = {1: 'LedgeGrab', 2: 'Beam', 3: 'Ladder', 4: 'Pole', 5: 'Rope', 6: 'Surface', 7: 'Kiosk', 12: 'HayStack',
+        13: 'LedgeGrabHandsOnly', 16: 'Parallel', 17: 'HorizontalParallel', 18: 'LedgeGrabPole', 19: 'PassOver',
+        21: 'HorizontalRope', 22: 'LedgeLookDown'}   # PS3 DWARF GuidanceObjectSubType (lead)
+
+
+def here(p, a):
+    pos = p.read()['pos']
+    return [a.x if a.x is not None else pos[0], a.y if a.y is not None else pos[1], a.z if a.z is not None else pos[2]]
+
+
+def cmd_ray(p, a):
+    st = p.ctl_send(3, [a.x, a.y, a.z, a.x2, a.y2, a.z2, a.layer])
+    n, rows = p.results(1, 8)
+    if st != 0 or not n:
+        print(f'status {st}: no hit'); return 0 if st == 0 else 1
+    r = rows[0]
+    print(f'status {st}: HIT pos=({r[0]:.2f},{r[1]:.2f},{r[2]:.2f}) normal=({r[3]:.2f},{r[4]:.2f},{r[5]:.2f}) '
+          f'dist={r[6]:.2f} m type={int(r[7])}({CTYPE.get(int(r[7]), "?")})')
+
+
+def cmd_ground(p, a):
+    pt = here(p, a)
+    st = p.ctl_send(4, pt + [a.half])
+    n, rows = p.results(1, 1)
+    print(f'status {st}: ' + (f'ground z={rows[0][0]:.3f} under ({pt[0]:.2f},{pt[1]:.2f}) (query z {pt[2]:.2f})' if n else 'no ground hit'))
+
+
+def cmd_nav(p, a):
+    pt = here(p, a)
+    st = p.ctl_send(5, pt)
+    tri = p.results_u32()[0]
+    n, rows = p.results(1, 2)
+    print(f'status {st}: ' + (f'navmesh triangle {tri:08X}, walk z={rows[0][1]:.3f} at ({pt[0]:.2f},{pt[1]:.2f})' if n else
+                               f'no HumanGround triangle at ({pt[0]:.2f},{pt[1]:.2f},{pt[2]:.2f})'))
+
+
+def cmd_navline(p, a):
+    pos = p.read()['pos']
+    ax, ay = (a.x, a.y) if a.x2 is not None else (pos[0], pos[1])
+    bx, by = (a.x2, a.y2) if a.x2 is not None else (a.x, a.y)
+    st = p.ctl_send(6, [ax, ay, pos[2], bx, by, pos[2]])
+    u = p.results_u32()
+    code = ctypes.c_int32(u[0]).value
+    print(f'status {st}: ({ax:.1f},{ay:.1f}) -> ({bx:.1f},{by:.1f}) ' + ('CLEAR' if code == 0 else f'BLOCKED code={code} err={u[1]} {u[2]} {u[3]}'))
+
+
+def cmd_edges(p, a):
+    st = p.ctl_send(7, [a.r, a.zmin, a.zmax, float(a.mask)])
+    n, rows = p.results(32, 8)
+    me = p.read()['pos']
+    print(f'status {st}: {n} climbable edges in +/-{a.r} m, z {a.zmin}..{a.zmax} around ({me[0]:.1f},{me[1]:.1f},{me[2]:.1f})')
+    for r in sorted(rows, key=lambda r: min(dist2(r[0:3], me), dist2(r[3:6], me))):
+        sub = int(r[6])
+        print(f'  {GSUB.get(sub, sub)!s:18} A=({r[0]:.2f},{r[1]:.2f},{r[2]:.2f}) B=({r[3]:.2f},{r[4]:.2f},{r[5]:.2f}) '
+              f'height {min(r[2], r[5]) - me[2]:+.2f}..{max(r[2], r[5]) - me[2]:+.2f} m')
+
+
+def cmd_sense(p, a):
+    st = p.ctl_send(8, [a.range, a.h, a.layer, a.rays])
+    n, rows = p.results(32, 4)
+    print(f'status {st}: {n} rays, range {a.range} m at +{a.h} m (0 deg = +x, counter-clockwise)')
+    for i, r in enumerate(rows):
+        deg = 360.0 * i / n
+        what = 'open' if r[1] == 0 else f'{CTYPE.get(int(r[1]), int(r[1]))} at {r[0]:.2f} m'
+        print(f'  {deg:5.1f} deg  {"#" * int(round(10 * r[0] / a.range)):<10} {what}')
+
+
 def cmd_mem(p, a):
     s = p.read()
     base = s['player'] if a.target == 'player' else int(a.target, 16)
@@ -343,6 +426,19 @@ def main():
     x = sub.add_parser('teleport'); x.add_argument('x', type=float); x.add_argument('y', type=float); x.add_argument('z', type=float)
     x.add_argument('--yaw', type=float)
     x = sub.add_parser('fps'); x.add_argument('n', type=float, nargs='?')
+    x = sub.add_parser('ray')
+    for n in ('x', 'y', 'z', 'x2', 'y2', 'z2'): x.add_argument(n, type=float)
+    x.add_argument('--layer', type=float, default=11)
+    for name in ('ground', 'nav'):
+        x = sub.add_parser(name)
+        for n in ('x', 'y', 'z'): x.add_argument(n, type=float, nargs='?')
+        if name == 'ground': x.add_argument('--half', type=float, default=3.0)
+    x = sub.add_parser('navline')
+    for n in ('x', 'y', 'x2', 'y2'): x.add_argument(n, type=float, nargs='?')
+    x = sub.add_parser('edges'); x.add_argument('--r', type=float, default=3); x.add_argument('--zmin', type=float, default=-1)
+    x.add_argument('--zmax', type=float, default=4); x.add_argument('--mask', type=lambda v: int(v, 0), default=0)
+    x = sub.add_parser('sense'); x.add_argument('--range', type=float, default=8); x.add_argument('--h', type=float, default=1.0)
+    x.add_argument('--layer', type=float, default=11); x.add_argument('--rays', type=float, default=16)
     x = sub.add_parser('mem'); x.add_argument('target'); x.add_argument('length', nargs='?', default='0x100')
     x = sub.add_parser('watch'); x.add_argument('--sec', type=float, default=30)
     a = ap.parse_args()

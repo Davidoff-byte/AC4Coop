@@ -31,7 +31,7 @@ static_assert(sizeof(Pilot::PilotChar) == 40, "PilotChar layout changed: update 
 static_assert(offsetof(Pilot::PilotState, seq) == 8 && offsetof(Pilot::PilotState, m) == 32 &&
               offsetof(Pilot::PilotState, chars) == 120 && sizeof(Pilot::PilotState) == 10360,
               "PilotState layout changed: update tools/pilot.py");
-static_assert(offsetof(Pilot::PilotCtl, f) == 20 && sizeof(Pilot::PilotCtl) == 100, "PilotCtl layout changed: update tools/pilot.py");
+static_assert(offsetof(Pilot::PilotCtl, f) == 20 && offsetof(Pilot::PilotCtl, rcount) == 100 && sizeof(Pilot::PilotCtl) == 1140, "PilotCtl layout changed: update tools/pilot.py");
 
 namespace Pilot {
 namespace {
@@ -292,6 +292,9 @@ void RunCommand(Entity* pl)
         float v = c->f[0];
         c->fpsCap = (v <= 0.0f) ? 0u : (uint32_t)(v > 240.0f ? 240.0f : v);
         status = g_realPresent ? 0 : -4;
+    } else if (c->cmd >= kCmdRay && c->cmd <= kCmdSense) {
+        if (!pl) status = -1;
+        else { __try { status = RunWorldCommand(c, pl); } __except (EXCEPTION_EXECUTE_HANDLER) { status = -2; } }
     } else status = -3;
     c->status = status;
     c->done = c->req;

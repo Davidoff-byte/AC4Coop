@@ -60,7 +60,9 @@ namespace Pilot
     };
     // Commands from the client, executed by the game (Local\ac4pilot-ctl-<pid>). The client fills cmd/f[] and then bumps
     // `req`; the game sets status and copies req into `done` when finished.
-    enum { kCmdTeleport = 1, kCmdFpsCap = 2 };
+    // 3..8: world queries (src/pilot_world.cpp), results in res[] (rcount items).
+    enum { kCmdTeleport = 1, kCmdFpsCap = 2, kCmdRay = 3, kCmdGround = 4, kCmdNavPoint = 5, kCmdNavLine = 6, kCmdEdges = 7, kCmdSense = 8 };
+    enum { kResMax = 256 };
     struct PilotCtl
     {
         uint32_t magic;           // 'AC4C' = 0x43344341
@@ -72,10 +74,14 @@ namespace Pilot
         volatile uint32_t presents, fps;   // IDXGISwapChain::Present calls / measured rate (when the Present patch is in)
         uint32_t presentPatched;
         uint32_t reserved[8];
+        uint32_t rcount;          // result items of the last world query
+        uint32_t rpad[3];
+        float    res[kResMax];
     };
 #pragma pack(pop)
 
     void Init();                        // DllMain attach, after the build gate
     void Poll();                         // poll thread, ~20 Hz: retries the IAT patch and the window subclass
     void OnPlayerFrame(void* human);     // game thread, once per player Human update
+    int  RunWorldCommand(PilotCtl* c, void* player);   // pilot_world.cpp, game thread; returns the ctl status
 }
