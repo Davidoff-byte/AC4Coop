@@ -311,6 +311,15 @@
    "size": 27,
    "status": "claimed"
   },
+  "007130C0": {
+   "addr": "007130C0",
+   "claimed_at": null,
+   "name": "ComponentSetEnabled",
+   "owner": null,
+   "receipts": [],
+   "size": 78,
+   "status": "unknown"
+  },
   "00733FB0": {
    "addr": "00733FB0",
    "claimed_at": "2026-11-08T12:37:07Z",
@@ -325,6 +334,15 @@
    ],
    "size": 50,
    "status": "claimed"
+  },
+  "007357E0": {
+   "addr": "007357E0",
+   "claimed_at": null,
+   "name": "RigidBodyComponentGetStaticClassDescriptor",
+   "owner": null,
+   "receipts": [],
+   "size": 6,
+   "status": "unknown"
   },
   "0073B4B0": {
    "addr": "0073B4B0",
