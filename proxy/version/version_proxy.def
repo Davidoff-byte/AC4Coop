@@ -1,0 +1,24 @@
+; Export table of %SystemRoot%\SysWOW64\version.dll (Windows 11 26200, pefile 2026-11-15): 17 names, ordinals 1-17.
+; GetFileVersionInfoByHandle is not declared in the SDK. The real version.dll implements it as a bare
+; `jmp [api-ms-win-core-version-private-l1-1-0.dll!GetFileVersionInfoByHandle]` (disassembled 2026-11-15), so it is
+; forwarded to that same target. VerLanguageNameA/W are forwarders to KERNEL32 in the real DLL too.
+LIBRARY version
+EXPORTS
+    GetFileVersionInfoA         = Px_GetFileVersionInfoA                                           @1
+    ; @2 GetFileVersionInfoByHandle: the .def parser rejects the dashed API-set module name, so this export is a
+    ; /EXPORT pragma in version_proxy.cpp.
+    GetFileVersionInfoExA       = Px_GetFileVersionInfoExA                                         @3
+    GetFileVersionInfoExW       = Px_GetFileVersionInfoExW                                         @4
+    GetFileVersionInfoSizeA     = Px_GetFileVersionInfoSizeA                                       @5
+    GetFileVersionInfoSizeExA   = Px_GetFileVersionInfoSizeExA                                     @6
+    GetFileVersionInfoSizeExW   = Px_GetFileVersionInfoSizeExW                                     @7
+    GetFileVersionInfoSizeW     = Px_GetFileVersionInfoSizeW                                       @8
+    GetFileVersionInfoW         = Px_GetFileVersionInfoW                                           @9
+    VerFindFileA                = Px_VerFindFileA                                                  @10
+    VerFindFileW                = Px_VerFindFileW                                                  @11
+    VerInstallFileA             = Px_VerInstallFileA                                               @12
+    VerInstallFileW             = Px_VerInstallFileW                                               @13
+    VerLanguageNameA            = KERNEL32.VerLanguageNameA                                        @14
+    VerLanguageNameW            = KERNEL32.VerLanguageNameW                                        @15
+    VerQueryValueA              = Px_VerQueryValueA                                                @16
+    VerQueryValueW              = Px_VerQueryValueW                                                @17

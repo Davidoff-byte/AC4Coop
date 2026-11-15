@@ -17,3 +17,4 @@ __pycache__/
 *.pyc
 docs/ops/bus/
 local/
+/proxy/version/out/
