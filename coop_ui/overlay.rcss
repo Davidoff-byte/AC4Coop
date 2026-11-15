@@ -1,0 +1,98 @@
+/* AC4 co-op panel. RmlUi has no user-agent stylesheet: every display value is set here.
+   No filters / backdrop-filter / box-shadow blur: the DX11 renderer marks filters as partial. */
+body {
+	width: 100%;
+	height: 100%;
+	font-family: LatoLatin;
+	font-size: 18dp;
+	color: #e9e2cf;
+}
+div, p, h1 { display: block; }
+
+#panel {
+	position: absolute;
+	top: 12%;
+	left: 50%;
+	width: 460dp;
+	margin-left: -230dp;
+	padding: 26dp 30dp 22dp 30dp;
+	background-color: #14110dee;
+	border: 2dp #b08d4a;
+	border-radius: 6dp;
+}
+h1 {
+	font-size: 30dp;
+	font-weight: bold;
+	letter-spacing: 3dp;
+	color: #d9b56a;
+}
+.sub { font-size: 14dp; color: #8d8573; margin-bottom: 18dp; }
+.label { font-size: 15dp; color: #a9a089; margin-top: 6dp; }
+.hint { font-size: 14dp; color: #8d8573; margin-top: 10dp; }
+
+#code {
+	font-size: 54dp;
+	font-weight: bold;
+	letter-spacing: 10dp;
+	color: #f4e3b5;
+	margin: 4dp 0 10dp 0;
+}
+
+input.text {
+	display: block;
+	width: 220dp;
+	font-size: 40dp;
+	font-weight: bold;
+	letter-spacing: 8dp;
+	color: #f4e3b5;
+	background-color: #0b0907;
+	border: 2dp #6f5a33;
+	padding: 6dp 12dp;
+	margin: 6dp 0 12dp 0;
+	cursor: text;
+}
+input.text:focus { border-color: #d9b56a; }
+
+.row { margin-top: 6dp; }
+button {
+	display: inline-block;
+	font-size: 18dp;
+	font-weight: bold;
+	color: #14110d;
+	background-color: #c9a35b;
+	padding: 8dp 18dp;
+	margin-right: 10dp;
+	border-radius: 3dp;
+	focus: auto;
+	tab-index: auto;
+	nav: auto;
+}
+button:hover { background-color: #e4c27e; }
+button:active { background-color: #9b7c42; }
+button.quiet { background-color: #3a3226; color: #e9e2cf; }
+button.quiet:hover { background-color: #4e4433; }
+
+#status {
+	margin-top: 20dp;
+	padding-top: 12dp;
+	border-top: 1dp #4a3f2c;
+	font-size: 15dp;
+}
+.k { color: #8d8573; display: inline-block; width: 110dp; }
+.good { color: #8fd18a; }
+.bad { color: #e07a64; }
+
+#cursor {
+	position: absolute;
+	left: 0;
+	top: 0;
+	width: 12dp;
+	height: 12dp;
+	margin-left: -6dp;
+	margin-top: -6dp;
+	background-color: #f4e3b5;
+	border: 2dp #14110d;
+	border-radius: 6dp;
+	pointer-events: none;
+}
+.note { font-size: 15dp; color: #e8c37a; margin-top: 12dp; }

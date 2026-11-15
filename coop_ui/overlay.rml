@@ -1,0 +1,45 @@
+<rml>
+<head>
+	<title>AC4 Co-op</title>
+	<link type="text/rcss" href="overlay.rcss"/>
+</head>
+<body data-model="coop">
+	<div id="panel">
+		<h1>AC4 CO-OP</h1>
+		<p class="sub">F10 closes this panel</p>
+
+		<div data-if="role == 'host'">
+			<p class="label">Your lobby code</p>
+			<p id="code">{{ code }}</p>
+			<div class="row">
+				<button id="btn-host" data-if="can_start" data-event-click="act('host')">Host</button>
+				<button id="btn-copy" data-if="has_code" data-event-click="act('copy')">Copy code</button>
+				<button data-if="active" class="quiet" data-event-click="act('stop')">Stop</button>
+			</div>
+			<p class="hint">Send the code to your friend. They type it in their own panel.</p>
+		</div>
+
+		<div data-if="role == 'join'">
+			<p class="label">Friend's lobby code</p>
+			<input id="codebox" type="text" maxlength="6" size="6" data-value="input"/>
+			<div class="row">
+				<button id="btn-join" data-event-click="act('join')">Join</button>
+				<button data-if="active" class="quiet" data-event-click="act('stop')">Cancel</button>
+			</div>
+		</div>
+
+		<div data-if="no_role">
+			<p class="hint">No role set. Pick Host or Join in the launcher.</p>
+		</div>
+
+		<p class="note" data-if="note != ''">{{ note }}</p>
+
+		<div id="status">
+			<p><span class="k">Connection</span> <span data-class-bad="failed" data-class-good="good">{{ state }}</span></p>
+			<p><span class="k">Route</span> {{ link }}</p>
+			<p><span class="k">Game link</span> {{ peer }}</p>
+		</div>
+	</div>
+	<div id="cursor"/>
+</body>
+</rml>
