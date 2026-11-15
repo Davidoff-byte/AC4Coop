@@ -11,6 +11,7 @@ using System; using System.Runtime.InteropServices;
 public struct AwRect { public int L, T, R, B; }
 public static class AwWin {
   [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+  [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr ctx);
   [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr a, int x, int y, int cx, int cy, uint f);
   [DllImport("user32.dll")] public static extern bool AdjustWindowRectEx(ref AwRect r, uint style, bool menu, uint ex);
   [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr h, int i);
@@ -19,7 +20,10 @@ public static class AwWin {
   [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out AwRect r);
 }
 '@
-[AwWin]::SetProcessDPIAware() | Out-Null
+# Physical pixels: per-thread awareness works even after the host process fixed its DPI mode (seen 2026-11-15: a
+# process-wide SetProcessDPIAware that did not take gave 1280x720 at 150% scaling and 640x360 windows).
+$prevCtx = [AwWin]::SetThreadDpiAwarenessContext([IntPtr](-4))   # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+if ($prevCtx -eq [IntPtr]::Zero) { [AwWin]::SetProcessDPIAware() | Out-Null }
 $sw = [AwWin]::GetSystemMetrics(0); $sh = [AwWin]::GetSystemMetrics(1)
 $cw = [int]($sw / 2); $ch = [int]($sh / 2)
 foreach ($pair in @(@($TopRight, 'topright'), @($BottomLeft, 'bottomleft'))) {
