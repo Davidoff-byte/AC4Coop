@@ -7563,8 +7563,14 @@ static uint64_t FiCanonicalId(Entity* e) {
     if (!e) return 0;
     if (g_entHost != 1)
         for (int i = 0; i < s_guestObjN; ++i) if (s_guestObj[i].ent == (unsigned int)e && s_guestObj[i].objId) return s_guestObj[i].objId;
+    // The entity's own handle [E+0xC8] is a HandleContainer* (m_Object at +0, m_ObjectID after the ref counts): the same
+    // identity the entity lane sends (es.objId = hc->GetObjectID(), phase1.cpp:5382). ManagedObject::GetObjectID on the
+    // entity itself returned 0 for a soldier (run 20956, [FI] diag match ownObjId=0), so it is not used.
     uint64_t id = 0;
-    __try { id = ((ManagedObject*)e)->GetObjectID(); } __except (EXCEPTION_EXECUTE_HANDLER) { id = 0; }
+    __try {
+        HandleContainer* hc = *(HandleContainer**)((char*)e + 0xC8);
+        if (readable(hc, sizeof(HandleContainer)) && hc->m_Object == (ManagedObject*)e) id = hc->GetObjectID();
+    } __except (EXCEPTION_EXECUTE_HANDLER) { id = 0; }
     return id;
 }
 static Entity* FiResolve(uint64_t id) {
@@ -7594,8 +7600,8 @@ static void FightIntentSend(Human* player) {
                 if (readable(e, 0xCC) && *(uint32_t*)((char*)e + 0xC8) == hnd) { s_target = FiCanonicalId(e); matched = true;
                     static int s_mlog = 0;   // DIAG (run 8880: matched but every tx carried target 0)
                     if (s_mlog < 8 && (!s_inFight || (attack && !s_attack))) { ++s_mlog;
-                        uint64_t own = 0; __try { own = ((ManagedObject*)e)->GetObjectID(); } __except (EXCEPTION_EXECUTE_HANDLER) { own = 0xFFFFFFFFFFFFFFFFull; }
-                        L("[FI] diag match: ent=%p handle=%08X canonical=%016llX ownObjId=%016llX entHost=%d role=%u\n", (void*)e, hnd,
+                        uint64_t own = 0; __try { own = ((HandleContainer*)(uintptr_t)hnd)->GetObjectID(); } __except (EXCEPTION_EXECUTE_HANDLER) { own = 0xFFFFFFFFFFFFFFFFull; }
+                        L("[FI] diag match: ent=%p handle=%08X canonical=%016llX hcObjId=%016llX entHost=%d role=%u\n", (void*)e, hnd,
                           (unsigned long long)s_target, (unsigned long long)own, g_entHost, (*(uint32_t*)((char*)e + 0x9C) & 0x1F8) >> 3); }
                     break; }
             }
