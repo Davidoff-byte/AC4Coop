@@ -971,6 +971,15 @@
    "size": 40,
    "status": "unknown"
   },
+  "01793650": {
+   "addr": "01793650",
+   "claimed_at": null,
+   "name": "CSrvNavigation_NavigateToPosition",
+   "owner": null,
+   "receipts": [],
+   "size": 310,
+   "status": "unknown"
+  },
   "0179CDF0": {
    "addr": "0179CDF0",
    "claimed_at": null,
@@ -1033,6 +1042,24 @@
    ],
    "size": 123,
    "status": "claimed"
+  },
+  "01CB91B0": {
+   "addr": "01CB91B0",
+   "claimed_at": null,
+   "name": "IHumanGround_SetDirection",
+   "owner": null,
+   "receipts": [],
+   "size": 12,
+   "status": "unknown"
+  },
+  "01D51690": {
+   "addr": "01D51690",
+   "claimed_at": null,
+   "name": "IHumanGround_SetSpeedRatio",
+   "owner": null,
+   "receipts": [],
+   "size": 125,
+   "status": "unknown"
   }
  }
 }

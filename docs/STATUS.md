@@ -30,6 +30,10 @@ journal and handoff in `docs/archive/`. Update it in the same PR as any change t
 - Everything after `cddbc41`: skel-attach (`[Coop] SkelAttach`, default 0, tested solo only) and BoardableTest
   (`[Coop] BoardableTest`, default 0).
 - Guest→host kill relay.
+- Native replica on the ground (`[Coop] NativeReplica`, default 0; `docs/design/native-replica.md`): solo replay
+  tested, the puppet moves itself through its nav service; p95 error 1.85 m fails the oracle
+  (`docs/evidence/native-replica-2026-11-15.md`). Same evidence: `HybridLoco`'s ground branch tests context 2, but real
+  packets send 4, so it never runs.
 
 ## Open
 - Guard perception of the other player: needs the Gamer/avatar route (`docs/ops/ANGLE-GAMER-AVATAR.md`,

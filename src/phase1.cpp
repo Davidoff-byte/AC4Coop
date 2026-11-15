@@ -1582,6 +1582,159 @@ static void LogPuppetMode() {
       phys ? "physics" : "position", phys, phys ? "untouched" : "disabled");
 }
 
+// ---- [Coop] NativeReplica (default 0; R3 of docs/design/coop-reevaluation-2026-11-15.md, design native-replica.md) ----
+// On the ground the puppet is a native replica, moved the way the engine moves every NPC: its CSrvNavigation service
+// (svc = *(*(entity+0xE8)+0x94), vt 0x026F4B70; started by [Coop] PuppetNavService) is given NavigateToPosition
+// toward the peer. Behaviour (its statechart) ENABLED, character controller drives the entity (m_DriveEntity = true),
+// no matrix write except a snap when the error exceeds NativeReplicaSnapCm (and on the first frame). Off the ground
+// the old path runs unchanged.
+// Why not the player's seam: run A (2026-11-15, pid 17580: HumanGroundData +0x20/+0x98 field writes) and run B (pid
+// 19364: the puppet's own IHumanGround slots 1/0, ground FSM present at HumanGround+0xA0) both left the replica at
+// 0.0 m of own movement; a [Probe] hook on SetSpeedRatio 0x01D51690 recorded 256 of 256 calls from the player only,
+// none from ~50 nearby NPCs (some walking). So NPC locomotion does not use IHumanGround slots 0/1.
+// NavigateToPosition = CSrvNavigation slot 49 (vt+0xC4) = 0x01793650, thiscall, retn 30h (12 args). Slot verified by
+// argument use (decompile): a1 Vec4* position, a2 NavigationSpeed, a3/a4 bool, a5 float (with a1 -> sub_507580),
+// a6 bool, a7 Vec4*, a8 Entity* (reads its +200 handle), a9 float, a10 NavigationContextID, a11/a12 float; matches PS3
+// DWARF NavigateToPosition (cu 311, DIE 0x9AACECE, vtable elem 50 = PC 49 after GCC's second destructor entry).
+// Argument template copied from the engine caller 0x01282FD0: (pos, 4 Regular, 0, 1, *(obj+0x5C), 0, &vec, nullptr,
+// 0.985f (0x3F7C1C5C), -1, 4.5f (0x40900000), 1.0f). NavigationSpeed (PS3 cu 12, DIE 0x2C411B): 1 Stop, 2 Slowest,
+// 3 Slow, 4 Regular, 5 RegularFast, 6 Fast, 7 VeryFast, 8 Fastest.
+// UNVERIFIED (to be measured, not assumed): what a5 (passed with the position) and a7/a9/a11/a12 mean; we pass a5 =
+// 0.5 and a7 = the peer heading. Ground context id is 4, not CTX_GROUND (2): PS3 enum ActorContextID (cu 277,
+// DIE 0x4A6766B) 2 = NOT_DEFINED, 4 = Ground; on PC the sender's GetCurrentContextID(1) is 4 while walking (taps:
+// PlayerState+134 = 4 with ground stage 1 in 36530 of 36573 packets of hold-guard-near.tap; logs: "[Net] puppet
+// behavior disabled (ctx=4)").
+static const int kCtxGroundLive = 4;
+static const unsigned kNavSvcVt = 0x026F4B70;
+static const uintptr_t kNavigateToPosition = 0x01793650;
+static int   s_nrOn = -1;
+static float s_nrSnapM = 3.0f;
+static bool NativeReplicaOn() {
+    if (s_nrOn < 0) {
+        s_nrOn = GetPrivateProfileIntA("Coop", "NativeReplica", 0, Paths::Ini()) != 0 ? 1 : 0;
+        const int cm = GetPrivateProfileIntA("Coop", "NativeReplicaSnapCm", 300, Paths::Ini());
+        s_nrSnapM = (cm < 50 ? 50 : cm > 2000 ? 2000 : cm) / 100.0f;
+    }
+    return s_nrOn != 0;
+}
+// Target handed from the player thread (ApplyRemoteState) to the puppet's own update (OwnDrain), which issues the call.
+struct NrTarget { void* ent; float x, y, z, hx, hy; int speed; uint32_t gen; };
+static SRWLOCK  s_nrTgtLock = SRWLOCK_INIT;
+static NrTarget s_nrTgt = {};
+static volatile LONG s_nrNavCalls = 0, s_nrNavFail = 0, s_nrNavSkip = 0;
+// 1 only while the last ApplyRemoteState took the replica path with the behaviour enabled and settled (g_switchCd 0).
+static volatile LONG s_nrNavOk = 0;
+struct NrStats {
+    void* ent; bool init; uint64_t nextLog;
+    float lastX, lastY; bool haveLast;
+    int n; float sum, max; int over; float moved; int stageMism;        // window
+    uint32_t hist[101]; uint32_t total; uint32_t snaps, frames;          // session: error histogram, 0.05 m bins
+};
+static NrStats s_nr = {};
+static float NrPct(const NrStats& st, float q) {
+    if (!st.total) return 0.0f;
+    const uint32_t want = (uint32_t)(q * st.total);
+    uint32_t acc = 0;
+    for (int i = 0; i < 101; ++i) { acc += st.hist[i]; if (acc > want) return (i + 1) * 0.05f; }
+    return 5.05f;
+}
+// Player update thread (ApplyRemoteState), replica path only. m = the peer's interpolated matrix. Snap + statistics,
+// then publish the navigation target for NativeReplicaNavTick. Returns true when it wrote the matrix (snap).
+static bool NativeReplicaDrive(Entity* pe, Human* h, HumanDataBundle* b, const PlayerState& s, const HookMath::Transform& m) {
+    (void)h;
+    NrStats& st = s_nr;
+    if (st.ent != (void*)pe) { memset(&st, 0, sizeof(st)); st.ent = pe; }
+    const float px = pe->m_GlobalMatrix.M41, py = pe->m_GlobalMatrix.M42, pz = pe->m_GlobalMatrix.M43;
+    const float ex = m.M41 - px, ey = m.M42 - py, ez = m.M43 - pz;
+    const float d = sqrtf(ex * ex + ey * ey);
+    ++st.frames;
+    if (st.haveLast) { const float mx = px - st.lastX, my = py - st.lastY; st.moved += sqrtf(mx * mx + my * my); }
+    bool snapped = false;
+    if (!st.init || d > s_nrSnapM || fabsf(ez) > 2.0f) {
+        HookMath::Transform mm = m;
+        pe->SetGlobalMatrixInternal(&mm, true);       // physics warp: the replica is a body
+        st.init = true; ++st.snaps; snapped = true;
+        L("[Replica] snap #%u err=%.2f dz=%.2f -> (%.1f,%.1f,%.1f)\n", st.snaps, d, ez, m.M41, m.M42, m.M43);
+    } else {
+        int bin = (int)(d / 0.05f); if (bin > 100) bin = 100;
+        ++st.hist[bin]; ++st.total;
+        ++st.n; st.sum += d; if (d > st.max) st.max = d; if (d > 0.75f) ++st.over;
+    }
+    // Peer heading = its HumanGroundData.m_DestHeading (world XY); its speed intention is destSpeed (m_CurSpeedRatio
+    // reads 0 on this build, sender note in phase1.cpp). Lead the peer by 0.5 s at run pace while it moves.
+    float fx = s.heading.x, fy = s.heading.y; const float fl = sqrtf(fx * fx + fy * fy);
+    if (fl > 1e-3f) { fx /= fl; fy /= fl; } else { fx = 0; fy = 0; }
+    NrTarget t = {};
+    t.ent = pe; t.z = m.M43; t.hx = fx; t.hy = fy;
+    if (s.destSpeed > 0.05f) {
+        const float lead = 0.5f * 4.5f * s.destSpeed;            // UNVERIFIED pace; tuned from the measured error
+        t.x = m.M41 + fx * lead; t.y = m.M42 + fy * lead;
+        const float along = ex * fx + ey * fy;                   // > 0: the replica is behind
+        t.speed = s.sprint ? 8 : s.destSpeed < 0.5f ? 4 : 7;
+        if (along > 1.5f && t.speed < 8) ++t.speed;              // catch up one class
+    } else {
+        t.x = m.M41; t.y = m.M42;
+        t.speed = d > 0.4f ? 4 : 1;                              // walk to the resting peer, else Stop
+    }
+    AcquireSRWLockExclusive(&s_nrTgtLock);
+    t.gen = s_nrTgt.gen + 1; s_nrTgt = t;
+    ReleaseSRWLockExclusive(&s_nrTgtLock);
+    if ((int)b->m_GroundData.m_HumanGroundStage != s.humanGroundStage) ++st.stageMism;
+    st.lastX = snapped ? m.M41 : px; st.lastY = snapped ? m.M42 : py; st.haveLast = true;
+    const uint64_t now = GetTickCount64();
+    if (now >= st.nextLog) {
+        st.nextLog = now + 2000;
+        L("[Replica] win n=%d err mean=%.2f max=%.2f >0.75m=%d moved=%.1fm stage nat=%d peer=%d mism=%d | "
+          "session frames=%u p50=%.2f p95=%.2f snaps=%u | nav calls=%ld fail=%ld skip=%ld | peer dest=%.2f speed=%d\n",
+          st.n, st.n ? st.sum / st.n : 0.0f, st.max, st.over, st.moved, (int)b->m_GroundData.m_HumanGroundStage,
+          s.humanGroundStage, st.stageMism, st.frames, NrPct(st, 0.5f), NrPct(st, 0.95f), st.snaps,
+          s_nrNavCalls, s_nrNavFail, s_nrNavSkip, s.destSpeed, t.speed);
+        st.n = 0; st.sum = 0; st.max = 0; st.over = 0; st.moved = 0; st.stageMism = 0;
+    }
+    return snapped;
+}
+// Puppet's own update (OwnDrain): issue NavigateToPosition when the target moved > 0.75 m, the speed class changed,
+// or 400 ms passed since the last call.
+static void NativeReplicaNavTick(Entity* e) {
+    if (s_nrOn != 1 || !e || !s_nrNavOk) return;
+    NrTarget t;
+    AcquireSRWLockShared(&s_nrTgtLock); t = s_nrTgt; ReleaseSRWLockShared(&s_nrTgtLock);
+    if (t.ent != (void*)e || t.gen == 0) return;
+    static void* s_ent = nullptr; static float s_x = 0, s_y = 0; static int s_speed = -1; static uint64_t s_ms = 0;
+    static uint32_t s_gen = 0;
+    if (t.gen == s_gen) return;
+    s_gen = t.gen;
+    const uint64_t now = GetTickCount64();
+    const float dx = t.x - s_x, dy = t.y - s_y;
+    if (s_ent == (void*)e && t.speed == s_speed && dx * dx + dy * dy < 0.75f * 0.75f && now - s_ms < 400) return;
+    char* aic = readable((char*)e + 0xE8, 4) ? *(char**)((char*)e + 0xE8) : nullptr;
+    char* svc = (aic && readable(aic + 0x94, 4)) ? *(char**)(aic + 0x94) : nullptr;
+    if (!readable(svc, 0x110) || *(const unsigned*)svc != kNavSvcVt ||
+        *(const uintptr_t*)(*(const char* const*)svc + 49 * 4) != kNavigateToPosition) {
+        if (InterlockedIncrement(&s_nrNavSkip) <= 3) L("[Replica] nav service missing or unexpected (svc=%p)\n", svc);
+        return;
+    }
+    // Run 7432 crashed inside this call: slot 46 (0x017B8220: ecx = [svc+0x84], call 0x0061F1F0) -> 0x0061F1F0
+    // (ecx = [ecx+0xC], jmp vt[0x30]) -> 0x01239590, which reads [[this]+0xC8]+0xE8 with this = [[svc+0x84]+0xC] and its
+    // +0xC8 null (AC4Coop_crashctx_7432_1.txt: eip 0x0123959C, ebx = ecx = 0x4123FF30). Skip while that pointer is null.
+    {
+        char* nctx = *(char**)(svc + 0x84);
+        char* obj = readable(nctx, 0x10) ? *(char**)(nctx + 0xC) : nullptr;
+        if (!readable(obj, 0xCC) || !*(void* const*)(obj + 0xC8)) {
+            if (InterlockedIncrement(&s_nrNavSkip) <= 5) L("[Replica] nav skipped: [svc+0x84]=%p [+0xC]=%p, +0xC8 null\n", nctx, obj);
+            return;
+        }
+    }
+    alignas(16) float pos[4] = { t.x, t.y, t.z, 1.0f };
+    alignas(16) float dir[4] = { t.hx, t.hy, 0.0f, 0.0f };
+    typedef int (__thiscall* NavTo_t)(void*, const float*, int, int, int, float, int, const float*, void*, float, int, float, float);
+    const int ok = ((NavTo_t)kNavigateToPosition)(svc, pos, t.speed, 0, 1, 0.5f, 0, dir, nullptr, 0.985f, -1, 4.5f, 1.0f);
+    InterlockedIncrement(&s_nrNavCalls);
+    if (s_nrNavCalls <= 3) L("[Replica] NavigateToPosition(svc=%p, (%.1f,%.1f,%.1f), speed %d) -> eax=%08X\n", svc, t.x, t.y, t.z, t.speed, (unsigned)ok);
+    if ((ok & 0xFF) == 0 && InterlockedIncrement(&s_nrNavFail) <= 5) L("[Replica] NavigateToPosition al=0 (speed %d, eax=%08X)\n", t.speed, (unsigned)ok);
+    s_ent = e; s_x = t.x; s_y = t.y; s_speed = t.speed; s_ms = now;
+}
+
 // Apply a remote peer's state to the puppet (absolute position — shared world coords, no offset).
 // Never nulls g_puppet on a transient fault (that would trigger endless respawns).
 // ---- puppet action block (CharacterActionSet once, SetTargetAction, blend-in fix, blend factors / time scale) ----
@@ -1888,6 +2041,11 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
         // single machine can see whether local AI treats it as a real body (loopback otherwise puts the
         // puppet exactly inside the player, which makes "did the guard attack the puppet" unobservable).
         if (g_puppetParkX != 0.0f) m.M41 += g_puppetParkX;
+        // [Coop] NativeReplica: on the ground the character controller moves the puppet; NativeReplicaDrive below
+        // writes the matrix only to snap. Everywhere else (flag off, or peer off the ground) the write is as before.
+        const bool replica = NativeReplicaOn() && s.contextId == kCtxGroundLive;
+        if (!replica) { s_nr.haveLast = false; InterlockedExchange(&s_nrNavOk, 0); }   // not the replica's own movement; no nav calls
+        if (!replica)
         g_puppet->SetGlobalMatrixInternal(&m, phys);
         { Human* oh = AIEntityHelper::GetHuman(g_puppet); if (oh) PuppetOwnNote(oh, g_puppet, m); }
         // First apply on this puppet: report the effective mode once (the spawn site logs the other one).
@@ -1909,6 +2067,7 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
         bool aiOff   = hybrid ? !peerGround : (g_disablePuppetAI != 0);   // disable the puppet's behavior?
         bool actNow  = hybrid ? !peerGround : (g_driveActions   != 0);    // run our action replication?
         bool locoNow = hybrid ?  peerGround : (g_driveLoco       != 0);   // feed HumanGroundData (FSM anim)?
+        if (replica) { aiOff = false; actNow = false; locoNow = false; }  // native: its FSM owns actions, we steer
         bool braindead = aiOff && !actNow;                               // position-only (never true in hybrid)
 
         // Behavior ownership toggle: ENABLE when the FSM should own the puppet (ground), DISABLE when WE do
@@ -1930,6 +2089,7 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
         }
         bool writeActions = actNow && g_switchCd == 0;   // our action writes are gated on the settle cooldown
         if (g_switchCd > 0) --g_switchCd;
+        InterlockedExchange(&s_nrNavOk, (replica && g_bhvState == 1 && g_switchCd == 0) ? 1 : 0);   // [Coop] NativeReplica
 
         // We are ALWAYS the position authority (SetGlobalMatrixInternal above): stop the character controller
         // from driving the entity so its physics can never fight the forced matrix — in both modes. In ground
@@ -1937,7 +2097,9 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
         // from the HumanGroundData intention we feed below, not from the puppet actually moving through space.
         {
             CharacterController* cc = (CharacterController*)h->GetCharacterComponent();
-            if (readable(cc, 0x600)) {
+            if (readable(cc, 0x600) && replica) {
+                cc->m_DriveEntity = true;    // [Coop] NativeReplica: the controller moves the replica; no collision change
+            } else if (readable(cc, 0x600)) {
                 cc->m_DriveEntity = false;
                 // [Coop] PuppetPhysics=0: the puppet is not a body. Disable its collision capsule with the
                 // same proven call the guard/corpse lane uses (0x636480 = collision-filter setter on
@@ -1982,6 +2144,7 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
         h->m_StalkingClipAllowFastStalkingCount = s.stalkingClipAllowFastStalkingCount;
         h->m_DisturbedZoneCount = s.disturbedZoneCount;
         } // locoNow
+        if (replica && bok) NativeReplicaDrive(g_puppet, h, qB, s, m);
         // Context replication: make the puppet ENTER the peer's active context so its statechart plays
         // the matching parkour/climb/swim animation (transform is already synced). Edge-triggered on the
         // remote id so we mirror each context change once (re-issuing every frame would restart the anim).
@@ -6638,6 +6801,7 @@ static void OwnDrain(Human* h) {
                 }
             }
         }
+        if (e) { __try { NativeReplicaNavTick(e); } __except (EXCEPTION_EXECUTE_HANDLER) {} }   // [Coop] NativeReplica
         if (e) PuppetStim::OnPuppetUpdate(e);   // [Coop] PuppetStimSeq (host test; no-op unless the key changes)
         return;
     }
@@ -11000,7 +11164,7 @@ static void DumpConfigOnce()
         { "Coop", "FloatProbe", 0 }, { "Coop", "FootOffsetFix", 0 }, { "Coop", "GuardActionGate", 0 }, { "Coop", "GuardExtrapMs", 100 },
         { "Coop", "GuardInterpBuffer", 0 }, { "Coop", "GuardInterpDelayMs", 120 }, { "Coop", "GuardPhaseLock", 0 },
         { "Coop", "GuardSeesPuppet", 0 }, { "Coop", "PuppetActionReassert", 0 }, { "Coop", "PuppetHostTime", 0 },
-        { "Coop", "AlertQueryAsPlayer", 0 }, { "Coop", "ConflictNullGuard", 0 }, { "Coop", "ConflictKeepPuppet", 0 }, { "Coop", "GuardPoiFightTarget", 0 }, { "Coop", "FightOrderPuppet", 0 }, { "Coop", "DespawnLeaveFight", 0 }, { "Coop", "FightKeepOnConflictEnd", 0 }, { "Coop", "FightStateProbe", 0 }, { "Coop", "PuppetNavService", 0 }, { "Coop", "FightProbe", 0 }, { "Coop", "PeerLastPacket", 0 }, { "Coop", "PuppetActionsOwnUpdate", 0 }, { "Coop", "DetectKeepTarget", 0 }, { "Coop", "GuardPlayerOfInterest", 0 }, { "Coop", "EventProbe", 0 }, { "Coop", "ReactProbe", 0 }, { "Coop", "FightSkipPuppet", 0 }, { "Coop", "NavNullGuard", 0 }, { "Coop", "PuppetStimMode", 1 }, { "Coop", "PuppetStimSeq", 0 }, { "Coop", "PuppetStimSource", 0 }, { "Coop", "SightProbe", 0 }, { "Coop", "StateProbe", 0 }, { "Coop", "StuckProbe", 0 },
+        { "Coop", "AlertQueryAsPlayer", 0 }, { "Coop", "ConflictNullGuard", 0 }, { "Coop", "ConflictKeepPuppet", 0 }, { "Coop", "GuardPoiFightTarget", 0 }, { "Coop", "FightOrderPuppet", 0 }, { "Coop", "DespawnLeaveFight", 0 }, { "Coop", "FightKeepOnConflictEnd", 0 }, { "Coop", "FightStateProbe", 0 }, { "Coop", "PuppetNavService", 0 }, { "Coop", "NativeReplica", 0 }, { "Coop", "NativeReplicaSnapCm", 300 }, { "Coop", "FightProbe", 0 }, { "Coop", "PeerLastPacket", 0 }, { "Coop", "PuppetActionsOwnUpdate", 0 }, { "Coop", "DetectKeepTarget", 0 }, { "Coop", "GuardPlayerOfInterest", 0 }, { "Coop", "EventProbe", 0 }, { "Coop", "ReactProbe", 0 }, { "Coop", "FightSkipPuppet", 0 }, { "Coop", "NavNullGuard", 0 }, { "Coop", "PuppetStimMode", 1 }, { "Coop", "PuppetStimSeq", 0 }, { "Coop", "PuppetStimSource", 0 }, { "Coop", "SightProbe", 0 }, { "Coop", "StateProbe", 0 }, { "Coop", "StuckProbe", 0 },
         { "Coop", "StageLog", 0 }, { "Coop", "SyncEnemiesOnly", 1 }, { "Coop", "SyncMaxEntities", 32 },
         { "Coop", "SyncRadiusM", 60 }, { "Coop", "TransformProbe", 0 }, { "Coop", "VPadEnable", 0 },
         { "Coop", "VPadTest", 0 }, { "Coop", "WatchDeadBit", 0 }, { "Coop", "WatchTarget", 0 },
