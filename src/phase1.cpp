@@ -1853,10 +1853,22 @@ static void NativeReplicaNavTick(Entity* e) {
     if (s_nrOn == 1 && e && s_nrExitReq && InterlockedExchange(&s_nrExitReq, 0)) {   // see the snap path (run 32668)
         Human* xh = AIEntityHelper::GetHuman(e);
         if (xh) {
+            // Forced exits (TransitToContext(4)) crashed in runs 32668 / 33576 / 33432 (evidence item 20). Native exit only:
+            // in Climbing (30) ask the context itself to let go - climbing interface (vtable 0x026D4588 at context+0x10,
+            // context = *(Human+0x720+0x70), lazy getter 0x016B7080) slot 2 0x0156F260 posts chart event 10 when the chart
+            // is in state 11 (hanging) [UNVERIFIED that event 10 = drop]. Other contexts (Walling 8 ends by itself, beam 9):
+            // nothing - the snap stays deferred until the replica is back on the ground.
             const int c0 = xh->GetCurrentContextID(MAIN_AI_TRACK);
-            if (c0 > 0 && c0 != 4) xh->TransitToContext(4);
+            int r = -1;
+            if (c0 == 30) {
+                char* cctx = readable((char*)xh + 0x720 + 0x70, 4) ? *(char**)((char*)xh + 0x720 + 0x70) : nullptr;
+                if (readable(cctx, 0x30) && *(uint32_t*)cctx == 0x026D4638u && *(uint32_t*)(cctx + 0x10) == 0x026D4588u) {
+                    void* ci = cctx + 0x10; void** cvt = *(void***)ci;
+                    r = (int)((char (__thiscall*)(void*))cvt[2])(ci);
+                }
+            }
             static int s_xl = 0;
-            if (++s_xl <= 20) L("[Replica] own update: context %d -> TransitToContext(4) -> now %d\n", c0, xh->GetCurrentContextID(MAIN_AI_TRACK));
+            if (++s_xl <= 30) L("[Replica] own update: replica in context %d, native drop (climbing slot 2) -> %d, now %d\n", c0, r, xh->GetCurrentContextID(MAIN_AI_TRACK));
         }
     }
     if (s_nrOn != 1 || !e || !s_nrNavOk) return;

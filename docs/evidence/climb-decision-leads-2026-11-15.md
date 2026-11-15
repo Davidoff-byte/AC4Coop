@@ -200,9 +200,12 @@ Climb reproduced with the Pilot (stick offset re-learned per attempt: `goto ... 
     | 33576 | c9db19e7 | TransitToContext(4) deferred to the puppet's own update | crash in the nav location update: 0x0179CDF0 -> 0x01793290 -> 0x00624440 -> 0x00411EE0 swaps a null handle at [[[svc+0x84]+4]+0x40] (asi frames = the PuppetNavService tick) |
     | 8812 | d091acb3 | + guard on [[svc+0x84]+0x40] (wrong field, null normally) | navigation blocked from the start; no applies, no crash |
     | 33432 | d86705b2 | guard corrected to [[[svc+0x84]+4]+0x40] | two applies -> context 8, then after a deferred exit from context 9: crash, read fault 0x009113BF (null+8) on an engine thread, no asi frame |
+    | 16212 | 40dc5daa | no forced exit: snap deferred while the replica is off the ground; in Climbing (30) ask for a native drop (climbing slot 2 / event 10), otherwise wait | **5 passes, no crash, no EXCEPTION**: 9 native entries (`slot 22 -> replica ctx now 8`); per pass the replica wall-ran (8), climbed (30), went onto the beam (9) like the peer and later dropped back to the ground by itself (6 -> 4), after which the deferred pass-reset snap held; 3D error during the climbs 0.6-2.2 m (window means) |
     Reading: entering Walling / Climbing through slots 21/22 is native and works; forcing the replica OUT of a beam / climb
-    context (TransitToContext(4)) is not safe even on its own thread. Next: never force exits - let the replica leave
-    climbing natively (climbing commands / the climbing intention seam) and only snap once it is back on the ground.
+    context (TransitToContext(4)) is not safe even on its own thread; leaving it to exit natively was stable in one 5-pass
+    run. The drop request never ran in run 16212 (the replica was on the beam, context 9, every time a snap was due), so
+    climbing slot 2 as "drop" is untested. Still open: following the peer's moves while climbing (climbing intention seam on
+    the replica), beam exits, more taps, two-machine.
 
 So a shimmy step is fully described by **(definition index, position on the guidance)** plus the guidance it lies on; that
 is what R4.3 would send. UNVERIFIED: that the definition table is identical in both games (same assets, so expected), how
