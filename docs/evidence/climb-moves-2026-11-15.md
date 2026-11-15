@@ -105,3 +105,37 @@ default 0, re-read every 2 s). Solo replay only; not two-machine tested.
   these slots.
 - Main finding: in about half of all 2 s windows the replica is on a beam the peer never used. The route splits at the
   wall-run entry, not in the climbing moves.
+
+## Why the replica ends on the beam: the stuck snap (`[Coop] NativeReplicaClimbNoSnap`, default 0)
+- Wall-entry alignment first (`[Coop] NativeReplicaWallEntry`, default 0): the peer's wall-run start = its last ground
+  position and travel direction when its context went ground / InAir -> Walling (8); while the start is < 5 s old the
+  replica (on the ground) navigates there at ChaseHigh and requests its wall run (slots 21/22) only within 1 m of it, in
+  the peer's direction. Probe run (asi 36d73806, pid 17976, 2 passes): 2 starts recorded, 391 tries from the start - and
+  still 54 % of windows with the replica on a beam alone.
+- The context sequence of that run showed why: every `[parkour, stuck 4 s]` snap (3D error > 2.5 m for 4 s) teleported the
+  replica from the ground to the peer's hanging spot in mid-air (snaps #2-#10 -> (33.6,-82.9,5.3) / (34.7,-85.3,6.6)); it
+  fell (6) and landed on the beam below (9). The native drop requests in that run all came while the replica was already
+  on the beam and did nothing (slot 2 returned -1 outside Climbing).
+- `NativeReplicaClimbNoSnap`: no stuck snap while the peer is on a wall (contexts 7 / 8 / 30 / 31); the far snap
+  (`NativeReplicaParkourSnapCm`, 8 m) stays. Test (asi `80d372ee8dd8f88c9e917913095bfd4905054e0a519ca2616032b3d5ac2bd117`
+  = the committed build, pid 22476, `abmoves.sh ... 0:0:0:1:1 0:0:0:0:0` x3, `tools/oneoff/beamalone.py`):
+
+| run | entry + no stuck snap | beam alone | both climbing | wall-run entries | parkour err3d | snaps |
+|---|---|---|---|---|---|---|
+| 1 | on | 5 % | 7 % | 4 | 2.97 m | 2 |
+| 2 | off | 51 % | 29 % | 14 | 2.85 m | 12 |
+| 3 | on | 7 % | 10 % | 4 | 3.36 m | 2 |
+| 4 | off | 51 % | 27 % | 15 | 2.83 m | 12 |
+| 5 | on | 5 % | 6 % | 3 | 2.85 m | 2 |
+| 6 | off | 51 % | 33 % | 13 | 2.64 m | 13 |
+
+- Reading: the stuck snaps cause the beam landings (51 % -> 5-7 %), but they are also how the replica got onto the wall
+  at all: without them it climbs with the peer in 6-10 % of windows instead of 27-33 %, and the overall 3D error is not
+  better. In a no-snap pass the replica reaches the peer's start, but its tries from there fail for ~6 s; the entry that
+  succeeds is the 5 s fallback from elsewhere, its wall run misses the ledge, it falls and then stands at the wall foot.
+- Run-up attempt (asi 6bc536d6, pid 31524, reverted, not committed): go 3 m behind the start, then run through it, try
+  only while moving toward the wall > 2 m/s. Zero tries: the run-through target lies in the wall, navigation routes around
+  it and the replica moved at 1.3-1.5 m/s (diagnostic log). An NPC cannot build a run-up into a wall by navigation.
+- Open: why the replica's wall-run request fails at the peer's start (precondition `sub_1CE0A40` on the current action's
+  flags is the lead - a running/sprinting action may be required), and a safe way to put a replica onto a wall (an
+  attach/grab, not a teleport into the air).

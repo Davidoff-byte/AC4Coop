@@ -1817,7 +1817,14 @@ static bool NativeReplicaOn() {
 struct NrTarget { void* ent; float x, y, z, hx, hy; int speed; uint32_t gen; };
 static SRWLOCK  s_nrTgtLock = SRWLOCK_INIT;
 static NrTarget s_nrTgt = {};
-static volatile LONG s_nrNavCalls = 0, s_nrNavFail = 0, s_nrNavSkip = 0;
+// [Coop] NativeReplicaWallEntry (default 0, re-read every 2 s): the peer's wall-run start = its last ground position and
+// travel direction when its context went from ground (4 / 2) or InAir (6) to Walling (8), on the interpolated stream.
+// Replays showed the replica starting its own wall run from wherever it was and landing on a beam the peer never used
+// in ~50 % of 2 s windows (docs/evidence/climb-moves-2026-11-15.md).
+static SRWLOCK s_nrWsLock = SRWLOCK_INIT;
+static struct NrWallStart { float x, y, z, hx, hy; uint64_t ms; bool valid; } s_nrWs = {};
+static int s_nrWeOn = 0;
+static volatile LONG s_nrWeStarts = 0, s_nrWeNav = 0, s_nrWeTries = 0, s_nrWeHeld = 0;static volatile LONG s_nrNavCalls = 0, s_nrNavFail = 0, s_nrNavSkip = 0;
 // 1 only while the last ApplyRemoteState took the replica path with the behaviour enabled and settled (g_switchCd 0).
 static volatile LONG s_nrNavOk = 0;
 struct NrStats {
@@ -1830,7 +1837,7 @@ struct NrStats {
     float wBlend; float sBlend;                                          // blended correction applied (m): window, session
     float wBoost; float sBoost; int wBoostFrames;                        // part of it applied under the start boost
     int pkN; float pkSum, pkMax; uint32_t repCtxMask, peerCtxMask;       // R4.1 window: off-ground frames, 3D error
-    uint64_t stuckSince; uint32_t stuckSnaps, pkSnaps;                   // R4.1 stuck timer / snap counts (session)
+    uint64_t stuckSince; uint32_t stuckSnaps, pkSnaps, noSnapHeld;                   // R4.1 stuck timer / snap counts (session)
     uint64_t lastSnapMs; uint32_t ctxExits;                              // snap rate limit; context exits before a snap
 };
 static NrStats s_nr = {};
@@ -1862,6 +1869,12 @@ static bool NativeReplicaDrive(Entity* pe, Human* h, HumanDataBundle* b, const P
     else if (pkFrame) {
         if (d3 > 2.5f) { if (!st.stuckSince) st.stuckSince = nowMs; } else st.stuckSince = 0;
         stuck = st.stuckSince && nowMs - st.stuckSince > 4000;
+        // [Coop] NativeReplicaClimbNoSnap (default 0, re-read every 2 s): no stuck snap while the peer is on a wall
+        // (Ledge 7, Walling 8, Climbing 30, Hanging 31). Run 17976: every stuck snap teleported the replica from the
+        // ground to the peer's hanging spot in mid-air; it fell and landed on the beam below (contexts 30 -> 6 -> 9).
+        static int s_nsOn = 0; static uint64_t s_nsNext = 0;
+        if (nowMs >= s_nsNext) { s_nsNext = nowMs + 2000; s_nsOn = GetPrivateProfileIntA("Coop", "NativeReplicaClimbNoSnap", 0, Paths::Ini()) != 0; }
+        if (s_nsOn && stuck && (s.contextId == 7 || s.contextId == 8 || s.contextId == 30 || s.contextId == 31)) { stuck = false; ++st.noSnapHeld; }
         wantSnap = d3 > s_nrPkSnapM || stuck;
     } else { st.stuckSince = 0; wantSnap = d > s_nrSnapM || fabsf(ez) > 2.0f; }
     // Run 27100: once the replica climbs natively (context 30), a teleport does not hold (the climbing context places the
@@ -1957,7 +1970,35 @@ static bool NativeReplicaDrive(Entity* pe, Human* h, HumanDataBundle* b, const P
     // run starts because the replica only began accelerating once the delayed position moved.
     const float dest = g_nrLatestDest; const bool sprint = g_nrLatestSprint;
     const bool moving = dest > 0.05f;
-    if (pkFrame) {
+    {   // NativeReplicaWallEntry: record the peer's wall-run start (see s_nrWs)
+        static uint64_t s_weNext = 0; static int s_prevPc = 4; static float s_gx = 0, s_gy = 0, s_gz = 0, s_ghx = 0, s_ghy = 0; static bool s_haveG = false;
+        const uint64_t tn = GetTickCount64();
+        if (tn >= s_weNext) { s_weNext = tn + 2000; s_nrWeOn = GetPrivateProfileIntA("Coop", "NativeReplicaWallEntry", 0, Paths::Ini()) != 0; }
+        const int pc = s.contextId;
+        if (pc == 4 || pc == 2) { s_gx = m.M41; s_gy = m.M42; s_gz = m.M43; if (fx * fx + fy * fy > 0.25f) { s_ghx = fx; s_ghy = fy; } s_haveG = true; }
+        if (pc == 8 && s_prevPc != 8 && (s_prevPc == 4 || s_prevPc == 2 || s_prevPc == 6) && s_haveG) {
+            AcquireSRWLockExclusive(&s_nrWsLock);
+            s_nrWs = { s_gx, s_gy, s_gz, s_ghx, s_ghy, tn, true };
+            ReleaseSRWLockExclusive(&s_nrWsLock);
+            InterlockedIncrement(&s_nrWeStarts);
+            L("[Replica] wall entry: peer wall-run start (%.2f,%.2f,%.2f) heading (%.2f,%.2f)\n", s_gx, s_gy, s_gz, s_ghx, s_ghy);
+        }
+        s_prevPc = pc;
+    }
+    // While the replica is still on the ground and the peer's wall-run start is fresh (< 5 s): go to the start point first.
+    bool weNav = false;
+    if (pkFrame && s_nrWeOn && h->GetCurrentContextID(MAIN_AI_TRACK) == 4) {
+        NrWallStart ws; AcquireSRWLockShared(&s_nrWsLock); ws = s_nrWs; ReleaseSRWLockShared(&s_nrWsLock);
+        if (ws.valid && GetTickCount64() - ws.ms < 5000) {
+            const float wx = ws.x - px, wy = ws.y - py, wd = sqrtf(wx * wx + wy * wy);
+            // at the start: keep running through it along the peer's direction (the wall run needs the run-up)
+            t.x = wd > 1.0f ? ws.x : ws.x + ws.hx * 3.0f; t.y = wd > 1.0f ? ws.y : ws.y + ws.hy * 3.0f; t.z = ws.z;
+            t.hx = ws.hx; t.hy = ws.hy; t.speed = 10;
+            weNav = true; InterlockedIncrement(&s_nrWeNav);
+        }
+    }
+    if (weNav) {
+    } else if (pkFrame) {
         // R4.1: go to the peer's 3D position at ChaseHigh (NavigationSpeed 10), the class guards use when they chase;
         // whether it makes the body climb is what R4.1 measures.
         t.x = m.M41; t.y = m.M42; t.z = m.M43;
@@ -1990,13 +2031,13 @@ static bool NativeReplicaDrive(Entity* pe, Human* h, HumanDataBundle* b, const P
         st.nextLog = now + 2000;
         L("[Replica] win n=%d err mean=%.2f max=%.2f >0.75m=%d moved=%.1fm stage nat=%d peer=%d mism=%d | "
           "session frames=%u p50=%.2f p95=%.2f snaps=%u | nav calls=%ld fail=%ld skip=%ld | peer dest=%.2f speed=%d | "
-          "moving frames=%d peerV=%.2f repV=%.2f along=%.2f | blend win=%.2fm session=%.1fm | boost win=%.2fm/%df session=%.1fm | mode switches=%ld | pk n=%d err3d mean=%.2f max=%.2f repCtx=0x%X peerCtx=0x%X pkSnaps=%u stuck=%u\n",
+          "moving frames=%d peerV=%.2f repV=%.2f along=%.2f | blend win=%.2fm session=%.1fm | boost win=%.2fm/%df session=%.1fm | mode switches=%ld | pk n=%d err3d mean=%.2f max=%.2f repCtx=0x%X peerCtx=0x%X pkSnaps=%u stuck=%u noSnapHeld=%u\n",
           st.n, st.n ? st.sum / st.n : 0.0f, st.max, st.over, st.moved, (int)b->m_GroundData.m_HumanGroundStage,
           s.humanGroundStage, st.stageMism, st.frames, NrPct(st, 0.5f), NrPct(st, 0.95f), st.snaps,
           s_nrNavCalls, s_nrNavFail, s_nrNavSkip, s.destSpeed, t.speed, st.wMov, st.wMov ? st.wPeerV / st.wMov : 0.0f,
           st.wMov ? st.wRepV / st.wMov : 0.0f, st.wMov ? st.wAlong / st.wMov : 0.0f, st.wBlend, st.sBlend,
           st.wBoost, st.wBoostFrames, st.sBoost, s_nrModeSwitches, st.pkN, st.pkN ? st.pkSum / st.pkN : 0.0f, st.pkMax,
-          st.repCtxMask, st.peerCtxMask, st.pkSnaps, st.stuckSnaps);
+          st.repCtxMask, st.peerCtxMask, st.pkSnaps, st.stuckSnaps, st.noSnapHeld);
         st.n = 0; st.sum = 0; st.max = 0; st.over = 0; st.moved = 0; st.stageMism = 0;
         st.wPeerV = 0; st.wRepV = 0; st.wAlong = 0; st.wMov = 0; st.wBlend = 0; st.wBoost = 0; st.wBoostFrames = 0;
         st.pkN = 0; st.pkSum = 0; st.pkMax = 0; st.repCtxMask = 0; st.peerCtxMask = 0;
@@ -2152,6 +2193,8 @@ static void NativeReplicaNavTick(Entity* e) {
                 }
             }
         }
+        static uint64_t s_weLog = 0;
+        if (s_nrWeOn && s_nrWeStarts && tn >= s_weLog) { s_weLog = tn + 2000; L("[Replica] wall entry: starts=%ld nav frames=%ld tries at start=%ld held (not there yet)=%ld\n", s_nrWeStarts, s_nrWeNav, s_nrWeTries, s_nrWeHeld); }
         static uint64_t s_bmLog = 0;
         if (s_bmOn && tn >= s_bmLog && s_bmFrames) { s_bmLog = tn + 2000; L("[Replica] beam steer: frames=%ld left beam=%ld replica ctx %d peer ctx %d\n", s_bmFrames, s_bmLeft, bctx, (int)g_nrLatestCtx); }
     }
@@ -2194,7 +2237,18 @@ static void NativeReplicaNavTick(Entity* e) {
             // Here: while the peer's newest packet says Walling (8) and the replica's own context is still Ground (4).
             Human* hh = h;
             const int rctx = hh ? hh->GetCurrentContextID(MAIN_AI_TRACK) : -1;
-            if ((g_nrLatestCtx == 8 || g_nrLatestCtx == 30) && rctx == 4) {   // Walling, or already Climbing (replica lags)
+            // NativeReplicaWallEntry: only within 1 m of the peer's wall-run start, in the peer's direction; a start older
+            // than 5 s falls back to trying from anywhere (the previous behaviour).
+            bool weAllow = true;
+            if (s_nrWeOn && (g_nrLatestCtx == 8 || g_nrLatestCtx == 30) && rctx == 4) {
+                NrWallStart ws; AcquireSRWLockShared(&s_nrWsLock); ws = s_nrWs; ReleaseSRWLockShared(&s_nrWsLock);
+                if (ws.valid && GetTickCount64() - ws.ms < 5000) {
+                    const float wx = ws.x - px, wy = ws.y - py;
+                    if (wx * wx + wy * wy > 1.0f) { weAllow = false; InterlockedIncrement(&s_nrWeHeld); }
+                    else { dir[0] = ws.hx; dir[1] = ws.hy; InterlockedIncrement(&s_nrWeTries); }
+                }
+            }
+            if (weAllow && (g_nrLatestCtx == 8 || g_nrLatestCtx == 30) && rctx == 4) {   // Walling, or already Climbing (replica lags)
                 alignas(16) uint8_t out28[32] = {}; alignas(16) uint8_t out16[16] = {};
                 int* hout = (int*)0x04DD5F8C;   // the engine's shared invalid handle container, as the caller seeds v633
                 alignas(16) float wdir[4] = { dir[0], dir[1], 0.0f, 0.0f };
@@ -11681,7 +11735,7 @@ static void DumpConfigOnce()
         { "Coop", "FloatProbe", 0 }, { "Coop", "FootOffsetFix", 0 }, { "Coop", "GuardActionGate", 0 }, { "Coop", "GuardExtrapMs", 100 },
         { "Coop", "GuardInterpBuffer", 0 }, { "Coop", "GuardInterpDelayMs", 120 }, { "Coop", "GuardPhaseLock", 0 },
         { "Coop", "GuardSeesPuppet", 0 }, { "Coop", "PuppetActionReassert", 0 }, { "Coop", "PuppetHostTime", 0 },
-        { "Coop", "AlertQueryAsPlayer", 0 }, { "Coop", "ConflictNullGuard", 0 }, { "Coop", "ConflictKeepPuppet", 0 }, { "Coop", "GuardPoiFightTarget", 0 }, { "Coop", "FightOrderPuppet", 0 }, { "Coop", "DespawnLeaveFight", 0 }, { "Coop", "FightKeepOnConflictEnd", 0 }, { "Coop", "FightStateProbe", 0 }, { "Coop", "PuppetNavService", 0 }, { "Coop", "NativeReplica", 0 }, { "Coop", "NativeReplicaSnapCm", 300 }, { "Coop", "NativeReplicaBlendCmS", 150 }, { "Coop", "NativeReplicaStartBoostCmS", 400 }, { "Coop", "NativeReplicaParkour", 0 }, { "Coop", "NativeReplicaFreeRun", 0 }, { "Coop", "NativeReplicaClimbIntent", 0 }, { "Coop", "NativeReplicaClimbMoves", 0 }, { "Coop", "NativeReplicaClimbChoice", 0 }, { "Coop", "NativeReplicaBeam", 0 }, { "Coop", "NativeReplicaParkourSnapCm", 800 }, { "Coop", "FightProbe", 0 }, { "Coop", "PeerLastPacket", 0 }, { "Coop", "PuppetActionsOwnUpdate", 0 }, { "Coop", "DetectKeepTarget", 0 }, { "Coop", "GuardPlayerOfInterest", 0 }, { "Coop", "EventProbe", 0 }, { "Coop", "ReactProbe", 0 }, { "Coop", "FightSkipPuppet", 0 }, { "Coop", "NavNullGuard", 0 }, { "Coop", "PuppetStimMode", 1 }, { "Coop", "PuppetStimSeq", 0 }, { "Coop", "PuppetStimSource", 0 }, { "Coop", "SightProbe", 0 }, { "Coop", "StateProbe", 0 }, { "Coop", "StuckProbe", 0 },
+        { "Coop", "AlertQueryAsPlayer", 0 }, { "Coop", "ConflictNullGuard", 0 }, { "Coop", "ConflictKeepPuppet", 0 }, { "Coop", "GuardPoiFightTarget", 0 }, { "Coop", "FightOrderPuppet", 0 }, { "Coop", "DespawnLeaveFight", 0 }, { "Coop", "FightKeepOnConflictEnd", 0 }, { "Coop", "FightStateProbe", 0 }, { "Coop", "PuppetNavService", 0 }, { "Coop", "NativeReplica", 0 }, { "Coop", "NativeReplicaSnapCm", 300 }, { "Coop", "NativeReplicaBlendCmS", 150 }, { "Coop", "NativeReplicaStartBoostCmS", 400 }, { "Coop", "NativeReplicaParkour", 0 }, { "Coop", "NativeReplicaFreeRun", 0 }, { "Coop", "NativeReplicaClimbIntent", 0 }, { "Coop", "NativeReplicaClimbMoves", 0 }, { "Coop", "NativeReplicaClimbChoice", 0 }, { "Coop", "NativeReplicaBeam", 0 }, { "Coop", "NativeReplicaWallEntry", 0 }, { "Coop", "NativeReplicaClimbNoSnap", 0 }, { "Coop", "NativeReplicaParkourSnapCm", 800 }, { "Coop", "FightProbe", 0 }, { "Coop", "PeerLastPacket", 0 }, { "Coop", "PuppetActionsOwnUpdate", 0 }, { "Coop", "DetectKeepTarget", 0 }, { "Coop", "GuardPlayerOfInterest", 0 }, { "Coop", "EventProbe", 0 }, { "Coop", "ReactProbe", 0 }, { "Coop", "FightSkipPuppet", 0 }, { "Coop", "NavNullGuard", 0 }, { "Coop", "PuppetStimMode", 1 }, { "Coop", "PuppetStimSeq", 0 }, { "Coop", "PuppetStimSource", 0 }, { "Coop", "SightProbe", 0 }, { "Coop", "StateProbe", 0 }, { "Coop", "StuckProbe", 0 },
         { "Coop", "StageLog", 0 }, { "Coop", "SyncEnemiesOnly", 1 }, { "Coop", "SyncMaxEntities", 32 },
         { "Coop", "SyncRadiusM", 60 }, { "Coop", "TransformProbe", 0 }, { "Coop", "VPadEnable", 0 },
         { "Coop", "VPadTest", 0 }, { "Coop", "WatchDeadBit", 0 }, { "Coop", "WatchTarget", 0 },
