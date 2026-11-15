@@ -168,6 +168,12 @@ bytes, and all match. What each function does is a strong lead until the S2 live
 - Live on two copies: enter/exit 3/3 end to end, and one real player attack replicated as PerformCombo on the puppet.
 - **Limit:** a target resolves only if the guest's entity lane has already bound that guard. S3 (identity for any NPC) is
   now the blocking dependency for S7, ahead of S4-S6.
+- **S3 first look (2026-11-16, `docs/evidence/s3-guard-identity-2026-11-16.md`):**
+  - Soldiers are already synced out of combat. The gap was the guest's 1.5 m body match (`nobod=101` of 145).
+  - The existing wide bind (`BindRadiusM=12`) gave `nobod=0`, and 3/3 out-of-combat targets resolved. Its identity is by
+    proximity.
+  - The SceneSpawner key (AU-RW's "match static entities by data id", applied to spawners) found no spawner components
+    in `m_Entities` (positive control passed). Next: the spawner registry, statically.
 
 ## 5. What stops now
 - **New NativeReplica parkour work** (`NativeReplicaParkour`, `ClimbIntent`, `ClimbMoves`, `WallEntry`). With the replica
