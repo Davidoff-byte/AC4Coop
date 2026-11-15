@@ -56,6 +56,8 @@ journal and handoff in `docs/archive/`. Update it in the same PR as any change t
 - The spine's byte arm needs the pinned compiler `cl 16.00.40219.01`; until then no unit can reach `matched`.
 
 ## Plan of record
+Replication layer: `docs/design/storm-replication.md` (2026-11-15, Storm/HackNet-style net objects, decisions on the
+intention lane, slices S0–S10). It refines the R1–R7 roadmap of `docs/design/coop-reevaluation-2026-11-15.md`.
 `docs/ops/PLAN-COOP-V2.md` (outcome-sync architecture, gates P0–P8), with `docs/ops/SOLO-PLAN.md` for what one
 machine can prove.
 
