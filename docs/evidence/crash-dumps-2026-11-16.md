@@ -31,7 +31,18 @@
 - **Reading:** the action system called through a stale or freed target. Whether shutdown alone causes this was not
   checked.
 
-## What both point at (hypothesis, UNVERIFIED)
+## 3. Guest 22296 (2026-11-15 21:26, frame-cap run 3, "exited during the moves"): the same family as 2, mid-run
+- The dump was still in `%LOCALAPPDATA%\CrashDumps\AC4BFSP.exe.22296.dmp`. That S0 "silent exit" was a crash.
+- `eip=00000000`, `ecx=36b32f20`, worker thread. Stack: `0x0067DC0A` ← `0x0073650D` ← `0x004C9161` / `0x004CAC5E` /
+  `0x004CB443` ← **`0x00662648`** ← job dispatch. This is the same chain as 14988, and it happened during play, not at
+  shutdown.
+- Its last phase1 log line: `[Net] action -> 1612324425 ch=0 ly=0 ratio=0.00 blendIn=0.20 (puppet, cur was 1612324400)`,
+  our own `SetTargetAction` write on the puppet from the player's update (replica off, actions mode).
+- `[Coop] PuppetActionsOwnUpdate` (default 0) exists for exactly this. Its code comment (review 2026-11-14) says the puppet
+  writes "can overlap the puppet's own update on another worker thread". No evidence file shows it measured live.
+- No dumps exist for the boot-time exits (10104, 27008, 29188). Those remain unexplained.
+
+## What the dumps point at (hypothesis, UNVERIFIED)
 - Both crashes are in the engine's **action system on a worker thread**.
 - The code map (`s3-takeover-release-2026-11-16.md`) notes two writers on a linked guard's action stack:
   - its own Human statechart keeps running (the behaviour component is off, the statechart is not);
