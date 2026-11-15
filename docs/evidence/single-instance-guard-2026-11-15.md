@@ -32,3 +32,21 @@ The store layer (Steam / Ubisoft Connect), recorded in DECISIONS D-019. AU-RW's 
 **non-Ubisoft** `uplay_r1_loader64.dll` (their ACU-RE-0085/0086); that is DRM replacement and out of scope here.
 - Open, legitimate test: with the genuine install, start a second `AC4BFSP.exe` directly from the game folder while one runs,
   and record whether it starts or relaunches through the store and exits.
+
+## Direct second launch with the genuine install (2026-11-15 12:58 / 13:00, owner's OK)
+The first copy was pid 29656, started by Steam as `AC4BFSP.exe -uplay_steam_mode` (build 5290bc0, asi 048a2d96).
+- **No arguments** (pid 8620): the plugin loaded fully (build check KNOWN, hooks installed, probe pipe opened), then the
+  process **exited with code 0 within 2 s**. No window, no relaunch: no new AC4BFSP or store process in 60 s. pid 29656 was
+  unaffected.
+- **With `-uplay_steam_mode`** (pid 33648), the store's own launch line: same result, exit 0 within 2 s.
+- **Not the game's mutex:** 29656 holds only `scimitar_mutex_ac4bf_61979_ac4coop_29656`; the original name is absent. A
+  second copy had nothing to wait on, and the mutex path waits 5 s anyway.
+- **The two silent code-0 exits on the store layer (IDA, both verified code):**
+  - Ubisoft Connect: `sub_507FA0` (only caller `_WinMain@16` 0x00406E04): `UPLAY_Startup(...)` 0 → continue; **2 → return
+    false with no message**; any other value → MessageBoxW error.
+  - Steam: `sub_497160` (from `sub_497220`): `SteamAPI_RestartAppIfNecessary(242050)` true → `sub_A475E0(0)` =
+    `ExitProcess(0)`; then `SteamAPI_Init`.
+  - Which of the two fired was not determined; telling them apart means probing the store/DRM layer, which is out of scope.
+- **Verdict:** with the genuine install, a second copy on one PC is stopped by the store layer, not by the game. Same-PC
+  two-instance stays unavailable within the project rules (DECISIONS D-019 stands); two rendered worlds need a second
+  machine (or a second account and licence on a separate OS).
