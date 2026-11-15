@@ -8,6 +8,7 @@
 #include <process.h>
 #include <cstdio>
 #include <cstring>
+#include <share.h>
 #include "overlay.h"
 #include "overlay_ui.h"
 #include "paths.h"
@@ -21,15 +22,18 @@ int  Phase1_EntityHostState();
 namespace {
 
 // ---- log: overlay_log.txt next to the other logs -------------------------------------------------------------
-CRITICAL_SECTION g_logCs; bool g_logInit = false; FILE* g_f = nullptr;
+// Opened, appended and closed per line, non-inheritable ("N"), sharing read+write. Measured 2026-11-15 17:34: a
+// long-lived deny-write handle opened by a store hand-off process was inherited by UbisoftGameLauncher.exe (the real
+// game's parent), which then held overlay_log.txt for the whole session, so every line of the real game was lost.
+CRITICAL_SECTION g_logCs; bool g_logInit = false;
 void Log(const char* fmt, ...) {
     if (!g_logInit) return;
     EnterCriticalSection(&g_logCs);
-    if (!g_f) g_f = _fsopen(Paths::LogPath("overlay_log.txt"), "a", 0x20);
-    if (g_f) {
+    if (FILE* f = _fsopen(Paths::LogPath("overlay_log.txt"), "aN", _SH_DENYNO)) {
         SYSTEMTIME t; GetLocalTime(&t);
-        fprintf(g_f, "%02d:%02d:%02d.%03d ", t.wHour, t.wMinute, t.wSecond, t.wMilliseconds);
-        va_list ap; va_start(ap, fmt); vfprintf(g_f, fmt, ap); va_end(ap); fflush(g_f);
+        fprintf(f, "%02d:%02d:%02d.%03d [%lu] ", t.wHour, t.wMinute, t.wSecond, t.wMilliseconds, GetCurrentProcessId());
+        va_list ap; va_start(ap, fmt); vfprintf(f, fmt, ap); va_end(ap);
+        fclose(f);
     }
     LeaveCriticalSection(&g_logCs);
 }
