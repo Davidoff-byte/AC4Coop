@@ -1,6 +1,7 @@
 # Guard fight sync: a guard fighting the guest looks and plays right on the guest's screen
 
-Status: **plan** (2026-11-15). Nothing below is built. Owner's requirement: when a host guard targets the puppet, the
+Status: **plan** (2026-11-15). Nothing below is built. Now slice R6 of docs/design/coop-reevaluation-2026-11-15.md: it
+  depends on native replicas (R3-R5) and should not be built before them. Owner's requirement: when a host guard targets the puppet, the
 guest sees that guard aim at *them*, with the attack indicators and everything, and a hit lands on the guest's real body;
 when the guest dies, the puppet dies.
 
