@@ -7531,12 +7531,17 @@ static volatile LONG s_fiPuppetFsm = 0;       // puppet's own path is in fight: 
 static struct { FightIntentPayload q[32]; volatile LONG head, tail; } s_fiRing = {};   // player thread -> puppet thread
 static LONG s_fiTx[4] = {}, s_fiRx[4] = {}, s_fiApplied[4] = {}, s_fiUnresolved = 0, s_fiDropped = 0;
 
+// The ini flag is read once; the lane is checked on every call, because the player's frames start before Net::Init
+// (first in-world frame) has read [Coop] IntentLane (run 33492: cached as off before the link was up).
+static int s_fiIni = -1;
 static bool FightIntentsOn() {
-    if (s_fiOn < 0) {
-        s_fiOn = (GetPrivateProfileIntA("Coop", "FightIntents", 0, Paths::Ini()) != 0 && Net::IntentLaneOn()) ? 1 : 0;
-        L("[FI] FightIntents=%d (needs [Coop] IntentLane=1: lane %s)\n", s_fiOn, Net::IntentLaneOn() ? "on" : "off");
+    if (s_fiIni < 0) s_fiIni = GetPrivateProfileIntA("Coop", "FightIntents", 0, Paths::Ini()) != 0 ? 1 : 0;
+    const int on = (s_fiIni == 1 && Net::IntentLaneOn()) ? 1 : 0;
+    if (on != s_fiOn) {
+        L("[FI] FightIntents active=%d (ini %d, intention lane %s)\n", on, s_fiIni, Net::IntentLaneOn() ? "on" : "off");
+        s_fiOn = on;
     }
-    return s_fiOn == 1;
+    return on == 1;
 }
 bool FightIntentOwnsPuppet() { return s_fiOn == 1 && InterlockedCompareExchange(&s_fiPuppetFsm, 0, 0) != 0; }
 
