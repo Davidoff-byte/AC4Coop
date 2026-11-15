@@ -24,8 +24,17 @@ Use **Epic Online Services** (EOS) for the session layer, not for gameplay:
 - **EOS is store-neutral.** relay.md rejected a store's lobby/relay service because players own AC4 on Steam *and* Ubisoft
   Connect; EOS Connect + Device ID needs neither store, so that objection does not apply.
 
-API names above are from the EOS SDK documentation as known before the SDK was installed. **UNVERIFIED against the
-headers** until the SDK is in `local/eos-sdk/`; the spike's first step is to confirm every call and constant.
+**Checked against the SDK headers** (EOS SDK v1.19.2.1, `EOS-SDK-58105819-Release-v1.19.2.1.zip`, sha256 56A3BD80…B582FB,
+extracted to the git-ignored `local/eos-sdk/`). Every call above exists. One name was wrong: forced relays is
+`EOS_RC_ForceRelays` (enum `EOS_ERelayControl`, `eos_p2p_types.h`), not `EOS_RNP_ForceRelays`.
+
+## SDK finding: no 32-bit Windows binary (changes where EOS runs)
+v1.19.2.1 ships `EOSSDK-Win64-Shipping.dll/.lib` and arm64 only. There is **no `EOSSDK-Win32-Shipping`**, even though
+`eos_base.h` still defines `EOS_CALL __stdcall` for `_M_IX86`. AC4 is a 32-bit process, so EOS cannot load inside it.
+**Decision (proposed):** a small **64-bit bridge process** shipped with the mod runs EOS.
+- The mod keeps its UDP transport and talks to the bridge on `127.0.0.1`.
+- The bridge relays each datagram over EOS P2P and serves the in-game panel's host/join requests over the same local link.
+- This keeps the current SDK. The alternative (an older SDK that still shipped Win32) builds on a version Epic may retire.
 
 ## Where it plugs in (our code, verified)
 - `src/net.h` / `src/net.cpp` own one UDP socket and a receive thread. The payload formats do not change:
@@ -73,6 +82,17 @@ headers** until the SDK is in `local/eos-sdk/`; the spike's first step is to con
    double-NAT host needs. A real two-network test still needs a second machine on another network (machine B).
 - PASS = both phases deliver all reliable packets in order, unreliable loss under 1 % locally, relay RTT reported, and a clean
   shutdown (lobby destroyed, no leaked handles).
+
+## Spike results (2026-11-15, `tools/eos_spike`, x64, run on the owner's PC)
+- **Host (verified against Epic's live backend):** EOS_Initialize OK, platform created (overlay disabled), Device-ID login OK
+  (ProductUserId issued), relay control set, **NAT type Moderate**, lobby created with a public `CODE` attribute (`EHGR7E`).
+- **Join by code (verified):** lobby search on the `CODE` attribute returned 1 result, and JoinLobby succeeded.
+- **P2P: NOT tested yet.** Both copies on one Windows user got the **same ProductUserId**. Device-ID credentials are per OS
+  user profile ("already exist for the current user profile"), not per `CacheDirectory`. The guest's packets to "the host"
+  were delivered locally (RTT 0.0 ms) and the host echoed nothing, so that run's PASS is void. The spike now refuses this case
+  (`VERDICT: INVALID`, exit 4).
+- **Next:** run `join` on a different Windows user or on another PC (that also exercises a real network path), then repeat
+  with `--relay force`.
 
 ## Open items
 - The owner sets the client policy on the Epic portal (Connect / Lobbies / P2P only) before a public build.
