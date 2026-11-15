@@ -37,6 +37,10 @@ On the ground (peer `contextId == 4`) with the flag on:
 4. Blended correction (AC4 MP's `STEERING_BLENDED`): between 0.5 m and the snap limit the body is moved toward the peer
    by at most `NativeReplicaBlendCmS` (default 150 cm/s; 0 = off), own rotation kept. Needed because the replica's top
    speed (Fastest) equals the peer's run speed, so a gap lost while accelerating never closes by steering alone.
+   Start boost: while the replica is > 1 m/s slower and > 0.5 m behind a moving peer, the cap is
+   `NativeReplicaStartBoostCmS` (default 400; 0 = off) - a short slide at run starts instead of a snap.
+5. Replica-mode hysteresis: the replica stays on through off-ground spells < 400 ms and takes over again only after 300 ms
+   of continuous ground, so quick context flips do not toggle the puppet's behaviour every frame.
 Off the ground the old path runs unchanged.
 
 Rejected on the way (measured, not assumed):

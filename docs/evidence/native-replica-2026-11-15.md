@@ -6,8 +6,8 @@ All runs: AC4BFSP.exe sha256 bc11ad79..., Havana save, Edward parked at (78.7,-7
 `NativeReplica=1` (PuppetNavService=1, PuppetPhysics=0, HybridLoco=1, IntentLane=1, [Pilot]/[Probe] Enabled).
 Builds are from the uncommitted tree on 5384554 (`tree=dirty`); the final one is this commit's content.
 Oracle: `py -3.14 tools/oneoff/replica_oracle.py <phase1_log> <tap>` (checks in the design note).
-Verdict: **solo-tested: native movement works; oracle 2 of 4 checks pass (movement, ground stage); p95 error and the
-run-start snaps fail.** Not two-machine tested.
+Verdict: **solo-tested. Final build (v9, run 28064): oracle 4 of 4 on host-p14-state-2 in one run (p95 0.60 m, no snap
+inside a walking segment), host-p14-state-5 clean. Earlier versions below failed it.** Not two-machine tested.
 
 ## Ground-context finding (affects the default path)
 The sender's `GetCurrentContextID(1)` is **4** on the ground (PS3 `ActorContextID`: 2 NOT_DEFINED, 4 Ground; tap
@@ -71,9 +71,27 @@ What the logs show (v4+ windows carry peer speed, replica speed and along-track 
 Final verdict (v7): checks 4 (stage) PASS; 3 (p95 <= 1.0) FAIL at 1.05 m; 2 FAIL (one run-start snap per pass);
 1 FAIL narrowly by construction (correction excluded). No crash in 4 tuning runs.
 
+## Start boost and switch hysteresis (builds on 908f0a8)
+| run | asi sha256 | change | state-2 p95 | snaps inside passes | own movement | state-5 run / rest | crash |
+|---|---|---|---|---|---|---|---|
+| 29404 | 0cb22391... | v8: start boost (correction cap 400 cm/s while the replica is > 1 m/s slower and > 0.5 m behind a moving peer) | pass 1 only: 0.55-0.69 m | 0 in pass 1 | - | - | **yes**, end of pass 1 |
+| 28064 | f16f2f26... | v9: + replica-mode hysteresis (stay through off-ground < 400 ms, re-enter after 300 ms of ground) | **0.60 m** | 1, 0, 0, 0 | 90-105 % | 0.43-0.54 / 0.19 m | no |
+- v9 oracle (state-2, 4 full passes): 1 movement PASS, 3 p95 PASS, 4 stage PASS; 2: the one snap (#4, 3.17 m, dz -1.20 at
+  (36.8,-80.8)) came 3 log lines after `puppet behavior ENABLED (ctx=4)` that followed an air spell (ctx 6) at the climb
+  area, i.e. a return from another context, which the oracle allows; no snap inside a ground walking segment. One run.
+- Cost of the boost: 3.3-3.6 m of correction per run start, applied over 41-47 frames (~0.8 s) - a visible slide that
+  was not looked at (no screenshot/video); session correction state-2 ~ 3.6 m per pass from the boost plus the 150 cm/s
+  blend. Mode switches: 25 in the state-2 run (5 passes).
+- Crash in 29404 (`AC4Coop_crashctx_29404_1.txt`): execute fault at eip 0xFED3B908 from 0x006781E0, which calls vt[0x4C] on
+  object 0x42764000 whose vtable pointer is 0x2913AC04 (a heap address, not an exe vtable): a freed/reused object in the
+  action code (callers 0x0067DAA0 / 0x0067DB40), no ASI frame on the stack, during peer context flips 4 -> 8 -> 4 -> 6.
+  Run 7432's crash 3 (eip 0, objects with vt 0x01E46FA0, exe frames 0x4C8xxx) happened in the same kind of flip. Both
+  modes toggle the puppet's behaviour on each flip; HybridLoco never did with real packets. The link to the toggles is
+  UNVERIFIED: v9 reduces toggles and did not crash in one run, which is not proof.
+
 ## Not established
-- Run-start snaps. Options not tried: a stronger correction only while the replica is accelerating (risks visible
-  sliding), a larger snap limit (would only hide it), a faster start through another nav argument (a5/a9/a11/a12 are
-  unknown).
+- Whether the toggle hysteresis really removes the action-system crash (needs several runs, ideally a forced flip test).
+- How the start slide looks; whether 400 cm/s should be lower.
+- A faster native start through another nav argument (a5/a9/a11/a12 are unknown).
 - Facing at rest, the meaning of NavigateToPosition's a5/a7/a9/a11/a12 and of its return value.
 - Whether guards, perception and damage now treat the native puppet differently (R4-R6).
