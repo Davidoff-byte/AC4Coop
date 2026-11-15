@@ -7685,12 +7685,16 @@ static void FightIntentApply(Human* pup) {
     char* hg = FiHumanGround(pup); uint16_t p[6];
     if (!hg || !FiPath(hg, p, nullptr)) return;
     void* ig = hg + 0x10;
-    while (s_fiRing.tail != s_fiRing.head) {
+    // One op per puppet frame: a Do transitions on the NEXT frame (probes: watch +1), so an exit queued right behind its
+    // enter must see the fight path first (run 32488/5852: enter + exit in one batch left the puppet in fight).
+    if (s_fiRing.tail != s_fiRing.head) {
         const LONG t = s_fiRing.tail; FightIntentPayload f = s_fiRing.q[t & 31]; InterlockedExchange(&s_fiRing.tail, t + 1);
         Entity* e = f.target ? FiResolve(f.target) : nullptr;
-        if (f.target && !readable(e, 0xCC)) { InterlockedIncrement(&s_fiUnresolved); L("[FI] apply op=%u target %016llX unresolved\n", f.op, (unsigned long long)f.target); continue; }
         uint32_t rc = 0, rd = 0;
-        if (f.op == FI_ENTER && e) {
+        if (f.target && !readable(e, 0xCC)) {
+            InterlockedIncrement(&s_fiUnresolved); e = nullptr;
+            L("[FI] apply op=%u target %016llX unresolved\n", f.op, (unsigned long long)f.target);
+        } else if (f.op == FI_ENTER && e) {
             uint32_t hnd = *(uint32_t*)((char*)e + 0xC8);
             rc = FiCall(ig, 75, 1, (uint32_t)&hnd);                          // CanEnterFight(const Handle&)
             if (rc & 0xFF) { rd = FiCall(ig, 76, 1, (uint32_t)&hnd); InterlockedIncrement(&s_fiApplied[FI_ENTER]); }   // DoEnterFight
