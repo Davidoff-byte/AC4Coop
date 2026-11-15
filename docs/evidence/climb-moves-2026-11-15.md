@@ -83,3 +83,25 @@ default 0, re-read every 2 s). Solo replay only; not two-machine tested.
 - Reading: the replica's own top candidate already matches the peer's hold; the divergence is not in the shimmy choice.
 - Same build, why `ReadClimbMove` fails on the replica (failing step, 3 runs with moves on): step 5 (newest move's vtable
   is not 0x0271F7E8) ~80 %, step 9 (one hand target only) ~15 %, step 6 (limb count) ~4 %.
+
+## Replica between moves; hold-following re-measured
+- The step-5 "other vtables" were heap addresses (run 25716: 0x40547818, 0x41655C08, ...): the newest record's move had
+  finished and its memory was reused - the replica was between moves. `ReadClimbMoveStep` now returns -1 with the
+  Human's last complete hand pair in that case (and fills a hand a one-hand move does not target from that pair;
+  UNVERIFIED that the other hand stays put). Failed reads fell from ~500 to ~45 per run.
+- Re-run (asi `77cbc2aef4f569281e9660326331d3b99291d8c5309ba1cb827ce4c35635d04e`, pid 27916, `abmoves.sh ... 1 0 1 0 1 0`):
+  on-wall error moves 0.95 / 1.15 / 1.14 m vs real input 0.98 / 1.10 / 1.01 m. With the replica's position known more
+  often, hold-following is not better than the real input; the earlier 0.92 vs 1.01 m edge is within run-to-run noise
+  (~0.1 m). Climbing steering is at its limit; the divergence is upstream.
+
+## Beam steering (`[Coop] NativeReplicaBeam`, default 0) - negative
+- NarrowObject context (9) = `*(Human+0x720+0x3C)` (getter `sub_16E8EF0`, factory case 9; ctor `sub_16D8EC0`: main vtable
+  0x026E9BD8, interface 0x026E9A40 at +0x10). Interface slot 0 `sub_1578490` stores a Vector4 at [fsm data]+0xC0, slot 1
+  `sub_1578510` a value at +0x19C - the same pattern as IHumanGround slot 1 `sub_1D51690` (lazy FSM, then store).
+- Test (asi `5284b637262caa628b2579bae588d0905325de639e51fb0a4aa2c170f434e10c`, pid 22336, `abmoves.sh ... 0:0:1 0:0:0` x3):
+  the steer ran ~3100 frames per run. Windows with the replica on a beam the peer is not on: 49 / 48 / 50 % (steer) vs
+  51 / 55 / 27 % (off); distance moved there 35 / 30 / 34 m vs 42 / 46 / 23 m; parkour error 2.79 / 2.78 / 2.81 vs
+  2.88 / 2.85 / 2.61 m. No effect: like the ground context with IHumanGround (R3), the NPC's beam context does not move on
+  these slots.
+- Main finding: in about half of all 2 s windows the replica is on a beam the peer never used. The route splits at the
+  wall-run entry, not in the climbing moves.
