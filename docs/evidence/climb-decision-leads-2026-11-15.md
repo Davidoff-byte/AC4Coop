@@ -221,6 +221,10 @@ Climb reproduced with the Pilot (stick offset re-learned per attempt: `goto ... 
     (context 9) stay ~2.3 m in both - after its own wall run the replica often takes a different route (onto the beam)
     than the peer. Driving that needs the peer's real decisions/input, not an error-derived intention.
 
+22. **Move creators on the climb script** (run 33660, hooks on `sub_13D5640` / `sub_1B59600`): 32 moves - initial grab
+    `0x015686E8` / `0x01B620F9`, shimmy `0x01B65599` (25), corner turn `0x01B5DDBA` (3; orientation quaternion turns 90 deg),
+    vertical step `0x01B61B4D` (2). Sent to the replica as hand holds: `docs/evidence/climb-moves-2026-11-15.md`.
+
 So a shimmy step is fully described by **(definition index, position on the guidance)** plus the guidance it lies on; that
 is what R4.3 would send. UNVERIFIED: that the definition table is identical in both games (same assets, so expected), how
 the replica side reaches the table (the generator's inputs), and the other 11 move types (climb up, jump, ...).

@@ -6,7 +6,8 @@ candidates, climbing input seam slots 37/38 verified on Edward; `docs/evidence/c
 R4.3 feasibility: free-run intention alone did not start a wall run (item 17); the ground's wall-run request/apply
 commands (IHumanGround slots 21/22) do: the NPC replica wall-runs and climbs natively, and with no forced exits a
 5-pass run had no crash (items 18-20). The peer's real climbing input now reaches the replica (ClimbBlock; on-wall
-error 1.02 vs 1.26 m, route still diverges: `docs/evidence/native-replica-climb-input-2026-11-15.md`). Open: replica climbing moves (slots 37/38), beam exits, more taps. Roadmap: `docs/design/coop-reevaluation-2026-11-15.md` (R4).
+error 1.02 vs 1.26 m, route still diverges: `docs/evidence/native-replica-climb-input-2026-11-15.md`). The peer's moves (hand holds per move)
+are sent too and the replica follows the hold path (0.92 vs 1.01 m; `docs/evidence/climb-moves-2026-11-15.md`). Open: replica climbing moves (slots 37/38), beam exits, more taps. Roadmap: `docs/design/coop-reevaluation-2026-11-15.md` (R4).
 Builds on R3 (`docs/design/native-replica.md`): on the ground the puppet is a native NPC body moved by its own nav
 service. Everything else still uses the old replay path (behaviour disabled, peer animation copied with
 SetTargetAction), and the target-needing parkour contexts (Ladder 5, Ledge 7, Walling 8, NarrowObject 9, Climbing 30,

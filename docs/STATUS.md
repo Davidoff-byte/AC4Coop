@@ -39,6 +39,9 @@ journal and handoff in `docs/archive/`. Update it in the same PR as any change t
 - R4 climbing input (`[Coop] NativeReplicaClimbIntent`, default 0): the peer's real climbing input rides in
   PlayerState's context block (ClimbBlock); solo replay: on-wall error 1.02 m vs 1.26 m error-derived, route still
   diverges (`docs/evidence/native-replica-climb-input-2026-11-15.md`).
+- R4 climbing moves (`[Coop] NativeReplicaClimbMoves`, default 0): each peer move's hand holds ride in the ClimbBlock and
+  the replica follows the peer's hold path; solo replay, 3 runs each: on-wall error 0.92 m vs 1.01 m with real input
+  only; route still diverges (`docs/evidence/climb-moves-2026-11-15.md`).
   (`docs/evidence/native-replica-2026-11-15.md`). Same evidence: `HybridLoco`'s ground branch tests context 2, but real
   packets send 4, so it never runs.
 

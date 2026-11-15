@@ -7,7 +7,7 @@ meta, recs = wt.tap_read(sys.argv[2])
 n = hit = 0; last = None; nz = 0
 for t, d in recs:
     i = d.find(b'CLMB')
-    if len(d) != 576 and i < 0:
+    if len(d) != 576:   # PlayerState datagrams only
         continue
     n += 1
     if i < 0:

@@ -32,6 +32,12 @@ struct ClimbBlock {
     uint32_t magic;              // CLIMB_BLOCK_MAGIC when filled ([Coop] NativeReplicaClimbIntent on the sender)
     float    dir[2];             // 2D climbing input: x sideways (the character's right), y up
     float    speed;              // speed ratio 0..1
+    // The player's newest climbing move (docs/evidence/climb-moves-2026-11-15.md): its hand target holds (world
+    // positions of the grab records of limbs 0 / 1) and the climbed entity's ObjectID. moveSeq counts new moves on the
+    // sender (0 = none read). Filled when [Coop] NativeReplicaClimbIntent is on.
+    uint32_t moveSeq;
+    float    hand[2][3];
+    uint64_t objectId;
 };
 
 union ContextBlock {
