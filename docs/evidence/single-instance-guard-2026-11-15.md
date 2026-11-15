@@ -50,3 +50,21 @@ The first copy was pid 29656, started by Steam as `AC4BFSP.exe -uplay_steam_mode
 - **Verdict:** with the genuine install, a second copy on one PC is stopped by the store layer, not by the game. Same-PC
   two-instance stays unavailable within the project rules (DECISIONS D-019 stands); two rendered worlds need a second
   machine (or a second account and licence on a separate OS).
+
+## Standalone version.dll proxy, live (2026-11-15 19:16-19:19)
+`proxy/version/` (commit 4483957), version.dll sha256 3f357d02c15bc4a57bd3e81e20038599154cb0654680a70e3c5c59f46fbdecb2,
+deployed to `D:\SteamLibrary\steamapps\common\Assassin's Creed IV Black Flag` (AC4BFSP.exe sha256 bc11ad79..., the pinned build).
+Source: `AC4MultiInstance.log` beside the DLL, plus read-only `OpenMutexW(SYNCHRONIZE)` probes.
+- **IAT state when the proxy runs:** filled. Each of pids 32212, 11180, 29936, 32756 logged `slot=01E3A20C (rva=01A3A20C)
+  *slot=7559E830 real=7559E830 slot_ok=1 hooked=1`. That slot is the same CreateMutexW IAT slot hardcoded in
+  `dllmain.cpp` `InstallMultiInstance`.
+- **With AC4Coop.asi on** (`HookMultiInstance=1`; this install's ini has no `RequireArm`, so the plugin was active):
+  - the hooks chain: `"scimitar_mutex_ac4bf_61979_ac4coop_29936" -> "..._ac4coop_29936_mi29936"`;
+  - live, pid 29936 (the game, started by UbisoftGameLauncher 31100): `..._ac4coop_29936_mi29936` = **exists**;
+    `scimitar_mutex_ac4bf_61979` and `..._ac4coop_29936` = absent (err 2).
+- **Proxy alone** (`HookMultiInstance=0` for one direct start, pid 32756; ini restored afterwards, same sha256):
+  `CreateMutexW "scimitar_mutex_ac4bf_61979" -> "scimitar_mutex_ac4bf_61979_mi32756"`. The original name reached the proxy
+  unchanged, and the proxy renamed it.
+- **Direct starts** (11180, 32756) beside the running game: exit code 0 within about 0.4 s. pid 29936 kept running. These exits come
+  after the mutex, through the store layer (section above); the proxy does not change that.
+- **Not checked:** a full play session with the proxy (29936 was only seen running, not played); Ubisoft-only installs; other Windows builds.
