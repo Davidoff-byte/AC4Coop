@@ -3,6 +3,7 @@
 //
 //   eos_bridge host            [--bridge-port 47900] [--game-port 47801] [--relay allow|force|none] [--ini local\eos.ini] [--tag A] [--echo]
 //   eos_bridge join <CODE>     (same options; default --tag B)
+//   --status <file>            one-line state file for the mod: state=<starting|hosting|joined|connected|stopped|failed-*> code= link= peer=
 //
 // Data path: UDP 127.0.0.1:<bridge-port> (loopback only)  <->  EOS P2P socket AC4COOP, channel 1, unreliable-unordered.
 //   game -> bridge : every datagram from a local sender goes to the remote bridge; the last local sender is remembered.
@@ -22,6 +23,24 @@ static SOCKET g_udp = INVALID_SOCKET;
 static sockaddr_in g_game = {};                          // where the local game is (last sender, or the default)
 static bool g_echo = false;
 struct Stats { uint64_t udpIn, udpOut, p2pIn, p2pOut, tooBig, noRemote, sendFail; } g_st = {};
+
+// --status <file>: one line `state=<s> code=<c> link=<l> peer=<puid> udpIn=.. p2pIn=..`, rewritten (temp file + rename)
+// whenever it changes, so the mod can show the host code and the link state without a control protocol yet.
+static std::string g_statusPath, g_state = "starting", g_code;
+static void WriteStatus(bool force = false)
+{
+    if (g_statusPath.empty()) return;
+    char line[512];
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "state=%s code=%s link=%s peer=%s\n", g_state.c_str(), g_code.empty() ? "-" : g_code.c_str(),
+                NetName(g_established), g_remote ? Puid(g_remote).c_str() : "-");
+    static std::string last;
+    if (!force && last == line) return;
+    last = line;
+    const std::string tmp = g_statusPath + ".tmp";
+    FILE* f = nullptr;
+    if (fopen_s(&f, tmp.c_str(), "wb") == 0 && f) { fputs(line, f); fclose(f); MoveFileExA(tmp.c_str(), g_statusPath.c_str(), MOVEFILE_REPLACE_EXISTING); }
+}
+static void SetState(const char* s) { g_state = s; WriteStatus(); }
 
 static bool OpenUdp(int port, int gamePort)
 {
@@ -80,14 +99,17 @@ int main(int argc, char** argv)
         else if (!strcmp(argv[i], "--bridge-port") && i + 1 < argc) bridgePort = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--game-port") && i + 1 < argc) gamePort = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--echo")) g_echo = true;
+        else if (!strcmp(argv[i], "--status") && i + 1 < argc) g_statusPath = argv[++i];
     }
     SetConsoleCtrlHandler(OnCtrl, TRUE);
     printf("eos_bridge %s tag=%s relay=%s%s\n", argv[1], tag.c_str(), relay.c_str(), g_echo ? " ECHO" : "");
-    if (!OpenUdp(bridgePort, gamePort)) return 1;
-    if (!StartPlatform(ini, tag, "AC4Coop EOS bridge")) return 1;
+    WriteStatus(true);
+    if (!OpenUdp(bridgePort, gamePort)) { SetState("failed-port"); return 1; }
+    if (!StartPlatform(ini, tag, "AC4Coop EOS bridge")) { SetState("failed-platform"); return 1; }
 
     int rc = 1;
-    if (Login(("ac4coop-bridge-" + tag).c_str())) {
+    if (!Login(("ac4coop-bridge-" + tag).c_str())) SetState("failed-login");
+    else {
         SetRelay(relay.c_str());
         WatchEstablished();
         if (host) {
@@ -100,12 +122,15 @@ int main(int argc, char** argv)
                 g_remote = i->RemoteUserId;
             });
             code = MakeCode();
-            if (!HostLobby(code)) goto done;
+            if (!HostLobby(code)) { SetState("failed-lobby"); goto done; }
+            g_code = code; SetState("hosting");
             printf("\n*** LOBBY CODE: %s ***  (Ctrl+C to stop)\n\n", code.c_str());
         } else {
+            g_code = code;
             g_remote = JoinByCode(code);
-            if (!g_remote) { printf("join failed\n"); goto done; }
-            if (Puid(g_remote) == Puid(g_me)) { printf("INVALID: the lobby owner is this same EOS user (run the other side on another Windows user or PC)\n"); goto done; }
+            if (!g_remote) { printf("join failed\n"); SetState("failed-join"); goto done; }
+            if (Puid(g_remote) == Puid(g_me)) { printf("INVALID: the lobby owner is this same EOS user (run the other side on another Windows user or PC)\n"); SetState("failed-sameuser"); goto done; }
+            SetState("joined");
             // Open the link now (EOS connects on first send) so it is up before game traffic starts.
             static const char hello[] = "AC4B-HELLO";
             Send(g_remote, 2, hello, sizeof(hello), EOS_EPacketReliability::EOS_PR_ReliableOrdered);
@@ -115,6 +140,8 @@ int main(int argc, char** argv)
             while (!g_quit) {
                 EOS_Platform_Tick(g_plat);
                 PumpData();
+                if (g_established && g_state != "connected") SetState("connected");
+                WriteStatus();   // also picks up link / peer changes (no-op when unchanged)
                 if (NowMs() >= nextStat) {
                     nextStat += 5000.0;
                     printf("[stats] link=%s udpIn=%llu udpOut=%llu p2pIn=%llu p2pOut=%llu tooBig=%llu noRemote=%llu sendFail=%llu\n", NetName(g_established),
@@ -127,6 +154,7 @@ int main(int argc, char** argv)
     done:
         LeaveLobby(host);
     }
+    if (g_state.rfind("failed", 0) != 0) SetState("stopped");
     EOS_Platform_Release(g_plat); EOS_Shutdown();
     closesocket(g_udp); WSACleanup();
     printf("shutdown done\n");

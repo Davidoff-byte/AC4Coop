@@ -2339,6 +2339,111 @@ namespace {
     }
 }
 
+namespace {
+    // ---- [Net] Transport=eos (docs/design/eos-transport.md, "The bridge", slice 2) ----------------------------------
+    // The EOS SDK v1.19 has no Win32 DLL, so a 64-bit eos_bridge.exe (tools/eos_bridge) carries the link. The game runs
+    // in manual mode with its peer = the bridge (127.0.0.1:EosBridgePort); every datagram the game sends goes over EOS
+    // P2P, and the bridge sends the remote side's datagrams back to the game's bound port. The bridge lives in
+    // <module dir>\eos\ with its own 64-bit DLLs, so they can never shadow the 32-bit ones next to AC4BFSP.exe. It is
+    // put in a kill-on-close job object, so it ends with the game. Keys ([Net]): Transport=eos, EosRole=host|join,
+    // EosCode (join), EosRelay=allow|force|none, EosBridgePort=47900, EosIni (default <module dir>\eos\eos.ini).
+    bool   g_eos = false;
+    HANDLE g_eosJob = nullptr, g_eosProc = nullptr;
+    char   g_eosStatusPath[MAX_PATH] = {0};
+
+    bool EosCopyToClipboard(const char* text) {
+        if (!OpenClipboard(nullptr)) return false;
+        EmptyClipboard();
+        const size_t n = strlen(text) + 1;
+        bool ok = false;
+        if (HGLOBAL g = GlobalAlloc(GMEM_MOVEABLE, n)) {
+            if (void* p = GlobalLock(g)) { memcpy(p, text, n); GlobalUnlock(g); ok = SetClipboardData(CF_TEXT, g) != nullptr; }
+            if (!ok) GlobalFree(g);
+        }
+        CloseClipboard();
+        return ok;
+    }
+
+    // Polls the bridge's one-line status file (state= code= link= peer=), logs every change, copies the host code to
+    // the clipboard once, and logs the bridge's exit.
+    unsigned __stdcall EosStatusThread(void*) {
+        char last[512] = {0};
+        bool copied = false;
+        for (;;) {
+            Sleep(500);
+            char line[512] = {0};
+            FILE* f = nullptr;
+            if (fopen_s(&f, g_eosStatusPath, "rb") == 0 && f) { if (!fgets(line, sizeof(line), f)) line[0] = 0; fclose(f); }
+            size_t L = strlen(line); while (L && (line[L - 1] == '\n' || line[L - 1] == '\r')) line[--L] = 0;
+            if (line[0] && strcmp(line, last) != 0) {
+                lstrcpynA(last, line, sizeof(last));
+                char m[600]; _snprintf(m, sizeof(m), "[EOS] bridge %s\n", line); m[sizeof(m) - 1] = 0; dbg(m);
+                const char* c = strstr(line, "code=");
+                if (!copied && strstr(line, "state=hosting") && c) {
+                    char code[16] = {0}; sscanf_s(c + 5, "%15s", code, (unsigned)sizeof(code));
+                    if (code[0] && code[0] != '-') {
+                        copied = EosCopyToClipboard(code);
+                        _snprintf(m, sizeof(m), "[EOS] host code %s %s\n", code, copied ? "copied to the clipboard" : "NOT copied (clipboard busy)");
+                        m[sizeof(m) - 1] = 0; dbg(m);
+                    }
+                }
+            }
+            DWORD ec = 0;
+            if (g_eosProc && GetExitCodeProcess(g_eosProc, &ec) && ec != STILL_ACTIVE) {
+                char m[96]; wsprintfA(m, "[EOS] bridge exited (code %u) - see eos\\bridge.log\n", (unsigned)ec); dbg(m);
+                return 0;
+            }
+        }
+    }
+
+    bool EosStartBridge(int gamePort, int bridgePort) {
+        char dir[MAX_PATH] = {0}, exe[MAX_PATH], ini[MAX_PATH], logPath[MAX_PATH], cmd[2048], role[16] = {0}, code[32] = {0}, relay[16] = {0};
+        _snprintf(dir, sizeof(dir), "%s\\eos", Paths::ModuleDir()); dir[sizeof(dir) - 1] = 0;
+        _snprintf(exe, sizeof(exe), "%s\\eos_bridge.exe", dir); exe[sizeof(exe) - 1] = 0;
+        _snprintf(logPath, sizeof(logPath), "%s\\bridge.log", dir); logPath[sizeof(logPath) - 1] = 0;
+        _snprintf(g_eosStatusPath, sizeof(g_eosStatusPath), "%s\\status.txt", dir); g_eosStatusPath[sizeof(g_eosStatusPath) - 1] = 0;
+        { char def[MAX_PATH]; _snprintf(def, sizeof(def), "%s\\eos.ini", dir); def[sizeof(def) - 1] = 0;
+          GetPrivateProfileStringA("Net", "EosIni", def, ini, sizeof(ini), Paths::Ini()); }
+        GetPrivateProfileStringA("Net", "EosRole", "host", role, sizeof(role), Paths::Ini());
+        GetPrivateProfileStringA("Net", "EosCode", "", code, sizeof(code), Paths::Ini());
+        GetPrivateProfileStringA("Net", "EosRelay", "allow", relay, sizeof(relay), Paths::Ini());
+        const bool join = _stricmp(role, "join") == 0;
+        char m[400];
+        if (GetFileAttributesA(exe) == INVALID_FILE_ATTRIBUTES) {
+            _snprintf(m, sizeof(m), "[EOS] %s not found - install the eos\\ folder (eos_bridge.exe + its DLLs + eos.ini)\n", exe); m[sizeof(m) - 1] = 0; dbg(m);
+            return false;
+        }
+        if (join && !code[0]) { dbg("[EOS] EosRole=join needs [Net] EosCode=<the host's 6-letter code>\n"); return false; }
+        DeleteFileA(g_eosStatusPath);
+        _snprintf(cmd, sizeof(cmd), "\"%s\" %s%s%s --game-port %d --bridge-port %d --relay %s --ini \"%s\" --status \"%s\"",
+                  exe, join ? "join" : "host", join ? " " : "", join ? code : "", gamePort, bridgePort, relay, ini, g_eosStatusPath);
+        cmd[sizeof(cmd) - 1] = 0;
+        SECURITY_ATTRIBUTES sa{ sizeof(sa), nullptr, TRUE };
+        HANDLE log = CreateFileA(logPath, GENERIC_WRITE, FILE_SHARE_READ, &sa, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        STARTUPINFOA si{}; si.cb = sizeof(si);
+        if (log != INVALID_HANDLE_VALUE) { si.dwFlags = STARTF_USESTDHANDLES; si.hStdOutput = log; si.hStdError = log; si.hStdInput = nullptr; }
+        PROCESS_INFORMATION pi{};
+        const BOOL ok = CreateProcessA(exe, cmd, nullptr, nullptr, TRUE, CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr, dir, &si, &pi);
+        if (log != INVALID_HANDLE_VALUE) CloseHandle(log);
+        if (!ok) { wsprintfA(m, "[EOS] could not start the bridge (error %u)\n", (unsigned)GetLastError()); dbg(m); return false; }
+        g_eosJob = CreateJobObjectA(nullptr, nullptr);
+        if (g_eosJob) {
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION li{};
+            li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            SetInformationJobObject(g_eosJob, JobObjectExtendedLimitInformation, &li, sizeof(li));
+            if (!AssignProcessToJobObject(g_eosJob, pi.hProcess)) dbg("[EOS] note: bridge not in a job object (it may outlive the game)\n");
+        }
+        ResumeThread(pi.hThread);
+        CloseHandle(pi.hThread);
+        g_eosProc = pi.hProcess;
+        _snprintf(m, sizeof(m), "[EOS] bridge started pid=%u role=%s%s%s relay=%s, bridge 127.0.0.1:%d <-> game port %d\n", (unsigned)pi.dwProcessId,
+                  join ? "join " : "host", join ? code : "", "", relay, bridgePort, gamePort);
+        m[sizeof(m) - 1] = 0; dbg(m);
+        _beginthreadex(nullptr, 0, EosStatusThread, nullptr, 0, nullptr);
+        return true;
+    }
+}
+
 namespace Net {
 
 bool BeginJoin(uint32_t ip, uint16_t port, char* err, size_t errN);   // below Init
@@ -2361,6 +2466,19 @@ bool Init() {
     else if (_stricmp(modeStr, "lobby") == 0) g_mode = LM_LOBBY;
     else if (_stricmp(modeStr, "manual") != 0) {
         char m[96]; _snprintf(m, sizeof(m), "[Lobby] unknown [Net] Mode=%s, using manual\n", modeStr); m[sizeof(m) - 1] = 0; dbg(m);
+    }
+    // [Net] Transport=eos (default udp): manual mode with the peer = the local EOS bridge (EosStartBridge below Init's
+    // bind). Every other lobby feature (UPnP, STUN, relay, codes) is off: EOS does rendezvous and NAT traversal.
+    {
+        char transport[16] = {0};
+        GetPrivateProfileStringA("Net", "Transport", "udp", transport, sizeof(transport), Paths::Ini());
+        if (_stricmp(transport, "eos") == 0) {
+            g_eos = true;
+            g_mode = LM_MANUAL;
+            lstrcpynA(peerIp, "127.0.0.1", sizeof(peerIp));
+            peerPort = GetPrivateProfileIntA("Net", "EosBridgePort", 47900, Paths::Ini());
+            char m[128]; wsprintfA(m, "[EOS] Transport=eos: manual mode, peer = bridge 127.0.0.1:%d\n", peerPort); dbg(m);
+        }
     }
     // Host mode only: [Net] Upnp=1 (default) and [Net] StunServer=stun.l.google.com:19302 (default; empty = off).
     g_upnpEnabled = GetPrivateProfileIntA("Net", "Upnp", 1, Paths::Ini());
@@ -2500,6 +2618,7 @@ bool Init() {
     char m[192];
     if (g_mode == LM_MANUAL) {
         wsprintfA(m, "[Net] up: bound:%d -> %s:%d\n", bindPort, peerIp, sendPort); dbg(m);
+        if (g_eos) EosStartBridge(bindPort, sendPort);   // [Net] Transport=eos
     } else if (g_mode == LM_HOST) {
         wsprintfA(m, "[Net] up: bound:%d mode=host (waiting for a guest)\n", bindPort); dbg(m);
         BeginHosting(bindPort);
