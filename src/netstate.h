@@ -140,7 +140,9 @@ static_assert(sizeof(PlayerState) == 576, "PlayerState wire size changed - updat
 static const uint32_t NET_MAGIC = 0x43344341; // 'AC4C'
 // Wire/struct-layout version. PlayerState is #pragma pack(1): adding a field shifts every following
 // offset, so both peers MUST run the same build. Bump this whenever the layout changes.
-static const uint32_t NET_PROTO_VER = 14;  // 14: entity header += u32 hostMs (36 B); PlayerState += u32 hostTimeMs
+static const uint32_t NET_PROTO_VER = 15;  // 15: intention lane, a new datagram type ('AC4I', IntentWireHeader below).
+                                           //     PlayerState, the entity header/records and LobbyPacket are unchanged
+                                           // 14: entity header += u32 hostMs (36 B); PlayerState += u32 hostTimeMs
                                            //     at +565 (tail pad, still 576 B); LobbyPacket and records unchanged
                                            // 13: guard animation block (EF_ANIM, GuardAnim) on the entity lane;
                                            //     PlayerState and LobbyPacket unchanged
@@ -298,3 +300,57 @@ static const int ENTITY_WIRE_HEADER_SIZE = 36;
 // 16 + 38 = 54 (objId is the wireId inside the fixed part, not an extra field); 62 is deliberate
 // headroom - do not "correct" this constant below 54.
 static const int ENTITY_WIRE_RECORD_MAX  = 16 + 46 + GUARD_ANIM_WIRE_FIXED + 2 * GUARD_ANIM_BLEND_MAX;   // proto 13
+
+// ---- proto 15: intention lane (docs/design/intention-lane.md) ------------------------------------
+// A reliable, ordered, deduplicated lane for per-guard "intentions" (the AC Unity netcode model,
+// docs/design/unity-netcode-mapping.md section 2 item 3). It is its own datagram type on the game socket
+// and is independent of the snapshot lanes: with [Coop] IntentLane=0 (default) the lane is idle and a
+// received 'AC4I' datagram is recognised and ignored. The payload is opaque to the lane: what a channel
+// means and how the guest applies it belong to the caller (phase1.cpp; not wired yet).
+//
+// Datagram = IntentWireHeader (28 B)
+//          + ackRanges x { u32 firstMsgId, u16 count }                       (6 B each)
+//          + msgCount  x { u32 msgId, u32 slot, u64 wireId, u8 channel, u8 flags, u8 len,
+//                          u32 chanSeq, u32 hostMs, u8 payload[len] }       (27 B + len each)
+// All little-endian, no padding. msgId is the per-peer transmission id the acks refer to (starts at
+// 1 for every pair of incarnations); chanSeq is the per-(guard, channel) order the receiver delivers in.
+static const uint32_t NET_INTENT_MAGIC = 0x49344341; // 'AC4I'
+
+enum IntentChannel : uint8_t {
+    IC_UNDEFINED = 0,   // reserved: never sent, rejected on receive
+    IC_ACTION    = 1,   // action (alias, channel, layer)
+    IC_LOCO      = 2,   // navigation / locomotion (destination or move target, speed)
+    IC_WEAPON    = 3,   // weapon (drawn / sheathed, which)
+    IC_LOOKAT    = 4,   // look-at target
+    IC_LIMIT     = 16,  // ids 1..15 are legal on the wire, so a later build can add a channel without a
+                        // layout change; the receiver delivers a channel id it does not name
+};
+
+enum IntentFlag : uint8_t {
+    IF_BASE = 1u << 0,  // the receiver may (re)start this (guard, channel) at chanSeq: set on the first
+                        // message of a key to a peer and on every persisted value replayed to a new or
+                        // rejoined peer. Every other bit is reserved and rejected on receive.
+};
+
+static const int INTENT_PAYLOAD_MAX    = 32;   // opaque payload bytes per message
+static const int INTENT_MSG_FIXED      = 27;   // wire bytes of a message before its payload
+static const int INTENT_ACK_RANGES_MAX = 16;   // SACK runs per datagram
+static const int INTENT_MSGS_MAX       = 64;   // messages per datagram (1400 B holds at most 50 empty ones)
+static const int INTENT_DGRAM_MAX      = 1400; // UDP payload budget, same as the entity lane's chunks
+
+#pragma pack(push, 1)
+struct IntentWireHeader {
+    uint32_t magic;       // NET_INTENT_MAGIC
+    uint32_t protoVer;    // NET_PROTO_VER
+    uint32_t senderInc;   // sender's lane incarnation: random, non-zero, new every process start
+    uint32_t peerInc;     // the receiver's incarnation as the sender knows it; 0 = not known yet. A
+                          // datagram naming another incarnation carries nothing for this receiver.
+    uint32_t hostMs;      // sender's clock at send (informational; each message carries its own)
+    uint32_t ackCum;      // every msgId < ackCum from the receiver has arrived (msgIds start at 1);
+                          // 0 = no ack information in this datagram
+    uint8_t  ackRanges;   // SACK runs that follow (msgIds above ackCum that have arrived)
+    uint8_t  msgCount;    // messages that follow the runs
+    uint16_t reserved;    // 0
+};
+#pragma pack(pop)
+static_assert(sizeof(IntentWireHeader) == 28, "IntentWireHeader is a wire layout (tools/lobby_peer.py INTENT_HDR_FMT)");

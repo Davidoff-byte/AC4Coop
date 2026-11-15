@@ -60,4 +60,39 @@ namespace Net {
     struct Stats { uint32_t txPackets, txBytes, txEnts, rxPackets, rxBytes, rejects, protoMismatch, sizeMismatch, staleChunks; };
     void GetStats(Stats& out);
     void ResetStats();
+
+    // ---- proto 15: intention lane ([Coop] IntentLane, default 0; docs/design/intention-lane.md) ----
+    // Reliable, ordered per (guard, channel), deduplicated; the last value per (guard, channel) is kept and
+    // replayed to a new or rejoined peer. A guard is named by {slot, wireId} as on the entity lane; its
+    // identity is wireId, or the slot when wireId == 0. With the flag off every call below is a no-op that
+    // returns false / 0. Thread-safe: callable from the game thread while the recv thread runs.
+    struct IntentMsg {
+        uint32_t slot;        // sender's slot (entity-manager index) at publish time
+        uint64_t wireId;      // sender's stable id (as the entity lane's wireId); 0 = none, slot is the identity
+        uint8_t  channel;     // IntentChannel (1..15; ids the build does not name are delivered as they are)
+        uint8_t  flags;       // IntentFlag: IF_BASE = this is the channel's current value (first message, or a
+                              // replay to a new / rejoined peer); a consumer applies it as a full state
+        uint8_t  len;         // payload bytes used (<= INTENT_PAYLOAD_MAX)
+        uint32_t seq;         // per-(guard, channel) sequence, strictly increasing in delivery order
+        uint32_t hostMs;      // sender's capture time as the caller stamped it (0 = unset)
+        uint8_t  payload[INTENT_PAYLOAD_MAX];
+    };
+    bool IntentLaneOn();     // [Coop] IntentLane read at Init
+    // Queue a new value of one channel of one guard. False = lane off, bad channel / length, or the
+    // persisted table is full (counted). The lane assigns seq; hostMs is carried through untouched.
+    bool PublishIntent(uint32_t slot, uint64_t wireId, uint8_t channel, uint32_t hostMs,
+                       const void* payload, uint8_t len);
+    // Pop the next received message (per-channel order; channels are independent). False = none.
+    bool PollIntent(IntentMsg& out);
+    // The guard is gone: drop its persisted values (no longer replayed) and its receive order state.
+    void ForgetIntents(uint32_t slot, uint64_t wireId);
+    // Send what is due (new messages, resends, acks, hello/keepalive). Net::Send and Net::SendEntities
+    // call it; a caller that sends neither can call it once per frame.
+    void PumpIntents();
+    struct IntentStats {
+        uint32_t txDgrams, txMsgs, txResends, rxDgrams, rxMsgs, delivered, dupDropped, buffered,
+                 malformed, foreign, refused, peerResets, resyncs, ignoredOff, persistFull;
+        uint32_t outstanding, persisted, myInc, peerInc;   // current values, not counters
+    };
+    void GetIntentStats(IntentStats& out);
 }

@@ -18,7 +18,9 @@ Typical use (same PC, game bound to its LAN address):
 
 Wire facts used (src/netstate.h): PlayerState = 576 B, 'AC4C', u32 protoVer, u32 seq at +8, u64 worldId at +12.
 Entity datagram = 32 B header: 'AC4E', u32 protoVer, u32 seq(+8), u32 epoch(+12), u32 count(+16), u64 worldId(+20),
-u16 chunkIndex(+28), u16 chunkTotal(+30). Nothing else is interpreted; payloads are replayed byte for byte.
+u16 chunkIndex(+28), u16 chunkTotal(+30); from proto 14 also u32 hostMs(+32), 36 B. Proto 15 adds the intention-lane
+datagram 'AC4I' (lobby_peer.unpack_intent): recorded and counted, never replayed (its incarnation handshake belongs to
+the process that sent it). Nothing else is interpreted; payloads are replayed byte for byte.
 Standard library only. Exit 0 = ok, 1 = failed, 2 = usage.
 """
 from __future__ import annotations
@@ -63,13 +65,16 @@ def tap_read(path):
 
 def kind(d):
     m = struct.unpack_from("<I", d)[0] if len(d) >= 4 else 0
-    return "player" if m == lp.NET_MAGIC and len(d) == lp.SIZEOF_PLAYERSTATE else "entity" if m == lp.NET_ENTITY_MAGIC and len(d) >= 32 else "other"
+    if m == lp.NET_MAGIC and len(d) == lp.SIZEOF_PLAYERSTATE: return "player"
+    if m == lp.NET_ENTITY_MAGIC and len(d) >= 32: return "entity"
+    if m == lp.NET_INTENT_MAGIC and len(d) >= 28: return "intent"   # proto 15 intention lane
+    return "other"
 
 
 def summarize(recs):
     # PlayerState offsets printed by cl from netstate.h (2026-11-12): sceneKey +20, matrix +32 (position = floats at
     # +80), shipValid +523, valid +564.
-    s = {"player": 0, "entity": 0, "other": 0, "bytes": 0, "worlds": set(), "ent_records": 0, "epochs": set(),
+    s = {"player": 0, "entity": 0, "intent": 0, "intent_msgs": 0, "other": 0, "bytes": 0, "worlds": set(), "ent_records": 0, "epochs": set(),
          "valid": 0, "aboard": 0, "scenes": set(), "pos_first": None, "pos_last": None}
     for _, d in recs:
         k = kind(d); s[k] += 1; s["bytes"] += len(d)
@@ -84,12 +89,15 @@ def summarize(recs):
             _, _, _, epoch, count, world, ci, ct = struct.unpack_from("<IIIIIQHH", d)
             s["epochs"].add(epoch); s["worlds"].add(world)
             if ci == 0: s["ent_records"] += count
+        elif k == "intent":
+            p = lp.unpack_intent(d)
+            s["intent_msgs"] += len(p["msgs"]) if p else 0
     s["seconds"] = recs[-1][0] - recs[0][0] if recs else 0.0
     return s
 
 
 def fmt_summary(s):
-    return (f"{s['player']} player + {s['entity']} entity datagrams ({s['other']} other), {s['bytes']} B over {s['seconds']:.1f} s; "
+    return (f"{s['player']} player + {s['entity']} entity + {s['intent']} intent datagrams ({s['intent_msgs']} intent msgs, {s['other']} other),{s['bytes']} B over {s['seconds']:.1f} s; "
             f"entity records {s['ent_records']} in {len(s['epochs'])} epoch(s); worldIds " + ",".join(f"{w:x}" for w in sorted(s['worlds']))
             + f"; live player packets {s['valid']} ({s['aboard']} aboard a ship), {len(s['scenes'])} scene key(s)"
             + (f", position {tuple(round(v, 1) for v in s['pos_first'])} -> {tuple(round(v, 1) for v in s['pos_last'])}" if s['pos_first'] else ""))
@@ -108,13 +116,15 @@ ENTITY_CHUNK_MAX = 1400   # src/net.cpp: datagram budget; record bytes per chunk
 
 
 def ent_hdr_len(d):
-    """Entity header size: 32 B up to proto 13, 36 B from proto 14 (u32 hostMs appended)."""
+    """Entity header size: 32 B up to proto 13, 36 B from proto 14 (u32 hostMs appended). Proto 15 left the entity
+    header as it was (it only added the 'AC4I' intent datagram), so 14 and 15 are both 36 B."""
     return 36 if struct.unpack_from("<I", d, 4)[0] >= 14 else 32
 
 
-def rechunk_as_14(chunks, host_ms):
-    """Proto-13 chunks of one snapshot (all of them, any order) -> proto-14 datagrams: 36 B header with hostMs,
-    record bytes re-split at 1364 B (the receiver places chunk i at i * (1400 - 36))."""
+def rechunk_36(chunks, host_ms, proto=14):
+    """Proto-13 chunks of one snapshot (all of them, any order) -> datagrams with the 36 B header (proto 14 or 15):
+    hostMs appended, protoVer = `proto`, record bytes re-split at 1364 B (the receiver places chunk i at
+    i * (1400 - 36))."""
     chunks = sorted(chunks, key=lambda d: struct.unpack_from("<H", d, 28)[0])
     body = b"".join(d[32:] for d in chunks)
     per = ENTITY_CHUNK_MAX - 36
@@ -122,9 +132,27 @@ def rechunk_as_14(chunks, host_ms):
     h0 = chunks[0]
     out = []
     for i in range(n):
-        hdr = h0[:4] + struct.pack("<I", 14) + h0[8:28] + struct.pack("<HHI", i, n, host_ms & 0xFFFFFFFF)
+        hdr = h0[:4] + struct.pack("<I", proto) + h0[8:28] + struct.pack("<HHI", i, n, host_ms & 0xFFFFFFFF)
         out.append(hdr + body[i * per:(i + 1) * per])
     return out
+
+
+def convert(d, k, as_proto, pend, now_ms):
+    """One recorded datagram -> what replay sends for --as-proto (a list; empty while a proto-13 snapshot is gathered).
+    13 -> 14/15: entity snapshots are re-split with the 36 B header and hostMs = now_ms; PlayerState.hostTimeMs (+565,
+    tail pad) is stamped when it is 0. 14 -> 15 and any other: only protoVer changes (proto 15 kept both layouts).
+    as_proto 0 = unchanged. `pend` holds the chunks of incomplete proto-13 snapshots, by seq."""
+    if not as_proto or k not in ("player", "entity"):
+        return [d]
+    if as_proto >= 14 and k == "entity" and ent_hdr_len(d) == 32:
+        seq_, ct_ = struct.unpack_from("<I", d, 8)[0], struct.unpack_from("<H", d, 30)[0]
+        pend.setdefault(seq_, []).append(d)
+        if len(pend[seq_]) < ct_:
+            return []
+        return rechunk_36(pend.pop(seq_), now_ms, as_proto)
+    if as_proto >= 14 and k == "player" and not struct.unpack_from("<I", d, 565)[0]:
+        d = d[:565] + struct.pack("<I", now_ms & 0xFFFFFFFF) + d[569:]
+    return [d[:4] + struct.pack("<I", as_proto) + d[8:]]
 
 
 def entity_snapshots(recs):
@@ -322,6 +350,8 @@ def cmd_replay(a):
                         break
                     time.sleep(min(dt, 0.005))
                 k = kind(d)
+                if k == "intent":
+                    continue                      # proto 15 intention lane: its incarnation handshake cannot be replayed
                 if a.player_only and k != "player":
                     continue                      # e.g. a host recording played INTO a host game: no guard/kill lane
                 if passes and k == "player":      # later passes: keep seq rising
@@ -334,22 +364,8 @@ def cmd_replay(a):
                         d = d[:12] + struct.pack("<Q", live_world[0]) + d[20:]
                     elif k == "entity":
                         d = d[:20] + struct.pack("<Q", live_world[0]) + d[28:]
-                if a.as_proto >= 14 and k == "entity" and ent_hdr_len(d) == 32:
-                    # proto 13 recording into a proto 14 guest: gather the snapshot's chunks, then send it re-split
-                    # with hostMs = this replay's send clock (the recording's timing is what is being replayed)
-                    seq_, ct_ = struct.unpack_from("<I", d, 8)[0], struct.unpack_from("<H", d, 30)[0]
-                    pend.setdefault(seq_, []).append(d)
-                    if len(pend[seq_]) < ct_:
-                        continue
-                    for dd in rechunk_as_14(pend.pop(seq_), int(time.monotonic() * 1000)):
-                        sock.sendto(dd, peer); sent += 1
-                    continue
-                if a.as_proto >= 14 and k == "player" and not struct.unpack_from("<I", d, 565)[0]:
-                    # proto 14 PlayerState.hostTimeMs (+565, tail pad): the replay's send clock
-                    d = d[:565] + struct.pack("<I", int(time.monotonic() * 1000) & 0xFFFFFFFF) + d[569:]
-                if a.as_proto and k in ("player", "entity"):
-                    d = d[:4] + struct.pack("<I", a.as_proto) + d[8:]
-                sock.sendto(d, peer); sent += 1
+                for dd in convert(d, k, a.as_proto, pend, int(time.monotonic() * 1000)):
+                    sock.sendto(dd, peer); sent += 1
                 if time.monotonic() - t_begin >= a.seconds:
                     break
             passes += 1
@@ -396,13 +412,38 @@ def selftest():
     ok = ok and len(an) == 1 and an[0][3][0]["anim"]["blend"] == [(4, 227), (37, 3)] and an[0][3][0]["anim"]["channel"] == 0x102
     # proto 14: the same two-chunk snapshot re-split with a 36 B header and hostMs decodes to the same rows; a body
     # longer than one chunk is cut at 1364 B
-    r14 = rechunk_as_14([hdr(1) + body[20:], hdr(0) + body[:20]], 123456)
+    r14 = rechunk_36([hdr(1) + body[20:], hdr(0) + body[:20]], 123456)
     rows14 = entity_table([(0.0, d) for d in r14])
-    big = rechunk_as_14([hdr(0) + b"z" * 1368, hdr(1) + b"z" * 500], 7)
+    big = rechunk_36([hdr(0) + b"z" * 1368, hdr(1) + b"z" * 500], 7)
     ok = ok and len(r14) == 1 and struct.unpack_from("<I", r14[0], 32)[0] == 123456 and ent_hdr_len(r14[0]) == 36         and rows14 == rows and [len(d) - 36 for d in big] == [1364, 504] and struct.unpack_from("<HH", big[1], 28) == (1, 2)
     g = rows.get((2, 0, 0xABCDEF0123)); sh = rows.get((1, 1, (1 << 32) | 9))
     ok = ok and len(rows) == 2 and g and sh and g["hp"] == 77 and g["arch"] == 412 and g["first"] == (1.0, 2.0, 3.0) and sh["first"] == (4.0, 5.0, 6.0)
-    print(f"[tap] selftest: {'PASS' if ok else 'FAIL'} (file round trip, classification, summary, entity decode across chunks, anim block, proto 14 re-split)")
+    # proto 15, --as-proto 15: a proto 13 tap (two-chunk snapshot, player with hostTimeMs 0) and a proto 14 tap
+    # (36 B header, hostMs already set) both come out as proto 15 datagrams that decode to the same rows
+    def ps(proto, host_ms=0):
+        d = bytearray(lp.player_state(3, proto)); d[565:569] = struct.pack("<I", host_ms); return bytes(d)
+    pend = {}
+    out13 = convert(ps(13), "player", 15, pend, 999) + convert(hdr(0) + body[:20], "entity", 15, pend, 4242) \
+        + convert(hdr(1) + body[20:], "entity", 15, pend, 4242)
+    p13, e13 = out13[0], out13[1:]
+    ok15a = (len(out13) == 2 and struct.unpack_from("<I", p13, 4)[0] == 15 and struct.unpack_from("<I", p13, 565)[0] == 999
+             and all(struct.unpack_from("<I", d, 4)[0] == 15 and ent_hdr_len(d) == 36 and struct.unpack_from("<I", d, 32)[0] == 4242
+                     for d in e13)
+             and entity_table([(0.0, d) for d in e13]) == rows and not pend)
+    e14 = r14[0]   # a proto 14 snapshot: hostMs 123456, 36 B header
+    out14 = convert(ps(14, 555), "player", 15, pend, 999) + convert(e14, "entity", 15, pend, 4242)
+    ok15b = (len(out14) == 2 and struct.unpack_from("<I", out14[0], 4)[0] == 15 and struct.unpack_from("<I", out14[0], 565)[0] == 555
+             and out14[1] == e14[:4] + struct.pack("<I", 15) + e14[8:] and entity_table([(0.0, out14[1])]) == rows)
+    ok15c = convert(e14, "entity", 0, pend, 1) == [e14] and convert(b"AC4I" + bytes(24), "intent", 15, pend, 1) == [b"AC4I" + bytes(24)]
+    # proto 15 intent datagrams: classified, counted, decoded; a truncated one still classifies but decodes to nothing
+    gold = bytes.fromhex(lp.INTENT_GOLDEN_HEX)
+    si = summarize([(0.0, gold), (0.1, gold[:40]), (0.2, lp.player_state(4))])
+    ok15d = kind(gold) == "intent" and si["intent"] == 2 and si["intent_msgs"] == 1 and si["player"] == 1 and si["other"] == 0
+    ok15 = ok15a and ok15b and ok15c and ok15d
+    ok = ok and ok15
+    print(f"[tap] selftest: {'PASS' if ok else 'FAIL'} (file round trip, classification, summary, entity decode across chunks, anim block, "
+          f"proto 14 re-split, proto 15: 13->15 {'ok' if ok15a else 'FAIL'}, 14->15 {'ok' if ok15b else 'FAIL'}, "
+          f"passthrough {'ok' if ok15c else 'FAIL'}, intent datagrams {'ok' if ok15d else 'FAIL'})")
     return 0 if ok else 1
 
 
@@ -422,7 +463,8 @@ def main(argv):
             p.add_argument("--player-only", action="store_true", help="send only PlayerState datagrams (no entity/kill lane): "
                            "replaying a host recording into a host game, where recorded kills would kill real guards")
             p.add_argument("--as-proto", type=int, default=0, help="rewrite each datagram's protoVer (play an older recording "
-                           "into a newer build; proto 13 only ADDED the optional EF_ANIM block)")
+                           "into a newer build; proto 13 only ADDED the optional EF_ANIM block; 13 -> 14/15 re-splits "
+                           "entity snapshots with the 36 B header; 14 -> 15 changes protoVer only)")
     i = sub.add_parser("info"); i.add_argument("file"); i.add_argument("--entities", action="store_true", help="list every entity the stream names")
     a = ap.parse_args(argv)
     if a.cmd in ("record", "replay") and a.role == "join" and not a.code:
