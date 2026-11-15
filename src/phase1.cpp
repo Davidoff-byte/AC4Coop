@@ -8122,6 +8122,47 @@ static void OwnReport() {
       s_ownPhysMs, pw2, cf, cg, ca, cf ? 100.0 * ca / cf : 0.0, co, (long)s_cxOtherId, mf, mm, mi, mf ? 100.0 * mi / mf : 0.0, pairs);
 }
 
+// ---- Guard take-over bookkeeping ([Coop] BindLock on; stage 1 of docs/design/storm-replication.md 4b) ------------------
+// A linked guest body IS the host guard's copy: ApplyGuards already turns its behaviour off and clears the drive flag
+// every packet (below). Code map 2026-11-16: only the wide-bind stale-slot release gave the body back to the local AI;
+// every other unlink (GuestObjForget, repoint, slot releases) left it a statue. So every body taken over is noted here,
+// and the 5 s sweep returns any body that is no longer linked and still alive to its own AI, with the same two writes
+// as the stale-slot release. Counted on the [Bind] takeover line.
+static unsigned int s_toEnt[256]; static int s_toN = 0; static LONG s_toReturned = 0, s_toGone = 0, s_toDead = 0;
+static void TakeoverNote(Entity* e) {
+    if (!BindLockOn() || !e) return;
+    for (int i = 0; i < s_toN; ++i) if (s_toEnt[i] == (unsigned int)e) return;
+    if (s_toN < 256) s_toEnt[s_toN++] = (unsigned int)e;
+}
+static void TakeoverSweep() {
+    if (!BindLockOn()) return;
+    World* w = World::GetCurrentWorld(); Entity* player = w ? w->GetPlayer() : nullptr;
+    int taken = 0;
+    for (int i = 0; i < s_toN;) {
+        const unsigned int ent = s_toEnt[i]; bool drop = false;
+        if (GuestObjEntGone(ent)) { ++s_toGone; drop = true; }
+        else if (GuestObjOfEnt(ent)) ++taken;
+        else if (MirrorKilledLocally((void*)ent)) { ++s_toDead; drop = true; }
+        else {
+            __try {
+                Entity* re = (Entity*)ent;
+                Component* rb = MirrorCandidateBhv(re, player);
+                if (rb && readable(rb, 0x40)) ((Component*)rb)->SetEnabled(true);
+                Human* rh = AIEntityHelper::GetHuman(re);
+                if (rh && readable(rh, 4)) {
+                    CharacterController* rcc = (CharacterController*)rh->GetCharacterComponent();
+                    if (readable(rcc, 0x600)) rcc->m_DriveEntity = true;
+                }
+                ++s_toReturned;
+                L("[Bind] returned ent=%08X to local AI (no longer linked)\n", ent);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
+            drop = true;
+        }
+        if (drop) s_toEnt[i] = s_toEnt[--s_toN]; else ++i;
+    }
+    L("[Bind] takeover takenOver=%d returnedToAI=%ld dropped(bodyGone=%ld deadLocally=%ld)\n", taken, s_toReturned, s_toGone, s_toDead);
+}
+
 static void ApplyGuards(const EntityPacket& pkt) {
     World* world = World::GetCurrentWorld();
     if (!world) return;
@@ -8413,6 +8454,7 @@ static void ApplyGuards(const EntityPacket& pkt) {
             // behaviour/anim graph pop.
             if (!locallyDead && bestBhv && readable(bestBhv, 0x40) && ((Component*)bestBhv)->GetEnabled())
                 ((Component*)bestBhv)->SetEnabled(false);
+            if (!locallyDead) TakeoverNote(best);   // [Coop] BindLock: remembered so an unlink returns it to its AI
             Human* bh = AIEntityHelper::GetHuman(best);
             if (!locallyDead && bh && readable(bh, 4)) {
                 CharacterController* cc = (CharacterController*)bh->GetCharacterComponent();
@@ -12478,7 +12520,7 @@ static void OnFrameInner(Human* updatedHuman) {
                       s_bindRejBhv, s_bindRejAi, s_bindRejHp, s_bindRejArch, s_bindRejTaken,
                       s_bindUnmatched, (s_bindMinD < 1e8f) ? sqrtf(s_bindMinD) : -1.0f);
                 WideBindReport();
-                if (!g_entHost) BindReport();   // guest only: the guest objId table is the link table
+                if (!g_entHost) { BindReport(); TakeoverSweep(); }   // guest only: the guest objId table is the link table
                 OwnReport();
                 L("[Mirror] actions on=%d calls=%u deferred=%d queued=%u applied=%ld expired=%ld noSlot=%u\n",
                   MirrorActionsEnabled() ? 1 : 0, s_mirrorActionCalls, MirrorActionsDeferred() ? 1 : 0, s_maqQueued,
