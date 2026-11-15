@@ -19,6 +19,7 @@ journal and handoff in `docs/archive/`. Update it in the same PR as any change t
 | ship mirror | a duplicated local ship carries the peer's hull HP (`GcLShip+0xD0`) and transform | live |
 | body spawn | engine `EntityBuilder` + duplicated `RowSelector` spawns a second Edward | in game |
 | event layer | exactly-once delivery under 30 % loss | `tools/event_peer.py` selftest (`05eb0c6`), Python only |
+| two copies on one PC | two `AC4BFSP.exe` running at once, both started directly from the exe (no Steam), with `proxy/version` `version.dll` | live 2026-11-15, pids 25788 + 26200 (`docs/evidence/single-instance-guard-2026-11-15.md`); render and co-op between them not yet checked |
 
 ## Measured negatives
 - Guards do not perceive the other player's body, with or without collision. `docs/ops/P6-RESULT.md`, `RUN-2026-11-10-X2b`.

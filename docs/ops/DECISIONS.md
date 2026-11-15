@@ -223,6 +223,12 @@ requiring a second rendered world. Those stay gated on a second machine.
 *Consequences:* E0-A is retired; E0-B (synthetic peer) is the transport gate. D-018 stays
 — the marker is still the correct mechanism for a VM or a second PC later.
 
+*Revisited 2026-11-15:* the premise is false for **direct starts**. With the `proxy/version` `version.dll` in the game folder,
+two `AC4BFSP.exe` copies started directly from the exe (no arguments, no Steam) ran at the same time (pids 25788 + 26200,
+`docs/evidence/single-instance-guard-2026-11-15.md`). Second copies started next to a **Steam-started** copy
+(`-uplay_steam_mode`) still exited with code 0. Same-PC two-instance runs are available again for tests, so D-011 can be
+decided from real logs. D-019's synthetic peer stays useful as the deterministic transport test.
+
 ## D-010 — `py -3` is fine, `python` is not — **accepted**
 
 *Context:* the audit rig initially assumed the `py` launcher was broken. It is not;
