@@ -67,3 +67,19 @@ default 0, re-read every 2 s). Solo replay only; not two-machine tested.
 - Next: (1) find why `ReadClimbMove` fails on the replica (dump the failing step); (2) make the replica pick the peer's
   candidate inside the shimmy creator (`sub_1B64320` candidate loop: choose the candidate whose position on the guidance is
   nearest the peer's hold) instead of steering by direction; (3) align the climb entry (same first hold as the peer).
+
+## Candidate choice in the shimmy creator (`[Coop] NativeReplicaClimbChoice`, default 0) - negative
+- Seam (static, IDA): generator `sub_1B509A0` is `__thiscall` (ecx = the shimmy creator's `this`, 7 stack args, `retn 1Ch`
+  at 0x01B50CC2 / 0x01B50CCF; only caller 0x01B64BD1 in `sub_1B64320`); it reads the movement definitions from a global
+  table (`dword_4E38B10`, count `word_4E38B16`: same data in both games) and returns a sorted array (+0 pointer, +6 u16
+  count) of 32-byte candidates (+0x10 position). The creator takes the first candidate passing its direction test
+  (threshold `dword_2A8902C`, loop at 0x01B64BF0); its Human is `*(this+0xC)` (0x01B6436C). The hook moves the candidate
+  nearest either hand of the peer's target move to the front, on the replica's calls only.
+- Run (asi `c7eaefe130e3f62e45e86037b9752da441b90a2e767eba2f4eebb4f0da5185b0`, pid 30680, `host-climbmoves-1.tap`,
+  `abmoves.sh ... 1:1 1:0 1:1 1:0 1:1 1:0` = moves+choice vs moves only): the hook installed and ran (467 generator calls),
+  but only 19 were the replica's, and in all 19 the nearest candidate was already first (`moved=0`). On-wall error
+  0.97 / 0.92 / 1.06 m (choice) vs 0.93 / 0.95 m (moves only; run 6 never reached the wall - the replica got one wall-run
+  entry - as in run 4 of the first A/B; a harness/state problem seen in both modes, excluded). No crash.
+- Reading: the replica's own top candidate already matches the peer's hold; the divergence is not in the shimmy choice.
+- Same build, why `ReadClimbMove` fails on the replica (failing step, 3 runs with moves on): step 5 (newest move's vtable
+  is not 0x0271F7E8) ~80 %, step 9 (one hand target only) ~15 %, step 6 (limb count) ~4 %.

@@ -1,6 +1,7 @@
 #!/bin/bash
-# One-off: produced the A/B run table in docs/evidence/climb-moves-2026-11-15.md (paths are the owner's machine)
-# abmoves.sh <pid> <tap> <seconds> <modes...>: replay <tap> once per mode with [Coop] NativeReplicaClimbMoves=<mode>, print log ranges
+# One-off: produced the A/B run tables in docs/evidence/climb-moves-2026-11-15.md (paths are the owner's machine)
+# abmoves.sh <pid> <tap> <seconds> <modes...>: replay <tap> once per mode; mode = M or M:C sets [Coop] NativeReplicaClimbMoves=M
+# (and NativeReplicaClimbChoice=C); prints the log range and summary per run
 pid=$1; tap=$2; secs=$3; shift 3
 G="D:/SteamLibrary/steamapps/common/Assassin's Creed IV Black Flag"
 L="$G/phase1_log_$pid.txt"; S="C:/Users/ADMINI~1/AppData/Local/Temp/claude/99b29c06899e5d90/a9873050-163f-4ce2-8854-2150b537f94e/scratchpad"
@@ -8,7 +9,8 @@ cd "/c/Users/Administrator/Documents/Default Project/projects/assassins-creed/bf
 i=0
 for m in "$@"; do
   i=$((i+1))
-  sed -i "s/^NativeReplicaClimbMoves=.*/NativeReplicaClimbMoves=$m/" "$G/AC4Coop.ini"
+  mv_=${m%%:*}; ch_=0; [ "$m" != "$mv_" ] && ch_=${m#*:}
+  sed -i "s/^NativeReplicaClimbMoves=.*/NativeReplicaClimbMoves=$mv_/; s/^NativeReplicaClimbChoice=.*/NativeReplicaClimbChoice=$ch_/" "$G/AC4Coop.ini"
   py -3 tools/pilot.py --pid $pid goto 80 -76 > /dev/null 2>&1
   sleep 3
   a=$(wc -l < "$L")

@@ -8,6 +8,7 @@
 #include "action_writer.h"
 #include "guard_sight.h"
 #include "event_probe.h"
+#include "../third_party/minhook/include/MinHook.h"
 #include "puppet_stim.h"
 #include "pilot.h"
 #include "react_probe.h"
@@ -253,19 +254,22 @@ bool readable(const void* p, size_t n) {
 // (vtable 0x01E5C448): +0x70 grab point (Vector4), +0x10 handle container whose +0xC is the climbed entity's ObjectID.
 // Limbs 0 / 1 are the hands (run 33660: both at ledge height ~0.8 m apart; limbs 2 / 3 ~1.3 m lower).
 struct ClimbMoveRead { const void* move; uint32_t w; float hand[2][3]; uint64_t objectId; };
-static bool ReadClimbMove(const void* human, ClimbMoveRead& o) {
+static int ReadClimbMoveStep(const void* human, ClimbMoveRead& o) {   // 0 = ok, else the failing step (diagnostics)
     auto u = [](const void* a) -> uint32_t { return readable(a, 4) ? *(const uint32_t*)a : 0u; };
     const char* mgr = (const char*)(uintptr_t)u((const char*)human + 0x818);
-    if (!readable(mgr, 0xE58) || *(const uint32_t*)mgr != 0x026BCD70u) return false;
+    if (!readable(mgr, 0xE58)) return 1;
+    if (*(const uint32_t*)mgr != 0x026BCD70u) return 2;
     const uint32_t w = *(const uint32_t*)(mgr + 0xE50);
     const char* ring = (const char*)(uintptr_t)*(const uint32_t*)(mgr + 0xE40);
-    if (!readable(ring, 4 * 0x350)) return false;
+    if (!readable(ring, 4 * 0x350)) return 3;
     const char* mv = (const char*)(uintptr_t)u(ring + 0x350 * ((w - 1) & 3) + 0x314);
-    if (!readable(mv, 0x2B0) || *(const uint32_t*)mv != 0x0271F7E8u) return false;
+    if (!readable(mv, 0x2B0)) return 4;
+    if (*(const uint32_t*)mv != 0x0271F7E8u) return 5;
     const char* tg = (const char*)(uintptr_t)*(const uint32_t*)(mv + 0x2A0);
     const char* items = (const char*)(uintptr_t)*(const uint32_t*)(mv + 0x2A8);
     const uint16_t n = *(const uint16_t*)(mv + 0x2AE);
-    if (n < 2 || n > 8 || !readable(items, 16u * n) || !readable(tg, 48)) return false;
+    if (n < 2 || n > 8) return 6;
+    if (!readable(items, 16u * n) || !readable(tg, 48)) return 7;
     int got = 0; o.objectId = 0;
     for (uint16_t i = 0; i < n; ++i) {
         const uint32_t limb = *(const uint32_t*)(items + 16 * i);
@@ -281,10 +285,11 @@ static bool ReadClimbMove(const void* human, ClimbMoveRead& o) {
         if (readable(hc, 0x14)) o.objectId = *(const uint64_t*)(hc + 0xC);
         got |= 1 << limb;
     }
-    if (got != 3) return false;
+    if (got != 3) return got == 0 ? 8 : 9;
     o.move = mv; o.w = w;
-    return true;
+    return 0;
 }
+static bool ReadClimbMove(const void* human, ClimbMoveRead& o) { return ReadClimbMoveStep(human, o) == 0; }
 
 // Compact blend-array log: only the non-zero slots as "idx:val" (46 slots, most are 0 at any time).
 static void FormatBlendSlots(const float* bf, int n, char* out, size_t cap) {
@@ -1688,7 +1693,56 @@ static volatile int g_nrLatestCtx = 4;     // newest packet's contextId
 static volatile bool g_nrClimbValid = false; static float g_nrClimbIn[3] = { 0, 0, 0 };   // newest packet's ClimbBlock
 static volatile LONG s_nrClimbReal = 0, s_nrClimbDerived = 0, s_nrClimbHold = 0, s_nrHoldPush = 0, s_nrHoldReached = 0, s_nrHoldDropped = 0;
 // [Coop] NativeReplicaClimbMoves: queue of the peer's climbing holds (hand midpoint per move, oldest first).
-struct NrHold { uint32_t seq; float m[3]; uint64_t obj; uint64_t ms; };
+struct NrHold { uint32_t seq; float m[3]; float h[2][3]; uint64_t obj; uint64_t ms; };
+// [Coop] NativeReplicaClimbChoice (default 0, re-read every 2 s; docs/evidence/climb-moves-2026-11-15.md): make the
+// replica's shimmy creator pick the peer's hold. Seam: the candidate generator sub_1B509A0 (__thiscall, 7 stack args,
+// retn 1Ch: 0x01B50CC2 / 0x01B50CCF; only caller 0x01B64BD1 in the shimmy creator sub_1B64320 with ecx = the creator's
+// this). Its output (arg 0) is an array header: +0 pointer to 32-byte candidates (CandidateCoreMovement: +0 definition*,
+// +4 score, +0x10 position on the guidance), +6 u16 count, sorted best first (sub_1B4AC80 with comparator sub_1B216C0).
+// The creator takes the FIRST candidate whose direction from the moving hand passes its input test (threshold
+// dword_2A8902C, loop at 0x01B64BF0). Its Human is *(this+0xC) (0x01B6436C: mov ecx,[ecx+0Ch]; call sub_169AE70 =
+// *(Human+0x818)). On the replica's calls only, the candidate nearest either hand target of the peer's target move is
+// moved to the front; the engine still tests and builds it itself.
+static SRWLOCK s_ccLock = SRWLOCK_INIT; static volatile LONG g_ccArmed = 0; static void* volatile g_ccHuman = nullptr;
+static float g_ccHand[2][3] = {};
+static volatile LONG s_ccCalls = 0, s_ccReplica = 0, s_ccMoved = 0, s_ccAlready = 0;
+typedef char (__thiscall* CandGen_t)(void*, void*, void*, int, void*, void*, int, int);
+static CandGen_t g_origCandGen = nullptr;
+static char __fastcall MyCandGen(void* self, void* /*edx*/, void* out, void* elem, int a5, void* a6, void* a7, int a8, int a9) {
+    const char r = g_origCandGen(self, out, elem, a5, a6, a7, a8, a9);
+    InterlockedIncrement(&s_ccCalls);
+    if (!r || !g_ccArmed || !readable((char*)self + 0xC, 4) || *(void**)((char*)self + 0xC) != g_ccHuman || !readable(out, 8)) return r;
+    InterlockedIncrement(&s_ccReplica);
+    char* arr = *(char**)out; const uint16_t n = *(const uint16_t*)((const char*)out + 6);
+    if (n < 2 || n > 64 || !readable(arr, 32u * n)) return r;
+    float hd[2][3];
+    AcquireSRWLockShared(&s_ccLock); memcpy(hd, g_ccHand, sizeof hd); ReleaseSRWLockShared(&s_ccLock);
+    int best = 0; float bd = 1e9f;
+    for (int k = 0; k < n; ++k) {
+        const float* q = (const float*)(arr + 32 * k + 0x10);
+        for (int j = 0; j < 2; ++j) {
+            const float dx = q[0] - hd[j][0], dy = q[1] - hd[j][1], dz = q[2] - hd[j][2], d = dx * dx + dy * dy + dz * dz;
+            if (d < bd) { bd = d; best = k; }
+        }
+    }
+    if (best == 0) { InterlockedIncrement(&s_ccAlready); return r; }
+    uint8_t tmp[32]; memcpy(tmp, arr + 32 * best, 32); memmove(arr + 32, arr, 32 * best); memcpy(arr, tmp, 32);
+    InterlockedIncrement(&s_ccMoved);
+    return r;
+}
+static bool InstallCandGenHook() {
+    static int s_state = 0;   // 0 untried, 1 installed, -1 failed
+    if (s_state) return s_state == 1;
+    s_state = -1;
+    static const uint8_t kWant[16] = { 0x53, 0x8B, 0xDC, 0x83, 0xEC, 0x08, 0x83, 0xE4, 0xF0, 0x83, 0xC4, 0x04, 0x55, 0x8B, 0x6B, 0x04 };
+    void* va = (void*)(uintptr_t)0x01B509A0;
+    if (!readable(va, 16) || memcmp(va, kWant, 16) != 0) { L("[Replica] climb choice: generator bytes differ -> not installed\n"); return false; }
+    const MH_STATUS si = MH_Initialize();
+    if (si != MH_OK && si != MH_ERROR_ALREADY_INITIALIZED) { L("[Replica] climb choice: MH_Initialize %d\n", (int)si); return false; }
+    if (MH_CreateHook(va, (void*)&MyCandGen, (void**)&g_origCandGen) != MH_OK || MH_EnableHook(va) != MH_OK) { L("[Replica] climb choice: hook failed\n"); return false; }
+    L("[Replica] climb choice: generator 0x01B509A0 hooked\n");
+    s_state = 1; return true;
+}
 static SRWLOCK s_nrHoldLock = SRWLOCK_INIT; static NrHold s_nrHolds[32]; static int s_nrHoldN = 0; static uint32_t s_nrHoldSeq = 0;
 static volatile LONG s_nrWallTries = 0, s_nrWallOk = 0;
 static volatile LONG s_nrExitReq = 0;   // set by the snap path, served on the puppet's own update   // newest packet's HumanGroundData destMvt (+0x125, IHumanGround slot 3)
@@ -1956,6 +2010,7 @@ static void NativeReplicaNavTick(Entity* e) {
     // replace this once the intention lane carries it.
     static int s_ciOn = -1;
     if (s_ciOn < 0) s_ciOn = GetPrivateProfileIntA("Coop", "NativeReplicaClimbIntent", 0, Paths::Ini()) != 0 ? 1 : 0;
+    InterlockedExchange(&g_ccArmed, 0);   // armed again below only while both climb and a peer hold is the target
     if (s_ciOn == 1 && s_nrOn == 1 && e && g_nrLatestCtx == 30) {
         Human* ch = AIEntityHelper::GetHuman(e);
         if (ch && ch->GetCurrentContextID(MAIN_AI_TRACK) == 30) {
@@ -1983,7 +2038,9 @@ static void NativeReplicaNavTick(Entity* e) {
                 { const uint64_t tn = GetTickCount64(); if (tn >= s_cmNext) { s_cmNext = tn + 2000; s_cmOn = GetPrivateProfileIntA("Coop", "NativeReplicaClimbMoves", 0, Paths::Ini()) != 0; } }
                 bool held = false;
                 ClimbMoveRead rm;
-                if (s_cmOn && !ReadClimbMove(ch, rm)) ++s_cmNoRead;
+                static LONG s_cmFail[10] = {};
+                const int rstep = s_cmOn ? ReadClimbMoveStep(ch, rm) : 0;
+                if (s_cmOn && rstep) { ++s_cmNoRead; ++s_cmFail[rstep]; }
                 else if (s_cmOn) {
                     const float rmx = 0.5f * (rm.hand[0][0] + rm.hand[1][0]), rmy = 0.5f * (rm.hand[0][1] + rm.hand[1][1]), rmz = 0.5f * (rm.hand[0][2] + rm.hand[1][2]);
                     NrHold hd = {}; bool have = false;
@@ -2003,6 +2060,12 @@ static void NativeReplicaNavTick(Entity* e) {
                         if (s_nrHoldN) { hd = s_nrHolds[0]; have = true; }
                     }
                     ReleaseSRWLockExclusive(&s_nrHoldLock);
+                    static int s_chOn = 0; static uint64_t s_chNext = 0;
+                    { const uint64_t tn = GetTickCount64(); if (tn >= s_chNext) { s_chNext = tn + 2000; s_chOn = GetPrivateProfileIntA("Coop", "NativeReplicaClimbChoice", 0, Paths::Ini()) != 0; } }
+                    if (s_chOn && have && InstallCandGenHook()) {
+                        AcquireSRWLockExclusive(&s_ccLock); memcpy(g_ccHand, hd.h, sizeof g_ccHand); g_ccHuman = ch; ReleaseSRWLockExclusive(&s_ccLock);
+                        InterlockedExchange(&g_ccArmed, 1);
+                    } else InterlockedExchange(&g_ccArmed, 0);
                     if (have) {
                         const float dx = hd.m[0] - rmx, dy = hd.m[1] - rmy, dz = hd.m[2] - rmz;
                         const float hx = dx * rx + dy * ry, hy = dz, hm = sqrtf(hx * hx + hy * hy);
@@ -2022,9 +2085,9 @@ static void NativeReplicaNavTick(Entity* e) {
                 const uint64_t cnow = GetTickCount64();
                 if (cnow >= s_ciNext) {
                     s_ciNext = cnow + 2000;
-                    L("[Replica] climb intent: frames=%ld mean |err on wall|=%.2f m last x=%.2f y=%.2f -> v=(%.2f,%.2f) speed %.2f | real=%ld derived=%ld peerBlock=%d | moves on=%d noread=%ld hold=%ld queued=%d pushed=%ld reached=%ld dropped=%ld\n",
+                    L("[Replica] climb intent: frames=%ld mean |err on wall|=%.2f m last x=%.2f y=%.2f -> v=(%.2f,%.2f) speed %.2f | real=%ld derived=%ld peerBlock=%d | moves on=%d noread=%ld (steps 1-9: %ld %ld %ld %ld %ld %ld %ld %ld %ld) hold=%ld queued=%d pushed=%ld reached=%ld dropped=%ld | choice gen=%ld replica=%ld moved=%ld already=%ld\n",
                       s_ciN, s_ciN ? s_ciSum / s_ciN : 0.0f, x, y, v[0], v[1], sp, s_nrClimbReal, s_nrClimbDerived, g_nrClimbValid ? 1 : 0,
-                      s_cmOn, s_cmNoRead, s_nrClimbHold, s_nrHoldN, s_nrHoldPush, s_nrHoldReached, s_nrHoldDropped);
+                      s_cmOn, s_cmNoRead, s_cmFail[1], s_cmFail[2], s_cmFail[3], s_cmFail[4], s_cmFail[5], s_cmFail[6], s_cmFail[7], s_cmFail[8], s_cmFail[9], s_nrClimbHold, s_nrHoldN, s_nrHoldPush, s_nrHoldReached, s_nrHoldDropped, s_ccCalls, s_ccReplica, s_ccMoved, s_ccAlready);
                     s_ciN = 0; s_ciSum = 0.0f;
                 }
             }
@@ -11556,7 +11619,7 @@ static void DumpConfigOnce()
         { "Coop", "FloatProbe", 0 }, { "Coop", "FootOffsetFix", 0 }, { "Coop", "GuardActionGate", 0 }, { "Coop", "GuardExtrapMs", 100 },
         { "Coop", "GuardInterpBuffer", 0 }, { "Coop", "GuardInterpDelayMs", 120 }, { "Coop", "GuardPhaseLock", 0 },
         { "Coop", "GuardSeesPuppet", 0 }, { "Coop", "PuppetActionReassert", 0 }, { "Coop", "PuppetHostTime", 0 },
-        { "Coop", "AlertQueryAsPlayer", 0 }, { "Coop", "ConflictNullGuard", 0 }, { "Coop", "ConflictKeepPuppet", 0 }, { "Coop", "GuardPoiFightTarget", 0 }, { "Coop", "FightOrderPuppet", 0 }, { "Coop", "DespawnLeaveFight", 0 }, { "Coop", "FightKeepOnConflictEnd", 0 }, { "Coop", "FightStateProbe", 0 }, { "Coop", "PuppetNavService", 0 }, { "Coop", "NativeReplica", 0 }, { "Coop", "NativeReplicaSnapCm", 300 }, { "Coop", "NativeReplicaBlendCmS", 150 }, { "Coop", "NativeReplicaStartBoostCmS", 400 }, { "Coop", "NativeReplicaParkour", 0 }, { "Coop", "NativeReplicaFreeRun", 0 }, { "Coop", "NativeReplicaClimbIntent", 0 }, { "Coop", "NativeReplicaClimbMoves", 0 }, { "Coop", "NativeReplicaParkourSnapCm", 800 }, { "Coop", "FightProbe", 0 }, { "Coop", "PeerLastPacket", 0 }, { "Coop", "PuppetActionsOwnUpdate", 0 }, { "Coop", "DetectKeepTarget", 0 }, { "Coop", "GuardPlayerOfInterest", 0 }, { "Coop", "EventProbe", 0 }, { "Coop", "ReactProbe", 0 }, { "Coop", "FightSkipPuppet", 0 }, { "Coop", "NavNullGuard", 0 }, { "Coop", "PuppetStimMode", 1 }, { "Coop", "PuppetStimSeq", 0 }, { "Coop", "PuppetStimSource", 0 }, { "Coop", "SightProbe", 0 }, { "Coop", "StateProbe", 0 }, { "Coop", "StuckProbe", 0 },
+        { "Coop", "AlertQueryAsPlayer", 0 }, { "Coop", "ConflictNullGuard", 0 }, { "Coop", "ConflictKeepPuppet", 0 }, { "Coop", "GuardPoiFightTarget", 0 }, { "Coop", "FightOrderPuppet", 0 }, { "Coop", "DespawnLeaveFight", 0 }, { "Coop", "FightKeepOnConflictEnd", 0 }, { "Coop", "FightStateProbe", 0 }, { "Coop", "PuppetNavService", 0 }, { "Coop", "NativeReplica", 0 }, { "Coop", "NativeReplicaSnapCm", 300 }, { "Coop", "NativeReplicaBlendCmS", 150 }, { "Coop", "NativeReplicaStartBoostCmS", 400 }, { "Coop", "NativeReplicaParkour", 0 }, { "Coop", "NativeReplicaFreeRun", 0 }, { "Coop", "NativeReplicaClimbIntent", 0 }, { "Coop", "NativeReplicaClimbMoves", 0 }, { "Coop", "NativeReplicaClimbChoice", 0 }, { "Coop", "NativeReplicaParkourSnapCm", 800 }, { "Coop", "FightProbe", 0 }, { "Coop", "PeerLastPacket", 0 }, { "Coop", "PuppetActionsOwnUpdate", 0 }, { "Coop", "DetectKeepTarget", 0 }, { "Coop", "GuardPlayerOfInterest", 0 }, { "Coop", "EventProbe", 0 }, { "Coop", "ReactProbe", 0 }, { "Coop", "FightSkipPuppet", 0 }, { "Coop", "NavNullGuard", 0 }, { "Coop", "PuppetStimMode", 1 }, { "Coop", "PuppetStimSeq", 0 }, { "Coop", "PuppetStimSource", 0 }, { "Coop", "SightProbe", 0 }, { "Coop", "StateProbe", 0 }, { "Coop", "StuckProbe", 0 },
         { "Coop", "StageLog", 0 }, { "Coop", "SyncEnemiesOnly", 1 }, { "Coop", "SyncMaxEntities", 32 },
         { "Coop", "SyncRadiusM", 60 }, { "Coop", "TransformProbe", 0 }, { "Coop", "VPadEnable", 0 },
         { "Coop", "VPadTest", 0 }, { "Coop", "WatchDeadBit", 0 }, { "Coop", "WatchTarget", 0 },
@@ -11991,10 +12054,11 @@ static void OnFrameInner(Human* updatedHuman) {
                               if (s_nrHoldN == 32) { memmove(s_nrHolds, s_nrHolds + 1, sizeof(NrHold) * 31); --s_nrHoldN; InterlockedIncrement(&s_nrHoldDropped); }
                               NrHold& nh = s_nrHolds[s_nrHoldN++]; nh.seq = cb.moveSeq; nh.obj = cb.objectId; nh.ms = GetTickCount64();
                               for (int k = 0; k < 3; ++k) nh.m[k] = 0.5f * (cb.hand[0][k] + cb.hand[1][k]);
+                              memcpy(nh.h, cb.hand, sizeof nh.h);
                               InterlockedIncrement(&s_nrHoldPush);
                           } else if (cb.moveSeq && s_nrHoldN) {   // same move: its targets may have settled since the first packet
                               NrHold& nh = s_nrHolds[s_nrHoldN - 1];
-                              if (nh.seq == cb.moveSeq) for (int k = 0; k < 3; ++k) nh.m[k] = 0.5f * (cb.hand[0][k] + cb.hand[1][k]);
+                              if (nh.seq == cb.moveSeq) { for (int k = 0; k < 3; ++k) nh.m[k] = 0.5f * (cb.hand[0][k] + cb.hand[1][k]); memcpy(nh.h, cb.hand, sizeof nh.h); }
                           }
                           ReleaseSRWLockExclusive(&s_nrHoldLock); } }
         const bool haveRaw = s_plpOn ? s_haveLastRaw : gotRaw;
