@@ -92,6 +92,20 @@ Climb reproduced with the Pilot (stick offset re-learned per attempt: `goto ... 
    (`TargetedGuidance::Type`): 1 HorizontalLedge, 2 HorizontalPole, 3/4 VerticalCrackLeft/Right, 5 HangFork.
    `HandsConfiguration::Type`: 1 OneHandLeft ... 3 Closed, 4 OpenedHorizontal, 5-8 opened diagonal/vertical.
 
+8. **Initial grab** (wall run -> hang, run 8744): moves were built by the base ctor from **0x015686E8** (`sub_15680C0`, climbing
+   context band) and **0x01B620F9** (`sub_1B61C40`), not by the shimmy creator. `sub_15680C0` loops over 44-byte entries of an
+   array at `a3+0xA4` (+0 id passed to `sub_652220` / `sub_1C34200`, +0x10 type 1-7 mapped to the move kind, +0x18 / +0x20
+   per-limb data) - a data list of contacts carried by the playing action (source of `a3` not traced). The mantle onto the
+   ledge top (stick up) created no climb move and no new candidates: a different mechanism (context transition, UNVERIFIED).
+9. **Guidance identity** (Edward hanging at (34.87,-81.31,4.87)): newest record -> move 0x45393620 -> per-limb items (limb 0 ->
+   target index 1, limb 1 -> index 2; sub-item type 2) -> 48-byte targets: type 0, `+8 = 0x07831600`, index -1, and a
+   ref-counted object at +0x14 (0x34326980, vtable 0x01E5C448, 0xE0 bytes, ctor `sub_6577A0`, built by `sub_524800` /
+   `sub_524980` / `sub_524B00`). That object holds the **grab point** at +0x70 (34.87,-81.31,7.27 = the ledge at Edward's x),
+   `+0x60 = 0x53B5`, and at +0x10 the **handle of the climbed entity** (ctor copies `a4[50]` = Entity+0xC8). Live: handle
+   container 0x3074FA74 = {object 0x34A54C10 (Entity, vt 0x01E4CE90, at (37.0,-84.0,3.6)), refs, **ObjectID
+   0x0000000A0D0158CD**}. A world-data ObjectID is the same in both games, so a climb target can be named as (climbed entity
+   ObjectID, guidance element, position). Meaning of `+8 = 0x07831600` and `+0x60 = 0x53B5` UNVERIFIED (element index?).
+
 So a shimmy step is fully described by **(definition index, position on the guidance)** plus the guidance it lies on; that
 is what R4.3 would send. UNVERIFIED: that the definition table is identical in both games (same assets, so expected), how
 the replica side reaches the table (the generator's inputs), and the other 11 move types (climb up, jump, ...).
