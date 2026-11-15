@@ -4702,20 +4702,49 @@ static void GuestObjStore(int slot, uint64_t objId, unsigned int ent) {
     s_guestObjStamp[slot]  = ++s_guestObjClock;
 }
 
+// ---- [Coop] BindLock: a host guard keeps the guest body it was first linked to ---------------------------------------
+// Default: on when [Coop] FightIntents=1, else off; [Coop] BindLock overrides. Read once per session (S3 follow-up,
+// docs/evidence/s3-guard-identity-2026-11-16.md: a live ini re-read dropped the wide bind to 0 mid-run). With the lock on:
+// a live link is never re-pointed to another body, and a body never plays two host guards; a link is replaced only once
+// its body is gone. Counted for the [Bind] line (BindReport).
+static int s_bindLock = -1;
+static LONG s_bindAdded = 0, s_bindRepoint = 0, s_bindBlockedRepoint = 0, s_bindBlockedDouble = 0, s_bindReplacedGone = 0,
+            s_bindDropEvicted = 0, s_bindDropForgot = 0;
+static bool BindLockOn() {
+    if (s_bindLock < 0) {
+        const int fi = GetPrivateProfileIntA("Coop", "FightIntents", 0, Paths::Ini()) != 0 ? 1 : 0;
+        s_bindLock = GetPrivateProfileIntA("Coop", "BindLock", fi, Paths::Ini()) != 0 ? 1 : 0;
+        L("[Bind] BindLock=%d (default follows FightIntents=%d; read once)\n", s_bindLock, fi);
+    }
+    return s_bindLock == 1;
+}
+
 static void GuestObjAdd(uint64_t objId, unsigned int ent) {
     if (!objId) return;
+    const bool lock = BindLockOn();
+    if (lock && ent) {   // a body already playing ANOTHER live host guard is never given a second one
+        for (int i = 0; i < s_guestObjN; ++i)
+            if (s_guestObj[i].ent == ent && s_guestObj[i].objId != objId && !GuestObjEntGone(ent)) { InterlockedIncrement(&s_bindBlockedDouble); return; }
+    }
     for (int i = 0; i < s_guestObjN; ++i)
         if (s_guestObj[i].objId == objId) {
+            const unsigned int old = s_guestObj[i].ent;
+            if (old && old != ent) {
+                if (lock && !GuestObjEntGone(old)) { InterlockedIncrement(&s_bindBlockedRepoint); s_guestObjStamp[i] = ++s_guestObjClock; return; }
+                if (GuestObjEntGone(old)) InterlockedIncrement(&s_bindReplacedGone); else InterlockedIncrement(&s_bindRepoint);
+            }
             s_guestObj[i].ent  = ent;
             s_guestObjStamp[i] = ++s_guestObjClock;      // refresh: a live mirror is never the LRU victim
             return;
         }
+    InterlockedIncrement(&s_bindAdded);
     if (s_guestObjN < 256) {
         GuestObjStore(s_guestObjN, objId, ent);
         ++s_guestObjN;
         return;
     }
-    GuestObjStore(GuestObjPickVictim(), objId, ent);
+    { const int v = GuestObjPickVictim(); if (!GuestObjEntGone(s_guestObj[v].ent)) InterlockedIncrement(&s_bindDropEvicted);
+      GuestObjStore(v, objId, ent); }
     ++s_guestObjEvicted;
     if (!s_guestObjEvictedShown || (s_guestObjEvicted - s_guestObjEvictedShown) >= 256) {
         s_guestObjEvictedShown = s_guestObjEvicted;
@@ -6254,7 +6283,22 @@ static uint64_t GuestObjOfEnt(unsigned int ent) {
 // was freed and reused, and keeping the binding is what makes a body appear to teleport between NPCs.
 static void GuestObjForget(uint64_t objId) {
     for (int i = 0; i < s_guestObjN; ++i)
-        if (s_guestObj[i].objId == objId) { s_guestObj[i].ent = 0; return; }
+        if (s_guestObj[i].objId == objId) { if (s_guestObj[i].ent) InterlockedIncrement(&s_bindDropForgot); s_guestObj[i].ent = 0; return; }
+}
+
+// [Bind] line (every 5 s with the [Sync] bind line): live links, doubles right now, and what happened to links.
+static void BindReport() {
+    int linked = 0, gone = 0, doubles = 0;
+    for (int i = 0; i < s_guestObjN; ++i) {
+        const unsigned int e = s_guestObj[i].ent;
+        if (!e) continue;
+        if (GuestObjEntGone(e)) { ++gone; continue; }
+        ++linked;
+        for (int j = i + 1; j < s_guestObjN; ++j) if (s_guestObj[j].ent == e) { ++doubles; break; }
+    }
+    L("[Bind] lock=%d linked=%d doubleNow=%d stale(bodyGone)=%d | added=%ld repointed=%ld blocked(repoint=%ld double=%ld) replacedGone=%ld dropped(evicted=%ld forgotten=%ld)\n",
+      s_bindLock, linked, doubles, gone, s_bindAdded, s_bindRepoint, s_bindBlockedRepoint, s_bindBlockedDouble, s_bindReplacedGone,
+      s_bindDropEvicted, s_bindDropForgot);
 }
 
 // Belt and braces: even with the table above, never run the visual-death path twice for the same body
@@ -6526,20 +6570,21 @@ static void ApplyRelayedHealth(uint64_t objId, Entity* e, const EntityState& es)
 // The value is re-read every 2 s so a live test can change it without a relaunch.
 static unsigned s_bindArchWait = 0;            // [Coop] BindRequireArch: records that waited for their archetype
 static int s_braOn = 0; static uint64_t s_braNext = 0;
+// Both read ONCE per session (2026-11-16: the earlier 2 s live re-read dropped the radius to 0 mid-run when the test
+// runner restored the ini, docs/evidence/s3-guard-identity-2026-11-16.md).
 static bool BindRequireArchOn() {
-    const uint64_t now = GetTickCount64();
-    if (now >= s_braNext) { s_braNext = now + 2000; s_braOn = GetPrivateProfileIntA("Coop", "BindRequireArch", 0, Paths::Ini()) != 0; }
+    if (!s_braNext) { s_braNext = 1; s_braOn = GetPrivateProfileIntA("Coop", "BindRequireArch", 0, Paths::Ini()) != 0; }
     return s_braOn != 0;
 }
+// [Coop] BindRadiusM: default 12 when [Coop] FightIntents=1 (fight targets need a guest body for out-of-combat soldiers:
+// 3/3 resolved at 12 vs 0/1 at 0), else 0; an explicit ini value overrides either way.
 static float WideBindRadiusM() {
-    static float s_r = 0.0f; static uint64_t s_next = 0;
-    const uint64_t now = GetTickCount64();
-    if (now >= s_next) {
-        s_next = now + 2000;
-        const int v = GetPrivateProfileIntA("Coop", "BindRadiusM", 0, Paths::Ini());
-        const float r = (v > 1) ? (float)(v > 200 ? 200 : v) : 0.0f;
-        if (r != s_r) L("[WideBind] BindRadiusM=%.0f (was %.0f)\n", (double)r, (double)s_r);
-        s_r = r;
+    static float s_r = -1.0f;
+    if (s_r < 0.0f) {
+        const int fi = GetPrivateProfileIntA("Coop", "FightIntents", 0, Paths::Ini()) != 0 ? 1 : 0;
+        const int v = GetPrivateProfileIntA("Coop", "BindRadiusM", fi ? 12 : 0, Paths::Ini());
+        s_r = (v > 1) ? (float)(v > 200 ? 200 : v) : 0.0f;
+        L("[WideBind] BindRadiusM=%.0f (default %d follows FightIntents=%d; read once)\n", (double)s_r, fi ? 12 : 0, fi);
     }
     return s_r;
 }
@@ -12433,6 +12478,7 @@ static void OnFrameInner(Human* updatedHuman) {
                       s_bindRejBhv, s_bindRejAi, s_bindRejHp, s_bindRejArch, s_bindRejTaken,
                       s_bindUnmatched, (s_bindMinD < 1e8f) ? sqrtf(s_bindMinD) : -1.0f);
                 WideBindReport();
+                if (!g_entHost) BindReport();   // guest only: the guest objId table is the link table
                 OwnReport();
                 L("[Mirror] actions on=%d calls=%u deferred=%d queued=%u applied=%ld expired=%ld noSlot=%u\n",
                   MirrorActionsEnabled() ? 1 : 0, s_mirrorActionCalls, MirrorActionsDeferred() ? 1 : 0, s_maqQueued,
