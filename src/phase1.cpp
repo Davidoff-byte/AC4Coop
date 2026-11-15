@@ -1614,6 +1614,12 @@ static volatile float g_nrLatestDest = 0.0f; static volatile bool g_nrLatestSpri
 static float s_nrBlendMps = 1.5f;   // [Coop] NativeReplicaBlendCmS / 100 (0 = no blended correction)
 static float s_nrBoostMps = 4.0f;   // [Coop] NativeReplicaStartBoostCmS / 100 (0 = no start boost)
 static volatile LONG s_nrModeSwitches = 0;
+// [Coop] NativeReplicaParkour (default 0; R4.1, docs/design/player-decisions-r4.md): the replica also covers the peer's
+// parkour contexts (Ladder 5, InAir 6, Ledge 7, Walling 8, NarrowObject 9, Climbing 30, Hanging 31; PS3 ActorContextID
+// cu 277 DIE 0x4A6766B) and follows by its own navigation instead of the replay path.
+static int   s_nrPk = 0;
+static float s_nrPkSnapM = 8.0f;
+static bool NrParkourCtx(int c) { return c == 5 || c == 6 || c == 7 || c == 8 || c == 9 || c == 30 || c == 31; }
 // Replica-mode decision with hysteresis. Runs 7432 and 29404 crashed in the action system (use-after-free class:
 // 0x006781E0 calling vt[0x4C] on an object whose vtable pointer was a heap address) while the peer flipped
 // ground -> ledge/air -> ground within frames; every flip toggles the puppet's behaviour (replica <-> old path), which
@@ -1622,7 +1628,7 @@ static volatile LONG s_nrModeSwitches = 0;
 static bool NativeReplicaMode(int ctx) {
     static bool s_in = false; static uint64_t s_groundSince = 0, s_offSince = 0;
     const uint64_t now = GetTickCount64();
-    const bool ground = ctx == 4;   // kCtxGroundLive (declared just above this function's callers)
+    const bool ground = ctx == 4 || (s_nrPk && NrParkourCtx(ctx));   // 4 = kCtxGroundLive; parkour with R4.1
     if (ground) { s_offSince = 0; if (!s_groundSince) s_groundSince = now; }
     else { s_groundSince = 0; if (!s_offSince) s_offSince = now; }
     const bool want = s_in ? (ground || now - s_offSince < 400) : (ground && now - s_groundSince >= 300);
@@ -1638,6 +1644,9 @@ static bool NativeReplicaOn() {
         s_nrBlendMps = (bl < 0 ? 0 : bl > 500 ? 500 : bl) / 100.0f;
         const int bo = GetPrivateProfileIntA("Coop", "NativeReplicaStartBoostCmS", 400, Paths::Ini());
         s_nrBoostMps = (bo < 0 ? 0 : bo > 800 ? 800 : bo) / 100.0f;
+        s_nrPk = GetPrivateProfileIntA("Coop", "NativeReplicaParkour", 0, Paths::Ini()) != 0 ? 1 : 0;
+        const int pc = GetPrivateProfileIntA("Coop", "NativeReplicaParkourSnapCm", 800, Paths::Ini());
+        s_nrPkSnapM = (pc < 200 ? 200 : pc > 3000 ? 3000 : pc) / 100.0f;
     }
     return s_nrOn != 0;
 }
@@ -1657,6 +1666,8 @@ struct NrStats {
     uint32_t hist[101]; uint32_t total; uint32_t snaps, frames;          // session: error histogram, 0.05 m bins
     float wBlend; float sBlend;                                          // blended correction applied (m): window, session
     float wBoost; float sBoost; int wBoostFrames;                        // part of it applied under the start boost
+    int pkN; float pkSum, pkMax; uint32_t repCtxMask, peerCtxMask;       // R4.1 window: off-ground frames, 3D error
+    uint64_t stuckSince; uint32_t stuckSnaps, pkSnaps;                   // R4.1 stuck timer / snap counts (session)
 };
 static NrStats s_nr = {};
 static float NrPct(const NrStats& st, float q) {
@@ -1669,7 +1680,6 @@ static float NrPct(const NrStats& st, float q) {
 // Player update thread (ApplyRemoteState), replica path only. m = the peer's interpolated matrix. Snap + statistics,
 // then publish the navigation target for NativeReplicaNavTick. Returns true when it wrote the matrix (snap).
 static bool NativeReplicaDrive(Entity* pe, Human* h, HumanDataBundle* b, const PlayerState& s, const HookMath::Transform& m) {
-    (void)h;
     NrStats& st = s_nr;
     if (st.ent != (void*)pe) { memset(&st, 0, sizeof(st)); st.ent = pe; }
     const float px = pe->m_GlobalMatrix.M41, py = pe->m_GlobalMatrix.M42, pz = pe->m_GlobalMatrix.M43;
@@ -1678,15 +1688,36 @@ static bool NativeReplicaDrive(Entity* pe, Human* h, HumanDataBundle* b, const P
     ++st.frames;
     if (st.haveLast) { const float mx = px - st.lastX, my = py - st.lastY; st.moved += sqrtf(mx * mx + my * my); }
     bool snapped = false;
-    if (!st.init || d > s_nrSnapM || fabsf(ez) > 2.0f) {
+    // R4.1: while the peer is in a parkour context, or more than 1.5 m above/below, the replica is allowed to climb
+    // after it: teleport only when the 3D error exceeds NativeReplicaParkourSnapCm or stays above 2.5 m for 4 s.
+    const uint64_t nowMs = GetTickCount64();
+    const float d3 = sqrtf(d * d + ez * ez);
+    const bool pkFrame = s_nrPk && (NrParkourCtx(s.contextId) || fabsf(ez) > 1.5f);
+    bool wantSnap, stuck = false;
+    if (!st.init) wantSnap = true;
+    else if (pkFrame) {
+        if (d3 > 2.5f) { if (!st.stuckSince) st.stuckSince = nowMs; } else st.stuckSince = 0;
+        stuck = st.stuckSince && nowMs - st.stuckSince > 4000;
+        wantSnap = d3 > s_nrPkSnapM || stuck;
+    } else { st.stuckSince = 0; wantSnap = d > s_nrSnapM || fabsf(ez) > 2.0f; }
+    if (wantSnap) {
         HookMath::Transform mm = m;
         pe->SetGlobalMatrixInternal(&mm, true);       // physics warp: the replica is a body
-        st.init = true; ++st.snaps; snapped = true;
-        L("[Replica] snap #%u err=%.2f dz=%.2f -> (%.1f,%.1f,%.1f)\n", st.snaps, d, ez, m.M41, m.M42, m.M43);
+        st.init = true; ++st.snaps; snapped = true; st.stuckSince = 0;
+        if (pkFrame) { ++st.pkSnaps; if (stuck) ++st.stuckSnaps; }
+        L("[Replica] snap #%u err=%.2f dz=%.2f -> (%.1f,%.1f,%.1f)%s\n", st.snaps, d, ez, m.M41, m.M42, m.M43,
+          pkFrame ? (stuck ? " [parkour, stuck 4 s]" : " [parkour]") : "");
+    } else if (pkFrame) {
+        ++st.pkN; st.pkSum += d3; if (d3 > st.pkMax) st.pkMax = d3;
     } else {
         int bin = (int)(d / 0.05f); if (bin > 100) bin = 100;
         ++st.hist[bin]; ++st.total;
         ++st.n; st.sum += d; if (d > st.max) st.max = d; if (d > 0.75f) ++st.over;
+    }
+    if (s_nrPk) {
+        const int rc = h->GetCurrentContextID(MAIN_AI_TRACK);
+        if (rc >= 0 && rc < 32) st.repCtxMask |= 1u << rc;
+        if (s.contextId >= 0 && s.contextId < 32) st.peerCtxMask |= 1u << s.contextId;
     }
     // Velocities from frame-to-frame positions (QPC time, EMA 0.2): the peer's interpolated position and the replica's
     // own position (snap frames excluded). The peer's speed intention destSpeed only says moving / not moving.
@@ -1706,7 +1737,7 @@ static bool NativeReplicaDrive(Entity* pe, Human* h, HumanDataBundle* b, const P
     // lost while accelerating never closes by steering alone. Between 0.5 m and the snap limit, move the body toward the
     // peer by at most NativeReplicaBlendCmS per second (own rotation kept, physics warp), leaving 0.3 m to steering.
     bool nudged = false; float nx = px, ny = py;
-    if (!snapped && s_nrBlendMps > 0.0f && d > 0.5f && st.havePeer) {
+    if (!snapped && !pkFrame && s_nrBlendMps > 0.0f && d > 0.5f && st.havePeer) {   // not while climbing (R4.1)
         const float dtb = (float)((double)(qn.QuadPart - st.pqpc) / (double)qf.QuadPart);
         if (dtb > 1e-4f && dtb < 0.1f) {
             // Start boost: v6/v7 (runs 17912, 25720) still snapped about once per run start because the replica's own
@@ -1741,7 +1772,12 @@ static bool NativeReplicaDrive(Entity* pe, Human* h, HumanDataBundle* b, const P
     // run starts because the replica only began accelerating once the delayed position moved.
     const float dest = g_nrLatestDest; const bool sprint = g_nrLatestSprint;
     const bool moving = dest > 0.05f;
-    if (moving) {
+    if (pkFrame) {
+        // R4.1: go to the peer's 3D position at ChaseHigh (NavigationSpeed 10), the class guards use when they chase;
+        // whether it makes the body climb is what R4.1 measures.
+        t.x = m.M41; t.y = m.M42; t.z = m.M43;
+        t.speed = d3 > 0.4f ? 10 : 1;
+    } else if (moving) {
         // Lead = peer velocity x 0.45 s (100 ms interpolation delay + reaction), at least 2 m along the travel direction
         // while the replica is still starting (< 2 m/s). Speed class: base from the peer's intention, then by the
         // along-track error (> 0 = replica behind); Fastest while the replica is below 1 m/s.
@@ -1769,14 +1805,16 @@ static bool NativeReplicaDrive(Entity* pe, Human* h, HumanDataBundle* b, const P
         st.nextLog = now + 2000;
         L("[Replica] win n=%d err mean=%.2f max=%.2f >0.75m=%d moved=%.1fm stage nat=%d peer=%d mism=%d | "
           "session frames=%u p50=%.2f p95=%.2f snaps=%u | nav calls=%ld fail=%ld skip=%ld | peer dest=%.2f speed=%d | "
-          "moving frames=%d peerV=%.2f repV=%.2f along=%.2f | blend win=%.2fm session=%.1fm | boost win=%.2fm/%df session=%.1fm | mode switches=%ld\n",
+          "moving frames=%d peerV=%.2f repV=%.2f along=%.2f | blend win=%.2fm session=%.1fm | boost win=%.2fm/%df session=%.1fm | mode switches=%ld | pk n=%d err3d mean=%.2f max=%.2f repCtx=0x%X peerCtx=0x%X pkSnaps=%u stuck=%u\n",
           st.n, st.n ? st.sum / st.n : 0.0f, st.max, st.over, st.moved, (int)b->m_GroundData.m_HumanGroundStage,
           s.humanGroundStage, st.stageMism, st.frames, NrPct(st, 0.5f), NrPct(st, 0.95f), st.snaps,
           s_nrNavCalls, s_nrNavFail, s_nrNavSkip, s.destSpeed, t.speed, st.wMov, st.wMov ? st.wPeerV / st.wMov : 0.0f,
           st.wMov ? st.wRepV / st.wMov : 0.0f, st.wMov ? st.wAlong / st.wMov : 0.0f, st.wBlend, st.sBlend,
-          st.wBoost, st.wBoostFrames, st.sBoost, s_nrModeSwitches);
+          st.wBoost, st.wBoostFrames, st.sBoost, s_nrModeSwitches, st.pkN, st.pkN ? st.pkSum / st.pkN : 0.0f, st.pkMax,
+          st.repCtxMask, st.peerCtxMask, st.pkSnaps, st.stuckSnaps);
         st.n = 0; st.sum = 0; st.max = 0; st.over = 0; st.moved = 0; st.stageMism = 0;
         st.wPeerV = 0; st.wRepV = 0; st.wAlong = 0; st.wMov = 0; st.wBlend = 0; st.wBoost = 0; st.wBoostFrames = 0;
+        st.pkN = 0; st.pkSum = 0; st.pkMax = 0; st.repCtxMask = 0; st.peerCtxMask = 0;
     }
     return snapped;
 }
@@ -11252,7 +11290,7 @@ static void DumpConfigOnce()
         { "Coop", "FloatProbe", 0 }, { "Coop", "FootOffsetFix", 0 }, { "Coop", "GuardActionGate", 0 }, { "Coop", "GuardExtrapMs", 100 },
         { "Coop", "GuardInterpBuffer", 0 }, { "Coop", "GuardInterpDelayMs", 120 }, { "Coop", "GuardPhaseLock", 0 },
         { "Coop", "GuardSeesPuppet", 0 }, { "Coop", "PuppetActionReassert", 0 }, { "Coop", "PuppetHostTime", 0 },
-        { "Coop", "AlertQueryAsPlayer", 0 }, { "Coop", "ConflictNullGuard", 0 }, { "Coop", "ConflictKeepPuppet", 0 }, { "Coop", "GuardPoiFightTarget", 0 }, { "Coop", "FightOrderPuppet", 0 }, { "Coop", "DespawnLeaveFight", 0 }, { "Coop", "FightKeepOnConflictEnd", 0 }, { "Coop", "FightStateProbe", 0 }, { "Coop", "PuppetNavService", 0 }, { "Coop", "NativeReplica", 0 }, { "Coop", "NativeReplicaSnapCm", 300 }, { "Coop", "NativeReplicaBlendCmS", 150 }, { "Coop", "NativeReplicaStartBoostCmS", 400 }, { "Coop", "FightProbe", 0 }, { "Coop", "PeerLastPacket", 0 }, { "Coop", "PuppetActionsOwnUpdate", 0 }, { "Coop", "DetectKeepTarget", 0 }, { "Coop", "GuardPlayerOfInterest", 0 }, { "Coop", "EventProbe", 0 }, { "Coop", "ReactProbe", 0 }, { "Coop", "FightSkipPuppet", 0 }, { "Coop", "NavNullGuard", 0 }, { "Coop", "PuppetStimMode", 1 }, { "Coop", "PuppetStimSeq", 0 }, { "Coop", "PuppetStimSource", 0 }, { "Coop", "SightProbe", 0 }, { "Coop", "StateProbe", 0 }, { "Coop", "StuckProbe", 0 },
+        { "Coop", "AlertQueryAsPlayer", 0 }, { "Coop", "ConflictNullGuard", 0 }, { "Coop", "ConflictKeepPuppet", 0 }, { "Coop", "GuardPoiFightTarget", 0 }, { "Coop", "FightOrderPuppet", 0 }, { "Coop", "DespawnLeaveFight", 0 }, { "Coop", "FightKeepOnConflictEnd", 0 }, { "Coop", "FightStateProbe", 0 }, { "Coop", "PuppetNavService", 0 }, { "Coop", "NativeReplica", 0 }, { "Coop", "NativeReplicaSnapCm", 300 }, { "Coop", "NativeReplicaBlendCmS", 150 }, { "Coop", "NativeReplicaStartBoostCmS", 400 }, { "Coop", "NativeReplicaParkour", 0 }, { "Coop", "NativeReplicaParkourSnapCm", 800 }, { "Coop", "FightProbe", 0 }, { "Coop", "PeerLastPacket", 0 }, { "Coop", "PuppetActionsOwnUpdate", 0 }, { "Coop", "DetectKeepTarget", 0 }, { "Coop", "GuardPlayerOfInterest", 0 }, { "Coop", "EventProbe", 0 }, { "Coop", "ReactProbe", 0 }, { "Coop", "FightSkipPuppet", 0 }, { "Coop", "NavNullGuard", 0 }, { "Coop", "PuppetStimMode", 1 }, { "Coop", "PuppetStimSeq", 0 }, { "Coop", "PuppetStimSource", 0 }, { "Coop", "SightProbe", 0 }, { "Coop", "StateProbe", 0 }, { "Coop", "StuckProbe", 0 },
         { "Coop", "StageLog", 0 }, { "Coop", "SyncEnemiesOnly", 1 }, { "Coop", "SyncMaxEntities", 32 },
         { "Coop", "SyncRadiusM", 60 }, { "Coop", "TransformProbe", 0 }, { "Coop", "VPadEnable", 0 },
         { "Coop", "VPadTest", 0 }, { "Coop", "WatchDeadBit", 0 }, { "Coop", "WatchTarget", 0 },
