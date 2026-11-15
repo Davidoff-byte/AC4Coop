@@ -10,6 +10,7 @@ written into the game's own shared section Local\\ac4pilot-pad-<pid>, read by th
     py -3.14 tools/pilot.py goto X Y [--tol 1.5] [--speed 1] [--timeout 60] [--route] [--stick]
                                   # in-process world-space intent (IHumanGround slots); --stick = old camera-relative pad
     py -3.14 tools/pilot.py intent DX DY [--speed 1] [--sec 1]   # world-space push, renewed until --sec elapses
+    py -3.14 tools/pilot.py hg --can 75 --do 76 --arg h:ENT   # S2 probe: HumanGround interface slot calls (src/pilot.cpp HgCall)
     py -3.14 tools/pilot.py route X Y                    # plan only (navmesh straight-line checks, no screen)
     py -3.14 tools/pilot.py boot [--pulses 6]            # menus -> world with A presses (pair with [Coop] AutoContinue=1)
     py -3.14 tools/pilot.py mem player 0x200             # hex dump (read-only); target = player | hex address
@@ -132,6 +133,19 @@ class Pilot:
         """Fill cmd/f, bump req, wait for done == req (the game runs it on the player frame or the poll thread)."""
         fl = list(floats) + [float('nan')] * (8 - len(floats))
         ctypes.memmove(self.ctl + 12, struct.pack('<Ii8f', cmd, 0, *fl), 40)
+        req = (ctypes.c_uint32.from_address(self.ctl + 4).value + 1) & 0xFFFFFFFF
+        ctypes.c_uint32.from_address(self.ctl + 4).value = req
+        end = time.time() + timeout
+        while time.time() < end:
+            if ctypes.c_uint32.from_address(self.ctl + 8).value == req:
+                return ctypes.c_int32.from_address(self.ctl + 16).value
+            time.sleep(0.02)
+        return None
+
+    def ctl_send_u32(self, cmd, words, timeout=5.0):
+        """ctl_send with raw u32 words in f[] (kCmdHgCall reads the bits, not floats)."""
+        w = list(words) + [0] * (8 - len(words))
+        ctypes.memmove(self.ctl + 12, struct.pack('<Ii8I', cmd, 0, *w), 40)
         req = (ctypes.c_uint32.from_address(self.ctl + 4).value + 1) & 0xFFFFFFFF
         ctypes.c_uint32.from_address(self.ctl + 4).value = req
         end = time.time() + timeout
@@ -353,6 +367,29 @@ def cmd_climb(p, a):
     print(f'from ({before[0]:.2f},{before[1]:.2f},{before[2]:.2f}) to ({after[0]:.2f},{after[1]:.2f},{after[2]:.2f}); '
           f'substitutions slot37={subs[0]} slot38={subs[1]} hooks={subs[2]}')
     return 0
+
+
+def cmd_hg(p, a):
+    """S2 live probe (kCmdHgCall 13, src/pilot.cpp HgCall): call a HumanGround interface slot on Edward from his own update.
+    --iface 0 IHumanGround (HG+0x10) | 1 HG+0x14 | 2 HG+0x70 | 3 HG+0x74; --can/--do slot numbers (Do runs only if the Can
+    returned non-zero, or with no --can); --arg N (int, 0x.. ok) or --arg h:ENTITY (passes &copy of *(ENTITY+0xC8)).
+    Path/context changes for the next 120 frames go to the phase1 log as [HG] watch lines."""
+    NONE = 0xFFFFFFFF
+    args, mask = [], 0
+    for i, s in enumerate(a.arg or []):
+        if s.startswith('h:'):
+            mask |= 1 << i
+            s = s[2:]
+        args.append(int(s, 0) & 0xFFFFFFFF)
+    if len(args) > 4:
+        print('at most 4 args'); return 2
+    can = NONE if a.can is None else a.can
+    do = NONE if a.do is None else a.do
+    st = p.ctl_send_u32(13, [a.iface, can, do, len(args) | (mask << 8)] + args)
+    r = struct.unpack('<11I', ctypes.string_at(p.ctl + 116, 44))
+    path = '/'.join('-' if v == NONE else str(v) for v in r[5:11])
+    print(f'status {st} | can {"-" if not r[2] else f"{r[0]:#x}"} do {"-" if not r[3] else f"{r[1]:#x}"} | before ctx={r[4] if r[4] < 0x80000000 else r[4] - 2**32} path={path}')
+    return 0 if st == 0 else 3
 
 
 def cmd_intent(p, a):
@@ -601,6 +638,8 @@ def main():
     x.add_argument('--speed', type=float, default=1.0); x.add_argument('--sec', type=float, default=1.0)
     x = sub.add_parser('climb'); x.add_argument('x', type=float); x.add_argument('y', type=float)
     x.add_argument('--speed', type=float, default=1.0); x.add_argument('--sec', type=float, default=1.0)
+    x = sub.add_parser('hg'); x.add_argument('--iface', type=int, default=0); x.add_argument('--can', type=int)
+    x.add_argument('--do', type=int); x.add_argument('--arg', action='append')
     x = sub.add_parser('route'); x.add_argument('x', type=float); x.add_argument('y', type=float)
     x = sub.add_parser('boot'); x.add_argument('--pulses', type=int, default=6); x.add_argument('--wait', type=float, default=5)
     x.add_argument('--settle', type=float, default=60); x.add_argument('--fps', type=float, default=0)   # 0: no Present patch (cap preceded 4 lost copies in 7 two-copy runs, docs/evidence/s0-two-copy-rig-2026-11-15.md)

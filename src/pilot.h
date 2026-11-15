@@ -62,7 +62,14 @@ namespace Pilot
     // `req`; the game sets status and copies req into `done` when finished.
     // 3..8: world queries (src/pilot_world.cpp), results in res[] (rcount items).
     enum { kCmdTeleport = 1, kCmdFpsCap = 2, kCmdRay = 3, kCmdGround = 4, kCmdNavPoint = 5, kCmdNavLine = 6, kCmdEdges = 7, kCmdSense = 8,
-           kCmdIntent = 9, kCmdGoto = 10, kCmdStop = 11, kCmdClimbIntent = 12 };
+           kCmdIntent = 9, kCmdGoto = 10, kCmdStop = 11, kCmdClimbIntent = 12, kCmdHgCall = 13 };
+    // kCmdHgCall (S2 live probes, docs/evidence/s2-sp-intent-seams-2026-11-15.md): call a HumanGround interface slot on the
+    // player from its own Human update. f[] carries raw u32 bits, not floats: f0 interface (0 = IHumanGround at
+    // HumanGround+0x10, 1 = +0x14, 2 = +0x70, 3 = +0x74), f1 Can slot (0xFFFFFFFF = none), f2 Do slot (0xFFFFFFFF = none),
+    // f3 = nargs (0..4) | handleRefMask << 8, f4..f7 args. A handleRef arg is an entity address: the call gets a pointer to a
+    // copy of *(entity+0xC8). The Do runs only if there is no Can or the Can returned non-zero (low byte). Results:
+    // res[0] Can return (u32 bits), res[1] Do return, res[2] Can called, res[3] Do called, res[4] context before,
+    // res[5..10] ground FSM path[0..5] before, rcount = 11. Then [HG] log lines on every path/context change for 120 frames.
     // kCmdClimbIntent: f0,f1 climbing 2D input (x sideways, y up; Climbing interface slot 37), f2 speed 0..1 (slot 38),
     // f3 hold ms (default 300). Substitution counts in reserved[5] (slot 37) / [6] (slot 38); [7] = hooks installed.
     // Intent (world-space locomotion, bf-coop ops/evidence/pilot/intention-seam.md seam 1): IHumanGround vtable 0x026E7DC0

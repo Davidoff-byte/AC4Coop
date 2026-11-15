@@ -13,6 +13,7 @@
 #include "Hook.h"
 #include "Scimitar/Entity.h"
 #include "Scimitar/World.h"
+#include "Scimitar/AI/AIActor.h"
 
 #include <windows.h>
 #include <d3d11.h>
@@ -421,6 +422,122 @@ void GotoTick(Entity* pl)
 }
 
 // ---- commands executed on the game thread (player frame) ------------------------------------------------------------
+// ---- HumanGround slot calls (kCmdHgCall: S2 live probes, docs/evidence/s2-sp-intent-seams-2026-11-15.md) ----------------
+// HumanGround = *(Human+0x720), validated by its context vtable 0x026E8AE8 at +0 and the IHumanGround vtable 0x026E7DC0 at
+// +0x10 (same check as phase1.cpp NativeReplicaFreeRun). Ground FSM = [IHumanGround+0x90]; active-state path = *(u16**)(fsm+0x118)
+// (S2 wrapper pattern; phase1.cpp wall-run diag reads the same fields). Test-only: runs only under [Pilot] Enabled.
+void*    g_human = nullptr;     // the player Human of the current OnPlayerFrame
+int      g_hgWatch = 0;         // frames left to log ground-FSM path / context changes
+uint16_t g_hgLastPath[6] = {};
+int      g_hgLastCtx = -100;
+uint32_t g_hgFrame = 0;
+
+char* HumanGroundOf(void* human)
+{
+    __try {
+        char* hg = human ? *(char**)((char*)human + 0x720) : nullptr;
+        if (hg && *(uint32_t*)hg == 0x026E8AE8u && *(uint32_t*)(hg + 0x10) == 0x026E7DC0u) return hg;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return nullptr;
+}
+
+bool HgPath(char* hg, uint16_t out[6])
+{
+    __try {
+        char* fsm = *(char**)(hg + 0x10 + 0x90);
+        const uint16_t* path = fsm ? *(const uint16_t**)(fsm + 0x118) : nullptr;
+        if (!path) return false;
+        for (int i = 0; i < 6; ++i) out[i] = path[i];
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+int HgCtx(void* human)
+{
+    __try { return human ? ((AIActor*)human)->GetCurrentContextID(1) : -1; }   // AIActor::GetCurrentContextID 0x0052C2E0
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -3; }
+}
+
+// thiscall through the interface's own vtable with exactly n dword args (the callees pop their args: retn 4*n).
+uint32_t HgInvoke(void* iface, uint32_t slot, int n, const uint32_t* a, bool* ok)
+{
+    *ok = false;
+    void* fn = nullptr;
+    __try { fn = (*(void***)iface)[slot]; } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    if ((uintptr_t)fn < 0x00401000u || (uintptr_t)fn >= 0x02400000u) return 0;   // must point into the exe's code
+    typedef uint32_t (__thiscall* F0)(void*);
+    typedef uint32_t (__thiscall* F1)(void*, uint32_t);
+    typedef uint32_t (__thiscall* F2)(void*, uint32_t, uint32_t);
+    typedef uint32_t (__thiscall* F3)(void*, uint32_t, uint32_t, uint32_t);
+    typedef uint32_t (__thiscall* F4)(void*, uint32_t, uint32_t, uint32_t, uint32_t);
+    uint32_t r = 0;
+    __try {
+        switch (n) {
+        case 0: r = ((F0)fn)(iface); break;
+        case 1: r = ((F1)fn)(iface, a[0]); break;
+        case 2: r = ((F2)fn)(iface, a[0], a[1]); break;
+        case 3: r = ((F3)fn)(iface, a[0], a[1], a[2]); break;
+        case 4: r = ((F4)fn)(iface, a[0], a[1], a[2], a[3]); break;
+        default: return 0;
+        }
+        *ok = true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { Log("[HG] EXCEPTION 0x%08X in slot %u\n", GetExceptionCode(), slot); }
+    return r;
+}
+
+int HgCall(PilotCtl* c)
+{
+    uint32_t u[8];
+    memcpy(u, c->f, sizeof(u));
+    char* hg = HumanGroundOf(g_human);
+    if (!hg) return -1;
+    static const int kIfaceOff[4] = { 0x10, 0x14, 0x70, 0x74 };
+    if (u[0] > 3) return -3;
+    void* iface = hg + kIfaceOff[u[0]];
+    const int n = (int)(u[3] & 0xFF);
+    const uint32_t refMask = (u[3] >> 8) & 0xF;
+    if (n > 4) return -3;
+    uint32_t hbuf[4] = {}, args[4] = {};
+    for (int i = 0; i < n; ++i) {
+        args[i] = u[4 + i];
+        if (refMask & (1u << i)) {
+            __try { hbuf[i] = *(const uint32_t*)(uintptr_t)(u[4 + i] + 0xC8); } __except (EXCEPTION_EXECUTE_HANDLER) { return -2; }
+            args[i] = (uint32_t)(uintptr_t)&hbuf[i];
+        }
+    }
+    uint16_t path[6] = {};
+    const bool havePath = HgPath(hg, path);
+    const int ctx0 = HgCtx(g_human);
+    uint32_t rCan = 0, rDo = 0, calledCan = 0, calledDo = 0;
+    bool ok = true;
+    if (u[1] != 0xFFFFFFFFu) { rCan = HgInvoke(iface, u[1], n, args, &ok); calledCan = ok ? 1 : 0; }
+    if (ok && u[2] != 0xFFFFFFFFu && (u[1] == 0xFFFFFFFFu || (rCan & 0xFF))) { rDo = HgInvoke(iface, u[2], n, args, &ok); calledDo = ok ? 1 : 0; }
+    float* res = c->res;
+    const uint32_t out[5] = { rCan, rDo, calledCan, calledDo, (uint32_t)ctx0 };
+    memcpy(res, out, sizeof(out));
+    for (int i = 0; i < 6; ++i) { const uint32_t p = havePath ? path[i] : 0xFFFFFFFFu; memcpy(res + 5 + i, &p, 4); }
+    c->rcount = 11;
+    Log("[HG] call iface=%u can=%d do=%d n=%d ref=%X args=%08X %08X %08X %08X -> can %08X (%u) do %08X (%u) | before ctx=%d path=%u/%u/%u/%u/%u/%u\n",
+        u[0], (int)u[1], (int)u[2], n, refMask, args[0], args[1], args[2], args[3], rCan, calledCan, rDo, calledDo, ctx0,
+        path[0], path[1], path[2], path[3], path[4], path[5]);
+    g_hgWatch = 120; g_hgLastCtx = -100;
+    return ok ? 0 : -2;
+}
+
+void HgWatchTick()
+{
+    if (g_hgWatch <= 0) return;
+    --g_hgWatch; ++g_hgFrame;
+    char* hg = HumanGroundOf(g_human);
+    uint16_t path[6] = {};
+    if (!hg || !HgPath(hg, path)) return;
+    const int ctx = HgCtx(g_human);
+    if (ctx != g_hgLastCtx || memcmp(path, g_hgLastPath, sizeof(path)) != 0) {
+        Log("[HG] watch +%d ctx=%d path=%u/%u/%u/%u/%u/%u\n", 120 - g_hgWatch, ctx, path[0], path[1], path[2], path[3], path[4], path[5]);
+        g_hgLastCtx = ctx; memcpy(g_hgLastPath, path, sizeof(path));
+    }
+}
+
 void RunCommand(Entity* pl)
 {
     PilotCtl* c = g_ctl;
@@ -465,6 +582,8 @@ void RunCommand(Entity* pl)
             g_climbX = c->f[0]; g_climbY = c->f[1]; g_climbSpeed = c->f[2] < 0 ? 0 : c->f[2] > 1 ? 1 : c->f[2];
             g_climbUntil = GetTickCount() + (c->f[3] > 0 ? (DWORD)c->f[3] : 300);
         }
+    } else if (c->cmd == kCmdHgCall) {
+        status = HgCall(c);
     } else if (c->cmd == kCmdStop) {
         g_goto.on = false; g_intentUntil = 0; g_climbUntil = 0; if (c->reserved[0] == 1) c->reserved[0] = 4;
     } else if (c->cmd >= kCmdRay && c->cmd <= kCmdSense) {
@@ -527,7 +646,9 @@ void OnPlayerFrame(void* human)
         s->player = (uint32_t)(uintptr_t)pl;
         s->human = (uint32_t)(uintptr_t)human;
         g_intentEntity = (uint32_t)(uintptr_t)pl;
+        g_human = human;
         RunCommand(pl);
+        HgWatchTick();
         GotoTick(pl);
         if (pl) memcpy(s->m, &((BaseEntity*)pl)->m_GlobalMatrix, sizeof(s->m));
         uint32_t n = 0, total = 0;
