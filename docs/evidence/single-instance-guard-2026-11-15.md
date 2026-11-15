@@ -68,3 +68,17 @@ Source: `AC4MultiInstance.log` beside the DLL, plus read-only `OpenMutexW(SYNCHR
 - **Direct starts** (11180, 32756) beside the running game: exit code 0 within about 0.4 s. pid 29936 kept running. These exits come
   after the mutex, through the store layer (section above); the proxy does not change that.
 - **Not checked:** a full play session with the proxy (29936 was only seen running, not played); Ubisoft-only installs; other Windows builds.
+
+## Two copies running at once, direct starts, with the proxy (2026-11-15 19:36-19:38)
+Same install and DLLs as the section above (version.dll 3f357d02...). Both copies started with `Start-Process AC4BFSP.exe`
+from the game folder: no arguments, no Steam. Copy 1 (pid 26768, started by Steam) had been closed by the owner beforehand.
+- pid 25788 started 19:36:30, still running after 30 s. Window title "Assassin's Creed IV Black Flag | AC4Coop host code ... |
+  waiting for a guest", `Responding=True`.
+- pid 26200 started 19:38:05 while 25788 ran, still running after 30 s, same window title, `Responding=True`. 25788 kept running.
+- Proxy log: `..._ac4coop_25788_mi25788` and `..._ac4coop_26200_mi26200`, so each copy owns its own mutex.
+- **This contradicts the verdict above** ("a second copy on one PC is stopped by the store layer"). That verdict came from second copies
+  started while a **store-started** copy (`-uplay_steam_mode`) was running. Here the first copy was itself a direct start.
+  Why the outcome differs was not traced. The difference in how copy 1 was started is the observed difference, not a proven cause.
+- **Not checked:** whether both copies render and run game logic (only the window title and `Responding` were read; no screenshots);
+  whether the same thing works without the proxy (no negative control was run); co-op between the two copies (both show the
+  same host code and both are in host mode).
