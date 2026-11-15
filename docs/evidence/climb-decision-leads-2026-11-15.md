@@ -207,6 +207,20 @@ Climb reproduced with the Pilot (stick offset re-learned per attempt: `goto ... 
     climbing slot 2 as "drop" is untested. Still open: following the peer's moves while climbing (climbing intention seam on
     the replica), beam exits, more taps, two-machine.
 
+21. **Replica climbing moves driven by intention** (`[Coop] NativeReplicaClimbIntent`, default 0): while the peer's newest
+    packet and the replica are both in Climbing (30), the replica's climbing interface slot 37 gets a 2D input derived from
+    the error (x = error along the replica's matrix row 0, y = vertical; unit vector, speed 1 outside a deadband) and slot
+    38 the speed, on the puppet's own update. Runs on host-p14-state-2 (+ state-10):
+    | run (pid) | asi | deadband | on-wall error while both climb (2 s window means) | crash |
+    |---|---|---|---|---|
+    | 31896 | e968ac06 | 0.3 m | 0.76-0.96 m; x sign flips between windows (overshoot: hand steps are ~1 m, idealStepDistance 1.0) | no |
+    | 31896 (state-10) | e968ac06 | 0.3 m | one joint segment with replica contexts {4,8,9,30}: 3D error 0.17 m; later the peer climbed from a standstill 1.5 m away and the replica stayed below (no run-up, slot 21 never succeeded) | no |
+    | 17752 | de8c23f2 | 0.6 m | 0.33-1.03 m, commands settle (v = 0 inside half a step), residual ~0.5 m sideways | no |
+    Same-metric comparison with the run without climbing intent (16212), 3D error in windows where the peer hangs: some
+    windows improve (0.80 / 1.03 / 1.06 m vs 1.23 / 1.38 m) but the long windows where the replica is on the beam
+    (context 9) stay ~2.3 m in both - after its own wall run the replica often takes a different route (onto the beam)
+    than the peer. Driving that needs the peer's real decisions/input, not an error-derived intention.
+
 So a shimmy step is fully described by **(definition index, position on the guidance)** plus the guidance it lies on; that
 is what R4.3 would send. UNVERIFIED: that the definition table is identical in both games (same assets, so expected), how
 the replica side reaches the table (the generator's inputs), and the other 11 move types (climb up, jump, ...).

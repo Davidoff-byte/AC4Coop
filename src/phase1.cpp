@@ -1871,6 +1871,43 @@ static void NativeReplicaNavTick(Entity* e) {
             if (++s_xl <= 30) L("[Replica] own update: replica in context %d, native drop (climbing slot 2) -> %d, now %d\n", c0, r, xh->GetCurrentContextID(MAIN_AI_TRACK));
         }
     }
+    // [Coop] NativeReplicaClimbIntent (default 0): while the peer and the replica are both in Climbing (30), steer the
+    // replica's own climbing sequencer with a 2D intention derived from the error, through the climbing interface
+    // (vtable 0x026D4588 at context+0x10; context = *(Human+0x720+0x70)): slot 37 SetDirection2D(x, y) / slot 38
+    // SetSpeedRatio - the seam verified on Edward (run 32012: x = +1 moved him along his matrix row 0). x = error along the
+    // replica's row 0 (right), y = vertical error, clamped to +/-1, 0.6 m deadband. The peer's real climbing input can
+    // replace this once the intention lane carries it.
+    static int s_ciOn = -1;
+    if (s_ciOn < 0) s_ciOn = GetPrivateProfileIntA("Coop", "NativeReplicaClimbIntent", 0, Paths::Ini()) != 0 ? 1 : 0;
+    if (s_ciOn == 1 && s_nrOn == 1 && e && g_nrLatestCtx == 30) {
+        Human* ch = AIEntityHelper::GetHuman(e);
+        if (ch && ch->GetCurrentContextID(MAIN_AI_TRACK) == 30) {
+            char* cctx = readable((char*)ch + 0x720 + 0x70, 4) ? *(char**)((char*)ch + 0x720 + 0x70) : nullptr;
+            if (readable(cctx, 0x30) && *(uint32_t*)cctx == 0x026D4638u && *(uint32_t*)(cctx + 0x10) == 0x026D4588u) {
+                NrTarget ct;
+                AcquireSRWLockShared(&s_nrTgtLock); ct = s_nrTgt; ReleaseSRWLockShared(&s_nrTgtLock);
+                const HookMath::Transform& M = e->m_GlobalMatrix;
+                const float ex = ct.x - M.M41, ey = ct.y - M.M42, ez = ct.z - M.M43;
+                float rx = M.M11, ry = M.M12; const float rl = sqrtf(rx * rx + ry * ry); if (rl > 1e-3f) { rx /= rl; ry /= rl; }
+                float x = ex * rx + ey * ry, y = ez;
+                const float mag = sqrtf(x * x + y * y);
+                float v[2] = { 0.0f, 0.0f }; float sp = 0.0f;
+                if (mag > 0.6f) { v[0] = x / mag; v[1] = y / mag; sp = 1.0f; }   // 0.6 m: half a hand step (run 31896 with 0.3 m overshot back and forth)
+                void* ci = cctx + 0x10; void** cvt = *(void***)ci;
+                ((void (__thiscall*)(void*, const float*))cvt[37])(ci, v);
+                ((void (__thiscall*)(void*, float))cvt[38])(ci, sp);
+                static LONG s_ciN = 0; static float s_ciSum = 0.0f; static uint64_t s_ciNext = 0;
+                ++s_ciN; s_ciSum += mag;
+                const uint64_t cnow = GetTickCount64();
+                if (cnow >= s_ciNext) {
+                    s_ciNext = cnow + 2000;
+                    L("[Replica] climb intent: frames=%ld mean |err on wall|=%.2f m last x=%.2f y=%.2f -> v=(%.2f,%.2f) speed %.0f\n",
+                      s_ciN, s_ciN ? s_ciSum / s_ciN : 0.0f, x, y, v[0], v[1], sp);
+                    s_ciN = 0; s_ciSum = 0.0f;
+                }
+            }
+        }
+    }
     if (s_nrOn != 1 || !e || !s_nrNavOk) return;
     NrTarget t;
     AcquireSRWLockShared(&s_nrTgtLock); t = s_nrTgt; ReleaseSRWLockShared(&s_nrTgtLock);
@@ -11397,7 +11434,7 @@ static void DumpConfigOnce()
         { "Coop", "FloatProbe", 0 }, { "Coop", "FootOffsetFix", 0 }, { "Coop", "GuardActionGate", 0 }, { "Coop", "GuardExtrapMs", 100 },
         { "Coop", "GuardInterpBuffer", 0 }, { "Coop", "GuardInterpDelayMs", 120 }, { "Coop", "GuardPhaseLock", 0 },
         { "Coop", "GuardSeesPuppet", 0 }, { "Coop", "PuppetActionReassert", 0 }, { "Coop", "PuppetHostTime", 0 },
-        { "Coop", "AlertQueryAsPlayer", 0 }, { "Coop", "ConflictNullGuard", 0 }, { "Coop", "ConflictKeepPuppet", 0 }, { "Coop", "GuardPoiFightTarget", 0 }, { "Coop", "FightOrderPuppet", 0 }, { "Coop", "DespawnLeaveFight", 0 }, { "Coop", "FightKeepOnConflictEnd", 0 }, { "Coop", "FightStateProbe", 0 }, { "Coop", "PuppetNavService", 0 }, { "Coop", "NativeReplica", 0 }, { "Coop", "NativeReplicaSnapCm", 300 }, { "Coop", "NativeReplicaBlendCmS", 150 }, { "Coop", "NativeReplicaStartBoostCmS", 400 }, { "Coop", "NativeReplicaParkour", 0 }, { "Coop", "NativeReplicaFreeRun", 0 }, { "Coop", "NativeReplicaParkourSnapCm", 800 }, { "Coop", "FightProbe", 0 }, { "Coop", "PeerLastPacket", 0 }, { "Coop", "PuppetActionsOwnUpdate", 0 }, { "Coop", "DetectKeepTarget", 0 }, { "Coop", "GuardPlayerOfInterest", 0 }, { "Coop", "EventProbe", 0 }, { "Coop", "ReactProbe", 0 }, { "Coop", "FightSkipPuppet", 0 }, { "Coop", "NavNullGuard", 0 }, { "Coop", "PuppetStimMode", 1 }, { "Coop", "PuppetStimSeq", 0 }, { "Coop", "PuppetStimSource", 0 }, { "Coop", "SightProbe", 0 }, { "Coop", "StateProbe", 0 }, { "Coop", "StuckProbe", 0 },
+        { "Coop", "AlertQueryAsPlayer", 0 }, { "Coop", "ConflictNullGuard", 0 }, { "Coop", "ConflictKeepPuppet", 0 }, { "Coop", "GuardPoiFightTarget", 0 }, { "Coop", "FightOrderPuppet", 0 }, { "Coop", "DespawnLeaveFight", 0 }, { "Coop", "FightKeepOnConflictEnd", 0 }, { "Coop", "FightStateProbe", 0 }, { "Coop", "PuppetNavService", 0 }, { "Coop", "NativeReplica", 0 }, { "Coop", "NativeReplicaSnapCm", 300 }, { "Coop", "NativeReplicaBlendCmS", 150 }, { "Coop", "NativeReplicaStartBoostCmS", 400 }, { "Coop", "NativeReplicaParkour", 0 }, { "Coop", "NativeReplicaFreeRun", 0 }, { "Coop", "NativeReplicaClimbIntent", 0 }, { "Coop", "NativeReplicaParkourSnapCm", 800 }, { "Coop", "FightProbe", 0 }, { "Coop", "PeerLastPacket", 0 }, { "Coop", "PuppetActionsOwnUpdate", 0 }, { "Coop", "DetectKeepTarget", 0 }, { "Coop", "GuardPlayerOfInterest", 0 }, { "Coop", "EventProbe", 0 }, { "Coop", "ReactProbe", 0 }, { "Coop", "FightSkipPuppet", 0 }, { "Coop", "NavNullGuard", 0 }, { "Coop", "PuppetStimMode", 1 }, { "Coop", "PuppetStimSeq", 0 }, { "Coop", "PuppetStimSource", 0 }, { "Coop", "SightProbe", 0 }, { "Coop", "StateProbe", 0 }, { "Coop", "StuckProbe", 0 },
         { "Coop", "StageLog", 0 }, { "Coop", "SyncEnemiesOnly", 1 }, { "Coop", "SyncMaxEntities", 32 },
         { "Coop", "SyncRadiusM", 60 }, { "Coop", "TransformProbe", 0 }, { "Coop", "VPadEnable", 0 },
         { "Coop", "VPadTest", 0 }, { "Coop", "WatchDeadBit", 0 }, { "Coop", "WatchTarget", 0 },
