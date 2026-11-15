@@ -37,3 +37,22 @@ it never disarmed) would have been armed. That attempt was killed and not counte
 ## Not tested yet
 Opening the panel (F10), drawing in game, mouse/keyboard on the panel, DirectInput zeroing while open, Host/Join and
 the bridge from the panel, the role lock, a two-PC session.
+
+## 5. Panel driven live (owner-approved input: F10, mouse, keys; screenshots)
+Build 0188bad (ASI 80c11198), title menu, pid 3008, 17:52:
+- F10 opened the panel, drawn over the running menu.
+- DirectInput devices are **W**. The mouse reads a 20 B state (DIMOUSESTATE2), the keyboard 256 B (logged per device).
+- The game window gets **no mouse window messages** (wm mouse=0 throughout), so the panel cursor comes from the DI
+  mouse deltas. With the A-struct GetDeviceInfo bug (fixed in 0188bad) the cursor never moved.
+- Input blocked while open: the game's own menu cursor froze. Closed: it follows the same injected relative moves.
+- Host clicked: `action host`, eos_bridge started (pid 8624), the panel showed code **KAHFHN** plus Copy / Stop, and the
+  Join section was hidden. Stop clicked: `action stop`, the bridge exited, state=stopped.
+
+Build a9f7a2d (ASI f66df9a3), pid 4996, 18:10:
+- **Title menu: F10 ignored** ("F10 ignored: not in a loaded save"), no panel.
+- Save loaded through the single-player tile, straight into Havana docks (no save menu).
+- **In the save: F10 opened the panel.** Clicking the code box and typing `ab12c9` showed it in the box. Keyboard
+  window messages do reach the window (wm key=12 = 6 keydown + 6 char). F10 closed the panel, back to the game.
+
+Still untested: Join to a real host (needs the second PC), the role lock on connect, the panel closing when a save
+unloads, WASD not moving Edward while open (DI zeroing is measured, the movement itself was not tried).
