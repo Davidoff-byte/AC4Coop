@@ -1489,6 +1489,21 @@ bool Phase1::CaptureLocalState(PlayerState& s) {
 
         // Context-tagged payload. Swim: read the swim locomotion input from the FSM scope so the peer's
         // puppet can play the moving-swim anim and travel (ground rides the common fields above).
+        // [Coop] NativeReplicaClimbIntent: carry the player's climbing input (see netstate.h ClimbBlock).
+        static int s_sendClimbIn = -1;
+        if (s_sendClimbIn < 0) s_sendClimbIn = GetPrivateProfileIntA("Coop", "NativeReplicaClimbIntent", 0, Paths::Ini()) != 0 ? 1 : 0;
+        if (s.contextId == 30 && s_sendClimbIn == 1) {
+            char* cctx = readable((char*)h + 0x720 + 0x70, 4) ? *(char**)((char*)h + 0x720 + 0x70) : nullptr;
+            if (readable(cctx, 0x30) && *(uint32_t*)cctx == 0x026D4638u && *(uint32_t*)(cctx + 0x10) == 0x026D4588u) {
+                const char* cd = *(const char* const*)(cctx + 0xC);
+                if (readable((void*)cd, 0x18)) {
+                    s.ctx.climb.magic = CLIMB_BLOCK_MAGIC;
+                    s.ctx.climb.dir[0] = *(const float*)(cd + 0x0C);
+                    s.ctx.climb.dir[1] = *(const float*)(cd + 0x10);
+                    s.ctx.climb.speed  = *(const float*)(cd + 0x14);
+                }
+            }
+        }
         if (s.contextId == CTX_SWIM) {
             HumanSwimScope* sc = swimScope(h);
             if (sc) {
@@ -1613,6 +1628,8 @@ static float s_nrSnapM = 3.0f;
 static volatile float g_nrLatestDest = 0.0f; static volatile bool g_nrLatestSprint = false;
 static volatile uint8_t g_nrLatestMvt = 0;
 static volatile int g_nrLatestCtx = 4;     // newest packet's contextId
+static volatile bool g_nrClimbValid = false; static float g_nrClimbIn[3] = { 0, 0, 0 };   // newest packet's ClimbBlock
+static volatile LONG s_nrClimbReal = 0, s_nrClimbDerived = 0;
 static volatile LONG s_nrWallTries = 0, s_nrWallOk = 0;
 static volatile LONG s_nrExitReq = 0;   // set by the snap path, served on the puppet's own update   // newest packet's HumanGroundData destMvt (+0x125, IHumanGround slot 3)
 static int s_nrFreeRun = -1;                 // [Coop] NativeReplicaFreeRun (default 0), read once
@@ -1892,7 +1909,12 @@ static void NativeReplicaNavTick(Entity* e) {
                 float x = ex * rx + ey * ry, y = ez;
                 const float mag = sqrtf(x * x + y * y);
                 float v[2] = { 0.0f, 0.0f }; float sp = 0.0f;
-                if (mag > 0.6f) { v[0] = x / mag; v[1] = y / mag; sp = 1.0f; }   // 0.6 m: half a hand step (run 31896 with 0.3 m overshot back and forth)
+                // The peer's real climbing input when its newest packet carries one (ClimbBlock); the error-derived
+                // direction only when the peer's input is idle and the replica is more than half a hand step off.
+                const bool real = g_nrClimbValid;
+                const float pin = real ? sqrtf(g_nrClimbIn[0] * g_nrClimbIn[0] + g_nrClimbIn[1] * g_nrClimbIn[1]) : 0.0f;
+                if (real && pin > 0.05f) { v[0] = g_nrClimbIn[0]; v[1] = g_nrClimbIn[1]; sp = g_nrClimbIn[2]; InterlockedIncrement(&s_nrClimbReal); }
+                else if (mag > 0.6f) { v[0] = x / mag; v[1] = y / mag; sp = 1.0f; InterlockedIncrement(&s_nrClimbDerived); }   // 0.6 m: half a hand step (run 31896 with 0.3 m overshot back and forth)
                 void* ci = cctx + 0x10; void** cvt = *(void***)ci;
                 ((void (__thiscall*)(void*, const float*))cvt[37])(ci, v);
                 ((void (__thiscall*)(void*, float))cvt[38])(ci, sp);
@@ -1901,8 +1923,8 @@ static void NativeReplicaNavTick(Entity* e) {
                 const uint64_t cnow = GetTickCount64();
                 if (cnow >= s_ciNext) {
                     s_ciNext = cnow + 2000;
-                    L("[Replica] climb intent: frames=%ld mean |err on wall|=%.2f m last x=%.2f y=%.2f -> v=(%.2f,%.2f) speed %.0f\n",
-                      s_ciN, s_ciN ? s_ciSum / s_ciN : 0.0f, x, y, v[0], v[1], sp);
+                    L("[Replica] climb intent: frames=%ld mean |err on wall|=%.2f m last x=%.2f y=%.2f -> v=(%.2f,%.2f) speed %.2f | real=%ld derived=%ld peerBlock=%d\n",
+                      s_ciN, s_ciN ? s_ciSum / s_ciN : 0.0f, x, y, v[0], v[1], sp, s_nrClimbReal, s_nrClimbDerived, g_nrClimbValid ? 1 : 0);
                     s_ciN = 0; s_ciSum = 0.0f;
                 }
             }
@@ -11857,7 +11879,9 @@ static void OnFrameInner(Human* updatedHuman) {
         static PlayerState s_lastRaw; static bool s_haveLastRaw = false;
         static int s_plpOn = 0; static uint64_t s_plpNext = 0;
         { const uint64_t t = GetTickCount64(); if (t >= s_plpNext) { s_plpNext = t + 2000; s_plpOn = GetPrivateProfileIntA("Coop", "PeerLastPacket", 0, Paths::Ini()) != 0; } }
-        if (gotRaw) { s_lastRaw = raw; s_haveLastRaw = true; g_nrLatestDest = raw.destSpeed; g_nrLatestSprint = raw.sprint; g_nrLatestMvt = raw.destMvt; g_nrLatestCtx = raw.contextId; }
+        if (gotRaw) { s_lastRaw = raw; s_haveLastRaw = true; g_nrLatestDest = raw.destSpeed; g_nrLatestSprint = raw.sprint; g_nrLatestMvt = raw.destMvt; g_nrLatestCtx = raw.contextId;
+                      g_nrClimbValid = raw.contextId == 30 && raw.ctx.climb.magic == CLIMB_BLOCK_MAGIC;
+                      if (g_nrClimbValid) { g_nrClimbIn[0] = raw.ctx.climb.dir[0]; g_nrClimbIn[1] = raw.ctx.climb.dir[1]; g_nrClimbIn[2] = raw.ctx.climb.speed; } }
         const bool haveRaw = s_plpOn ? s_haveLastRaw : gotRaw;
         if (!gotRaw && haveRaw) raw = s_lastRaw;
 

@@ -23,8 +23,20 @@ struct SwimBlock {
     float    ccImpulse[4];       // CharacterController::m_Impulse
 };
 
+// Climbing (contextId 30): the player's climbing input as the Climbing context's own data block holds it - the values
+// the player's climbing handler (sub_113DAC0) wrote through the climbing interface (vtable 0x026D4588) slot 37
+// SetDirection2D (data+0x0C/+0x10) and slot 38 SetSpeedRatio (data+0x14); data = [context+0xC] = [interface-4]
+// (docs/evidence/climb-decision-leads-2026-11-15.md items 13-14). `magic` marks the block as filled.
+static const uint32_t CLIMB_BLOCK_MAGIC = 0x424D4C43;   // 'CLMB'
+struct ClimbBlock {
+    uint32_t magic;              // CLIMB_BLOCK_MAGIC when filled ([Coop] NativeReplicaClimbIntent on the sender)
+    float    dir[2];             // 2D climbing input: x sideways (the character's right), y up
+    float    speed;              // speed ratio 0..1
+};
+
 union ContextBlock {
     SwimBlock swim;
+    ClimbBlock climb;
     uint8_t   _reserve[128]; // stable footprint as future context blocks are added
 };
 
