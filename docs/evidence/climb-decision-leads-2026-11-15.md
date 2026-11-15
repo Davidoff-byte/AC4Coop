@@ -148,6 +148,17 @@ Climb reproduced with the Pilot (stick offset re-learned per attempt: `goto ... 
     `sub_1D65BB0`) then **30 from 0x01756D5A** (Walling code). The ground -> wall-run choice is made by the native ground
     chart; whether it can be driven by intention on a replica is open.
 
+16. **Entry by intention, on Edward** (run 32012, scratch `intentclimb.py`: Pilot ground intent cmd 9 toward the wall
+    plus pad state): (b) intent only, stick neutral, no buttons -> walked into the wall, no climb; (a) intent + RT + A,
+    stick neutral -> did not move (with free-run held and no stick the handler does not call the ground slots, so the
+    intent hook never fires); (c) intent + RT + A + stick held (direction replaced by the intent) -> wall run and climb onto
+    the top (max dz +2.05, end z 7.02). Player-filtered hooks on IHumanGround (vtable 0x026E7DC0) slot 3 `0x01D0DA00`
+    (SetMovementType) and slot 32 `0x016D8960` (SetSprint), entity snapshot `[[[ecx-0xC]+0x108]+4]`: walking -> slot 32
+    arg low byte 0, slot 3 arg 0; RT + A running -> slot 32 low byte 1, slot 3 arg **1**; both from the player handler
+    (0x01AEF9C7 / 0x01AEF9EF). So the free-run state reaches the ground context as movement type 1 + sprint, both
+    callable on a replica's IHumanGround; the sender already transmits `destMvt` (HumanGroundData+0x125, written by
+    slot 3) and `sprint`. Whether an NPC replica's ground chart then wall-runs is untested.
+
 So a shimmy step is fully described by **(definition index, position on the guidance)** plus the guidance it lies on; that
 is what R4.3 would send. UNVERIFIED: that the definition table is identical in both games (same assets, so expected), how
 the replica side reaches the table (the generator's inputs), and the other 11 move types (climb up, jump, ...).
