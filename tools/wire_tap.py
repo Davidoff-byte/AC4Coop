@@ -112,7 +112,13 @@ def fmt_summary(s):
 EF = ((1, "pos", "<3f"), (2, "quat", "<4f"), (4, "action", "<I"), (0x10, "hp", "<H"), (0x20, "arch", "<H"), (0x40, "dead", "<B"), (0x80, "stage", "<B"))
 
 
-ENTITY_CHUNK_MAX = 1400   # src/net.cpp: datagram budget; record bytes per chunk = 1400 - header
+ENTITY_CHUNK_MAX = 1170   # src/net.cpp: datagram budget since proto 16 (EOS P2P max); 1400 before
+
+
+def chunk_stride(proto):
+    """Record bytes per entity chunk, which the receiver uses as the placement stride (chunk i at i * stride):
+    proto 13: 1400 - 32 = 1368; proto 14/15: 1400 - 36 = 1364; proto 16+: 1170 - 36 = 1134."""
+    return 1170 - 36 if proto >= 16 else (1400 - 36 if proto >= 14 else 1400 - 32)
 
 
 def ent_hdr_len(d):
@@ -122,12 +128,14 @@ def ent_hdr_len(d):
 
 
 def rechunk_36(chunks, host_ms, proto=14):
-    """Proto-13 chunks of one snapshot (all of them, any order) -> datagrams with the 36 B header (proto 14 or 15):
-    hostMs appended, protoVer = `proto`, record bytes re-split at 1364 B (the receiver places chunk i at
-    i * (1400 - 36))."""
+    """All chunks of one snapshot (any order; 32 B proto-13 or 36 B proto-14/15 headers) -> datagrams with the 36 B
+    header for `proto`: record bytes re-split at chunk_stride(proto) (1364 for 14/15, 1134 for 16+). hostMs = host_ms
+    for proto-13 input; a 36 B input keeps its recorded hostMs."""
     chunks = sorted(chunks, key=lambda d: struct.unpack_from("<H", d, 28)[0])
-    body = b"".join(d[32:] for d in chunks)
-    per = ENTITY_CHUNK_MAX - 36
+    body = b"".join(d[ent_hdr_len(d):] for d in chunks)
+    if ent_hdr_len(chunks[0]) == 36:
+        host_ms = struct.unpack_from("<I", chunks[0], 32)[0]
+    per = chunk_stride(proto)
     n = max(1, (len(body) + per - 1) // per)
     h0 = chunks[0]
     out = []
@@ -139,12 +147,15 @@ def rechunk_36(chunks, host_ms, proto=14):
 
 def convert(d, k, as_proto, pend, now_ms):
     """One recorded datagram -> what replay sends for --as-proto (a list; empty while a proto-13 snapshot is gathered).
-    13 -> 14/15: entity snapshots are re-split with the 36 B header and hostMs = now_ms; PlayerState.hostTimeMs (+565,
-    tail pad) is stamped when it is 0. 14 -> 15 and any other: only protoVer changes (proto 15 kept both layouts).
+    13 -> 14/15/16: entity snapshots are re-split with the 36 B header and hostMs = now_ms; PlayerState.hostTimeMs
+    (+565, tail pad) is stamped when it is 0. 14/15 -> 16: entity snapshots are re-split at the proto-16 stride, keeping
+    their hostMs. 14 -> 15 and players: only protoVer changes.
     as_proto 0 = unchanged. `pend` holds the chunks of incomplete proto-13 snapshots, by seq."""
     if not as_proto or k not in ("player", "entity"):
         return [d]
-    if as_proto >= 14 and k == "entity" and ent_hdr_len(d) == 32:
+    src_proto = struct.unpack_from("<I", d, 4)[0]
+    if k == "entity" and ((as_proto >= 14 and ent_hdr_len(d) == 32) or (as_proto >= 16 and 14 <= src_proto < 16)):
+        # 13 -> 14+: new header; 14/15 -> 16+: the chunk stride changed (1364 -> 1134), so re-split, not just relabel
         seq_, ct_ = struct.unpack_from("<I", d, 8)[0], struct.unpack_from("<H", d, 30)[0]
         pend.setdefault(seq_, []).append(d)
         if len(pend[seq_]) < ct_:
@@ -440,10 +451,22 @@ def selftest():
     si = summarize([(0.0, gold), (0.1, gold[:40]), (0.2, lp.player_state(4))])
     ok15d = kind(gold) == "intent" and si["intent"] == 2 and si["intent_msgs"] == 1 and si["player"] == 1 and si["other"] == 0
     ok15 = ok15a and ok15b and ok15c and ok15d
-    ok = ok and ok15
+    # proto 16, --as-proto 16: a proto-15 snapshot of 2000 record bytes (chunks 1364 + 636, hostMs 31337) is re-split at the
+    # proto-16 stride (1134 + 866), keeps its hostMs, and decodes to the same rows as the original
+    b15 = bytes(range(256)) * 7 + bytes(208)                      # 2000 B of record-region filler (not decoded)
+    c15 = rechunk_36([hdr(0) + b15[:1368], hdr(1) + b15[1368:]], 31337, 15)
+    r16 = []
+    for d in c15:
+        r16 += convert(d, "entity", 16, pend, 1)
+    ok16 = ([len(d) - 36 for d in c15] == [1364, 636] and [len(d) - 36 for d in r16] == [1134, 866] and not pend
+            and all(struct.unpack_from("<I", d, 4)[0] == 16 and struct.unpack_from("<I", d, 32)[0] == 31337 for d in r16)
+            and b"".join(d[36:] for d in r16) == b"".join(d[36:] for d in c15) and struct.unpack_from("<HH", r16[1], 28) == (1, 2))
+    r16b = convert(r14[0], "entity", 16, pend, 1)                 # a one-chunk proto-14 snapshot still decodes the same
+    ok16 = ok16 and len(r16b) == 1 and entity_table([(0.0, r16b[0])]) == rows
+    ok = ok and ok15 and ok16
     print(f"[tap] selftest: {'PASS' if ok else 'FAIL'} (file round trip, classification, summary, entity decode across chunks, anim block, "
           f"proto 14 re-split, proto 15: 13->15 {'ok' if ok15a else 'FAIL'}, 14->15 {'ok' if ok15b else 'FAIL'}, "
-          f"passthrough {'ok' if ok15c else 'FAIL'}, intent datagrams {'ok' if ok15d else 'FAIL'})")
+          f"passthrough {'ok' if ok15c else 'FAIL'}, intent datagrams {'ok' if ok15d else 'FAIL'}, 15->16 re-split {'ok' if ok16 else 'FAIL'})")
     return 0 if ok else 1
 
 

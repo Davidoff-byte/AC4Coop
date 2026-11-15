@@ -158,7 +158,9 @@ static_assert(sizeof(PlayerState) == 576, "PlayerState wire size changed - updat
 static const uint32_t NET_MAGIC = 0x43344341; // 'AC4C'
 // Wire/struct-layout version. PlayerState is #pragma pack(1): adding a field shifts every following
 // offset, so both peers MUST run the same build. Bump this whenever the layout changes.
-static const uint32_t NET_PROTO_VER = 15;  // 15: intention lane, a new datagram type ('AC4I', IntentWireHeader below).
+static const uint32_t NET_PROTO_VER = 16;  // 16: datagram budget 1400 -> 1170 B (EOS P2P max) on both the entity lane (chunk
+                                           //     stride 1368 -> 1134 B, part of the wire format) and the intent lane
+                                           // 15: intention lane, a new datagram type ('AC4I', IntentWireHeader below).
                                            //     PlayerState, the entity header/records and LobbyPacket are unchanged
                                            // 14: entity header += u32 hostMs (36 B); PlayerState += u32 hostTimeMs
                                            //     at +565 (tail pad, still 576 B); LobbyPacket and records unchanged
@@ -277,7 +279,7 @@ struct EntityPacket {
 // `count` keeps its old meaning: it is the number of element records the caller captured / the
 // number written on the wire, not the number of field groups.
 // Proto 11 (X15/X5): the header now also carries `worldId` (the sender's world; a mismatched snapshot
-// is dropped) and `chunkIndex`/`chunkTotal`, so a snapshot whose encoded records exceed 1400 B is split
+// is dropped) and `chunkIndex`/`chunkTotal`, so a snapshot whose encoded records exceed the datagram budget (1170 B since proto 16) is split
 // into several UDP datagrams and reassembled on the receive side (a partial set is never applied).
 // Old (proto <= 10) peers are rejected by the protoVer check rather than mis-parsed (both lanes).
 enum EntityField : uint16_t {
@@ -353,8 +355,8 @@ enum IntentFlag : uint8_t {
 static const int INTENT_PAYLOAD_MAX    = 32;   // opaque payload bytes per message
 static const int INTENT_MSG_FIXED      = 27;   // wire bytes of a message before its payload
 static const int INTENT_ACK_RANGES_MAX = 16;   // SACK runs per datagram
-static const int INTENT_MSGS_MAX       = 64;   // messages per datagram (1400 B holds at most 50 empty ones)
-static const int INTENT_DGRAM_MAX      = 1400; // UDP payload budget, same as the entity lane's chunks
+static const int INTENT_MSGS_MAX       = 64;   // messages per datagram (1170 B holds at most 42 empty ones)
+static const int INTENT_DGRAM_MAX      = 1170; // UDP / EOS P2P payload budget (proto 16), same as the entity lane's chunks
 
 #pragma pack(push, 1)
 struct IntentWireHeader {

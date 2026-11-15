@@ -40,7 +40,7 @@ NET_MAGIC = 0x43344341         # 'AC4C'  netstate.h
 NET_ENTITY_MAGIC = 0x45344341  # 'AC4E'  netstate.h
 NET_LOBBY_MAGIC = 0x4C344341   # 'AC4L'  netstate.h
 NET_INTENT_MAGIC = 0x49344341  # 'AC4I'  netstate.h, proto 15 intention lane
-NET_PROTO_VER = 15   # 15: intention lane datagram 'AC4I'; PlayerState, entity header (36 B) and LobbyPacket unchanged
+NET_PROTO_VER = 16   # 16: datagram budget 1170 B (EOS); 15: intention lane datagram 'AC4I'; PlayerState, entity header (36 B) and LobbyPacket unchanged
 SIZEOF_PLAYERSTATE = 576       # netstate.h static_assert
 
 # ---- proto 15 intention lane (src/netstate.h IntentWireHeader, src/net.cpp IntentPut*/IntentParse) ----
@@ -51,10 +51,10 @@ INTENT_HDR_FMT, INTENT_RANGE_FMT, INTENT_MSG_FMT = "<IIIIIIBBH", "<IH", "<IIQBBB
 INTENT_PAYLOAD_MAX = 32
 INTENT_CHANNELS = {1: "ACTION", 2: "LOCO", 3: "WEAPON", 4: "LOOKAT"}   # IntentChannel; 1..15 legal on the wire
 IF_BASE = 1
-# The same 64 bytes as kGolden in src/net.cpp SelfTestIntent (proto 15): senderInc 0x11223344, peerInc 0x55667788,
+# The same 64 bytes as kGolden in src/net.cpp SelfTestIntent (protoVer field = 16 since 2026-11-15): senderInc 0x11223344, peerInc 0x55667788,
 # hostMs 0x01020304, ackCum 7, one run {9, 2}, one message {msgId 5, slot 3, wireId 0x0102030405060708, ACTION,
 # BASE, "xyz", chanSeq 0x0A0B0C0D, hostMs 0x0E0F1011}. selftest() checks both sides against it.
-INTENT_GOLDEN_HEX = ("414334490f00000044332211887766550403020107000000010100000900000002000500000003000000"
+INTENT_GOLDEN_HEX = ("414334491000000044332211887766550403020107000000010100000900000002000500000003000000"
                      "08070605040302010101030d0c0b0a11100f0e78797a")
 
 
@@ -335,7 +335,7 @@ def selftest() -> int:
         print("[lobby_peer] selftest: FAIL " + "; ".join(fails))
         return 1
     print("[lobby_peer] selftest: PASS (layout, round trip, negatives, code check, netstate.h constants, "
-          "proto 15 intent golden vector vs net.cpp)")
+          "proto 16 intent golden vector vs net.cpp)")
     return 0
 
 

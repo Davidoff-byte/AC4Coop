@@ -186,12 +186,15 @@ namespace {
     uint32_t   g_wireRecs = 0;                   // instrumentation: records in the last packet
 
     // ---- X15 (chunked transport) + X5 (world identity on the entity lane) ----------------------
-    // A snapshot whose encoded record region would exceed ENTITY_CHUNK_MAX (1400 B UDP payload) is
-    // split into chunkTotal datagrams, each <= 1400 B, so no chunk IP-fragments at MTU 1500 (one lost
-    // fragment no longer discards the whole snapshot). The header repeats in every chunk.
-    static const int ENTITY_CHUNK_MAX       = 1400;                              // UDP payload budget
-    static const int ENTITY_CHUNK_DATA      = ENTITY_CHUNK_MAX - ENTITY_WIRE_HEADER_SIZE; // 1368 B records/chunk
-    static const int ENTITY_CHUNK_MAX_TOTAL = 12;                                // = ceil((16384-32)/1368): the
+    // A snapshot whose encoded record region would exceed ENTITY_CHUNK_MAX (UDP payload budget) is
+    // split into chunkTotal datagrams, each <= ENTITY_CHUNK_MAX, so no chunk IP-fragments at MTU 1500 (one
+    // lost fragment no longer discards the whole snapshot). The header repeats in every chunk.
+    // Proto 16 (2026-11-15): 1400 -> 1170 B = EOS_P2P_MAX_PACKET_SIZE (EOS SDK v1.19 eos_p2p_types.h:14), so every
+    // datagram also fits the EOS bridge (docs/design/eos-transport.md). The receiver places chunk i at
+    // i * ENTITY_CHUNK_DATA, so the stride is part of the wire format: hence the protoVer bump.
+    static const int ENTITY_CHUNK_MAX       = 1170;                              // UDP / EOS P2P payload budget
+    static const int ENTITY_CHUNK_DATA      = ENTITY_CHUNK_MAX - ENTITY_WIRE_HEADER_SIZE; // 1134 B records/chunk
+    static const int ENTITY_CHUNK_MAX_TOTAL = 15;                                // = ceil((16384-36)/1134): the
                                                                                  // receive buffer cannot hold more
     static const uint64_t ENTITY_CHUNK_TIMEOUT_MS = 1000;   // drop an incomplete set after 1 s
 
@@ -223,8 +226,8 @@ namespace {
     RxAssembly g_asm;
 
     // M1 hardening: the mask has one bit per chunk, and the receive buffer must hold the largest set
-    // the encoder can ever emit. recordBytes <= sizeof(g_txBuf) - header = 16352, and
-    // ceil(16352/1368) = 12 chunks (the last one short): 11*1368 = 15048 < 16352, 15*1368 = 20520 does not.
+    // the encoder can ever emit. recordBytes <= sizeof(g_txBuf) - header = 16348, and
+    // ceil(16348/1134) = 15 chunks (the last one short): 14*1134 = 15876 < 16348.
     static_assert(ENTITY_CHUNK_MAX_TOTAL <= 16,
                   "receivedMask is uint16_t: one bit per chunk index");
     static_assert((ENTITY_CHUNK_MAX_TOTAL - 1) * ENTITY_CHUNK_DATA
@@ -233,6 +236,26 @@ namespace {
     static_assert((int)((sizeof(g_txBuf) - ENTITY_WIRE_HEADER_SIZE + ENTITY_CHUNK_DATA - 1)
                         / ENTITY_CHUNK_DATA) <= ENTITY_CHUNK_MAX_TOTAL,
                   "encoder can emit more chunks than the validator accepts");
+
+    // X15 chunking, shared by SendEntities and SelfTestWire (proto 16 multi-chunk case). A header-only snapshot
+    // (recordBytes == 0) still sends one chunk so the peer sees the heartbeat.
+    inline uint16_t EntityChunkCount(size_t recordBytes) {
+        return recordBytes == 0 ? (uint16_t)1 : (uint16_t)((recordBytes + ENTITY_CHUNK_DATA - 1) / ENTITY_CHUNK_DATA);
+    }
+    // enc/n = one encoded snapshot ([header][records]); writes chunk i of `total` to out (>= ENTITY_CHUNK_MAX bytes)
+    // and returns its length: the header (chunkIndex/chunkTotal set) + up to ENTITY_CHUNK_DATA record bytes.
+    inline size_t BuildEntityChunk(const uint8_t* enc, size_t n, uint16_t i, uint16_t total, uint8_t* out) {
+        const size_t hdr = sizeof(EntityWireHeader), recordBytes = n - hdr, off = (size_t)i * ENTITY_CHUNK_DATA;
+        size_t len = recordBytes > off ? recordBytes - off : 0;
+        if (len > (size_t)ENTITY_CHUNK_DATA) len = (size_t)ENTITY_CHUNK_DATA;
+        EntityWireHeader h{};
+        std::memcpy(&h, enc, sizeof(h));   // magic/proto/seq/epoch/count/worldId already set
+        h.chunkIndex = i;
+        h.chunkTotal = total;
+        std::memcpy(out, &h, sizeof(h));
+        std::memcpy(out + hdr, enc + hdr + off, len);
+        return hdr + len;
+    }
 
     // RFC 1982 serial-number comparison on the uint32 seq counter: valid while |a-b| < 2^31, i.e. for
     // any reordering distance a real link can produce.
@@ -542,10 +565,51 @@ namespace {
             okT = okT && DecodeEntityChunk(buf, t2, c, &w) == DEC_OK;            // restarted sender: accepted
             g_rxHaveDone = false; g_rxDoneSeq = 0;
         }
+        // Proto 16: a snapshot larger than one chunk goes through the real split (BuildEntityChunk, as SendEntities),
+        // every datagram <= ENTITY_CHUNK_MAX (1170 B, the EOS P2P limit), chunks decoded in REVERSE order (pending until
+        // the set is complete), and the reassembled records equal the input.
+        bool okC = false;
+        unsigned chunksC = 0;
+        {
+            std::memset(g_txShadow, 0, sizeof(g_txShadow));
+            std::memset(g_rxShadow, 0, sizeof(g_rxShadow));
+            g_txEpoch = g_rxEpoch = 1; g_txSinceReset = 0; g_rxHaveDone = false; g_rxDoneSeq = 0;
+            std::memset(&d, 0, sizeof(d));
+            d.magic = NET_ENTITY_MAGIC; d.protoVer = NET_PROTO_VER; d.seq = 7000; d.count = 120;
+            for (int i = 0; i < 120; ++i) {
+                EntityState& e = d.ents[i];
+                e.key = 1000u + i; e.kind = 2; e.stage = 1; e.hp = (uint16_t)(30 + i);
+                e.pos[0] = 1.0f * i; e.pos[1] = -2.0f * i; e.pos[2] = 0.5f * i;
+                e.quat[3] = 1.0f; e.actionAlias = 0x55000000u + i; e.objId = 0x1122000000000000ull + i; e.arch = (uint16_t)(0x3600 + i);
+            }
+            const size_t nc = EncodeEntityPacket(d, buf, sizeof(buf));
+            const uint16_t total = nc ? EntityChunkCount(nc - sizeof(EntityWireHeader)) : 0;
+            chunksC = total;
+            static uint8_t ch[ENTITY_CHUNK_MAX_TOTAL][ENTITY_CHUNK_MAX];
+            size_t clen[ENTITY_CHUNK_MAX_TOTAL] = {};
+            okC = total >= 3 && total <= ENTITY_CHUNK_MAX_TOTAL;
+            for (uint16_t i = 0; okC && i < total; ++i) {
+                clen[i] = BuildEntityChunk(buf, nc, i, total, ch[i]);
+                okC = clen[i] <= (size_t)ENTITY_CHUNK_MAX;
+            }
+            DecodeReason w = DEC_OK;
+            for (int i = (int)total - 1; okC && i >= 0; --i) {
+                const DecodeReason r = DecodeEntityChunk(ch[i], clen[i], f, &w);
+                okC = (i > 0) ? (r == DEC_PENDING) : (r == DEC_OK);
+            }
+            okC = okC && f.count == 120 && SameEntity(d.ents[0], f.ents[0]) && SameEntity(d.ents[119], f.ents[119]);
+            g_rxHaveDone = false; g_rxDoneSeq = 0;
+        }
         // Both peers must start from an empty shadow.
         std::memset(g_txShadow, 0, sizeof(g_txShadow));
         std::memset(g_rxShadow, 0, sizeof(g_rxShadow));
         g_txEpoch = g_rxEpoch = 1; g_txSinceReset = 0;
+        {
+            char mc[128];
+            wsprintfA(mc, "[Net] wire chunk selftest (proto %u, <= %d B/datagram): %s (chunks=%u, decoded in reverse)\n",
+                      (unsigned)NET_PROTO_VER, ENTITY_CHUNK_MAX, okC ? "PASS" : "FAIL", chunksC);
+            dbg(mc);
+        }
         char m[256];
         wsprintfA(m, "[Net] wire codec selftest: roundtrip=%s resend=%s nochange=%s deaddelta=%s resurrect=%s halfdead=%s anim=%s"
                      " stale=%s restart=%s (full=%u B, resend=%u B, repeat=%u B, res=%u B, idle=%u B, half=%u B, anim=%u B)\n",
@@ -554,7 +618,7 @@ namespace {
                   (unsigned)n1, (unsigned)nr, (unsigned)n2, (unsigned)n3, (unsigned)n4, (unsigned)n5, (unsigned)n6);
         dbg(m);
         const bool okI = SelfTestIntent();   // proto 15: golden, parse, ack, dedup, reorder, 30% loss, rejoin replay
-        return ok && okR && ok2 && ok3 && ok4 && ok5 && ok6 && okS && okT && okI;
+        return ok && okR && ok2 && ok3 && ok4 && ok5 && ok6 && okS && okT && okC && okI;
     }
 
     bool DecodeEntityPacket(const uint8_t* in, size_t len, EntityPacket& out, DecodeReason* why) {
@@ -1183,9 +1247,9 @@ namespace {
         static uint8_t d1[INTENT_DGRAM_MAX], d2[INTENT_DGRAM_MAX];
 
         // (0) golden vector: the byte layout tools/lobby_peer.py packs (INTENT_GOLDEN_HEX there). Proto 15.
-        static_assert(NET_PROTO_VER == 15, "re-derive the intent golden vector (and lobby_peer.py) for the new protoVer");
+        static_assert(NET_PROTO_VER == 16, "re-derive the intent golden vector (and lobby_peer.py) for the new protoVer");
         static const uint8_t kGolden[64] = {
-            0x41,0x43,0x34,0x49, 0x0F,0x00,0x00,0x00, 0x44,0x33,0x22,0x11, 0x88,0x77,0x66,0x55,
+            0x41,0x43,0x34,0x49, 0x10,0x00,0x00,0x00, 0x44,0x33,0x22,0x11, 0x88,0x77,0x66,0x55,
             0x04,0x03,0x02,0x01, 0x07,0x00,0x00,0x00, 0x01, 0x01, 0x00,0x00,
             0x09,0x00,0x00,0x00, 0x02,0x00,
             0x05,0x00,0x00,0x00, 0x03,0x00,0x00,0x00, 0x08,0x07,0x06,0x05,0x04,0x03,0x02,0x01,
@@ -2581,26 +2645,14 @@ void SendEntities(const EntityPacket& p) {
     const sockaddr_in peer = PeerCopy(&slot);
     const size_t n = EncodeEntityPacket(p, g_txBuf, sizeof(g_txBuf));   // [header][records]
     if (n == 0) return;
-    const size_t hdr = sizeof(EntityWireHeader);
-    const size_t recordBytes = n - hdr;
-    // X15: chunk the record region so every UDP payload stays <= ENTITY_CHUNK_MAX. A header-only
-    // snapshot (recordBytes == 0) still sends one chunk so the peer sees the heartbeat.
-    const uint16_t total = (recordBytes == 0) ? 1u
-                            : (uint16_t)((recordBytes + ENTITY_CHUNK_DATA - 1) / ENTITY_CHUNK_DATA);
+    // X15: chunk the record region so every UDP payload stays <= ENTITY_CHUNK_MAX (1170 B since proto 16).
+    const uint16_t total = EntityChunkCount(n - sizeof(EntityWireHeader));
     uint8_t chunk[ENTITY_CHUNK_MAX];
     for (uint16_t i = 0; i < total; ++i) {
-        const size_t off = (size_t)i * ENTITY_CHUNK_DATA;
-        size_t len = recordBytes - off;
-        if (len > (size_t)ENTITY_CHUNK_DATA) len = (size_t)ENTITY_CHUNK_DATA;
-        EntityWireHeader h{};
-        std::memcpy(&h, g_txBuf, sizeof(h));   // magic/proto/seq/epoch/count/worldId already set
-        h.chunkIndex = i;
-        h.chunkTotal = total;
-        std::memcpy(chunk, &h, sizeof(h));
-        std::memcpy(chunk + hdr, g_txBuf + hdr + off, len);
-        SendRaw(chunk, (int)(hdr + len), peer, slot);   // <= 1400 B + 16 B relay header <= Relay::kMaxDatagram
+        const size_t len = BuildEntityChunk(g_txBuf, n, i, total, chunk);
+        SendRaw(chunk, (int)len, peer, slot);   // <= 1170 B + 16 B relay header <= Relay::kMaxDatagram
         InterlockedIncrement(&g_txPackets);
-        InterlockedAdd(&g_txBytes, (LONG)(hdr + len));   // actual bytes on the wire (per chunk)
+        InterlockedAdd(&g_txBytes, (LONG)len);   // actual bytes on the wire (per chunk)
     }
     InterlockedAdd(&g_txEnts, (LONG)g_wireRecs);
     PumpIntents();                             // proto 15: no-op unless [Coop] IntentLane=1
