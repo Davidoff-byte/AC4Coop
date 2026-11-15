@@ -331,6 +331,67 @@ void InstallIntentHooks()
     Log("[Pilot] intent hooks installed on IHumanGround vtable 0x026E7DC0 slots 0/1\n");
 }
 
+// ---- climbing intent: Climbing context interface vtable 0x026D4588 slots 37/38 ---------------------------------------
+// bf-coop ref/AC4Coop-lobby/docs/evidence/climb-decision-leads-2026-11-15.md item 13 (run 8744): slot 37 0x01537F30
+// SetDirection2D(const Vector2*) stores [this-4]+0x0C/+0x10, slot 38 0x0152B0C0 SetSpeedRatio(float) clamps 0..1 to
+// [this-4]+0x14; the player's climbing handler sub_113DAC0 calls both every update. The interface sits at context+0x10
+// (ctor sub_1581770), context+4 = Human, so entity = [[[p-0xC]+0x108]+4] exactly as for IHumanGround. Both thiscall,
+// retn 4 (slot 37: `mov eax,[ecx-4]` ... `retn 4`, 24 bytes; slot 38: 44 bytes).
+typedef void (__thiscall* ClimbDir_t)(void*, const float*);
+typedef void (__thiscall* ClimbSpd_t)(void*, float);
+ClimbDir_t g_origClimbDir = nullptr;
+ClimbSpd_t g_origClimbSpd = nullptr;
+float g_climbX = 0, g_climbY = 0, g_climbSpeed = 1.0f;
+volatile DWORD g_climbUntil = 0;
+
+bool ClimbIntentFor(void* ig)
+{
+    if (!g_climbUntil || (LONG)(GetTickCount() - g_climbUntil) > 0) return false;
+    uint32_t a = *(const uint32_t*)((const char*)ig - 0xC);
+    if (!a) return false;
+    uint32_t h = *(const uint32_t*)(uintptr_t)(a + 0x108);
+    return h && *(const uint32_t*)(uintptr_t)(h + 4) == g_intentEntity;
+}
+
+void __fastcall HookClimbDir(void* ig, void* /*edx*/, const float* v)
+{
+    if (ClimbIntentFor(ig)) {
+        float d[2] = { g_climbX, g_climbY };
+        if (g_ctl) InterlockedIncrement((volatile LONG*)&g_ctl->reserved[5]);
+        g_origClimbDir(ig, d);
+        return;
+    }
+    g_origClimbDir(ig, v);
+}
+
+void __fastcall HookClimbSpd(void* ig, void* /*edx*/, float r)
+{
+    if (ClimbIntentFor(ig)) {
+        if (g_ctl) InterlockedIncrement((volatile LONG*)&g_ctl->reserved[6]);
+        g_origClimbSpd(ig, g_climbSpeed);
+        return;
+    }
+    g_origClimbSpd(ig, r);
+}
+
+void InstallClimbIntentHooks()
+{
+    uint32_t* slot = (uint32_t*)(0x026D4588 + 37 * 4);
+    if (slot[0] != 0x01537F30u || slot[1] != 0x0152B0C0u) {
+        Log("[Pilot] climb intent hooks NOT installed: vtable 0x026D4588 slots 37/38 hold %08X %08X (expected 01537F30 0152B0C0)\n", slot[0], slot[1]);
+        return;
+    }
+    DWORD old = 0;
+    if (!VirtualProtect(slot, 8, PAGE_READWRITE, &old)) { Log("[Pilot] climb intent hooks: VirtualProtect failed\n"); return; }
+    g_origClimbDir = (ClimbDir_t)(uintptr_t)slot[0];
+    g_origClimbSpd = (ClimbSpd_t)(uintptr_t)slot[1];
+    InterlockedExchange((volatile LONG*)&slot[0], (LONG)(uintptr_t)&HookClimbDir);
+    InterlockedExchange((volatile LONG*)&slot[1], (LONG)(uintptr_t)&HookClimbSpd);
+    VirtualProtect(slot, 8, old, &old);
+    if (g_ctl) g_ctl->reserved[7] = 1;
+    Log("[Pilot] climb intent hooks installed on vtable 0x026D4588 slots 37/38\n");
+}
+
 void SetIntent(float dx, float dy, float speed, DWORD holdMs)
 {
     float l = sqrtf(dx * dx + dy * dy);
@@ -398,8 +459,14 @@ void RunCommand(Entity* pl)
             g_goto.stuckSec = c->f[4] > 0 ? c->f[4] : 3.0f; g_goto.best = 1e9f; g_goto.bestTick = GetTickCount();
             c->reserved[0] = 1;
         }
+    } else if (c->cmd == kCmdClimbIntent) {
+        if (!g_origClimbDir) status = -4;
+        else {
+            g_climbX = c->f[0]; g_climbY = c->f[1]; g_climbSpeed = c->f[2] < 0 ? 0 : c->f[2] > 1 ? 1 : c->f[2];
+            g_climbUntil = GetTickCount() + (c->f[3] > 0 ? (DWORD)c->f[3] : 300);
+        }
     } else if (c->cmd == kCmdStop) {
-        g_goto.on = false; g_intentUntil = 0; if (c->reserved[0] == 1) c->reserved[0] = 4;
+        g_goto.on = false; g_intentUntil = 0; g_climbUntil = 0; if (c->reserved[0] == 1) c->reserved[0] = 4;
     } else if (c->cmd >= kCmdRay && c->cmd <= kCmdSense) {
         if (!pl) status = -1;
         else { __try { status = RunWorldCommand(c, pl); } __except (EXCEPTION_EXECUTE_HANDLER) { status = -2; } }
@@ -435,6 +502,7 @@ void Init()
     Log("[Pilot] on: pad section %p state section %p (sizeof state %u)\n", (void*)g_pad, (void*)g_state, (unsigned)sizeof(PilotState));
     TryPatchImports();
     if (GetPrivateProfileIntA("Pilot", "Intent", 1, Paths::Ini())) InstallIntentHooks();   // [Pilot] Intent (default 1 under Enabled)
+    if (GetPrivateProfileIntA("Pilot", "ClimbIntent", 1, Paths::Ini())) InstallClimbIntentHooks();   // [Pilot] ClimbIntent (default 1 under Enabled)
 }
 
 void Poll()

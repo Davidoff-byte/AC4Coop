@@ -137,6 +137,17 @@ Climb reproduced with the Pilot (stick offset re-learned per attempt: `goto ... 
     player handlers feed IHumanGround slots 0/1 on the ground and the climbing interface slots 37/38 while climbing, and the
     Climbing context's own sequencer turns that intention into moves.
 
+14. **Seam verified live** (run 32012, asi a3decf69, `[Pilot] ClimbIntent` hooks on vtable 0x026D4588 slots 37/38 for the
+    player entity, `tools/pilot.py climb x y --sec 1`): Edward hanging at (34.66,-81.31,4.87), pad neutral throughout.
+    Control (no intent, 1 s): no movement. Intent x = +1: 34.66 -> 34.07 m along the ledge; x = -1: 34.01 -> 34.49; x = -1:
+    34.62 -> 36.19. Substitutions ~66/s on each slot (every update). So the 2D climbing intention alone makes the native
+    sequencer choose and play shimmy moves - the replica-side mechanism R4.3 needs (on the player here; replica untested).
+15. **Entry**: transitions requested for Edward (hook on `sub_52DFF0(ctxId)`, the enter half of TransitToContext: main track
+    `this+0x100`, factory `[track+0x28]->vt[8]`, then context Enter at +0x30): drop = 6 from 0x01583840 (climbing dispatcher),
+    4 from 0x01DC6EF0; wall-run grab = **8 from 0x01D65A11** (ground statechart band, near the event dispatcher
+    `sub_1D65BB0`) then **30 from 0x01756D5A** (Walling code). The ground -> wall-run choice is made by the native ground
+    chart; whether it can be driven by intention on a replica is open.
+
 So a shimmy step is fully described by **(definition index, position on the guidance)** plus the guidance it lies on; that
 is what R4.3 would send. UNVERIFIED: that the definition table is identical in both games (same assets, so expected), how
 the replica side reaches the table (the generator's inputs), and the other 11 move types (climb up, jump, ...).

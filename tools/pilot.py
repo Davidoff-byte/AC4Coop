@@ -337,6 +337,24 @@ def leg(p, target, tol, a):
     return drive_to(p, target, tol, a) if a.stick else goto_inproc(p, target, tol, a)
 
 
+def cmd_climb(p, a):
+    """Climbing intent (Climbing interface slots 37/38, src/pilot.cpp): 2D input x sideways / y up, held for --sec."""
+    before = p.read()['pos']
+    end = time.time() + a.sec
+    while time.time() < end:
+        st = p.ctl_send(12, [a.x, a.y, a.speed, 300])
+        if st != 0:
+            print(f'climb intent refused: status {st}'); return 4
+        time.sleep(0.1)
+    p.ctl_send(11, [])
+    time.sleep(0.4)
+    after = p.read()['pos']
+    subs = struct.unpack_from('<III', ctypes.string_at(p.ctl + 88, 12))
+    print(f'from ({before[0]:.2f},{before[1]:.2f},{before[2]:.2f}) to ({after[0]:.2f},{after[1]:.2f},{after[2]:.2f}); '
+          f'substitutions slot37={subs[0]} slot38={subs[1]} hooks={subs[2]}')
+    return 0
+
+
 def cmd_intent(p, a):
     before = p.read()['pos']
     end = time.time() + a.sec
@@ -580,6 +598,8 @@ def main():
     x.add_argument('--stick', action='store_true', help='old camera-relative virtual-pad controller')
     x.add_argument('--speed', type=float, default=1.0)
     x = sub.add_parser('intent'); x.add_argument('dx', type=float); x.add_argument('dy', type=float)
+    x.add_argument('--speed', type=float, default=1.0); x.add_argument('--sec', type=float, default=1.0)
+    x = sub.add_parser('climb'); x.add_argument('x', type=float); x.add_argument('y', type=float)
     x.add_argument('--speed', type=float, default=1.0); x.add_argument('--sec', type=float, default=1.0)
     x = sub.add_parser('route'); x.add_argument('x', type=float); x.add_argument('y', type=float)
     x = sub.add_parser('boot'); x.add_argument('--pulses', type=int, default=6); x.add_argument('--wait', type=float, default=5)

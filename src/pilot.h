@@ -62,7 +62,9 @@ namespace Pilot
     // `req`; the game sets status and copies req into `done` when finished.
     // 3..8: world queries (src/pilot_world.cpp), results in res[] (rcount items).
     enum { kCmdTeleport = 1, kCmdFpsCap = 2, kCmdRay = 3, kCmdGround = 4, kCmdNavPoint = 5, kCmdNavLine = 6, kCmdEdges = 7, kCmdSense = 8,
-           kCmdIntent = 9, kCmdGoto = 10, kCmdStop = 11 };
+           kCmdIntent = 9, kCmdGoto = 10, kCmdStop = 11, kCmdClimbIntent = 12 };
+    // kCmdClimbIntent: f0,f1 climbing 2D input (x sideways, y up; Climbing interface slot 37), f2 speed 0..1 (slot 38),
+    // f3 hold ms (default 300). Substitution counts in reserved[5] (slot 37) / [6] (slot 38); [7] = hooks installed.
     // Intent (world-space locomotion, bf-coop ops/evidence/pilot/intention-seam.md seam 1): IHumanGround vtable 0x026E7DC0
     // slot 0 SetDirection / slot 1 SetSpeedRatio are patched; for the player entity, while an intent is live, the
     // direction/ratio the game computed from the camera-relative stick are replaced by the client's world direction.
