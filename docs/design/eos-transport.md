@@ -91,8 +91,24 @@ v1.19.2.1 ships `EOSSDK-Win64-Shipping.dll/.lib` and arm64 only. There is **no `
   user profile ("already exist for the current user profile"), not per `CacheDirectory`. The guest's packets to "the host"
   were delivered locally (RTT 0.0 ms) and the host echoed nothing, so that run's PASS is void. The spike now refuses this case
   (`VERDICT: INVALID`, exit 4).
-- **Next:** run `join` on a different Windows user or on another PC (that also exercises a real network path), then repeat
-  with `--relay force`.
+- **Two PCs in different hemispheres (owner's PCs, 2026-11-15): P2P PASS.**
+  - Runs 1-2 (build 9a1a125) were invalid as measurements. The first phase was sent before the link was up (0 echoes back),
+    and 200 packets/s queued behind a ~400 ms link, giving 0.4-4.4 s RTT. Fixed in 0f1c55c: wait for the
+    connection-established event, report DIRECT/RELAYED, send at 60/30 Hz.
+  - **Run 3 (0f1c55c):** host `000252c6…`, guest `000209b6…`, both NAT Moderate. Lobby by code, then connection established.
+    The guest reported **DIRECT** and the host reported **RELAYED** (both lines quoted from the two logs; asymmetric, meaning
+    UNVERIFIED).
+
+    | phase | lost | RTT median / p95 |
+    |---|---|---|
+    | unreliable 576 B @60 Hz | 0 / 600 | 399.3 / 411.8 ms |
+    | unreliable 1170 B @30 Hz | 0 / 300 | 406.9 / 423.8 ms |
+    | reliable-ordered 576 B @30 Hz | 0 / 300 | 400.3 / 414.0 ms |
+
+    The host echoed 1201 packets (hello + 600 + 300 + 300 = everything). `VERDICT: PASS`.
+  - **Reading:** EOS P2P works across the world with no loss and low jitter. The ~400 ms RTT is the intercontinental path,
+    which co-op must be designed for (intent-based replicas, no round-trip waits); EOS cannot remove it.
+- **Still open:** a `--relay force` run (both sides) to measure the relay-only path. Then the 64-bit bridge.
 
 ## Open items
 - The owner sets the client policy on the Epic portal (Connect / Lobbies / P2P only) before a public build.
