@@ -39,11 +39,14 @@ so the BuildGate pin and Steam file verification are unaffected.
   - `GetFileVersionInfoSizeA/GetFileVersionInfoA/VerQueryValueA` through the proxy give the same kernel32 version as
     the system DLL.
 
+## Verified in the game (2026-11-15, D: Steam install, pinned exe)
+See `docs/evidence/single-instance-guard-2026-11-15.md`, section "Standalone version.dll proxy, live":
+- `slot_ok=1 hooked=1` in AC4BFSP.exe, at IAT slot 0x01E3A20C;
+- proxy alone (`HookMultiInstance=0`): `scimitar_mutex_ac4bf_61979` -> `scimitar_mutex_ac4bf_61979_mi<pid>`;
+- with AC4Coop.asi: the hooks chain (`..._ac4coop_<pid>_mi<pid>`), and the game runs holding that mutex.
+
 ## Not verified yet
-- **In the game:** whether `AC4BFSP.exe`'s IAT is already filled when the proxy's `DllMain` runs (`slot_ok=1` in the
-  log). The test exe is a different binary.
-- **Running with AC4Coop.asi:** the plugin's `InstallMultiInstance` would find the slot holding the proxy rather than
-  kernel32 and fall back to its hardcoded RVA. The name would then get both suffixes. Not run.
+- A full play session with the proxy installed. The game was only seen running.
 - **What it does not change:** a second copy on one PC is still stopped by Steam/Ubisoft start-up
-  (`SteamAPI_RestartAppIfNecessary` / `UPLAY_Startup` → 2; see the evidence file and DECISIONS D-019). This proxy only
+  (`SteamAPI_RestartAppIfNecessary` / `UPLAY_Startup` -> 2; see the evidence file and DECISIONS D-019). This proxy only
   removes the game's own mutex wait.
