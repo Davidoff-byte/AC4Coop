@@ -7515,6 +7515,79 @@ static void PuppetOwnClear() {
 }
 
 // Frame hook, every Human's update (any thread).
+// ---- [Coop] SpawnerIdProbe (default 0): guard <-> SceneSpawner identity, read-only -------------------------------------
+// The probe proposed in docs/evidence/guard-spawner-id-2026-11-13.md section 6 (branch claude/optimistic-satoshi-0a0b33,
+// cae66f8, static): SceneSpawningComponent vtable 0x026900B8, SceneSpawner S = C+0x10, owner (layout entity) = *(C+8),
+// S+0xCC = HandleContainer* of the spawned entity (null handle 0x4DD5F8C), ids via ManagedObject::GetObjectID 0x9F0B50
+// (never mints: a spawner without an authored id reads 0). Candidate cross-process key of a spawned guard:
+// (ownerId, spawnerId). Walks m_EntityManager.m_Entities (components at +0x60, count u16 +0x66, as the [Target] dump)
+// 20 s after the first player frame and then every 60 s; logs [GSID] lines. PASS criteria P1-P5 are in that file.
+static int s_gsidOn = -1;
+static void SpawnerIdProbeTick() {
+    if (s_gsidOn < 0) s_gsidOn = GetPrivateProfileIntA("Coop", "SpawnerIdProbe", 0, Paths::Ini()) != 0 ? 1 : 0;
+    if (s_gsidOn != 1) return;
+    static uint64_t s_first = 0, s_next = 0; static int s_pass = 0;
+    const uint64_t now = GetTickCount64();
+    if (!s_first) { s_first = now; s_next = now + 20000; }
+    if (now < s_next) return;
+    s_next = now + 60000; ++s_pass;
+    World* w = World::GetCurrentWorld();
+    if (!w) return;
+    BaseBigArray<Reference>& ents = w->m_EntityManager.m_Entities;
+    const int nobj = ents.GetSize();
+    int comps = 0, withEnt = 0, selfOk = 0, idsZero = 0, idsMinted = 0, logged = 0;
+    static uint32_t s_keyedHc[512]; int nKeyed = 0;
+    for (int i = 0; i < nobj; ++i) {
+        Reference* ref = ents.GetElement(i);
+        if (!ref || !readable(ref, 4)) continue;
+        HandleContainer* hc = ref->m_HandleContainer;
+        if (!readable(hc, 4)) continue;
+        char* e = (char*)hc->m_Object;
+        if (!readable(e, 0x68)) continue;
+        const uint16_t cnt = *(uint16_t*)(e + 0x66);
+        Component** data = *(Component***)(e + 0x60);
+        if (cnt < 1 || cnt > 96 || !readable(data, cnt * 4)) continue;
+        for (int k = 0; k < cnt; ++k) {
+            char* C = (char*)data[k];
+            if (!readable(C, 0x118) || *(uint32_t*)C != 0x026900B8u) continue;
+            ++comps;
+            char* S = C + 0x10; char* owner = *(char**)(C + 8);
+            uint64_t ownerId = 0, spawnerId = 0;
+            __try { ownerId = owner ? ((ManagedObject*)owner)->GetObjectID() : 0; spawnerId = ((ManagedObject*)S)->GetObjectID(); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { ownerId = spawnerId = 0xFFFFFFFFFFFFFFFFull; }
+            if (!ownerId || !spawnerId) ++idsZero;
+            if (ownerId >= 0xF0000000ull || spawnerId >= 0xF0000000ull) ++idsMinted;
+            HandleContainer* shc = *(HandleContainer**)(S + 0xCC);
+            char* se = (readable(shc, sizeof(HandleContainer)) && (uint32_t)shc != 0x04DD5F8Cu) ? (char*)shc->m_Object : nullptr;
+            int self = -1, role = -1; uint64_t entHcId = 0;
+            if (readable(se, 0xCC)) {
+                ++withEnt;
+                self = (*(HandleContainer**)(se + 0xC8) == shc) ? 1 : 0; selfOk += self == 1;
+                role = (int)((*(uint32_t*)(se + 0x9C) & 0x1F8) >> 3);
+                entHcId = shc->m_ObjectID;
+                if (nKeyed < 512) s_keyedHc[nKeyed++] = (uint32_t)shc;
+            }
+            if (logged < 300 && se) {   // keys for the P4 host/guest comparison: only spawners that hold an entity
+                ++logged;
+                L("[GSID] pass=%d key=%016llX:%016llX ent=%p entSelf=%d role=%d entHcId=%016llX comp=%p\n", s_pass,
+                  (unsigned long long)ownerId, (unsigned long long)spawnerId, (void*)se, self, role, (unsigned long long)entHcId, (void*)C);
+            }
+        }
+    }
+    // Guards (role 1 'Templar' = soldiers, tools/pilot.py ROLE) in m_CharacterList, and how many a spawner holds.
+    int guards = 0, guardsKeyed = 0;
+    const int nc = (int)w->m_CharacterList.GetSize();
+    for (int i = 0; i < nc; ++i) {
+        Entity** sl = w->m_CharacterList.GetElement(i); char* e = sl ? (char*)*sl : nullptr;
+        if (!readable(e, 0xCC) || ((*(uint32_t*)(e + 0x9C) & 0x1F8) >> 3) != 1) continue;
+        ++guards;
+        const uint32_t h = *(uint32_t*)(e + 0xC8);
+        for (int j = 0; j < nKeyed; ++j) if (s_keyedHc[j] == h) { ++guardsKeyed; break; }
+    }
+    L("[GSID] summary pass=%d entities=%d comps=%d withEnt=%d entSelf=%d/%d idsZero=%d idsMinted=%d guards=%d guardsKeyed=%d\n",
+      s_pass, nobj, comps, withEnt, selfOk, withEnt, idsZero, idsMinted, guards, guardsKeyed);
+}
+
 // ---- [Coop] FightIntents (default 0): S7 slice 1, docs/design/s7-fight-intents.md -------------------------------------
 // Each machine publishes its own player's fight decisions (enter / attack / exit, with the target's canonical objId) on
 // the intention lane (IC_FIGHT), and applies the peer's to its puppet through the HumanGround Can/Do slots on the puppet's
@@ -12123,7 +12196,7 @@ static void DumpConfigOnce()
         { "Coop", "StageLog", 0 }, { "Coop", "SyncEnemiesOnly", 1 }, { "Coop", "SyncMaxEntities", 32 },
         { "Coop", "SyncRadiusM", 60 }, { "Coop", "TransformProbe", 0 }, { "Coop", "VPadEnable", 0 },
         { "Coop", "VPadTest", 0 }, { "Coop", "WatchDeadBit", 0 }, { "Coop", "WatchTarget", 0 },
-        { "Coop", "HookFrame", 1 }, { "Coop", "HookPad", 1 }, { "Coop", "HookWindowed", 1 }, { "Coop", "ActMatchProbe", 0 }, { "Coop", "FightIntents", 0 },
+        { "Coop", "HookFrame", 1 }, { "Coop", "HookPad", 1 }, { "Coop", "HookWindowed", 1 }, { "Coop", "ActMatchProbe", 0 }, { "Coop", "FightIntents", 0 }, { "Coop", "SpawnerIdProbe", 0 },
         { "Coop", "HookMultiInstance", 1 },
         { "Display", "Borderless", 0 }, { "Display", "ForceWindowedMs", 5000 }, { "Display", "Fullscreen", 0 },
         { "Net", "Enabled", 0 }, { "Net", "InterpDelayMs", 100 }, { "Net", "InterpMaxExtrapMs", 100 },
@@ -12158,7 +12231,7 @@ static void OnFrameInner(Human* updatedHuman) {
         InterlockedExchange(&g_inSaveTick, (w && w->m_CharacterList.GetSize() >= 2) ? (LONG)GetTickCount() : 0);
     }
     Pilot::OnPlayerFrame(updatedHuman);   // [Pilot] Enabled only: publish the player + m_CharacterList
-    __try { FightIntentSend(updatedHuman); FightIntentDrain(); }   // [Coop] FightIntents only (S7 slice 1)
+    __try { FightIntentSend(updatedHuman); FightIntentDrain(); SpawnerIdProbeTick(); }   // [Coop] FightIntents / SpawnerIdProbe only
     __except (EXCEPTION_EXECUTE_HANDLER) { static int s_fe = 0; if (s_fe < 10) { ++s_fe; L("[FI] EXCEPTION 0x%08X in send/drain\n", GetExceptionCode()); } }
 
     ProbeIdentityOnce();
