@@ -47,6 +47,12 @@ consistent with `act-match-ab-2026-11-15.md`.
 - **Change:** `tools/pilot.py boot` now defaults to `--fps 0`; `tools/two_copy.ps1` passes `-Fps 0` by default. A fix
   for the patch itself (hook the game's own swap chain, no throwaway device) is open.
 
+## Correction (later the same evening)
+- A silent exit also happened **without** the cap: host 27008 (`two_copy.ps1 -Fps 0`, build deba4e8c) exited during boot
+  try 2. Its log ends on ordinary lines with no `[Pilot] frame cap` line, and the new FightIntents code was inactive.
+- Totals: cap on 4 of 7 runs lost a copy; cap off 1 of 6. The cap stays off by default, but it is **not the only cause**
+  of the silent exits. The cause remains open.
+
 ## Not checked
 The cause of the silent exits (a debugger with first-chance exception capture would catch them); the guest window in run 3
 came out 964x567 outer (one-off, not re-measured).

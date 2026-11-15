@@ -161,6 +161,14 @@ bytes, and all match. What each function does is a strong lead until the S2 live
     is the wrong layer. UNVERIFIED where the scheduler reads the enabled bit.
   - **Next:** the S2 live probes on Edward (Can/Do pairs per slot, from the player's own update, hook 0x016FAACD), then S3.
 
+## 4b. S7 slice 1 status (2026-11-15)
+- `[Coop] FightIntents` (`docs/design/s7-fight-intents.md`, evidence `docs/evidence/s7-fight-intents-2026-11-15.md`).
+- Puppet probes: on the replica, enter fight holds, PerformCombo plays and exit works through the Can/Do slots, with the
+  behaviour component off (`s2-puppet-probes-2026-11-15.md`).
+- Live on two copies: enter/exit 3/3 end to end, and one real player attack replicated as PerformCombo on the puppet.
+- **Limit:** a target resolves only if the guest's entity lane has already bound that guard. S3 (identity for any NPC) is
+  now the blocking dependency for S7, ahead of S4-S6.
+
 ## 5. What stops now
 - **New NativeReplica parkour work** (`NativeReplicaParkour`, `ClimbIntent`, `ClimbMoves`, `WallEntry`). With the replica
   on, the peer's actions never reach the puppet; S6 replaces the follow-by-navigation approach. Keep the flags, default 0.
