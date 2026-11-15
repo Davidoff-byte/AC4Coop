@@ -196,3 +196,30 @@ default 0, re-read every 2 s). Solo replay only; not two-machine tested.
 - Status of this line: a native entry can follow the peer's route (once, 0.27 m), but the NPC replica cannot reliably
   wall-run on demand - navigation holds the ground chart in sub-state 115, IHumanGround does not move it, and a standing
   request succeeds only sometimes. The committed default-0 flags keep the tested behaviour; nothing here is on by default.
+
+## Native entry, round 2 (2026-11-15 evening; builds on feat/launcher 610cfe7, replays `--as-proto 16`)
+- Static (IDA): sub-state 115 is entered from 4 by event 114 (`sub_1D6EB00`: consumes 114, entry function `sub_1CDCC20`,
+  `sub_1D659D0(4211)`); event 114 is posted only by `sub_1D2AD40` = **IHumanGround slot 632** (in sub-state 4), applied by
+  slot 631 (`sub_1D7C120` -> `sub_1D6EB00`). IHumanGround has 841 slots (0x026E7DC0..0x026E8AE4). The only reader of slot
+  632 is the navigation service: `sub_179DCB0` (called from `sub_17A7F00`) gets IHumanGround by component id 17, asks
+  slot 630 (`vt+0x9D8`, meaning UNVERIFIED), drives with slot 638 (`vt+0x9F8`), slot 0 SetDirection and slot 24
+  (`vt+0x60`), or requests 115 through slot 632. So 115 is navigation's own locomotion state, and its drive is slots
+  0 + 24 + 638, not slot 1.
+- Runs (pids 2468, 19596, 26868, 11324, 29936, 26456; asi cc444230 / 27982581 / 63e2348f / 1f558228 / 49bf639b / f8532f86;
+  one 90 s replay of host-climbmoves-1 each):
+  - Pushing slot 0 along the peer's heading after the navigation Stop moved the replica (2.5 -> 3.2 m/s) while the chart
+    stayed in 115: slot 0 steers navigation's state too.
+  - Sub-state during navigation varies by run: 115 for the whole approach in runs 17948 / 22736 / 2468, but 4 at 4 m/s in
+    run 19596 (wall test failed, then a mode-1 success at 2.8 m/s).
+  - In sub-state 4 the NPC did not move on slots 0/1/3/32 (back-away phase: 0.00 m/s; one sample before the next entry).
+  - **Every run's first entry now follows the peer's route**: replica contexts {4,8,30} with the peer's {4,8,30}, 3D
+    error 0.53-1.31 m in that window (0.24-0.60 m on the wall). Then, within ~2 s, the replica goes 30 -> 9 (onto the beam
+    above) while the peer keeps hanging - with navigation stopped on the wall (63e2348f), with a neutral ground intention
+    on the wall (1f558228), with no climbing input (hold queue empty / input idle, 49bf639b), and with the wall run applied
+    only after a mode-0 success like the player (f8532f86).
+- Reading: entering the wall natively on the peer's route works; what moves the hanging replica onto the beam is inside
+  the replica (not navigation, not our ground or climbing input). Lead, UNVERIFIED: the NPC's own behaviour, enabled in
+  replica mode.
+- Committed under `NativeReplicaWallEntry` (default 0): final-approach drive phases, no navigation while the replica is on
+  a wall, neutral ground intention on a wall, hold-idle (no stick fallback when hold-following has no target), mode-0-only
+  apply. None of them changes the 30 -> 9 outcome; kept as the measured configuration.
