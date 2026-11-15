@@ -342,6 +342,7 @@ enum IntentChannel : uint8_t {
     IC_LOCO      = 2,   // navigation / locomotion (destination or move target, speed)
     IC_WEAPON    = 3,   // weapon (drawn / sheathed, which)
     IC_LOOKAT    = 4,   // look-at target
+    IC_FIGHT     = 5,   // player avatar fight decisions ([Coop] FightIntents, docs/design/s7-fight-intents.md)
     IC_LIMIT     = 16,  // ids 1..15 are legal on the wire, so a later build can add a channel without a
                         // layout change; the receiver delivers a channel id it does not name
 };

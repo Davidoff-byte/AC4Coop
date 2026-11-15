@@ -1307,6 +1307,7 @@ static int      g_proxyGhostCount = 0, g_proxyGhostNext = 0;
 struct ProxyPick { uint32_t srcId; int idx; float srcMax; float tierDelta; uint32_t hint; uint32_t cls; int classMiss; const char* camSrc; };
 
 static void PuppetOwnNote(Human* h, Entity* e, const HookMath::Transform& m);   // own-update block, before ApplyGuards
+bool FightIntentOwnsPuppet();   // [Coop] FightIntents (S7 slice 1), defined with OwnDrain
 static void PuppetOwnClear();
 static Entity* ResolveEntityById(uint64_t id);   // engine registry, defined with the ApplyGuards
 static void ProxySrcClearAll();
@@ -2806,7 +2807,9 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
                 }
             }
         }
-        bool writeActions = actNow && g_switchCd == 0;   // our action writes are gated on the settle cooldown
+        // [Coop] FightIntents: while the puppet's own FSM is in a fight it was put into by the peer's decisions, the FSM owns
+        // its actions; copying the peer's alias on top would make two writers (docs/design/s7-fight-intents.md).
+        bool writeActions = actNow && g_switchCd == 0 && !FightIntentOwnsPuppet();   // gated on the settle cooldown
         if (g_switchCd > 0) --g_switchCd;
         InterlockedExchange(&s_nrNavOk, (replica && g_bhvState == 1 && g_switchCd == 0) ? 1 : 0);   // [Coop] NativeReplica
 
@@ -7512,11 +7515,163 @@ static void PuppetOwnClear() {
 }
 
 // Frame hook, every Human's update (any thread).
+// ---- [Coop] FightIntents (default 0): S7 slice 1, docs/design/s7-fight-intents.md -------------------------------------
+// Each machine publishes its own player's fight decisions (enter / attack / exit, with the target's canonical objId) on
+// the intention lane (IC_FIGHT), and applies the peer's to its puppet through the HumanGround Can/Do slots on the puppet's
+// own update. Slots and fields live-verified: docs/evidence/s2-puppet-probes-2026-11-15.md (75/76, 160, 112/113 on the
+// replica; path[2]==163 fight, path[4]==173 attack) and the focus chain fight=[fsm+0x74], handle=[fight+0x1C8]==[E+0xC8].
+static const uint64_t kFiAvatarWire = 0x4156415441524F31ull;   // 'AVATARO1': the intent subject "peer avatar"
+enum : uint8_t { FI_ENTER = 1, FI_ATTACK = 2, FI_EXIT = 3 };
+#pragma pack(push, 1)
+struct FightIntentPayload { uint8_t op, comboCount, endCondition, reserved; uint64_t target; };
+#pragma pack(pop)
+static_assert(sizeof(FightIntentPayload) == 12, "IC_FIGHT payload is a wire layout (docs/design/s7-fight-intents.md)");
+static int s_fiOn = -1;                       // [Coop] FightIntents, read once
+static volatile LONG s_fiPuppetFsm = 0;       // puppet's own path is in fight: action copy suspended (PuppetActionBlock)
+static struct { FightIntentPayload q[32]; volatile LONG head, tail; } s_fiRing = {};   // player thread -> puppet thread
+static LONG s_fiTx[4] = {}, s_fiRx[4] = {}, s_fiApplied[4] = {}, s_fiUnresolved = 0, s_fiDropped = 0;
+
+static bool FightIntentsOn() {
+    if (s_fiOn < 0) {
+        s_fiOn = (GetPrivateProfileIntA("Coop", "FightIntents", 0, Paths::Ini()) != 0 && Net::IntentLaneOn()) ? 1 : 0;
+        L("[FI] FightIntents=%d (needs [Coop] IntentLane=1: lane %s)\n", s_fiOn, Net::IntentLaneOn() ? "on" : "off");
+    }
+    return s_fiOn == 1;
+}
+bool FightIntentOwnsPuppet() { return s_fiOn == 1 && InterlockedCompareExchange(&s_fiPuppetFsm, 0, 0) != 0; }
+
+// HumanGround = *(Human+0x720) checked by both vtables (as phase1 NativeReplicaFreeRun / pilot HgCall); fsm = [hg+0x10+0x90].
+static char* FiHumanGround(Human* h) {
+    char* hg = (h && readable((char*)h + 0x720, 4)) ? *(char**)((char*)h + 0x720) : nullptr;
+    return (readable(hg, 0x20) && *(uint32_t*)hg == 0x026E8AE8u && *(uint32_t*)(hg + 0x10) == 0x026E7DC0u) ? hg : nullptr;
+}
+static bool FiPath(char* hg, uint16_t out[6], char** fsmOut) {
+    char* fsm = readable(hg + 0xA0, 4) ? *(char**)(hg + 0xA0) : nullptr;
+    const uint16_t* p = readable(fsm, 0x11C) ? *(const uint16_t**)(fsm + 0x118) : nullptr;
+    if (!readable(p, 12)) return false;
+    for (int i = 0; i < 6; ++i) out[i] = p[i];
+    if (fsmOut) *fsmOut = fsm;
+    return true;
+}
+// Canonical id of a local entity: the host's objId (guest: from the guest objId table; else the entity's own id).
+static uint64_t FiCanonicalId(Entity* e) {
+    if (!e) return 0;
+    if (g_entHost != 1)
+        for (int i = 0; i < s_guestObjN; ++i) if (s_guestObj[i].ent == (unsigned int)e && s_guestObj[i].objId) return s_guestObj[i].objId;
+    uint64_t id = 0;
+    __try { id = ((ManagedObject*)e)->GetObjectID(); } __except (EXCEPTION_EXECUTE_HANDLER) { id = 0; }
+    return id;
+}
+static Entity* FiResolve(uint64_t id) {
+    if (!id) return nullptr;
+    if (g_entHost == 1) return ResolveEntityById(id);
+    unsigned int e = GuestObjFind(id);
+    if (!e) e = GuestObjFindResolve(id);
+    return (Entity*)e;
+}
+
+// Sender: the local player's own frame.
+static void FightIntentSend(Human* player) {
+    if (!FightIntentsOn()) return;
+    static int s_inFight = 0, s_attack = 0; static uint64_t s_target = 0;
+    char* hg = FiHumanGround(player); char* fsm = nullptr; uint16_t p[6];
+    if (!hg || !FiPath(hg, p, &fsm)) return;
+    const int inFight = p[2] == 163 ? 1 : 0, attack = (inFight && p[4] == 173) ? 1 : 0;
+    if (inFight) {   // focus target: [fsm+0x74] -> fight, [fight+0x1C8] -> handle; find the character with [E+0xC8] == handle
+        char* fight = readable(fsm + 0x74, 4) ? *(char**)(fsm + 0x74) : nullptr;
+        const uint32_t hnd = readable(fight + 0x1C8, 4) ? *(uint32_t*)(fight + 0x1C8) : 0;
+        World* w = World::GetCurrentWorld();
+        if (hnd && hnd != 0x04DD5F8Cu && w) {
+            const int n = (int)w->m_CharacterList.GetSize();
+            for (int i = 0; i < n; ++i) {
+                Entity** sl = w->m_CharacterList.GetElement(i); Entity* e = sl ? *sl : nullptr;
+                if (readable(e, 0xCC) && *(uint32_t*)((char*)e + 0xC8) == hnd) { s_target = FiCanonicalId(e); break; }
+            }
+        }
+    }
+    auto pub = [&](uint8_t op) {
+        FightIntentPayload f = { op, (uint8_t)(op == FI_ATTACK ? 1 : 0), 0 /* ComboEndCondition_Damage */, 0, op == FI_EXIT ? 0 : s_target };
+        const bool ok = Net::PublishIntent(0, kFiAvatarWire, IC_FIGHT, (uint32_t)GetTickCount(), &f, (uint8_t)sizeof(f));
+        InterlockedIncrement(&s_fiTx[op]);
+        L("[FI] tx %s target=%016llX ok=%d path=%u/%u/%u/%u/%u/%u\n", op == FI_ENTER ? "enter" : op == FI_ATTACK ? "attack" : "exit",
+          (unsigned long long)f.target, ok ? 1 : 0, p[0], p[1], p[2], p[3], p[4], p[5]);
+    };
+    if (inFight && !s_inFight) pub(FI_ENTER);
+    if (attack && !s_attack) pub(FI_ATTACK);
+    if (!inFight && s_inFight) { pub(FI_EXIT); s_target = 0; }
+    s_inFight = inFight; s_attack = attack;
+}
+
+// Receiver part 1, the local player's frame: drain the lane (the only consumer) and queue IC_FIGHT for the puppet.
+static void FightIntentDrain() {
+    if (!FightIntentsOn()) return;
+    Net::IntentMsg m;
+    while (Net::PollIntent(m)) {
+        if (m.channel != IC_FIGHT || m.wireId != kFiAvatarWire || m.len != sizeof(FightIntentPayload)) continue;
+        FightIntentPayload f; memcpy(&f, m.payload, sizeof(f));
+        if (f.op < FI_ENTER || f.op > FI_EXIT) continue;
+        InterlockedIncrement(&s_fiRx[f.op]);
+        const LONG h = s_fiRing.head, t = s_fiRing.tail;
+        if (h - t >= 32) { InterlockedIncrement(&s_fiDropped); continue; }
+        s_fiRing.q[h & 31] = f; InterlockedExchange(&s_fiRing.head, h + 1);
+        L("[FI] rx %s target=%016llX seq=%u base=%d\n", f.op == FI_ENTER ? "enter" : f.op == FI_ATTACK ? "attack" : "exit",
+          (unsigned long long)f.target, m.seq, (m.flags & IF_BASE) ? 1 : 0);
+    }
+}
+
+// thiscall through the IHumanGround vtable with exactly n dword args (callees pop: retn 4n); SEH-guarded.
+static uint32_t FiCall(void* ig, int slot, int n, uint32_t a0 = 0, uint32_t a1 = 0, uint32_t a2 = 0, uint32_t a3 = 0) {
+    void* fn = (*(void***)ig)[slot];
+    __try {
+        switch (n) {
+        case 1: return ((uint32_t (__thiscall*)(void*, uint32_t))fn)(ig, a0);
+        case 4: return ((uint32_t (__thiscall*)(void*, uint32_t, uint32_t, uint32_t, uint32_t))fn)(ig, a0, a1, a2, a3);
+        default: return 0;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { L("[FI] EXCEPTION 0x%08X in slot %d\n", GetExceptionCode(), slot); return 0; }
+}
+
+// Receiver part 2, the puppet's own update: apply queued ops through the Can/Do slots; track the puppet's fight state.
+static void FightIntentApply(Human* pup) {
+    if (s_fiOn != 1) return;
+    char* hg = FiHumanGround(pup); uint16_t p[6];
+    if (!hg || !FiPath(hg, p, nullptr)) return;
+    void* ig = hg + 0x10;
+    while (s_fiRing.tail != s_fiRing.head) {
+        const LONG t = s_fiRing.tail; FightIntentPayload f = s_fiRing.q[t & 31]; InterlockedExchange(&s_fiRing.tail, t + 1);
+        Entity* e = f.target ? FiResolve(f.target) : nullptr;
+        if (f.target && !readable(e, 0xCC)) { InterlockedIncrement(&s_fiUnresolved); L("[FI] apply op=%u target %016llX unresolved\n", f.op, (unsigned long long)f.target); continue; }
+        uint32_t rc = 0, rd = 0;
+        if (f.op == FI_ENTER && e) {
+            uint32_t hnd = *(uint32_t*)((char*)e + 0xC8);
+            rc = FiCall(ig, 75, 1, (uint32_t)&hnd);                          // CanEnterFight(const Handle&)
+            if (rc & 0xFF) { rd = FiCall(ig, 76, 1, (uint32_t)&hnd); InterlockedIncrement(&s_fiApplied[FI_ENTER]); }   // DoEnterFight
+        } else if (f.op == FI_ATTACK && e && p[2] == 163) {
+            rd = FiCall(ig, 160, 4, (uint32_t)e, f.comboCount ? f.comboCount : 1, f.endCondition, 0);   // PerformCombo
+            InterlockedIncrement(&s_fiApplied[FI_ATTACK]);
+        } else if (f.op == FI_EXIT && p[2] == 163) {
+            rc = FiCall(ig, 112, 1, 0);                                       // CanExitFight(ExitFightType_Normal)
+            if (rc & 0xFF) { rd = FiCall(ig, 113, 1, 0); InterlockedIncrement(&s_fiApplied[FI_EXIT]); }   // DoExitFight
+        }
+        L("[FI] apply %s ent=%p can=%08X do=%08X puppet path before=%u/%u/%u/%u/%u/%u\n",
+          f.op == FI_ENTER ? "enter" : f.op == FI_ATTACK ? "attack" : "exit", (void*)e, rc, rd, p[0], p[1], p[2], p[3], p[4], p[5]);
+    }
+    if (FiPath(hg, p, nullptr)) InterlockedExchange(&s_fiPuppetFsm, p[2] == 163 ? 1 : 0);
+    static uint64_t s_log = 0; const uint64_t now = GetTickCount64();
+    if (now >= s_log) {
+        s_log = now + 5000;
+        L("[FI] stats tx e/a/x=%ld/%ld/%ld rx=%ld/%ld/%ld applied=%ld/%ld/%ld unresolved=%ld dropped=%ld puppetFight=%ld\n",
+          s_fiTx[1], s_fiTx[2], s_fiTx[3], s_fiRx[1], s_fiRx[2], s_fiRx[3], s_fiApplied[1], s_fiApplied[2], s_fiApplied[3],
+          s_fiUnresolved, s_fiDropped, s_fiPuppetFsm);
+    }
+}
+
 static void OwnDrain(Human* h) {
     const unsigned int key = (unsigned int)h;
     // ---- puppet ----
     if (s_pupHumanKey && (LONG)key == s_pupHumanKey) {
         Pilot::OnPuppetFrame(h);   // [Pilot] Enabled only: S2 puppet slot probes (kCmdHgCall | 0x100), on the puppet's own update
+        FightIntentApply(h);       // [Coop] FightIntents only: the peer's fight decisions, applied on the puppet's own update
         Entity* e = nullptr; HookMath::Transform m;
         AcquireSRWLockShared(&s_pupLock);
         const bool have = s_pupHaveM; e = s_pupEnt; m = s_pupM;
@@ -11908,7 +12063,7 @@ static void DumpConfigOnce()
         { "Coop", "StageLog", 0 }, { "Coop", "SyncEnemiesOnly", 1 }, { "Coop", "SyncMaxEntities", 32 },
         { "Coop", "SyncRadiusM", 60 }, { "Coop", "TransformProbe", 0 }, { "Coop", "VPadEnable", 0 },
         { "Coop", "VPadTest", 0 }, { "Coop", "WatchDeadBit", 0 }, { "Coop", "WatchTarget", 0 },
-        { "Coop", "HookFrame", 1 }, { "Coop", "HookPad", 1 }, { "Coop", "HookWindowed", 1 }, { "Coop", "ActMatchProbe", 0 },
+        { "Coop", "HookFrame", 1 }, { "Coop", "HookPad", 1 }, { "Coop", "HookWindowed", 1 }, { "Coop", "ActMatchProbe", 0 }, { "Coop", "FightIntents", 0 },
         { "Coop", "HookMultiInstance", 1 },
         { "Display", "Borderless", 0 }, { "Display", "ForceWindowedMs", 5000 }, { "Display", "Fullscreen", 0 },
         { "Net", "Enabled", 0 }, { "Net", "InterpDelayMs", 100 }, { "Net", "InterpMaxExtrapMs", 100 },
@@ -11943,6 +12098,8 @@ static void OnFrameInner(Human* updatedHuman) {
         InterlockedExchange(&g_inSaveTick, (w && w->m_CharacterList.GetSize() >= 2) ? (LONG)GetTickCount() : 0);
     }
     Pilot::OnPlayerFrame(updatedHuman);   // [Pilot] Enabled only: publish the player + m_CharacterList
+    __try { FightIntentSend(updatedHuman); FightIntentDrain(); }   // [Coop] FightIntents only (S7 slice 1)
+    __except (EXCEPTION_EXECUTE_HANDLER) { static int s_fe = 0; if (s_fe < 10) { ++s_fe; L("[FI] EXCEPTION 0x%08X in send/drain\n", GetExceptionCode()); } }
 
     ProbeIdentityOnce();
 
