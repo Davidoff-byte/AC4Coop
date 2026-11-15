@@ -1,6 +1,7 @@
 # R4: player decisions on the native replica (plan)
 
-Status: **plan** (2026-11-15), slice R4.1 in progress. Roadmap: `docs/design/coop-reevaluation-2026-11-15.md` (R4).
+Status: **plan** (2026-11-15). R4.1 built and solo-tested: **negative** (navigation does not climb;
+`docs/evidence/native-replica-parkour-2026-11-15.md`). Next: R4.2. Roadmap: `docs/design/coop-reevaluation-2026-11-15.md` (R4).
 Builds on R3 (`docs/design/native-replica.md`): on the ground the puppet is a native NPC body moved by its own nav
 service. Everything else still uses the old replay path (behaviour disabled, peer animation copied with
 SetTargetAction), and the target-needing parkour contexts (Ladder 5, Ledge 7, Walling 8, NarrowObject 9, Climbing 30,

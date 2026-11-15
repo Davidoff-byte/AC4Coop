@@ -34,6 +34,8 @@ journal and handoff in `docs/archive/`. Update it in the same PR as any change t
   tested and tuned, the puppet moves itself through its nav service plus a capped correction; final build passed the
   oracle in one run (p95 0.60 m); an action-system crash during rapid context flips was seen twice before the switch
   hysteresis (link unverified)
+- R4.1 off-ground follow by navigation (`[Coop] NativeReplicaParkour`, default 0): solo-tested negative, the replica
+  does not climb after the peer (`docs/evidence/native-replica-parkour-2026-11-15.md`).
   (`docs/evidence/native-replica-2026-11-15.md`). Same evidence: `HybridLoco`'s ground branch tests context 2, but real
   packets send 4, so it never runs.
 
