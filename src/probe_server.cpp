@@ -38,7 +38,9 @@ bool SafeCopy(void* dst, const void* src, size_t n)
     __try { memcpy(dst, src, n); return true; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
-bool Plausible(u32 p) { return p >= 0x10000 && p < 0x7FFF0000; }
+// AC4BFSP.exe is large-address-aware: live heap objects sit above 2 GB (e.g. the climbing context 0xFD1FFC30, run 26944),
+// so the old < 0x7FFF0000 bound made them unreadable. Every access is still SEH-guarded (SafeCopy).
+bool Plausible(u32 p) { return p >= 0x10000 && p < 0xFFFF0000u; }
 
 // ---- hooks ---------------------------------------------------------------------------------------------------
 enum { kHooks = 64, kArgs = 8, kSnapMax = 256, kSnapsPerEv = 4, kRing = 4096, kSpecs = 256, kShadow = 256 };
