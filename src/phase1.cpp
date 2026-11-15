@@ -95,6 +95,7 @@ bool     g_casActivated = false;         // whether the current puppet's Charact
 // correct locomotion gait; on every OTHER context WE own actions (behavior DISABLED + action replication) for
 // parkour/climb/etc. HybridLoco=0 falls back to the old global-flag behavior for A/B.
 int      g_hybridLoco = 1;
+int      g_actMatchProbe = 0;   // [Coop] ActMatchProbe: log puppet-vs-peer action alias match (ActMatchNote)
 int      g_seekOnSwitch = 1;   // [Coop] SeekOnSwitch: seek a newly targeted action to the peer's phase
 float    g_minBlendIn = 0.1f;   // [Coop] MinBlendInMs: blend used when the peer's switch had none (0 = off)
 // [Coop] BlendTypeSafe (default 0, read at load). Before the puppet's blend-in fix stores a blend type, it maps the
@@ -2625,6 +2626,43 @@ static void PuppetActionBlock(Human* h, const PlayerState& s, bool writeActions)
         }
 }
 
+// [Coop] ActMatchProbe (default 0): does the puppet play the peer's action? Each apply compares the puppet's current
+// ACTLAYER_PRIMARY action alias with the peer's PlayerState.actionAlias, using the same reads as the [Net] PUP line, and
+// buckets the result by the peer's context id and by mode (native replica vs our action replication). Logged every
+// 5 s as "[ActMatch]". Diagnostic only: reads, never writes. Runs on the thread that already calls GetCurrentAction
+// for the PUP line.
+static void ActMatchNote(Human* h, const PlayerState& s, bool replica) {
+    struct Bucket { uint32_t frames, match, rxZero; };
+    static Bucket b[2][32] = {};
+    static uint64_t s_last = 0;
+    const uint64_t now = GetTickCount64();
+    if (!s_last) s_last = now;
+    uint32_t pAlias = 0;
+    ActionComponent* ac = h ? h->GetActionComponent() : nullptr;
+    if (readable(ac, 0x40)) {
+        unsigned char mir = 0;
+        void* pcur = ac->GetCurrentAction(&mir, 0, ACTLAYER_PRIMARY);
+        if (readable(pcur, 0x0C)) pAlias = *(uint32_t*)((char*)pcur + 8);
+    }
+    const int ctx = (s.contextId >= 0 && s.contextId < 32) ? s.contextId : 31;
+    Bucket& k = b[replica ? 1 : 0][ctx];
+    ++k.frames;
+    if (s.actionAlias == 0) ++k.rxZero;
+    else if (pAlias == s.actionAlias) ++k.match;
+    if (now - s_last >= 5000) {
+        s_last = now;
+        for (int m = 0; m < 2; ++m)
+            for (int c = 0; c < 32; ++c) {
+                Bucket& q = b[m][c];
+                if (!q.frames) continue;
+                const uint32_t scored = q.frames - q.rxZero;
+                L("[ActMatch] mode=%s ctx=%d frames=%u match=%u/%u (%.1f%%) rxZero=%u\n", m ? "replica" : "actions", c,
+                  q.frames, q.match, scored, scored ? 100.0 * q.match / scored : 0.0, q.rxZero);
+                q = Bucket{};
+            }
+    }
+}
+
 void Phase1::ApplyRemoteState(const PlayerState& s) {
     // [Relevance] Remember where the peer actually is; the host's entity capture filters by this.
     if (s.valid) {
@@ -2735,6 +2773,7 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
         Human* h = AIEntityHelper::GetHuman(g_puppet);
         HumanDataBundle* qB = h->m_Data.m_HumanDataBundle;
         bool bok = readable((void*)qB, 0x150);
+        if (g_actMatchProbe) ActMatchNote(h, s, replica);
 
         // ---- per-frame effective mode (per-context action ownership) -------------------------------------
         // Exactly ONE action-writer at all times so two threads never play an action at once (the crash):
@@ -11868,7 +11907,7 @@ static void DumpConfigOnce()
         { "Coop", "StageLog", 0 }, { "Coop", "SyncEnemiesOnly", 1 }, { "Coop", "SyncMaxEntities", 32 },
         { "Coop", "SyncRadiusM", 60 }, { "Coop", "TransformProbe", 0 }, { "Coop", "VPadEnable", 0 },
         { "Coop", "VPadTest", 0 }, { "Coop", "WatchDeadBit", 0 }, { "Coop", "WatchTarget", 0 },
-        { "Coop", "HookFrame", 1 }, { "Coop", "HookPad", 1 }, { "Coop", "HookWindowed", 1 },
+        { "Coop", "HookFrame", 1 }, { "Coop", "HookPad", 1 }, { "Coop", "HookWindowed", 1 }, { "Coop", "ActMatchProbe", 0 },
         { "Coop", "HookMultiInstance", 1 },
         { "Display", "Borderless", 0 }, { "Display", "ForceWindowedMs", 5000 }, { "Display", "Fullscreen", 0 },
         { "Net", "Enabled", 0 }, { "Net", "InterpDelayMs", 100 }, { "Net", "InterpMaxExtrapMs", 100 },
@@ -12992,6 +13031,7 @@ void Phase1::InstallFrameHook() {
     g_driveActions = GetPrivateProfileIntA("Coop", "DriveActions", 1, Paths::Ini());
     g_disablePuppetAI = GetPrivateProfileIntA("Coop", "DisablePuppetAI", 1, Paths::Ini());
     g_hybridLoco = GetPrivateProfileIntA("Coop", "HybridLoco", 1, Paths::Ini());
+    g_actMatchProbe = GetPrivateProfileIntA("Coop", "ActMatchProbe", 0, Paths::Ini());
     // Test-only: shift the puppet sideways so a single machine can test AI reaction to it.
     // 0 (default) = off, production behaviour unchanged. Read as an int in centimetres.
     g_puppetParkX = (float)GetPrivateProfileIntA("Coop", "PuppetParkX", 0, Paths::Ini());
