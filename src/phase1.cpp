@@ -7528,7 +7528,7 @@ struct FightIntentPayload { uint8_t op, comboCount, endCondition, reserved; uint
 static_assert(sizeof(FightIntentPayload) == 12, "IC_FIGHT payload is a wire layout (docs/design/s7-fight-intents.md)");
 static int s_fiOn = -1;                       // [Coop] FightIntents, read once
 static volatile LONG s_fiPuppetFsm = 0;       // puppet's own path is in fight: action copy suspended (PuppetActionBlock)
-static struct { FightIntentPayload q[32]; volatile LONG head, tail; } s_fiRing = {};   // player thread -> puppet thread
+static struct { FightIntentPayload q[32]; uint64_t ms[32]; volatile LONG head, tail; } s_fiRing = {};   // player thread -> puppet thread
 static LONG s_fiTx[4] = {}, s_fiRx[4] = {}, s_fiApplied[4] = {}, s_fiUnresolved = 0, s_fiDropped = 0;
 
 // The ini flag is read once; the lane is checked on every call, because the player's frames start before Net::Init
@@ -7661,7 +7661,7 @@ static void FightIntentDrain() {
         InterlockedIncrement(&s_fiRx[f.op]);
         const LONG h = s_fiRing.head, t = s_fiRing.tail;
         if (h - t >= 32) { InterlockedIncrement(&s_fiDropped); continue; }
-        s_fiRing.q[h & 31] = f; InterlockedExchange(&s_fiRing.head, h + 1);
+        s_fiRing.q[h & 31] = f; s_fiRing.ms[h & 31] = GetTickCount64(); InterlockedExchange(&s_fiRing.head, h + 1);
         L("[FI] rx %s target=%016llX seq=%u base=%d\n", f.op == FI_ENTER ? "enter" : f.op == FI_ATTACK ? "attack" : "exit",
           (unsigned long long)f.target, m.seq, (m.flags & IF_BASE) ? 1 : 0);
     }
@@ -7687,9 +7687,17 @@ static void FightIntentApply(Human* pup) {
     void* ig = hg + 0x10;
     // One op per puppet frame: a Do transitions on the NEXT frame (probes: watch +1), so an exit queued right behind its
     // enter must see the fight path first (run 32488/5852: enter + exit in one batch left the puppet in fight).
+    // An unresolved target is retried for up to 2 s before the op is dropped: the entity lane binds a newly engaged guard
+    // only once it has synced it (run 21888/23360: the second soldier's id was not yet in the guest table).
+    bool defer = false;
     if (s_fiRing.tail != s_fiRing.head) {
-        const LONG t = s_fiRing.tail; FightIntentPayload f = s_fiRing.q[t & 31]; InterlockedExchange(&s_fiRing.tail, t + 1);
+        const LONG t0 = s_fiRing.tail; const FightIntentPayload& f0 = s_fiRing.q[t0 & 31];
+        if (f0.target && !readable(FiResolve(f0.target), 0xCC) && GetTickCount64() - s_fiRing.ms[t0 & 31] < 2000) defer = true;
+    }
+    if (!defer && s_fiRing.tail != s_fiRing.head) {
+        const LONG t = s_fiRing.tail; FightIntentPayload f = s_fiRing.q[t & 31];
         Entity* e = f.target ? FiResolve(f.target) : nullptr;
+        InterlockedExchange(&s_fiRing.tail, t + 1);
         uint32_t rc = 0, rd = 0;
         if (f.target && !readable(e, 0xCC)) {
             InterlockedIncrement(&s_fiUnresolved); e = nullptr;
