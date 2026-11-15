@@ -159,6 +159,16 @@ Climb reproduced with the Pilot (stick offset re-learned per attempt: `goto ... 
     callable on a replica's IHumanGround; the sender already transmits `destMvt` (HumanGroundData+0x125, written by
     slot 3) and `sprint`. Whether an NPC replica's ground chart then wall-runs is untested.
 
+17. **Free-run intention on the NPC replica - negative** (run 22432, asi 63aea3a7, `[Coop] NativeReplicaFreeRun=1` with
+    NativeReplica=1 / NativeReplicaParkour=1; replica's IHumanGround slots 3 (peer destMvt), 32 (peer sprint), 1 (speed),
+    0 (direction to target) called on every replica frame from the puppet's own update; host-p14-state-2 x3): the replica's
+    own context stayed 4 on every window (repCtx 0x10) while the peer went 6 / 9 / 8 / 30; 8 snaps (3 parkour), no crash.
+    Caveat from the tap: the recorded peer only carries sprint = 1 / destMvt = 1 from t = 23.0 s (its jump) onward - during
+    the run-up both are 0 - so the replica had the free-run state on the ground for ~0.4 s before the peer went to Walling.
+    Consistent with R3 (NPC locomotion ignores IHumanGround). Next lead: the ground chart's transitions go through
+    `sub_1D659D0(state)` (280 callers; the argument is a state of the 644-state ground chart, not a context id); naming
+    those states (PS3 DWARF) and filtering to the player's chart would give the wall-run transition and its condition.
+
 So a shimmy step is fully described by **(definition index, position on the guidance)** plus the guidance it lies on; that
 is what R4.3 would send. UNVERIFIED: that the definition table is identical in both games (same assets, so expected), how
 the replica side reaches the table (the generator's inputs), and the other 11 move types (climb up, jump, ...).

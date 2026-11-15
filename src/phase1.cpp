@@ -1611,6 +1611,9 @@ static int   s_nrOn = -1;
 static float s_nrSnapM = 3.0f;
 // The newest packet's locomotion intention (set where packets are drained), 100 ms ahead of the interpolated state.
 static volatile float g_nrLatestDest = 0.0f; static volatile bool g_nrLatestSprint = false;
+static volatile uint8_t g_nrLatestMvt = 0;   // newest packet's HumanGroundData destMvt (+0x125, IHumanGround slot 3)
+static int s_nrFreeRun = -1;                 // [Coop] NativeReplicaFreeRun (default 0), read once
+static volatile LONG s_nrFrCalls = 0;
 static float s_nrBlendMps = 1.5f;   // [Coop] NativeReplicaBlendCmS / 100 (0 = no blended correction)
 static float s_nrBoostMps = 4.0f;   // [Coop] NativeReplicaStartBoostCmS / 100 (0 = no start boost)
 static volatile LONG s_nrModeSwitches = 0;
@@ -1830,6 +1833,31 @@ static void NativeReplicaNavTick(Entity* e) {
     static uint32_t s_gen = 0;
     if (t.gen == s_gen) return;
     s_gen = t.gen;
+    // [Coop] NativeReplicaFreeRun (default 0; R4.3 feasibility, docs/evidence/climb-decision-leads-2026-11-15.md items 13-16):
+    // also give the replica the peer's ground intention the way the player's handler gives Edward his: IHumanGround
+    // (HumanGround = *(Human+0x720), interface at +0x10, vtable 0x026E7DC0) slot 3 SetMovementType(peer destMvt; 1 = the
+    // RT + A free-run state, run 32012), slot 32 SetSprint(peer sprint), slot 1 SetSpeedRatio(destSpeed), slot 0
+    // SetDirection(toward the target). Question measured: does the NPC replica's own ground chart then wall-run / climb
+    // (replica context 8 / 30 in the [Replica] windows) when the peer does. Puppet's own update thread (OwnDrain).
+    if (s_nrFreeRun < 0) s_nrFreeRun = GetPrivateProfileIntA("Coop", "NativeReplicaFreeRun", 0, Paths::Ini()) != 0 ? 1 : 0;
+    if (s_nrFreeRun == 1) {
+        Human* h = AIEntityHelper::GetHuman(e);
+        char* hg = (h && readable((char*)h + 0x720, 4)) ? *(char**)((char*)h + 0x720) : nullptr;
+        if (readable(hg, 0x20) && *(uint32_t*)hg == 0x026E8AE8u && *(uint32_t*)(hg + 0x10) == 0x026E7DC0u) {
+            void* ig = hg + 0x10; void** vt = *(void***)ig;
+            const float px = e->m_GlobalMatrix.M41, py = e->m_GlobalMatrix.M42;
+            float ddx = t.x - px, ddy = t.y - py; const float dl = sqrtf(ddx * ddx + ddy * ddy);
+            alignas(16) float dir[4] = { dl > 1e-3f ? ddx / dl : t.hx, dl > 1e-3f ? ddy / dl : t.hy, 0.0f, 0.0f };
+            const float sp = g_nrLatestDest > 1.0f ? 1.0f : g_nrLatestDest < 0.0f ? 0.0f : g_nrLatestDest;
+            ((void (__thiscall*)(void*, int))vt[3])(ig, (int)g_nrLatestMvt);
+            ((void (__thiscall*)(void*, int))vt[32])(ig, g_nrLatestSprint ? 1 : 0);
+            ((void (__thiscall*)(void*, float))vt[1])(ig, sp);
+            ((void (__thiscall*)(void*, const float*))vt[0])(ig, dir);
+            if (InterlockedIncrement(&s_nrFrCalls) <= 3)
+                L("[Replica] free-run intention: mvt=%u sprint=%d speed=%.2f dir=(%.2f,%.2f)\n", (unsigned)g_nrLatestMvt,
+                  g_nrLatestSprint ? 1 : 0, sp, dir[0], dir[1]);
+        }
+    }
     const uint64_t now = GetTickCount64();
     const float dx = t.x - s_x, dy = t.y - s_y;
     if (s_ent == (void*)e && t.speed == s_speed && dx * dx + dy * dy < 0.5f * 0.5f && now - s_ms < 2000) return;
@@ -11290,7 +11318,7 @@ static void DumpConfigOnce()
         { "Coop", "FloatProbe", 0 }, { "Coop", "FootOffsetFix", 0 }, { "Coop", "GuardActionGate", 0 }, { "Coop", "GuardExtrapMs", 100 },
         { "Coop", "GuardInterpBuffer", 0 }, { "Coop", "GuardInterpDelayMs", 120 }, { "Coop", "GuardPhaseLock", 0 },
         { "Coop", "GuardSeesPuppet", 0 }, { "Coop", "PuppetActionReassert", 0 }, { "Coop", "PuppetHostTime", 0 },
-        { "Coop", "AlertQueryAsPlayer", 0 }, { "Coop", "ConflictNullGuard", 0 }, { "Coop", "ConflictKeepPuppet", 0 }, { "Coop", "GuardPoiFightTarget", 0 }, { "Coop", "FightOrderPuppet", 0 }, { "Coop", "DespawnLeaveFight", 0 }, { "Coop", "FightKeepOnConflictEnd", 0 }, { "Coop", "FightStateProbe", 0 }, { "Coop", "PuppetNavService", 0 }, { "Coop", "NativeReplica", 0 }, { "Coop", "NativeReplicaSnapCm", 300 }, { "Coop", "NativeReplicaBlendCmS", 150 }, { "Coop", "NativeReplicaStartBoostCmS", 400 }, { "Coop", "NativeReplicaParkour", 0 }, { "Coop", "NativeReplicaParkourSnapCm", 800 }, { "Coop", "FightProbe", 0 }, { "Coop", "PeerLastPacket", 0 }, { "Coop", "PuppetActionsOwnUpdate", 0 }, { "Coop", "DetectKeepTarget", 0 }, { "Coop", "GuardPlayerOfInterest", 0 }, { "Coop", "EventProbe", 0 }, { "Coop", "ReactProbe", 0 }, { "Coop", "FightSkipPuppet", 0 }, { "Coop", "NavNullGuard", 0 }, { "Coop", "PuppetStimMode", 1 }, { "Coop", "PuppetStimSeq", 0 }, { "Coop", "PuppetStimSource", 0 }, { "Coop", "SightProbe", 0 }, { "Coop", "StateProbe", 0 }, { "Coop", "StuckProbe", 0 },
+        { "Coop", "AlertQueryAsPlayer", 0 }, { "Coop", "ConflictNullGuard", 0 }, { "Coop", "ConflictKeepPuppet", 0 }, { "Coop", "GuardPoiFightTarget", 0 }, { "Coop", "FightOrderPuppet", 0 }, { "Coop", "DespawnLeaveFight", 0 }, { "Coop", "FightKeepOnConflictEnd", 0 }, { "Coop", "FightStateProbe", 0 }, { "Coop", "PuppetNavService", 0 }, { "Coop", "NativeReplica", 0 }, { "Coop", "NativeReplicaSnapCm", 300 }, { "Coop", "NativeReplicaBlendCmS", 150 }, { "Coop", "NativeReplicaStartBoostCmS", 400 }, { "Coop", "NativeReplicaParkour", 0 }, { "Coop", "NativeReplicaFreeRun", 0 }, { "Coop", "NativeReplicaParkourSnapCm", 800 }, { "Coop", "FightProbe", 0 }, { "Coop", "PeerLastPacket", 0 }, { "Coop", "PuppetActionsOwnUpdate", 0 }, { "Coop", "DetectKeepTarget", 0 }, { "Coop", "GuardPlayerOfInterest", 0 }, { "Coop", "EventProbe", 0 }, { "Coop", "ReactProbe", 0 }, { "Coop", "FightSkipPuppet", 0 }, { "Coop", "NavNullGuard", 0 }, { "Coop", "PuppetStimMode", 1 }, { "Coop", "PuppetStimSeq", 0 }, { "Coop", "PuppetStimSource", 0 }, { "Coop", "SightProbe", 0 }, { "Coop", "StateProbe", 0 }, { "Coop", "StuckProbe", 0 },
         { "Coop", "StageLog", 0 }, { "Coop", "SyncEnemiesOnly", 1 }, { "Coop", "SyncMaxEntities", 32 },
         { "Coop", "SyncRadiusM", 60 }, { "Coop", "TransformProbe", 0 }, { "Coop", "VPadEnable", 0 },
         { "Coop", "VPadTest", 0 }, { "Coop", "WatchDeadBit", 0 }, { "Coop", "WatchTarget", 0 },
@@ -11713,7 +11741,7 @@ static void OnFrameInner(Human* updatedHuman) {
         static PlayerState s_lastRaw; static bool s_haveLastRaw = false;
         static int s_plpOn = 0; static uint64_t s_plpNext = 0;
         { const uint64_t t = GetTickCount64(); if (t >= s_plpNext) { s_plpNext = t + 2000; s_plpOn = GetPrivateProfileIntA("Coop", "PeerLastPacket", 0, Paths::Ini()) != 0; } }
-        if (gotRaw) { s_lastRaw = raw; s_haveLastRaw = true; g_nrLatestDest = raw.destSpeed; g_nrLatestSprint = raw.sprint; }
+        if (gotRaw) { s_lastRaw = raw; s_haveLastRaw = true; g_nrLatestDest = raw.destSpeed; g_nrLatestSprint = raw.sprint; g_nrLatestMvt = raw.destMvt; }
         const bool haveRaw = s_plpOn ? s_haveLastRaw : gotRaw;
         if (!gotRaw && haveRaw) raw = s_lastRaw;
 
