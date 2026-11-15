@@ -109,6 +109,45 @@ STALE_SKIP_BYTES = bytes.fromhex("C6 45 08 00")
 DEREF_CONT_VA = [0x006797DC, 0x006797EA, 0x00681AED, 0x00681B67, 0x00681B29, 0x00681B5C]
 INFO_BYTES = 6
 
+# --- import slots swapped by the overlay (src/overlay.cpp, InstallEarly) -------------------------
+# IDA: import dxgi!CreateDXGIFactory1 at IAT 0x01E3A618, sole user the thunk 0x00976220, called once from
+# sub_968150 (0x00968181). The swap chain is then created in sub_949FA0 by IDXGIFactory::CreateSwapChain
+# (mov edx,[edx+28h] at 0x0094A1D7, three pushes, call edx at 0x0094A1DD) on that factory, which is why the factory's slot 10 is wrapped.
+IAT_SITES = [
+    (0x01E3A618, "dxgi.dll", "CreateDXGIFactory1", "overlay factory hook"),
+]
+CALL_SITES = [
+    ("CreateSwapChain call", 0x0094A1D7, bytes.fromhex("8B 52 28 57 51 50 FF D2"), "mov edx,[edx+28h]; push edi,ecx,eax; call edx"),
+    ("factory thunk", 0x00976220, bytes.fromhex("FF 25 18 A6 E3 01"), "jmp [0x01E3A618]"),
+]
+
+
+def import_slots(data, pe):
+    """{iat_rva: (dll, name)} for every by-name import of the main image (PE32)."""
+    e_lfanew = struct.unpack_from("<I", data, 0x3C)[0]
+    opt = e_lfanew + 4 + 20
+    imp_rva, _ = struct.unpack_from("<II", data, opt + 96 + 8 * 1)   # data directory 1 = imports
+    out = {}
+    off = pe.rva_to_offset(imp_rva)
+    while True:
+        oft, _, _, name_rva, ft = struct.unpack_from("<IIIII", data, off)
+        if name_rva == 0:
+            break
+        dll = data[pe.rva_to_offset(name_rva):].split(b"\0", 1)[0].decode("ascii")
+        lookup = oft or ft
+        i = 0
+        while True:
+            entry = struct.unpack_from("<I", data, pe.rva_to_offset(lookup) + 4 * i)[0]
+            if entry == 0:
+                break
+            if not entry & 0x80000000:
+                fn = data[pe.rva_to_offset(entry) + 2:].split(b"\0", 1)[0].decode("ascii")
+                out[ft + 4 * i] = (dll, fn)
+            i += 1
+        off += 20
+    return out
+
+
 # --- the guard's vtable acceptance window (src/deref_guard.cpp, BuildStub) ----------------------
 # The stub tests `sub eax,IMAGE_BASE; cmp eax,IMAGE_SIZE; jae reject` over the MAPPED PE, so the window
 # is [ImageBase, ImageBase+SizeOfImage). These samples pin the behaviour the widening was for: a vtable
@@ -371,6 +410,24 @@ def main():
     print(table(["vtable", "value", "vtable-base", "stub", "rejected by", "expect"], rows,
                 [24, 10, 11, 6, 12, 6]))
 
+    # --- import slots the plugin swaps (src/overlay.cpp): the slot must be bound to that DLL!name -------
+    print("\n=== import slots ===")
+    rows = []
+    imports_ok = True
+    found = import_slots(data, pe)
+    for va, dll, fn, note in IAT_SITES:
+        got = found.get(va - pe.image_base)
+        equal = got is not None and got[0].lower() == dll.lower() and got[1] == fn
+        imports_ok &= equal
+        rows.append(("0x%08X" % va, "%s!%s" % got if got else "-", "%s!%s" % (dll, fn), note, "PASS" if equal else "FAIL"))
+    print(table(["iat va", "on-disk", "expected", "user", "result"], rows, [10, 30, 30, 22, 6]))
+    for label, va, expected, note in CALL_SITES:
+        got = pe.read_rva(va - pe.image_base, len(expected))
+        equal = got == expected
+        imports_ok &= equal
+        print("  %-22s 0x%08X  %-17s expected %-17s %s  %s" % (label, va, " ".join("%02X" % b for b in got),
+              " ".join("%02X" % b for b in expected), note, "PASS" if equal else "FAIL"))
+
     window_ok = (pe.size_of_image == EXPECTED_SIZE_OF_IMAGE and
                  image_lo == EXPECTED_IMAGE_BASE and
                  image_hi == (EXPECTED_IMAGE_BASE + EXPECTED_SIZE_OF_IMAGE))
@@ -383,10 +440,11 @@ def main():
     print("  stale-target site bytes: %s" % ("PASS" if stale_ok else "FAIL"))
     print("  image window 0x00400000..0x0527E000: %s" % ("PASS" if window_ok else "FAIL"))
     print("  vtable accept/reject samples: %s" % ("PASS" if samples_ok else "FAIL"))
-    print("  %d sites, %d targets, 3 stale-target checks, %d vtable samples"
-          % (len(SITES), len(TARGETS), len(VTABLE_SAMPLES)))
+    print("  import slots + call sites: %s" % ("PASS" if imports_ok else "FAIL"))
+    print("  %d sites, %d targets, 3 stale-target checks, %d vtable samples, %d import slots, %d call sites"
+          % (len(SITES), len(TARGETS), len(VTABLE_SAMPLES), len(IAT_SITES), len(CALL_SITES)))
 
-    if pattern_ok and sites_ok and targets_ok and stale_ok and window_ok and samples_ok:
+    if pattern_ok and sites_ok and targets_ok and stale_ok and window_ok and samples_ok and imports_ok:
         print("\nORACLE: PASS")
         return 0
     print("\nORACLE: FAIL")

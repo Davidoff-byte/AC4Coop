@@ -2365,8 +2365,10 @@ namespace {
     }
 
     // Polls the bridge's one-line status file (state= code= link= peer=), logs every change, copies the host code to
-    // the clipboard once, and logs the bridge's exit.
-    unsigned __stdcall EosStatusThread(void*) {
+    // the clipboard once, and logs the bridge's exit. It owns `arg`, a duplicate of the bridge's process handle, so
+    // EosStop can close g_eosProc without racing this thread.
+    unsigned __stdcall EosStatusThread(void* arg) {
+        const HANDLE proc = (HANDLE)arg;
         char last[512] = {0};
         bool copied = false;
         for (;;) {
@@ -2389,14 +2391,16 @@ namespace {
                 }
             }
             DWORD ec = 0;
-            if (g_eosProc && GetExitCodeProcess(g_eosProc, &ec) && ec != STILL_ACTIVE) {
+            if (proc && GetExitCodeProcess(proc, &ec) && ec != STILL_ACTIVE) {
                 char m[96]; wsprintfA(m, "[EOS] bridge exited (code %u) - see eos\\bridge.log\n", (unsigned)ec); dbg(m);
+                CloseHandle(proc);
                 return 0;
             }
         }
     }
 
-    bool EosStartBridge(int gamePort, int bridgePort) {
+    // role/code: nullptr = read [Net] EosRole / EosCode from the ini (the start-at-Init path).
+    bool EosStartBridge(int gamePort, int bridgePort, const char* roleArg = nullptr, const char* codeArg = nullptr) {
         char dir[MAX_PATH] = {0}, exe[MAX_PATH], ini[MAX_PATH], logPath[MAX_PATH], cmd[2048], role[16] = {0}, code[32] = {0}, relay[16] = {0};
         _snprintf(dir, sizeof(dir), "%s\\eos", Paths::ModuleDir()); dir[sizeof(dir) - 1] = 0;
         _snprintf(exe, sizeof(exe), "%s\\eos_bridge.exe", dir); exe[sizeof(exe) - 1] = 0;
@@ -2404,8 +2408,8 @@ namespace {
         _snprintf(g_eosStatusPath, sizeof(g_eosStatusPath), "%s\\status.txt", dir); g_eosStatusPath[sizeof(g_eosStatusPath) - 1] = 0;
         { char def[MAX_PATH]; _snprintf(def, sizeof(def), "%s\\eos.ini", dir); def[sizeof(def) - 1] = 0;
           GetPrivateProfileStringA("Net", "EosIni", def, ini, sizeof(ini), Paths::Ini()); }
-        GetPrivateProfileStringA("Net", "EosRole", "host", role, sizeof(role), Paths::Ini());
-        GetPrivateProfileStringA("Net", "EosCode", "", code, sizeof(code), Paths::Ini());
+        if (roleArg) lstrcpynA(role, roleArg, sizeof(role)); else GetPrivateProfileStringA("Net", "EosRole", "host", role, sizeof(role), Paths::Ini());
+        if (codeArg) lstrcpynA(code, codeArg, sizeof(code)); else GetPrivateProfileStringA("Net", "EosCode", "", code, sizeof(code), Paths::Ini());
         GetPrivateProfileStringA("Net", "EosRelay", "allow", relay, sizeof(relay), Paths::Ini());
         const bool join = _stricmp(role, "join") == 0;
         char m[400];
@@ -2439,9 +2443,29 @@ namespace {
         _snprintf(m, sizeof(m), "[EOS] bridge started pid=%u role=%s%s%s relay=%s, bridge 127.0.0.1:%d <-> game port %d\n", (unsigned)pi.dwProcessId,
                   join ? "join " : "host", join ? code : "", "", relay, bridgePort, gamePort);
         m[sizeof(m) - 1] = 0; dbg(m);
-        _beginthreadex(nullptr, 0, EosStatusThread, nullptr, 0, nullptr);
+        HANDLE dup = nullptr;
+        DuplicateHandle(GetCurrentProcess(), pi.hProcess, GetCurrentProcess(), &dup, 0, FALSE, DUPLICATE_SAME_ACCESS);
+        _beginthreadex(nullptr, 0, EosStatusThread, dup, 0, nullptr);
         return true;
     }
+
+    // Ends the bridge (it leaves the lobby only on a clean exit; a killed bridge's lobby times out on Epic's side) and
+    // marks the status file stopped so the panel shows it at once.
+    void EosStopBridge() {
+        if (g_eosProc) {
+            TerminateProcess(g_eosProc, 0);
+            WaitForSingleObject(g_eosProc, 2000);
+            CloseHandle(g_eosProc); g_eosProc = nullptr;
+            dbg("[EOS] bridge stopped from the panel\n");
+        }
+        if (g_eosJob) { CloseHandle(g_eosJob); g_eosJob = nullptr; }
+        if (g_eosStatusPath[0]) {
+            if (FILE* f = fopen(g_eosStatusPath, "wb")) { fputs("state=stopped code=- link=none peer=-\n", f); fclose(f); }
+        }
+    }
+    bool EosAlive() { DWORD ec = 0; return g_eosProc && GetExitCodeProcess(g_eosProc, &ec) && ec == STILL_ACTIVE; }
+    int  EosGamePort() { return GetPrivateProfileIntA("Net", "LocalPort", 47801, Paths::Ini()); }
+    int  EosBridgePort() { return GetPrivateProfileIntA("Net", "EosBridgePort", 47900, Paths::Ini()); }
 }
 
 namespace Net {
@@ -2618,7 +2642,11 @@ bool Init() {
     char m[192];
     if (g_mode == LM_MANUAL) {
         wsprintfA(m, "[Net] up: bound:%d -> %s:%d\n", bindPort, peerIp, sendPort); dbg(m);
-        if (g_eos) EosStartBridge(bindPort, sendPort);   // [Net] Transport=eos
+        if (g_eos) {   // [Net] Transport=eos: start now only with EosAutoStart (default: on unless the in-game panel is on)
+            const int autoDef = GetPrivateProfileIntA("Overlay", "Enable", 0, Paths::Ini()) ? 0 : 1;
+            if (GetPrivateProfileIntA("Net", "EosAutoStart", autoDef, Paths::Ini())) { if (!EosAlive()) EosStartBridge(bindPort, sendPort); }
+            else dbg("[EOS] bridge waits for the in-game panel (Host / Join)\n");
+        }
     } else if (g_mode == LM_HOST) {
         wsprintfA(m, "[Net] up: bound:%d mode=host (waiting for a guest)\n", bindPort); dbg(m);
         BeginHosting(bindPort);
@@ -2655,6 +2683,27 @@ bool BeginJoin(uint32_t ip, uint16_t port, char* err, size_t errN) {
 int LobbyMode() { return (int)g_mode; }
 
 void Log(const char* line) { dbg(line); }
+
+bool EosTransport() {
+    char t[16] = {0};
+    GetPrivateProfileStringA("Net", "Transport", "udp", t, sizeof(t), Paths::Ini());
+    return _stricmp(t, "eos") == 0;
+}
+bool EosRunning() { return EosAlive(); }
+void EosStop() { EosStopBridge(); }
+static bool EosStartFromPanel(const char* role, const char* code, char* err, size_t errN) {
+    if (!EosTransport()) { _snprintf(err, errN, "[Net] Transport is not eos"); return false; }
+    if (EosAlive()) EosStopBridge();
+    if (!EosStartBridge(EosGamePort(), EosBridgePort(), role, code)) { _snprintf(err, errN, "bridge did not start (see net_log)"); return false; }
+    return true;
+}
+bool EosHost(char* err, size_t errN) { return EosStartFromPanel("host", "", err, errN); }
+bool EosJoin(const char* code, char* err, size_t errN) {
+    char c[16] = {0}; int n = 0;
+    for (const char* p = code; p && *p && n < 15; ++p) if (isalnum((unsigned char)*p)) c[n++] = (char)toupper((unsigned char)*p);
+    if (n != 6) { _snprintf(err, errN, "a lobby code is 6 letters/digits"); return false; }
+    return EosStartFromPanel("join", c, err, errN);
+}
 
 bool JoinByCode(const char* text, char* err, size_t errN) {
     auto fail = [&](const char* why) { if (err && errN) { lstrcpynA(err, why, (int)errN); } return false; };

@@ -22,6 +22,7 @@
 #include "net.h"
 #include "lobby_ui.h"
 #include "ui_probe.h"
+#include "overlay.h"
 #include "video_hook.h"
 #include "menu_probe.h"
 #include "auto_continue.h"
@@ -334,6 +335,7 @@ static unsigned __stdcall PollThread(void*)
     }
 
     UiProbe::Start();   // [Coop] UiProbe=1 only (default 0): measures the present + input paths for the overlay
+    Overlay::Start();   // [Overlay] Probe/Enable only (default 0): DirectInput hooks + status thread for the co-op panel
 
     while (g_run)
     {
@@ -565,6 +567,10 @@ BOOL APIENTRY DllMain(HMODULE hMod, DWORD reason, LPVOID)
         bool fullscreen = GetPrivateProfileIntA("Display", "Fullscreen", 0, Paths::Ini()) != 0;
         bool borderless = GetPrivateProfileIntA("Display", "Borderless", 0, Paths::Ini()) != 0;
         if (HookGate("HookWindowed")) Windowed::Apply(fullscreen, borderless);
+
+        // In-game co-op panel: swap the CreateDXGIFactory1 IAT slot now, before WinMain reaches the renderer
+        // (sub_968150). [Overlay] Probe / Enable, default 0 -> two GetPrivateProfileIntA, nothing patched.
+        Overlay::InstallEarly();
 
         // Phase 1: hook the per-frame Human update so spawns/drives run on the game's main thread.
         if (HookGate("HookFrame")) Phase1::InstallFrameHook();

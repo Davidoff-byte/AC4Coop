@@ -125,6 +125,8 @@
     <ClCompile Include="src\stun.cpp" />
     <ClCompile Include="src\lobby_ui.cpp" />
     <ClCompile Include="src\ui_probe.cpp" />
+    <ClCompile Include="src\overlay.cpp" />
+    <ClCompile Include="src\overlay_ui.cpp"><LanguageStandard>stdcpp17</LanguageStandard></ClCompile>
     <ClCompile Include="src\video_hook.cpp" />
     <ClCompile Include="src\menu_probe.cpp" />
     <ClCompile Include="src\auto_continue.cpp" />
@@ -162,6 +164,8 @@
     <ClInclude Include="src\stun.h" />
     <ClInclude Include="src\lobby_ui.h" />
     <ClInclude Include="src\ui_probe.h" />
+    <ClInclude Include="src\overlay.h" />
+    <ClInclude Include="src\overlay_ui.h" />
     <ClInclude Include="src\video_hook.h" />
     <ClInclude Include="src\menu_probe.h" />
     <ClInclude Include="src\auto_continue.h" />
@@ -212,6 +216,28 @@
   </ItemGroup>
   <ItemGroup>
     <None Include="AC4Coop.ini" />
+  </ItemGroup>
+  <!-- In-game overlay (src\overlay_ui.cpp): RmlUi + FreeType static x86 libraries built by third_party\rmlui\build_rmlui.cmd
+       into the ignored local\rmlui-x86. Without them the overlay compiles as a stub (AC4COOP_OVERLAY 0) and the ASI
+       builds exactly as before. d3dcompiler_47 and imm32 are delay-loaded so the ASI's load-time imports do not grow. -->
+  <PropertyGroup Condition="Exists('$(ProjectDir)local\rmlui-x86\lib\rmlui.lib')">
+    <Ac4Overlay>1</Ac4Overlay>
+    <Ac4RmlInc>$(ProjectDir)local\rmlui-x86\include;$(ProjectDir)local\vendor\rmlui\Backends</Ac4RmlInc>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Ac4Overlay)'=='1'">
+    <ClCompile>
+      <AdditionalIncludeDirectories>$(Ac4RmlInc);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>AC4COOP_OVERLAY=1;RMLUI_STATIC_LIB;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <Link>
+      <AdditionalLibraryDirectories>$(ProjectDir)local\rmlui-x86\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>rmlui.lib;freetype.lib;d3dcompiler.lib;imm32.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <DelayLoadDLLs>d3dcompiler_47.dll;imm32.dll;%(DelayLoadDLLs)</DelayLoadDLLs>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup Condition="'$(Ac4Overlay)'=='1'">
+    <ClCompile Include="local\vendor\rmlui\Backends\RmlUi_Renderer_DX11.cpp"><ObjectFileName>$(IntDir)rml_dx11.obj</ObjectFileName><LanguageStandard>stdcpp17</LanguageStandard><WarningLevel>TurnOffAllWarnings</WarningLevel></ClCompile>
+    <ClCompile Include="local\vendor\rmlui\Backends\RmlUi_Platform_Win32.cpp"><ObjectFileName>$(IntDir)rml_win32.obj</ObjectFileName><LanguageStandard>stdcpp17</LanguageStandard><WarningLevel>TurnOffAllWarnings</WarningLevel></ClCompile>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

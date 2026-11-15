@@ -53,6 +53,15 @@ namespace Net {
     bool     HostCode(char out[16]);
     // One line for the window title, e.g. "host code K7M2-9QXD-4AB1 (F7 copies) | guest joined".
     void     LobbyStatus(char* out, size_t n);
+    // ---- [Net] Transport=eos: the bridge on demand (the in-game panel, src/overlay.cpp) ----
+    // Valid before Init (the bridge learns the game's port from its first datagram; until then it uses
+    // [Net] LocalPort). [Net] EosAutoStart (default 1, or 0 when [Overlay] Enable=1) keeps the old
+    // start-at-Init behaviour with EosRole/EosCode from the ini.
+    bool     EosTransport();
+    bool     EosHost(char* err, size_t errN);
+    bool     EosJoin(const char* code, char* err, size_t errN);
+    void     EosStop();
+    bool     EosRunning();
     // Append a line to net_log.txt (+ OutputDebugString). The file is opened deny-write by this unit, so
     // other units must log through here rather than open it themselves.
     void     Log(const char* line);
