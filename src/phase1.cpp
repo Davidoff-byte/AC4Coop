@@ -7516,6 +7516,7 @@ static void OwnDrain(Human* h) {
     const unsigned int key = (unsigned int)h;
     // ---- puppet ----
     if (s_pupHumanKey && (LONG)key == s_pupHumanKey) {
+        Pilot::OnPuppetFrame(h);   // [Pilot] Enabled only: S2 puppet slot probes (kCmdHgCall | 0x100), on the puppet's own update
         Entity* e = nullptr; HookMath::Transform m;
         AcquireSRWLockShared(&s_pupLock);
         const bool have = s_pupHaveM; e = s_pupEnt; m = s_pupM;

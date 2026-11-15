@@ -385,7 +385,8 @@ def cmd_hg(p, a):
         print('at most 4 args'); return 2
     can = NONE if a.can is None else a.can
     do = NONE if a.do is None else a.do
-    st = p.ctl_send_u32(13, [a.iface, can, do, len(args) | (mask << 8)] + args)
+    iface = a.iface | (0x100 if a.puppet else 0)   # 0x100: run on the co-op puppet's own update (Pilot::OnPuppetFrame)
+    st = p.ctl_send_u32(13, [iface, can, do, len(args) | (mask << 8)] + args)
     r = struct.unpack('<11I', ctypes.string_at(p.ctl + 116, 44))
     path = '/'.join('-' if v == NONE else str(v) for v in r[5:11])
     print(f'status {st} | can {"-" if not r[2] else f"{r[0]:#x}"} do {"-" if not r[3] else f"{r[1]:#x}"} | before ctx={r[4] if r[4] < 0x80000000 else r[4] - 2**32} path={path}')
@@ -639,7 +640,7 @@ def main():
     x = sub.add_parser('climb'); x.add_argument('x', type=float); x.add_argument('y', type=float)
     x.add_argument('--speed', type=float, default=1.0); x.add_argument('--sec', type=float, default=1.0)
     x = sub.add_parser('hg'); x.add_argument('--iface', type=int, default=0); x.add_argument('--can', type=int)
-    x.add_argument('--do', type=int); x.add_argument('--arg', action='append')
+    x.add_argument('--do', type=int); x.add_argument('--arg', action='append'); x.add_argument('--puppet', action='store_true')
     x = sub.add_parser('route'); x.add_argument('x', type=float); x.add_argument('y', type=float)
     x = sub.add_parser('boot'); x.add_argument('--pulses', type=int, default=6); x.add_argument('--wait', type=float, default=5)
     x.add_argument('--settle', type=float, default=60); x.add_argument('--fps', type=float, default=0)   # 0: no Present patch (cap preceded 4 lost copies in 7 two-copy runs, docs/evidence/s0-two-copy-rig-2026-11-15.md)

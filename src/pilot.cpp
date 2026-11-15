@@ -427,10 +427,10 @@ void GotoTick(Entity* pl)
 // +0x10 (same check as phase1.cpp NativeReplicaFreeRun). Ground FSM = [IHumanGround+0x90]; active-state path = *(u16**)(fsm+0x118)
 // (S2 wrapper pattern; phase1.cpp wall-run diag reads the same fields). Test-only: runs only under [Pilot] Enabled.
 void*    g_human = nullptr;     // the player Human of the current OnPlayerFrame
-int      g_hgWatch = 0;         // frames left to log ground-FSM path / context changes
-uint16_t g_hgLastPath[6] = {};
-int      g_hgLastCtx = -100;
-uint32_t g_hgFrame = 0;
+struct HgWatch { int left; uint16_t last[6]; int lastCtx; };
+HgWatch  g_hgW = { 0, {}, -100 };    // player
+HgWatch  g_hgWP = { 0, {}, -100 };   // puppet (kHgPuppet requests, served on the puppet's own update)
+const uint32_t kHgPuppet = 0x100;    // f0 bit: run on the co-op puppet instead of the player
 
 char* HumanGroundOf(void* human)
 {
@@ -485,11 +485,12 @@ uint32_t HgInvoke(void* iface, uint32_t slot, int n, const uint32_t* a, bool* ok
     return r;
 }
 
-int HgCall(PilotCtl* c)
+int HgCall(PilotCtl* c, void* human, const char* tag, HgWatch& w)
 {
     uint32_t u[8];
     memcpy(u, c->f, sizeof(u));
-    char* hg = HumanGroundOf(g_human);
+    u[0] &= ~kHgPuppet;
+    char* hg = HumanGroundOf(human);
     if (!hg) return -1;
     static const int kIfaceOff[4] = { 0x10, 0x14, 0x70, 0x74 };
     if (u[0] > 3) return -3;
@@ -507,7 +508,7 @@ int HgCall(PilotCtl* c)
     }
     uint16_t path[6] = {};
     const bool havePath = HgPath(hg, path);
-    const int ctx0 = HgCtx(g_human);
+    const int ctx0 = HgCtx(human);
     uint32_t rCan = 0, rDo = 0, calledCan = 0, calledDo = 0;
     bool ok = true;
     if (u[1] != 0xFFFFFFFFu) { rCan = HgInvoke(iface, u[1], n, args, &ok); calledCan = ok ? 1 : 0; }
@@ -517,24 +518,24 @@ int HgCall(PilotCtl* c)
     memcpy(res, out, sizeof(out));
     for (int i = 0; i < 6; ++i) { const uint32_t p = havePath ? path[i] : 0xFFFFFFFFu; memcpy(res + 5 + i, &p, 4); }
     c->rcount = 11;
-    Log("[HG] call iface=%u can=%d do=%d n=%d ref=%X args=%08X %08X %08X %08X -> can %08X (%u) do %08X (%u) | before ctx=%d path=%u/%u/%u/%u/%u/%u\n",
-        u[0], (int)u[1], (int)u[2], n, refMask, args[0], args[1], args[2], args[3], rCan, calledCan, rDo, calledDo, ctx0,
+    Log("[%s] call human=%p iface=%u can=%d do=%d n=%d ref=%X args=%08X %08X %08X %08X -> can %08X (%u) do %08X (%u) | before ctx=%d path=%u/%u/%u/%u/%u/%u\n",
+        tag, human, u[0], (int)u[1], (int)u[2], n, refMask, args[0], args[1], args[2], args[3], rCan, calledCan, rDo, calledDo, ctx0,
         path[0], path[1], path[2], path[3], path[4], path[5]);
-    g_hgWatch = 120; g_hgLastCtx = -100;
+    w.left = 120; w.lastCtx = -100;
     return ok ? 0 : -2;
 }
 
-void HgWatchTick()
+void HgWatchTick(void* human, const char* tag, HgWatch& w)
 {
-    if (g_hgWatch <= 0) return;
-    --g_hgWatch; ++g_hgFrame;
-    char* hg = HumanGroundOf(g_human);
+    if (w.left <= 0) return;
+    --w.left;
+    char* hg = HumanGroundOf(human);
     uint16_t path[6] = {};
     if (!hg || !HgPath(hg, path)) return;
-    const int ctx = HgCtx(g_human);
-    if (ctx != g_hgLastCtx || memcmp(path, g_hgLastPath, sizeof(path)) != 0) {
-        Log("[HG] watch +%d ctx=%d path=%u/%u/%u/%u/%u/%u\n", 120 - g_hgWatch, ctx, path[0], path[1], path[2], path[3], path[4], path[5]);
-        g_hgLastCtx = ctx; memcpy(g_hgLastPath, path, sizeof(path));
+    const int ctx = HgCtx(human);
+    if (ctx != w.lastCtx || memcmp(path, w.last, sizeof(path)) != 0) {
+        Log("[%s] watch +%d ctx=%d path=%u/%u/%u/%u/%u/%u\n", tag, 120 - w.left, ctx, path[0], path[1], path[2], path[3], path[4], path[5]);
+        w.lastCtx = ctx; memcpy(w.last, path, sizeof(path));
     }
 }
 
@@ -542,6 +543,7 @@ void RunCommand(Entity* pl)
 {
     PilotCtl* c = g_ctl;
     if (!c || c->req == c->done) return;
+    if (c->cmd == kCmdHgCall) { uint32_t f0; memcpy(&f0, &c->f[0], 4); if (f0 & kHgPuppet) return; }   // served by OnPuppetFrame
     int32_t status = 0;
     if (c->cmd == kCmdTeleport) {
         if (!pl) status = -1;
@@ -583,7 +585,7 @@ void RunCommand(Entity* pl)
             g_climbUntil = GetTickCount() + (c->f[3] > 0 ? (DWORD)c->f[3] : 300);
         }
     } else if (c->cmd == kCmdHgCall) {
-        status = HgCall(c);
+        status = HgCall(c, g_human, "HG", g_hgW);
     } else if (c->cmd == kCmdStop) {
         g_goto.on = false; g_intentUntil = 0; g_climbUntil = 0; if (c->reserved[0] == 1) c->reserved[0] = 4;
     } else if (c->cmd >= kCmdRay && c->cmd <= kCmdSense) {
@@ -595,6 +597,21 @@ void RunCommand(Entity* pl)
 }
 
 }  // namespace
+
+// The co-op puppet's own Human update (phase1.cpp OwnDrain, puppet branch): serves kHgPuppet slot calls on the puppet
+// and its [HG-P] watch, on the puppet's own thread.
+void OnPuppetFrame(void* human)
+{
+    if (!g_enabled || !g_ctl || !human) return;
+    PilotCtl* c = g_ctl;
+    __try {
+        if (c->req != c->done && c->cmd == kCmdHgCall) {
+            uint32_t f0; memcpy(&f0, &c->f[0], 4);
+            if (f0 & kHgPuppet) { c->status = HgCall(c, human, "HG-P", g_hgWP); c->done = c->req; }
+        }
+        HgWatchTick(human, "HG-P", g_hgWP);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { Log("[HG-P] EXCEPTION 0x%08X\n", GetExceptionCode()); }
+}
 
 void Init()
 {
@@ -648,7 +665,7 @@ void OnPlayerFrame(void* human)
         g_intentEntity = (uint32_t)(uintptr_t)pl;
         g_human = human;
         RunCommand(pl);
-        HgWatchTick();
+        HgWatchTick(g_human, "HG", g_hgW);
         GotoTick(pl);
         if (pl) memcpy(s->m, &((BaseEntity*)pl)->m_GlobalMatrix, sizeof(s->m));
         uint32_t n = 0, total = 0;

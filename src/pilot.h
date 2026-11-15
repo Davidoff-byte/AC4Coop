@@ -100,5 +100,6 @@ namespace Pilot
     void Init();                        // DllMain attach, after the build gate
     void Poll();                         // poll thread, ~20 Hz: retries the IAT patch and the window subclass
     void OnPlayerFrame(void* human);     // game thread, once per player Human update
+    void OnPuppetFrame(void* human);     // the co-op puppet's own Human update: kCmdHgCall with f0 | 0x100 (target puppet)
     int  RunWorldCommand(PilotCtl* c, void* player);   // pilot_world.cpp, game thread; returns the ctl status
 }
