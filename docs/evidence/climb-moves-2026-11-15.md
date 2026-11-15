@@ -172,3 +172,27 @@ default 0, re-read every 2 s). Solo replay only; not two-machine tested.
   IHumanGround with free-run (slot 3 = 1), sprint, speed 1.0 and the direction to the wall. Not run: the game exited
   ~2 s after start on three launches (store-layer restart, docs/evidence/single-instance-guard-2026-11-15.md; Ubisoft
   Connect had not been running), and the owner was using the PC.
+- Final approach run (asi `ea083c34...` = feat/launcher f3d4898 incl. this code, pid 22736, replays converted with
+  `--as-proto 16`, `0:0:0:1:1`, 2 passes): the Stop came once; afterwards the chart still reported a sub-state other than 4
+  for 38 tries while the replica coasted 3.9 -> 3.2 m/s (IHumanGround did not drive it), then sub-state 4 near standstill
+  (0.33 m/s, turned to the peer's wall): the first request there succeeded. That entry followed the peer's route - contexts
+  {4,8} with the peer {4,8,30}, then {8,30} with an on-wall error of 0.27 m (first time the replica hung on the peer's ledge
+  after its own entry). Afterwards it climbed onto the beam (the peer's input said up), dropped, and stood at the wall foot
+  (start older than 5 s, no re-entry).
+- Re-entry variant (asi `9dab1b5e...`, pid 29204, reverted, not committed): start kept valid while the peer is off the
+  ground, Stop radius 1.5 m, hold-following on; `abmoves.sh ... 1:0:0:1:1 0:0:0:0:0` x3:
+
+| run | mode | parkour err3d | both climbing | beam alone | wall-run entries |
+|---|---|---|---|---|---|
+| 1 | entry + no snap + moves | 3.74 m | 5 % | 11 % | 3 |
+| 2 | baseline | 2.26 m | 18 % | 24 % | 18 |
+| 3 | entry + no snap + moves | 3.68 m | 10 % | 11 % | 4 |
+| 4 | baseline | 9.04 m (replica parked on a beam all run) | 0 % | 93 % | 1 |
+| 5 | entry + no snap + moves | 3.53 m | 13 % | 20 % | 6 |
+| 6 | baseline | 2.82 m | 24 % | 48 % | 11 |
+
+  Worse: the replica stayed pinned at the wall foot (~7000 requests and as many facing writes per run, wall test failing)
+  and without the stuck snap it never caught up. Negative; reverted.
+- Status of this line: a native entry can follow the peer's route (once, 0.27 m), but the NPC replica cannot reliably
+  wall-run on demand - navigation holds the ground chart in sub-state 115, IHumanGround does not move it, and a standing
+  request succeeds only sometimes. The committed default-0 flags keep the tested behaviour; nothing here is on by default.
