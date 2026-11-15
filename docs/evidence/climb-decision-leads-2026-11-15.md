@@ -168,6 +168,9 @@ Climb reproduced with the Pilot (stick offset re-learned per attempt: `goto ... 
     Consistent with R3 (NPC locomotion ignores IHumanGround). Next lead: the ground chart's transitions go through
     `sub_1D659D0(state)` (280 callers; the argument is a state of the 644-state ground chart, not a context id); naming
     those states (PS3 DWARF) and filtering to the player's chart would give the wall-run transition and its condition.
+    Checked: PS3 enum `HumanGroundEntryPointID` (cu 289, DIE 0x62200C1, 811 values; e.g. 276 GrabbedFromClimb_Standard,
+    724 WallingImpulsion_Standard) does not match the sampled `sub_1D659D0` arguments (648 / 652 / 657 = DropHidingSpot /
+    CarryObject..., and values up to 53252) - either a different id space or NPC calls (no player filter yet).
 
 So a shimmy step is fully described by **(definition index, position on the guidance)** plus the guidance it lies on; that
 is what R4.3 would send. UNVERIFIED: that the definition table is identical in both games (same assets, so expected), how
