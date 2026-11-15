@@ -110,6 +110,26 @@ v1.19.2.1 ships `EOSSDK-Win64-Shipping.dll/.lib` and arm64 only. There is **no `
     which co-op must be designed for (intent-based replicas, no round-trip waits); EOS cannot remove it.
 - **Still open:** a `--relay force` run (both sides) to measure the relay-only path. Then the 64-bit bridge.
 
+## The bridge (`tools/eos_bridge`, x64)
+**Data path.** The bridge binds UDP `127.0.0.1:<BridgePort>` (default 47900, loopback only, never exposed). Every datagram from
+the local game goes out over EOS P2P (socket `AC4COOP`, channel 1, unreliable-unordered: the mod already has its own
+reliability and staleness rules, and the intention lane carries its own sequencing). Every P2P datagram from the remote
+bridge goes to the local game, at the last local sender's endpoint (default `127.0.0.1:47801`).
+- Datagrams larger than `EOS_P2P_MAX_PACKET_SIZE` (1170) are dropped and counted. Entity chunks (1400 B today) need the
+  `ENTITY_CHUNK_MAX` change in `net.cpp` before the mod runs over the bridge.
+
+**Roles.** `host` creates the lobby and prints the code; `join <CODE>` finds it, joins, and opens P2P to the lobby owner.
+The host accepts the first peer that requests a connection. Two players today, matching the mod's single `g_peer`.
+
+**Slices.**
+1. Bridge exe with the console roles above, stats every 5 s, and `--echo` (send P2P datagrams back instead of to the
+   game) for tests. Oracle: `udp_probe.py` here → bridge (host) → EOS → remote bridge (`--echo`) → back; loss, order and RTT.
+   **No mod change** in this slice.
+2. The mod runs over it. `[Net] Mode=manual`, `PeerIP=127.0.0.1`, `PeerPort=47900`, `BindIP=127.0.0.1`, entity chunks of
+   1170 B or less. The game's HELLO/WELCOME runs end to end through two bridges (needs a game on both PCs).
+3. In-game panel (ImGui) drives the bridge over a local control protocol (HOST / JOIN code / STATUS / LEAVE); the mod
+   starts and stops the bridge process; the launcher installs it.
+
 ## Open items
 - The owner sets the client policy on the Epic portal (Connect / Lobbies / P2P only) before a public build.
 - EOS terms and the SDK licence for redistributing `EOSSDK-Win32-Shipping.dll` with a game mod: read before release.
