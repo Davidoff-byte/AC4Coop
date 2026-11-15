@@ -7536,6 +7536,7 @@ static void SpawnerIdProbeTick() {
     BaseBigArray<Reference>& ents = w->m_EntityManager.m_Entities;
     const int nobj = ents.GetSize();
     int comps = 0, withEnt = 0, selfOk = 0, idsZero = 0, idsMinted = 0, logged = 0;
+    int walkedEnts = 0, walkedComps = 0, charEnts = 0;   // positive control: the walk reaches entities and components
     static uint32_t s_keyedHc[512]; int nKeyed = 0;
     for (int i = 0; i < nobj; ++i) {
         Reference* ref = ents.GetElement(i);
@@ -7547,6 +7548,7 @@ static void SpawnerIdProbeTick() {
         const uint16_t cnt = *(uint16_t*)(e + 0x66);
         Component** data = *(Component***)(e + 0x60);
         if (cnt < 1 || cnt > 96 || !readable(data, cnt * 4)) continue;
+        ++walkedEnts; walkedComps += cnt; if (*(uint32_t*)e == 0x01E4CE90u) ++charEnts;
         for (int k = 0; k < cnt; ++k) {
             char* C = (char*)data[k];
             if (!readable(C, 0x118) || *(uint32_t*)C != 0x026900B8u) continue;
@@ -7584,8 +7586,8 @@ static void SpawnerIdProbeTick() {
         const uint32_t h = *(uint32_t*)(e + 0xC8);
         for (int j = 0; j < nKeyed; ++j) if (s_keyedHc[j] == h) { ++guardsKeyed; break; }
     }
-    L("[GSID] summary pass=%d entities=%d comps=%d withEnt=%d entSelf=%d/%d idsZero=%d idsMinted=%d guards=%d guardsKeyed=%d\n",
-      s_pass, nobj, comps, withEnt, selfOk, withEnt, idsZero, idsMinted, guards, guardsKeyed);
+    L("[GSID] summary pass=%d entities=%d walked=%d components=%d charEntities=%d | spawnerComps=%d withEnt=%d entSelf=%d/%d idsZero=%d idsMinted=%d guards=%d guardsKeyed=%d\n",
+      s_pass, nobj, walkedEnts, walkedComps, charEnts, comps, withEnt, selfOk, withEnt, idsZero, idsMinted, guards, guardsKeyed);
 }
 
 // ---- [Coop] FightIntents (default 0): S7 slice 1, docs/design/s7-fight-intents.md -------------------------------------
