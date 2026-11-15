@@ -268,7 +268,7 @@ static bool HookGate(const char* key)
 // 2026-11-15 17:21: a direct AC4BFSP.exe start exits with code 0 within ~1 s and UbisoftGameLauncher.exe starts the
 // real game (-uplay_steam_mode) ~3 s later - so it is removed by the live game after 60 s, not on first load.
 // [Launcher] ArmWindowSec (default 300) bounds a marker left behind by a crash before that.
-static void ArmPath(char* p, size_t n) { _snprintf(p, n, "%s\\AC4Coop.armed", Paths::ModuleDir()); p[n - 1] = 0; }
+static void ArmPath(char* p, size_t n) { _snprintf_s(p, n, _TRUNCATE, "%s\\AC4Coop.armed", Paths::ModuleDir()); }
 static bool LaunchArmed()
 {
     if (!GetPrivateProfileIntA("Launcher", "RequireArm", 0, Paths::Ini())) return true;

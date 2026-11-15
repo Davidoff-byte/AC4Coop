@@ -1,4 +1,40 @@
-# AC4Coop Launcher: a pre-game party
+# AC4Coop Launcher: the only way co-op runs
+
+Status: **2026-11-15 rewrite (EOS era). Install path checked offline on scratch game folders. Not run with the game
+yet.** The party-launcher design below ("pre-game party") is superseded: Host / Join moved into the game (the co-op
+panel, F10, docs/design/eos-transport.md), and the launcher now only installs and starts the modded game.
+
+## What it does now
+1. **Game**: finds `AC4BFSP.exe` (Steam libraries, Ubisoft Connect installs, or Browse) and checks its sha256 against
+   `known_builds.txt`.
+2. **Install / update** (on Play when anything differs, by sha256): `AC4Coop.asi`, `known_builds.txt`, the loader,
+   `eos\` (64-bit bridge, EOS SDK DLL, x64 VC runtime, `eos.ini` with the client credentials) and `coop_ui\` (panel
+   RML/RCSS, fonts). Replaced files are kept as `*.launcher-bak`. A missing `AC4Coop.ini` is created from the
+   template, an existing one is kept and only these keys are written (backup `AC4Coop.ini.launcher.bak`):
+   `[Launcher] RequireArm=1`, `[Net] Enabled=1 Mode=manual Transport=eos EosAutoStart=0`,
+   `[Overlay] Enable=1 RoleFromPanel=1`, plus the role-independent `[Coop]` sync profile.
+3. **Loader name**: Ultimate ASI Loader as `dinput8.dll`. When another mod owns a `dinput8.dll` that is not Ultimate
+   ASI Loader, ours goes in as `version.dll` (both names are on the loader's Win32 list and AC4BFSP.exe imports both).
+   Other `.asi` mods simply load alongside through the same loader.
+4. **Play**: refuses while `AC4BFSP.exe` runs, writes `<game>\AC4Coop.armed`, starts `AC4BFSP.exe` from the game folder.
+
+## Separate from the plain game
+With `RequireArm=1` the ASI installs nothing unless `AC4Coop.armed` is fresh (`[Launcher] ArmWindowSec`, default 300 s),
+so Play in Steam / Ubisoft Connect is the unmodded game. Measured 2026-11-15 17:21 (genuine Steam install, Steam and
+Ubisoft Connect running): a direct `AC4BFSP.exe` start (pid 30256) exited with code 0 within ~1 s, and
+`UbisoftGameLauncher.exe` started `AC4BFSP.exe -uplay_steam_mode` (pid 11020) ~3 s later, which became the game. So the
+marker must outlive the first process: the live game deletes it after 60 s. The same measurement rules out a
+Seamless-Co-op-style "start the game and inject" launcher: the process the launcher starts is never the game.
+
+## Offline check (2026-11-15, package AC4Coop-Launcher-0577dca-dirty)
+`AC4CoopLauncher.exe --game-dir <scratch> --payload <pkg>\files --no-launch --auto-play --report r.txt`:
+- clean folder (only AC4BFSP.exe): all payload files installed, loader `dinput8.dll`, marker written, ini keys as above;
+- folder with a foreign `dinput8.dll` (SysWOW64 copy): left untouched, loader installed as `version.dll`.
+Packaging: `tools\package_launcher.ps1` (eos.ini comes from the ignored `local\eos.ini`; the package is never committed).
+
+---
+
+# (superseded) AC4Coop Launcher: a pre-game party
 
 Status: **built and checked offline (two launchers + relay on one PC); not run with the game yet.** 2026-11-12.
 
