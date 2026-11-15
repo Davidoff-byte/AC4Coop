@@ -8,8 +8,8 @@
 		<h1>AC4 CO-OP</h1>
 		<p class="sub">F10 closes this panel</p>
 
-		<div data-if="role == 'host'">
-			<p class="label">Your lobby code</p>
+		<div data-if="show_host">
+			<p class="label">Host a game - your lobby code</p>
 			<p id="code">{{ code }}</p>
 			<div class="row">
 				<button id="btn-host" data-if="can_start" data-event-click="act('host')">Host</button>
@@ -19,8 +19,8 @@
 			<p class="hint">Send the code to your friend. They type it in their own panel.</p>
 		</div>
 
-		<div data-if="role == 'join'">
-			<p class="label">Friend's lobby code</p>
+		<div data-if="show_join">
+			<p class="label">Join a friend - their lobby code</p>
 			<input id="codebox" type="text" maxlength="6" size="6" data-value="input"/>
 			<div class="row">
 				<button id="btn-join" data-event-click="act('join')">Join</button>

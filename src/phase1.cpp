@@ -7310,6 +7310,22 @@ void* Phase1_PuppetEntity() {
     return e;
 }
 bool Phase1_IsEntityHost() { return g_entHost == 1; }
+// [Overlay] RoleFromPanel=1: the in-game panel picks the role (Host -> 1, Join -> 0) instead of [Coop] EntityHost.
+// Until it does, g_entHost stays -1 and EntitySyncTick does nothing. Set once per process: returns false (and
+// changes nothing) when a different role is already in force. -1 is "undecided" everywhere: every role test
+// outside EntitySyncTick is `== 1` (Phase1_IsEntityHost, SendHealthEvent, the death apply).
+static int g_roleFromPanel = -1;
+static bool RoleFromPanel() {
+    if (g_roleFromPanel < 0) g_roleFromPanel = GetPrivateProfileIntA("Overlay", "RoleFromPanel", 0, Paths::Ini()) != 0;
+    return g_roleFromPanel != 0;
+}
+bool Phase1_SetEntityHost(int host) {
+    const int want = host ? 1 : 0;
+    const int prev = InterlockedCompareExchange((volatile LONG*)&g_entHost, want, -1);
+    if (prev == -1) { L("[Coop] role from the panel: %s (g_entHost=%d)\n", want ? "host" : "guest", want); return true; }
+    return prev == want;
+}
+int Phase1_EntityHostState() { return g_entHost; }
 
 // ---- [Coop] StateProbe (default 0; live; read-only; <= 4000 lines per process) ----------------------------------
 // docs/evidence/guard-statechart-2026-11-13.md: the second writer on mirrored guards is the Human context
@@ -8243,6 +8259,7 @@ static void DriveCachedMirrors() {
 // Runs each frame inside OnFrame's net path (main thread). Host captures+broadcasts; peer applies.
 static void EntitySyncTick() {
     if (g_entSync < 0) g_entSync = GetPrivateProfileIntA("Coop", "EntitySync", 0, Paths::Ini());
+    if (g_entHost < 0 && RoleFromPanel()) return;   // the panel has not picked Host / Join yet
     if (g_entHost < 0) {
         g_entHost = GetPrivateProfileIntA("Coop", "EntityHost", 0, Paths::Ini());
         // Same-PC 2nd instance (instance-slot mutex marker) = the mirror/guest, regardless of the ini.
@@ -9770,7 +9787,7 @@ static uint64_t s_pushedDeathIds[256];
 static int      s_pushedDeathN = 0;
 
 static void SendHealthEvent(uint64_t objId, unsigned short life, float x, float y, float z) {
-    if (!g_entHost) { KtSkipPush(objId, 0, "not-host"); return; }   // host lane only
+    if (g_entHost != 1) { KtSkipPush(objId, 0, "not-host"); return; }   // host lane only (-1 = role not decided yet)
     if (!objId)     { KtSkipPush(objId, 0, "objId=0"); return; }
     if (life == 0xFFFFu) {
         for (int i = 0; i < s_pushedDeathN; ++i)
@@ -10231,7 +10248,7 @@ static void ApplyPeerHealth(uint64_t objId, unsigned short life, float x, float 
             // GuestKillMirrorEntity); MirrorVisualDeath stays first so the "[Mirror] dead ..." line is
             // still emitted exactly as before.
             bool applied = false;
-            if (g_entHost) { applied = KillGuardEntity((Entity*)ent); }
+            if (g_entHost == 1) { applied = KillGuardEntity((Entity*)ent); }
             else if (!DeathAppliedRecently(ent)) {
                 MarkDeathApplied(ent);
                 MirrorVisualDeath((Entity*)ent);

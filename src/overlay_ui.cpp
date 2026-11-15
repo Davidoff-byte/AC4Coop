@@ -61,17 +61,19 @@ int g_w = 0, g_h = 0;
 // Derived flags are computed here, not in RML expressions, so the markup stays plain comparisons.
 struct Model {
     Rml::String role = "-", state = "off", code = "-", link = "-", peer = "-", note, input;
-    bool can_start = true, has_code = false, active = false, failed = false, good = false, no_role = true;
+    bool can_start = true, has_code = false, active = false, failed = false, good = false, no_role = true, show_host = false, show_join = false;
 } g_m;
 
 void Derive() {
     const bool off = g_m.state == "off" || g_m.state == "stopped";
     const bool failed = g_m.state.compare(0, 6, "failed") == 0;
+    // role "any" = [Overlay] RoleFromPanel and nothing picked yet: both Host and Join are offered.
+    const bool any = g_m.role == "any";
     const bool v[] = { off || failed, g_m.code != "-", !off && !failed, failed, g_m.state == "connected",
-                       g_m.role != "host" && g_m.role != "join" };
-    bool* dst[] = { &g_m.can_start, &g_m.has_code, &g_m.active, &g_m.failed, &g_m.good, &g_m.no_role };
-    const char* names[] = { "can_start", "has_code", "active", "failed", "good", "no_role" };
-    for (int i = 0; i < 6; ++i)
+                       g_m.role != "host" && g_m.role != "join" && !any, g_m.role == "host" || any, g_m.role == "join" || any };
+    bool* dst[] = { &g_m.can_start, &g_m.has_code, &g_m.active, &g_m.failed, &g_m.good, &g_m.no_role, &g_m.show_host, &g_m.show_join };
+    const char* names[] = { "can_start", "has_code", "active", "failed", "good", "no_role", "show_host", "show_join" };
+    for (int i = 0; i < 8; ++i)
         if (*dst[i] != v[i]) { *dst[i] = v[i]; g_model.DirtyVariable(names[i]); }
 }
 
@@ -122,6 +124,7 @@ bool Init(ID3D11Device* dev, HWND hwnd, int w, int h, const char* uiDir, ActionF
         c.Bind("link", &g_m.link); c.Bind("peer", &g_m.peer); c.Bind("note", &g_m.note); c.Bind("input", &g_m.input);
         c.Bind("can_start", &g_m.can_start); c.Bind("has_code", &g_m.has_code); c.Bind("active", &g_m.active);
         c.Bind("failed", &g_m.failed); c.Bind("good", &g_m.good); c.Bind("no_role", &g_m.no_role);
+        c.Bind("show_host", &g_m.show_host); c.Bind("show_join", &g_m.show_join);
         c.BindEventCallback("act", &OnAct);
         g_model = c.GetModelHandle();
     }

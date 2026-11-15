@@ -261,6 +261,34 @@ static bool HookGate(const char* key)
     return GetPrivateProfileIntA("Coop", key, 1, Paths::Ini()) != 0;
 }
 
+// ---- launcher arm ([Launcher] RequireArm, default 0 = always active, as before) -------------------------------------
+// The launcher keeps co-op separate from the plain game: it writes [Launcher] RequireArm=1 on install, and before each
+// co-op start it writes <module dir>\AC4Coop.armed. A start without a fresh marker (Steam / Ubisoft Play) leaves this
+// module inert: loaded by the ASI loader, nothing installed. The marker must survive the store hand-off - measured
+// 2026-11-15 17:21: a direct AC4BFSP.exe start exits with code 0 within ~1 s and UbisoftGameLauncher.exe starts the
+// real game (-uplay_steam_mode) ~3 s later - so it is removed by the live game after 60 s, not on first load.
+// [Launcher] ArmWindowSec (default 300) bounds a marker left behind by a crash before that.
+static void ArmPath(char* p, size_t n) { _snprintf(p, n, "%s\\AC4Coop.armed", Paths::ModuleDir()); p[n - 1] = 0; }
+static bool LaunchArmed()
+{
+    if (!GetPrivateProfileIntA("Launcher", "RequireArm", 0, Paths::Ini())) return true;
+    char p[MAX_PATH]; ArmPath(p, sizeof(p));
+    WIN32_FILE_ATTRIBUTE_DATA a;
+    if (!GetFileAttributesExA(p, GetFileExInfoStandard, &a)) return false;
+    FILETIME now; GetSystemTimeAsFileTime(&now);
+    const long long t = ((long long)now.dwHighDateTime << 32 | now.dwLowDateTime) -
+                        ((long long)a.ftLastWriteTime.dwHighDateTime << 32 | a.ftLastWriteTime.dwLowDateTime);
+    const long long ageS = t / 10000000LL;
+    const int window = GetPrivateProfileIntA("Launcher", "ArmWindowSec", 300, Paths::Ini());
+    return ageS >= -5 && ageS <= window;
+}
+static void DisarmLaunch()
+{
+    if (!GetPrivateProfileIntA("Launcher", "RequireArm", 0, Paths::Ini())) return;
+    char p[MAX_PATH]; ArmPath(p, sizeof(p));
+    if (DeleteFileA(p)) logline("[AC4Coop] launch marker removed (this is the live game)\n");
+}
+
 static unsigned __stdcall PollThread(void*)
 {
     // First thing: the boot videos start early. [Coop] VideoLog / SkipIntroVideos only (both default 0).
@@ -343,6 +371,7 @@ static unsigned __stdcall PollThread(void*)
         Pilot::Poll();                     // [Pilot] Enabled only: import patch + window subclass retries
         Sleep(50); // ~20 Hz
         ++ticks;
+        if (ticks == 1200) DisarmLaunch();   // 60 s alive = the live game (store hand-off copies exit within ~1 s)
 
         // Every 200 iterations (~10 s at 20 Hz): one heartbeat and one poll-tick line.
         // There is NO distinct ini-watch path in this loop: its only periodic config read is
@@ -558,6 +587,13 @@ BOOL APIENTRY DllMain(HMODULE hMod, DWORD reason, LPVOID)
         if (!BuildGate::Verify(hMod)) {
             OutputDebugStringA("[AC4Coop] build not trusted - module inert (no patches)\n");
             return TRUE;   // stay resident for logging; install nothing
+        }
+
+        // Plain-game start (no fresh launcher marker while [Launcher] RequireArm=1): install nothing at all.
+        if (!LaunchArmed()) {
+            OutputDebugStringA("[AC4Coop] not started by the co-op launcher - inert (plain game)\n");
+            Paths::AppendBeacon("[AC4Coop] not started by the co-op launcher - inert (plain game)\r\n");
+            return TRUE;
         }
 
         if (HookGate("HookMultiInstance")) InstallMultiInstance();   // must run before WinMain

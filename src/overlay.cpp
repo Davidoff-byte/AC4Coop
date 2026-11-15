@@ -12,6 +12,10 @@
 #include "overlay_ui.h"
 #include "paths.h"
 #include "net.h"
+
+// phase1.cpp: the co-op role ([Overlay] RoleFromPanel). Set once per process; -1 = not picked yet.
+bool Phase1_SetEntityHost(int host);
+int  Phase1_EntityHostState();
 #pragma comment(lib, "dxguid.lib")
 
 namespace {
@@ -147,6 +151,9 @@ bool CopyText(const char* text) {
 // Panel buttons arrive on the render thread; they are queued and run on the overlay thread (starting or stopping the
 // bridge can take up to ~2 s, which must never stall a frame).
 char g_pendAct[16] = {0}, g_pendArg[16] = {0}, g_note[96] = {0};
+// The role is locked (Phase1_SetEntityHost) only once the bridge reports "connected", so a failed Join or a typo never
+// forces a restart before the player can Host instead. Until then it is only pending (shown, not in force).
+volatile LONG g_pendingRole = -1;
 void OnAction(const char* a, const char* arg) {
     Log("[Overlay] action %s %s\n", a, arg ? arg : "");
     EnterCriticalSection(&g_cs);
@@ -165,13 +172,18 @@ void RunPendingAction() {
         const bool ok = code[0] && CopyText(code);
         _snprintf(note, sizeof(note), ok ? "Code %s copied" : "Could not copy the code", code);
     } else if (!strcmp(a, "host")) {
-        if (Net::EosHost(err, sizeof(err))) lstrcpynA(note, "Starting... the code appears in a few seconds", sizeof(note));
+        if (Phase1_EntityHostState() == 0) lstrcpynA(note, "This game joined a friend - restart it from the launcher to host", sizeof(note));
+        else if (Net::EosHost(err, sizeof(err))) { g_pendingRole = 1; lstrcpynA(note, "Starting... the code appears in a few seconds", sizeof(note)); }
         else _snprintf(note, sizeof(note), "Host failed: %s", err);
     } else if (!strcmp(a, "join")) {
-        if (Net::EosJoin(arg, err, sizeof(err))) _snprintf(note, sizeof(note), "Joining %s...", arg);
+        char c[16] = {0}; int n = 0;
+        for (const char* q = arg; *q && n < 15; ++q) if (isalnum((unsigned char)*q)) c[n++] = *q;
+        if (n != 6) lstrcpynA(note, "A lobby code is 6 letters/digits", sizeof(note));
+        else if (Phase1_EntityHostState() == 1) lstrcpynA(note, "This game is hosting - restart it from the launcher to join", sizeof(note));
+        else if (Net::EosJoin(arg, err, sizeof(err))) { g_pendingRole = 0; _snprintf(note, sizeof(note), "Joining %s...", arg); }
         else _snprintf(note, sizeof(note), "Join failed: %s", err);
     } else if (!strcmp(a, "stop")) {
-        Net::EosStop(); lstrcpynA(note, "Stopped", sizeof(note));
+        Net::EosStop(); if (Phase1_EntityHostState() < 0) g_pendingRole = -1; lstrcpynA(note, "Stopped", sizeof(note));
     }
     note[sizeof(note) - 1] = 0;
     Log("[Overlay] %s -> %s\n", a, note);
@@ -389,7 +401,12 @@ void ReadStatus() {
     char role[16] = {0}, transport[16] = {0};
     GetPrivateProfileStringA("Net", "Transport", "udp", transport, sizeof(transport), Paths::Ini());
     GetPrivateProfileStringA("Net", "EosRole", "", role, sizeof(role), Paths::Ini());
-    if (!_stricmp(transport, "eos")) lstrcpynA(s.role, role, sizeof(s.role));
+    if (!_stricmp(transport, "eos")) {
+        if (GetPrivateProfileIntA("Overlay", "RoleFromPanel", 0, Paths::Ini())) {   // role picked in this panel
+            const int r = Phase1_EntityHostState() >= 0 ? Phase1_EntityHostState() : (int)g_pendingRole;
+            lstrcpynA(s.role, r == 1 ? "host" : r == 0 ? "join" : "any", sizeof(s.role));
+        } else lstrcpynA(s.role, role, sizeof(s.role));
+    }
     lstrcpynA(s.state, "off", sizeof(s.state));
     char path[MAX_PATH], line[512] = {0};
     _snprintf(path, sizeof(path), "%s\\eos\\status.txt", Paths::ModuleDir()); path[sizeof(path) - 1] = 0;
@@ -404,6 +421,11 @@ void ReadStatus() {
     if (!strcmp(s.link, "none") || !strcmp(s.link, "-")) s.link[0] = 0;
     if (!Net::EosRunning() && strcmp(s.state, "off") && strncmp(s.state, "failed", 6)) {   // stale file from an earlier run
         lstrcpynA(s.state, "stopped", sizeof(s.state)); s.code[0] = 0; s.link[0] = 0;
+    }
+    if (!strcmp(s.state, "connected") && g_pendingRole >= 0 && Phase1_EntityHostState() < 0
+        && GetPrivateProfileIntA("Overlay", "RoleFromPanel", 0, Paths::Ini())) {
+        const bool ok = Phase1_SetEntityHost((int)g_pendingRole);
+        Log("[Overlay] connected: role %s locked=%d\n", g_pendingRole ? "host" : "guest", ok);
     }
     if (!Net::Enabled()) lstrcpynA(s.peer, "load into the world to link", sizeof(s.peer));
     else {
