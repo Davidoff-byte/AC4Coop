@@ -31,7 +31,7 @@ journal and handoff in `docs/archive/`. Update it in the same PR as any change t
   (`[Coop] BoardableTest`, default 0).
 - Guest→host kill relay.
 - Native replica on the ground (`[Coop] NativeReplica`, default 0; `docs/design/native-replica.md`): solo replay
-  tested, the puppet moves itself through its nav service; p95 error 1.85 m fails the oracle
+  tested and tuned, the puppet moves itself through its nav service plus a capped correction; p95 error 1.05 m and one snap per run start still fail the oracle
   (`docs/evidence/native-replica-2026-11-15.md`). Same evidence: `HybridLoco`'s ground branch tests context 2, but real
   packets send 4, so it never runs.
 

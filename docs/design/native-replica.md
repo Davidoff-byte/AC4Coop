@@ -1,6 +1,6 @@
 # Native replica (R3): the puppet moves itself on the ground
 
-Status: **slice 1 built and solo-tested** behind `[Coop] NativeReplica` (default 0), 2026-11-15. Slice R3 of
+Status: **slice 1 built, tuned and solo-tested** behind `[Coop] NativeReplica` (default 0), 2026-11-15. Slice R3 of
 `docs/design/coop-reevaluation-2026-11-15.md`. Evidence: `docs/evidence/native-replica-2026-11-15.md`.
 
 ## Goal
@@ -26,10 +26,17 @@ On the ground (peer `contextId == 4`) with the flag on:
 2. No per-frame matrix write. A snap (`SetGlobalMatrixInternal(.., true)`) only on the first frame or when the planar
    error exceeds `NativeReplicaSnapCm` (default 300) or |dz| > 2 m.
 3. Steering through the engine's NPC locomotion entry: `CSrvNavigation::NavigateToPosition` (slot 49, 0x01793650) on
-   the puppet's nav service, issued from the puppet's own update (OwnDrain) when the target moved > 0.75 m, the speed
-   class changed, or 400 ms passed. Target = peer position + 0.5 s lead along the peer's heading while it moves; speed
-   class from the peer's `destSpeed`/`sprint` (Regular 4 / VeryFast 7 / Fastest 8, +1 class when > 1.5 m behind; Stop 1
-   at rest within 0.4 m).
+   the puppet's nav service, issued from the puppet's own update (OwnDrain) when the target moved > 0.5 m or the speed
+   class changed (2 s keepalive). Tuned version (v7, evidence "Tuning"):
+   - moving / stopped and the base class follow the **newest packet's** intention (`destSpeed`, `sprint`), 100 ms ahead
+     of the interpolated position;
+   - target = interpolated peer position + peer velocity x 0.45 s (at least 2 m ahead while the replica is starting);
+   - class: Regular 4 / VeryFast 7 / Fastest 8 from the intention, +1 when > 0.8 m behind along the track, +2 when
+     > 2 m, -1 when 0.6 m ahead, Fastest while the replica is below 1 m/s; at rest Regular toward the peer, Stop within
+     0.4 m.
+4. Blended correction (AC4 MP's `STEERING_BLENDED`): between 0.5 m and the snap limit the body is moved toward the peer
+   by at most `NativeReplicaBlendCmS` (default 150 cm/s; 0 = off), own rotation kept. Needed because the replica's top
+   speed (Fastest) equals the peer's run speed, so a gap lost while accelerating never closes by steering alone.
 Off the ground the old path runs unchanged.
 
 Rejected on the way (measured, not assumed):

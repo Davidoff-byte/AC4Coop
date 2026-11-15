@@ -1609,11 +1609,16 @@ static const unsigned kNavSvcVt = 0x026F4B70;
 static const uintptr_t kNavigateToPosition = 0x01793650;
 static int   s_nrOn = -1;
 static float s_nrSnapM = 3.0f;
+// The newest packet's locomotion intention (set where packets are drained), 100 ms ahead of the interpolated state.
+static volatile float g_nrLatestDest = 0.0f; static volatile bool g_nrLatestSprint = false;
+static float s_nrBlendMps = 1.5f;   // [Coop] NativeReplicaBlendCmS / 100 (0 = no blended correction)
 static bool NativeReplicaOn() {
     if (s_nrOn < 0) {
         s_nrOn = GetPrivateProfileIntA("Coop", "NativeReplica", 0, Paths::Ini()) != 0 ? 1 : 0;
         const int cm = GetPrivateProfileIntA("Coop", "NativeReplicaSnapCm", 300, Paths::Ini());
         s_nrSnapM = (cm < 50 ? 50 : cm > 2000 ? 2000 : cm) / 100.0f;
+        const int bl = GetPrivateProfileIntA("Coop", "NativeReplicaBlendCmS", 150, Paths::Ini());
+        s_nrBlendMps = (bl < 0 ? 0 : bl > 500 ? 500 : bl) / 100.0f;
     }
     return s_nrOn != 0;
 }
@@ -1628,7 +1633,10 @@ struct NrStats {
     void* ent; bool init; uint64_t nextLog;
     float lastX, lastY; bool haveLast;
     int n; float sum, max; int over; float moved; int stageMism;        // window
+    float wPeerV, wRepV, wAlong; int wMov;                               // window, frames with the peer moving
+    float ppx, ppy, pvx, pvy, rvx, rvy; LONGLONG pqpc; bool havePeer;    // peer / replica velocity (EMA, m/s)
     uint32_t hist[101]; uint32_t total; uint32_t snaps, frames;          // session: error histogram, 0.05 m bins
+    float wBlend; float sBlend;                                          // blended correction applied (m): window, session
 };
 static NrStats s_nr = {};
 static float NrPct(const NrStats& st, float q) {
@@ -1660,18 +1668,63 @@ static bool NativeReplicaDrive(Entity* pe, Human* h, HumanDataBundle* b, const P
         ++st.hist[bin]; ++st.total;
         ++st.n; st.sum += d; if (d > st.max) st.max = d; if (d > 0.75f) ++st.over;
     }
-    // Peer heading = its HumanGroundData.m_DestHeading (world XY); its speed intention is destSpeed (m_CurSpeedRatio
-    // reads 0 on this build, sender note in phase1.cpp). Lead the peer by 0.5 s at run pace while it moves.
+    // Velocities from frame-to-frame positions (QPC time, EMA 0.2): the peer's interpolated position and the replica's
+    // own position (snap frames excluded). The peer's speed intention destSpeed only says moving / not moving.
+    LARGE_INTEGER qn, qf; QueryPerformanceCounter(&qn); QueryPerformanceFrequency(&qf);
+    if (st.havePeer) {
+        const float dt = (float)((double)(qn.QuadPart - st.pqpc) / (double)qf.QuadPart);
+        if (dt > 1e-4f && dt < 0.25f) {
+            const float k = 0.2f;
+            st.pvx += k * ((m.M41 - st.ppx) / dt - st.pvx); st.pvy += k * ((m.M42 - st.ppy) / dt - st.pvy);
+            if (st.haveLast && !snapped) {
+                st.rvx += k * ((px - st.lastX) / dt - st.rvx); st.rvy += k * ((py - st.lastY) / dt - st.rvy);
+            }
+        }
+    }
+    // Blended correction (AC4 MP's MoveReplicationMode STEERING_BLENDED, ops/evidence/x360-mp-2014-pdb.md: steering plus
+    // correction): run 31300 (v5) showed the replica's top speed (NavigationSpeed 8) equals the peer's run speed, so a gap
+    // lost while accelerating never closes by steering alone. Between 0.5 m and the snap limit, move the body toward the
+    // peer by at most NativeReplicaBlendCmS per second (own rotation kept, physics warp), leaving 0.3 m to steering.
+    bool nudged = false; float nx = px, ny = py;
+    if (!snapped && s_nrBlendMps > 0.0f && d > 0.5f && st.havePeer) {
+        const float dtb = (float)((double)(qn.QuadPart - st.pqpc) / (double)qf.QuadPart);
+        if (dtb > 1e-4f && dtb < 0.1f) {
+            float step = s_nrBlendMps * dtb; if (step > d - 0.3f) step = d - 0.3f;
+            nx = px + ex / d * step; ny = py + ey / d * step;
+            HookMath::Transform mm = pe->m_GlobalMatrix;
+            mm.M41 = nx; mm.M42 = ny;
+            pe->SetGlobalMatrixInternal(&mm, true);
+            nudged = true; st.wBlend += step; st.sBlend += step;
+        }
+    }
+    st.ppx = m.M41; st.ppy = m.M42; st.pqpc = qn.QuadPart; st.havePeer = true;
+    const float pv = sqrtf(st.pvx * st.pvx + st.pvy * st.pvy), rv = sqrtf(st.rvx * st.rvx + st.rvy * st.rvy);
+    // Direction of travel: the peer's velocity when it moves, else its HumanGroundData.m_DestHeading.
     float fx = s.heading.x, fy = s.heading.y; const float fl = sqrtf(fx * fx + fy * fy);
-    if (fl > 1e-3f) { fx /= fl; fy /= fl; } else { fx = 0; fy = 0; }
+    if (pv > 0.5f) { fx = st.pvx / pv; fy = st.pvy / pv; } else if (fl > 1e-3f) { fx /= fl; fy /= fl; } else { fx = 0; fy = 0; }
     NrTarget t = {};
     t.ent = pe; t.z = m.M43; t.hx = fx; t.hy = fy;
-    if (s.destSpeed > 0.05f) {
-        const float lead = 0.5f * 4.5f * s.destSpeed;            // UNVERIFIED pace; tuned from the measured error
-        t.x = m.M41 + fx * lead; t.y = m.M42 + fy * lead;
-        const float along = ex * fx + ey * fy;                   // > 0: the replica is behind
-        t.speed = s.sprint ? 8 : s.destSpeed < 0.5f ? 4 : 7;
-        if (along > 1.5f && t.speed < 8) ++t.speed;              // catch up one class
+    // Moving = the peer's intention (destSpeed). Run 22720 (v4) led by the peer's velocity also while it was stopping
+    // and parked the replica 1.2-1.8 m past a resting peer, so the lead now follows the intention only.
+    // Start / stop and the base class follow the NEWEST packet's intention (g_nrLatestDest), which arrives ~100 ms
+    // (the interpolation delay) before the interpolated position shows the move: v6 (run 17912) still snapped at
+    // run starts because the replica only began accelerating once the delayed position moved.
+    const float dest = g_nrLatestDest; const bool sprint = g_nrLatestSprint;
+    const bool moving = dest > 0.05f;
+    if (moving) {
+        // Lead = peer velocity x 0.45 s (100 ms interpolation delay + reaction), at least 2 m along the travel direction
+        // while the replica is still starting (< 2 m/s). Speed class: base from the peer's intention, then by the
+        // along-track error (> 0 = replica behind); Fastest while the replica is below 1 m/s.
+        // NavigationSpeed 2..8 (PS3 cu 12, DIE 0x2C411B).
+        const float along = ex * fx + ey * fy;
+        float lx = st.pvx * 0.45f, ly = st.pvy * 0.45f;
+        if (rv < 2.0f && lx * lx + ly * ly < 4.0f) { lx = fx * 2.0f; ly = fy * 2.0f; }
+        t.x = m.M41 + lx; t.y = m.M42 + ly;
+        int sp = sprint ? 8 : dest < 0.5f ? 4 : 7;
+        if (along > 2.0f) sp += 2; else if (along > 0.8f) sp += 1; else if (along < -0.6f) sp -= 1;
+        if (rv < 1.0f) sp = 8;
+        t.speed = sp < 2 ? 2 : sp > 8 ? 8 : sp;
+        st.wPeerV += pv; st.wRepV += rv; st.wAlong += along; ++st.wMov;
     } else {
         t.x = m.M41; t.y = m.M42;
         t.speed = d > 0.4f ? 4 : 1;                              // walk to the resting peer, else Stop
@@ -1680,21 +1733,25 @@ static bool NativeReplicaDrive(Entity* pe, Human* h, HumanDataBundle* b, const P
     t.gen = s_nrTgt.gen + 1; s_nrTgt = t;
     ReleaseSRWLockExclusive(&s_nrTgtLock);
     if ((int)b->m_GroundData.m_HumanGroundStage != s.humanGroundStage) ++st.stageMism;
-    st.lastX = snapped ? m.M41 : px; st.lastY = snapped ? m.M42 : py; st.haveLast = true;
+    st.lastX = snapped ? m.M41 : nudged ? nx : px; st.lastY = snapped ? m.M42 : nudged ? ny : py; st.haveLast = true;
     const uint64_t now = GetTickCount64();
     if (now >= st.nextLog) {
         st.nextLog = now + 2000;
         L("[Replica] win n=%d err mean=%.2f max=%.2f >0.75m=%d moved=%.1fm stage nat=%d peer=%d mism=%d | "
-          "session frames=%u p50=%.2f p95=%.2f snaps=%u | nav calls=%ld fail=%ld skip=%ld | peer dest=%.2f speed=%d\n",
+          "session frames=%u p50=%.2f p95=%.2f snaps=%u | nav calls=%ld fail=%ld skip=%ld | peer dest=%.2f speed=%d | "
+          "moving frames=%d peerV=%.2f repV=%.2f along=%.2f | blend win=%.2fm session=%.1fm\n",
           st.n, st.n ? st.sum / st.n : 0.0f, st.max, st.over, st.moved, (int)b->m_GroundData.m_HumanGroundStage,
           s.humanGroundStage, st.stageMism, st.frames, NrPct(st, 0.5f), NrPct(st, 0.95f), st.snaps,
-          s_nrNavCalls, s_nrNavFail, s_nrNavSkip, s.destSpeed, t.speed);
+          s_nrNavCalls, s_nrNavFail, s_nrNavSkip, s.destSpeed, t.speed, st.wMov, st.wMov ? st.wPeerV / st.wMov : 0.0f,
+          st.wMov ? st.wRepV / st.wMov : 0.0f, st.wMov ? st.wAlong / st.wMov : 0.0f, st.wBlend, st.sBlend);
         st.n = 0; st.sum = 0; st.max = 0; st.over = 0; st.moved = 0; st.stageMism = 0;
+        st.wPeerV = 0; st.wRepV = 0; st.wAlong = 0; st.wMov = 0; st.wBlend = 0;
     }
     return snapped;
 }
-// Puppet's own update (OwnDrain): issue NavigateToPosition when the target moved > 0.75 m, the speed class changed,
-// or 400 ms passed since the last call.
+// Puppet's own update (OwnDrain): issue NavigateToPosition when the target moved > 0.5 m or the speed class changed,
+// plus a 2 s keepalive. Run 22720 (v4, 250 ms keepalive): an unchanged walk-to-peer re-issued every 250 ms never moved
+// the replica (0.0 m for 6 s at 1.2-1.8 m error); v3 (400 ms) settled within 0.04-0.34 m. Cause UNVERIFIED.
 static void NativeReplicaNavTick(Entity* e) {
     if (s_nrOn != 1 || !e || !s_nrNavOk) return;
     NrTarget t;
@@ -1706,7 +1763,7 @@ static void NativeReplicaNavTick(Entity* e) {
     s_gen = t.gen;
     const uint64_t now = GetTickCount64();
     const float dx = t.x - s_x, dy = t.y - s_y;
-    if (s_ent == (void*)e && t.speed == s_speed && dx * dx + dy * dy < 0.75f * 0.75f && now - s_ms < 400) return;
+    if (s_ent == (void*)e && t.speed == s_speed && dx * dx + dy * dy < 0.5f * 0.5f && now - s_ms < 2000) return;
     char* aic = readable((char*)e + 0xE8, 4) ? *(char**)((char*)e + 0xE8) : nullptr;
     char* svc = (aic && readable(aic + 0x94, 4)) ? *(char**)(aic + 0x94) : nullptr;
     if (!readable(svc, 0x110) || *(const unsigned*)svc != kNavSvcVt ||
@@ -11164,7 +11221,7 @@ static void DumpConfigOnce()
         { "Coop", "FloatProbe", 0 }, { "Coop", "FootOffsetFix", 0 }, { "Coop", "GuardActionGate", 0 }, { "Coop", "GuardExtrapMs", 100 },
         { "Coop", "GuardInterpBuffer", 0 }, { "Coop", "GuardInterpDelayMs", 120 }, { "Coop", "GuardPhaseLock", 0 },
         { "Coop", "GuardSeesPuppet", 0 }, { "Coop", "PuppetActionReassert", 0 }, { "Coop", "PuppetHostTime", 0 },
-        { "Coop", "AlertQueryAsPlayer", 0 }, { "Coop", "ConflictNullGuard", 0 }, { "Coop", "ConflictKeepPuppet", 0 }, { "Coop", "GuardPoiFightTarget", 0 }, { "Coop", "FightOrderPuppet", 0 }, { "Coop", "DespawnLeaveFight", 0 }, { "Coop", "FightKeepOnConflictEnd", 0 }, { "Coop", "FightStateProbe", 0 }, { "Coop", "PuppetNavService", 0 }, { "Coop", "NativeReplica", 0 }, { "Coop", "NativeReplicaSnapCm", 300 }, { "Coop", "FightProbe", 0 }, { "Coop", "PeerLastPacket", 0 }, { "Coop", "PuppetActionsOwnUpdate", 0 }, { "Coop", "DetectKeepTarget", 0 }, { "Coop", "GuardPlayerOfInterest", 0 }, { "Coop", "EventProbe", 0 }, { "Coop", "ReactProbe", 0 }, { "Coop", "FightSkipPuppet", 0 }, { "Coop", "NavNullGuard", 0 }, { "Coop", "PuppetStimMode", 1 }, { "Coop", "PuppetStimSeq", 0 }, { "Coop", "PuppetStimSource", 0 }, { "Coop", "SightProbe", 0 }, { "Coop", "StateProbe", 0 }, { "Coop", "StuckProbe", 0 },
+        { "Coop", "AlertQueryAsPlayer", 0 }, { "Coop", "ConflictNullGuard", 0 }, { "Coop", "ConflictKeepPuppet", 0 }, { "Coop", "GuardPoiFightTarget", 0 }, { "Coop", "FightOrderPuppet", 0 }, { "Coop", "DespawnLeaveFight", 0 }, { "Coop", "FightKeepOnConflictEnd", 0 }, { "Coop", "FightStateProbe", 0 }, { "Coop", "PuppetNavService", 0 }, { "Coop", "NativeReplica", 0 }, { "Coop", "NativeReplicaSnapCm", 300 }, { "Coop", "NativeReplicaBlendCmS", 150 }, { "Coop", "FightProbe", 0 }, { "Coop", "PeerLastPacket", 0 }, { "Coop", "PuppetActionsOwnUpdate", 0 }, { "Coop", "DetectKeepTarget", 0 }, { "Coop", "GuardPlayerOfInterest", 0 }, { "Coop", "EventProbe", 0 }, { "Coop", "ReactProbe", 0 }, { "Coop", "FightSkipPuppet", 0 }, { "Coop", "NavNullGuard", 0 }, { "Coop", "PuppetStimMode", 1 }, { "Coop", "PuppetStimSeq", 0 }, { "Coop", "PuppetStimSource", 0 }, { "Coop", "SightProbe", 0 }, { "Coop", "StateProbe", 0 }, { "Coop", "StuckProbe", 0 },
         { "Coop", "StageLog", 0 }, { "Coop", "SyncEnemiesOnly", 1 }, { "Coop", "SyncMaxEntities", 32 },
         { "Coop", "SyncRadiusM", 60 }, { "Coop", "TransformProbe", 0 }, { "Coop", "VPadEnable", 0 },
         { "Coop", "VPadTest", 0 }, { "Coop", "WatchDeadBit", 0 }, { "Coop", "WatchTarget", 0 },
@@ -11587,7 +11644,7 @@ static void OnFrameInner(Human* updatedHuman) {
         static PlayerState s_lastRaw; static bool s_haveLastRaw = false;
         static int s_plpOn = 0; static uint64_t s_plpNext = 0;
         { const uint64_t t = GetTickCount64(); if (t >= s_plpNext) { s_plpNext = t + 2000; s_plpOn = GetPrivateProfileIntA("Coop", "PeerLastPacket", 0, Paths::Ini()) != 0; } }
-        if (gotRaw) { s_lastRaw = raw; s_haveLastRaw = true; }
+        if (gotRaw) { s_lastRaw = raw; s_haveLastRaw = true; g_nrLatestDest = raw.destSpeed; g_nrLatestSprint = raw.sprint; }
         const bool haveRaw = s_plpOn ? s_haveLastRaw : gotRaw;
         if (!gotRaw && haveRaw) raw = s_lastRaw;
 

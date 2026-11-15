@@ -48,8 +48,32 @@ call unless the last ApplyRemoteState took the replica path with behaviour enabl
 while `[[[svc+0x84]+0xC]+0xC8]` is null. Run 25508 (5 passes + the second tap): no crash, guard skip count 0, so the
 null guard itself was not exercised.
 
+## Tuning (same day, same two taps, oracle script unchanged)
+Each version is one run (game restarted, build installed with the game closed). "state-5 run" = 2 s window means of the
+error during the walk after spawn; "state-5 rest" = settled error with the peer at rest.
+| run | asi sha256 | change | state-2 p95 | snaps inside passes | own movement | state-5 run / rest | crash |
+|---|---|---|---|---|---|---|---|
+| 25508 | 5ea32a0c... | v3 (baseline, committed db8f1f0) | 1.85 m | 2, 2, 0 | 86-118 % | 0.9-1.3 / 0.34 m | no |
+| 22720 | 613be28d... | v4: velocity lead 0.45 s, class by along-track error, re-issue 0.5 m / 250 ms | 1.25 m | 2, 1, 0 | 93-108 % | 0.7-1.3 / **1.21 m stuck** | no |
+| 31300 | 63ae42c7... | v5: lead only while the intention moves, 2 s keepalive, Fastest + 2 m aim at starts | 1.60 m | 3, 0, 2 | 86-91 % | 1.2-1.5 / 0.16 m | no |
+| 17912 | cd70e0c0... | v6: + blended correction 150 cm/s | 1.05 m | 1, 0, 1, 1 | 79-111 %* | 0.44-0.6 / 0.15 m | no |
+| 25720 | bb5340b3... | v7: + start/stop from the newest packet's intention (final) | 1.05 m | 1, 1, 1, 0 | 78-96 %* | 0.42-0.59 / 0.17 m | no |
+\* own movement excludes the blended correction by design (about 0.6-0.8 m/s of correction while catching up), so
+check 1 now fails narrowly although own + correction covers the peer path.
+
+What the logs show (v4+ windows carry peer speed, replica speed and along-track error):
+- Steady running: replica speed equals the peer's (~6.1 m/s at Fastest) and the error is 0.2-0.6 m.
+- v4's stuck replica: commanded Regular toward a resting peer 1.2-1.8 m away, 0.0 m moved for 6 s while the same request
+  was re-issued every 250 ms; with a 2 s keepalive (v5) it settles within 0.16 m. Cause of the stall UNVERIFIED.
+- Run starts remain the failure: in the first 2 s window the replica averages 3.8-3.9 m/s against the peer's 5.6-5.7,
+  falls 3 m behind and snaps (about once per pass). Starting from the newest intention (v7) did not change this, so the
+  limit is the NPC body's acceleration, not the 100 ms delay.
+Final verdict (v7): checks 4 (stage) PASS; 3 (p95 <= 1.0) FAIL at 1.05 m; 2 FAIL (one run-start snap per pass);
+1 FAIL narrowly by construction (correction excluded). No crash in 4 tuning runs.
+
 ## Not established
-- p95 <= 1 m: fails (1.85 m). Candidate fixes (not tried): steer to an extrapolated peer position from its velocity,
-  start the run at a faster class, shorter interpolation delay for the replica.
+- Run-start snaps. Options not tried: a stronger correction only while the replica is accelerating (risks visible
+  sliding), a larger snap limit (would only hide it), a faster start through another nav argument (a5/a9/a11/a12 are
+  unknown).
 - Facing at rest, the meaning of NavigateToPosition's a5/a7/a9/a11/a12 and of its return value.
 - Whether guards, perception and damage now treat the native puppet differently (R4-R6).
