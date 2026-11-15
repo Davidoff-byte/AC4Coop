@@ -1,7 +1,8 @@
 # R4.2 climb decision: static leads (in progress), 2026-11-15
 
 Goal (docs/design/player-decisions-r4.md R4.2): find, on PC, where the player's free-climb step is chosen and what the
-chosen step's target is, so R4.3 can send it to the replica. Status: **the selection function is not identified on PC yet; the live hand-placement chain below it is.** Binary: AC4BFSP.exe md5 2058342866688f780c8b34526a65bc35, IDA db `D:\ac4ida\a3` (jobs r42a-r42h).
+chosen step's target is, so R4.3 can send it to the replica. Status: **the shimmy decision is identified live on PC** (candidate generator, selection, move build and push; section
+"Decision chain"). Climb-up and other move types are not traced yet. Binary: AC4BFSP.exe md5 2058342866688f780c8b34526a65bc35, IDA db `D:\ac4ida\a3` (jobs r42a-r42h).
 
 ## PS3 DWARF (names and layouts are leads, not PC facts; `ops/tools/dwarf_die.py`, cu 297)
 - `scimitar::ClimbingSequencer::CandidateMove` (DIE 0x6FE894A, 240 B): movingLimb / staticLimb (IKLimbEffector),
@@ -56,7 +57,39 @@ host-p14-state-2.tap (contexts 8 -> 30). Stick left/right then shimmied him 1.5 
   choice feeds it from above.
 - Probe fix: `Plausible()` rejected addresses >= 0x7FFF0000, but the exe is large-address-aware and live objects sit above
   2 GB; bound raised to 0xFFFF0000 (built, not yet deployed).
+## Decision chain (run 8744, asi 0454741f = 0795f21 + nothing else, probe reads above 2 GB; earlier steps run 26944)
+Climb reproduced with the Pilot (stick offset re-learned per attempt: `goto ... --stick` prints it, then RT + A push for
+1.6 s), Edward hanging at (35.24,-81.31,4.85); shimmies with stick left/right.
+1. **Contact manager** = the 0x026BCD70 object at **Human+0x818** (`sub_169AE70` returns `*(Human+0x818)`). It keeps a ring
+   of 4 move records (0x350 B each; base +0xE40, write index +0xE50, read index +0xE54). Slot 18 `sub_13BEC30(limb, out)`
+   copies the newest record's guidance target for a hand (record+0x314 -> move object, per-limb table +0x2A8 / count
+   +0x2AE, 48-byte targets at +0x2A0); slot 16 **`sub_13D9010`** pops finished records and pushes a new move (write watch on
+   +0xE50 during a shimmy: writes only from 0x013D91FA / 0x013D9100, a few per shimmy, not per frame).
+2. **Guidance target** (48 B, vtable 0x026BA8A4; ctor `sub_1C11C10`, copy `sub_1C11CC0`): +4 type (11 = none), +0xC index
+   (-1 = none), +0x14 ref-counted guidance pointer, +0x20 Vector4 position.
+3. **Move object** (vtable 0x0271F7E8; base ctor **`sub_13D5640`**, derived ctor **`sub_1B59600`** adding +0x330/+0x334/+0x338):
+   the base ctor fills the per-limb guidance targets (`sub_13CF650(this+0x2A0, this+0x2A8, ...)`) and pushes itself into the
+   contact manager (`mgr->vt[16]`). During shimmies every move was created via `sub_1B59600` from **0x01B65599**, i.e. by
+   **`sub_1B64320`** (one of 12 move-type creators in 0x1B5xxxx-0x1B6xxxx that call `sub_1B59600`).
+4. **`sub_1B64320`** (shimmy move type): `sub_1B509A0(&cands, ...)` = **candidate generator** (verified live: called from
+   0x01B64BD6, returns al=1 and 3 candidates per step); a loop over the candidates takes the first one passing a distance
+   test (threshold `dword_2A8902C`); `sub_1B633E0` resolves it into per-limb guidance targets; `sub_1B59140` /
+   `sub_1B4D650` validate; then the move is allocated (0x340 B) and built with `sub_1B59600`.
+5. **Candidates** (32 B each, = PS3 `ClimbingSequencer::CandidateCoreMovement`): +0 `CoreMovementDefinition*`, +4 score,
+   +8 = 3, +0x10 position on the guidance. Live, per shimmy step: 3 candidates sorted by score 1.000 / 0.796 / 0.775 (moving
+   one way) or 0.998 / 0.795 / 0.774 (the other way), position = the ledge point at Edward's x (z 7.25-7.26).
+6. **Movement definitions**: 0x20-byte records in a table (0x2B106D70, +0x20 ...), each starting with an **index**
+   (D70 = 1, D90 = 2, DB0 = 3, DD0 = 4, DF0 = 5, E10 = 6, E30 = 7), then floats (+0x0C, +0x10) and a pointer (+0x14).
+   One direction used definitions 2 / 4 / 6, the other 1 / 5 / 3.
+
+So a shimmy step is fully described by **(definition index, position on the guidance)** plus the guidance it lies on; that
+is what R4.3 would send. UNVERIFIED: that the definition table is identical in both games (same assets, so expected), how
+the replica side reaches the table (the generator's inputs), and the other 11 move types (climb up, jump, ...).
+
 ## Next
-1. Follow the limb target into `sub_13CFA60`: which member of the 0x026BCD70 task holds each hand's intended target, and
-   who writes it (write watch on that member during a shimmy step - it should change once per hand move, not per frame).
-2. That writer, or its caller, is where a climb step is chosen; snapshot its inputs (guidance pointer, position) for R4.3.
+1. How the generator reaches the definition table (its arguments; owner object of the table) - needed to resolve an index
+   on the replica side.
+2. Trace the other move-type creators (climb up, drop, jump-across) the same way (hook `sub_1B59600`, read the return
+   address, hook that creator's generator).
+3. R4.3 design: publish (move type, definition index, guidance reference + position) on the intention lane; on the replica,
+   build the same move through the same creator path.
