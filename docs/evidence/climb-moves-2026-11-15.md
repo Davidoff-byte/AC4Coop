@@ -139,3 +139,10 @@ default 0, re-read every 2 s). Solo replay only; not two-machine tested.
 - Open: why the replica's wall-run request fails at the peer's start (precondition `sub_1CE0A40` on the current action's
   flags is the lead - a running/sprinting action may be required), and a safe way to put a replica onto a wall (an
   attach/grab, not a teleport into the air).
+- Precondition, static (IDA, `sub_1D5D920` = IHumanGround slot 21 body, ground sub-state `*(*(chart+0x118)+6)` == 4):
+  `sub_1CE0A40(scope = *(chart+0xC))` reads the flag word of the current action (`*(sub_667230(0,0)+0x14)`, after
+  `sub_5FC110(*(*scope+0x108))`); bit 5 refuses; otherwise one bit of 6-11 decides, chosen by scope+0x424 (0 / 1 / 2) and
+  scope+0x42C (0 / 1): (0,0) bit 6, (0,1) bit 7, (1,0) bit 8, (1,1) bit 10, (2,0) bit 9, (2,1) bit 11. Only then the
+  wall/geometry test `sub_1CED250` runs (result 2 posts event 127). So the request needs the action being played to
+  carry a wall-run flag. UNVERIFIED: that only run/sprint actions carry these bits, and what +0x424 / +0x42C select
+  (gait / leading foot are guesses) - consistent with the replica's tries failing at 1.3-1.5 m/s.
