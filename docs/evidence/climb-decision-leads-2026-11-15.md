@@ -104,7 +104,9 @@ Climb reproduced with the Pilot (stick offset re-learned per attempt: `goto ... 
    `+0x60 = 0x53B5`, and at +0x10 the **handle of the climbed entity** (ctor copies `a4[50]` = Entity+0xC8). Live: handle
    container 0x3074FA74 = {object 0x34A54C10 (Entity, vt 0x01E4CE90, at (37.0,-84.0,3.6)), refs, **ObjectID
    0x0000000A0D0158CD**}. A world-data ObjectID is the same in both games, so a climb target can be named as (climbed entity
-   ObjectID, guidance element, position). Meaning of `+8 = 0x07831600` and `+0x60 = 0x53B5` UNVERIFIED (element index?).
+   ObjectID, guidance element, position). Over three shimmy steps (`grabrec.py`, scratch): `+0x60` rose 0x7115 -> 0x7172 -> 0x71CE (a per-move counter/time, not an
+   element id); `+8` changed 0x07831600 -> 0x01124100 when the hands moved to new targets (packed element id? UNVERIFIED);
+   the entity ObjectID stayed 0x0000000A0D0158CD and the grab point followed Edward along the ledge (34.87 -> 34.20).
 
 So a shimmy step is fully described by **(definition index, position on the guidance)** plus the guidance it lies on; that
 is what R4.3 would send. UNVERIFIED: that the definition table is identical in both games (same assets, so expected), how

@@ -28,6 +28,14 @@ update crashes without the context's attach target (AC4Coop.ini note).
 | R4.4 | **Actions with targets**: attack, assassinate, custom actions (IHumanGround `Do*` family, MP slots 163/313/...); damage authority stays with R6 | action sequence parity on a combat tap |
 | R4.5 | Swim and boat contexts on the replica | swim tap divergence |
 
+## R4.3 message (from R4.2, docs/evidence/climb-decision-leads-2026-11-15.md)
+A free-climb step on the sender is: move-type creator (shimmy = `sub_1B64320`), `CoreMovementDefinition::Type` (named enum,
+e.g. 2 HorizontalRight), the position on the guidance, and the guidance's owner: the climbed entity's ObjectID (world data,
+identical on both machines) with the grab point. Proposed intention-lane payload per step: {move kind, cycle type, climbed
+entity ObjectID (u64), grab point (3 floats), per-limb flags}. Open before building: how the replica enters the Climbing
+context with a valid grab (the crash class), and how to build the same move there (the creator path takes candidates from
+the generator, so the replica may have to run its own generator and pick the matching cycle type).
+
 ## R4.1 design
 - Flag `[Coop] NativeReplicaParkour` (default 0; needs `NativeReplica=1`).
 - Replica mode also covers peer contexts 5/6/7/8/9/30/31 (with the R3 hysteresis); swim, boat and the rest keep the old
