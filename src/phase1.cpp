@@ -7591,7 +7591,13 @@ static void FightIntentSend(Human* player) {
             const int n = (int)w->m_CharacterList.GetSize();
             for (int i = 0; i < n; ++i) {
                 Entity** sl = w->m_CharacterList.GetElement(i); Entity* e = sl ? *sl : nullptr;
-                if (readable(e, 0xCC) && *(uint32_t*)((char*)e + 0xC8) == hnd) { s_target = FiCanonicalId(e); matched = true; break; }
+                if (readable(e, 0xCC) && *(uint32_t*)((char*)e + 0xC8) == hnd) { s_target = FiCanonicalId(e); matched = true;
+                    static int s_mlog = 0;   // DIAG (run 8880: matched but every tx carried target 0)
+                    if (s_mlog < 8 && (!s_inFight || (attack && !s_attack))) { ++s_mlog;
+                        uint64_t own = 0; __try { own = ((ManagedObject*)e)->GetObjectID(); } __except (EXCEPTION_EXECUTE_HANDLER) { own = 0xFFFFFFFFFFFFFFFFull; }
+                        L("[FI] diag match: ent=%p handle=%08X canonical=%016llX ownObjId=%016llX entHost=%d role=%u\n", (void*)e, hnd,
+                          (unsigned long long)s_target, (unsigned long long)own, g_entHost, (*(uint32_t*)((char*)e + 0x9C) & 0x1F8) >> 3); }
+                    break; }
             }
         }
         // DIAG (run 14160: every tx carried target 0 in a real player fight): where does the PLAYER keep its opponent?
