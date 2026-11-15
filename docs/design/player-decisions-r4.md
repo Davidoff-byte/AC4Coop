@@ -32,7 +32,11 @@ update crashes without the context's attach target (AC4Coop.ini note).
 A free-climb step on the sender is: move-type creator (shimmy = `sub_1B64320`), `CoreMovementDefinition::Type` (named enum,
 e.g. 2 HorizontalRight), the position on the guidance, and the guidance's owner: the climbed entity's ObjectID (world data,
 identical on both machines) with the grab point. Proposed intention-lane payload per step: {move kind, cycle type, climbed
-entity ObjectID (u64), grab point (3 floats), per-limb flags}. Open before building: how the replica enters the Climbing
+entity ObjectID (u64), grab point (3 floats), per-limb flags}.
+Better (found later in R4.2): send the **intention**, not the decision - the peer's climbing input (climbing interface
+slot 37 Vector2 at data+0x0C/+0x10, slot 38 speed at +0x14) every frame, and call the same slots on the replica's
+Climbing context so its own sequencer picks the same moves from the same geometry (the R3 / IHumanGround pattern). The
+decision fields above become the correction channel (verify the replica's chosen cycle type and grab point). Open before building: how the replica enters the Climbing
 context with a valid grab (the crash class), and how to build the same move there (the creator path takes candidates from
 the generator, so the replica may have to run its own generator and pick the matching cycle type).
 

@@ -126,8 +126,16 @@ Climb reproduced with the Pilot (stick offset re-learned per attempt: `goto ... 
     the queue at +0x20 unless queued). Slot 0 `sub_156F1E0(a2, a3)`: in state 11 and if the sequencer's +0xD0 is set,
     `sub_1567A60` computes a target (`sub_16EC080`) and posts event 15; slot 2 `sub_156F260`: in state 11, posts event 10.
     These are the climbing analog of IHumanGround - a native command seam usable on a replica (UNVERIFIED in game).
-13. **Input**: `[scope+8]` = Human+0x1A40; its +0x0C went 0 -> 1.0 while the stick was held right and back to 0 on release
-    (+0x14 stayed 1.0). No direction vector there; where the sequencer reads the direction is not found yet.
+13. **Input seam** (write watch on Human+0x1A4C while hanging and holding the stick, run 8744): all writes come from
+    `sub_1537F30` = **climbing interface (vtable 0x026D4588) slot 37** (`data = [this-4]; data+0x0C = v.x; data+0x10 = v.y`:
+    **SetDirection2D(Vector2*)**); slot 38 `sub_152B0C0` = **SetSpeedRatio(float)**, clamped 0..1 -> data+0x14 (the field the
+    sequencer gate tests). data = Human+0x1A40 in this run. Callers: `sub_113DAC0` every update - first slot 37 (0,0) and
+    slot 38 1.0 (0x0113E1B5, 61 hits), then the real input (0x0113F96B, 36 hits): v = (in.x * (+/-1 mirror), in.y) from
+    locals [ebp-0xBC] / [ebp-0xB8]. `sub_113DAC0` is registered by `sub_113FA00` via `sub_112D810(2000, ...)` on the object
+    returned by `sub_1AD9510` (the player behaviour task accessor family, as the ground handlers registered by
+    `sub_1AF8390`) - the player's climbing handler (role consistent, not proven). So climbing mirrors the ground exactly:
+    player handlers feed IHumanGround slots 0/1 on the ground and the climbing interface slots 37/38 while climbing, and the
+    Climbing context's own sequencer turns that intention into moves.
 
 So a shimmy step is fully described by **(definition index, position on the guidance)** plus the guidance it lies on; that
 is what R4.3 would send. UNVERIFIED: that the definition table is identical in both games (same assets, so expected), how
