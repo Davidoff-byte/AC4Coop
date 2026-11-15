@@ -7586,12 +7586,43 @@ static void FightIntentSend(Human* player) {
         char* fight = readable(fsm + 0x74, 4) ? *(char**)(fsm + 0x74) : nullptr;
         const uint32_t hnd = readable(fight + 0x1C8, 4) ? *(uint32_t*)(fight + 0x1C8) : 0;
         World* w = World::GetCurrentWorld();
+        bool matched = false;
         if (hnd && hnd != 0x04DD5F8Cu && w) {
             const int n = (int)w->m_CharacterList.GetSize();
             for (int i = 0; i < n; ++i) {
                 Entity** sl = w->m_CharacterList.GetElement(i); Entity* e = sl ? *sl : nullptr;
-                if (readable(e, 0xCC) && *(uint32_t*)((char*)e + 0xC8) == hnd) { s_target = FiCanonicalId(e); break; }
+                if (readable(e, 0xCC) && *(uint32_t*)((char*)e + 0xC8) == hnd) { s_target = FiCanonicalId(e); matched = true; break; }
             }
+        }
+        // DIAG (run 14160: every tx carried target 0 in a real player fight): where does the PLAYER keep its opponent?
+        // On a new fight / attack without a match, scan the fight object [0, 0x800) and the fsm [0, 0x400) for any dword
+        // equal to a character's own handle [E+0xC8] (player excluded), and log offset + entity + role. Read-only, rate-limited.
+        static int s_diagN = 0;
+        if (!matched && w && s_diagN < 12 && ((inFight && !s_inFight) || (attack && !s_attack))) {
+            ++s_diagN;
+            L("[FI] diag: target unresolved fsm=%p fight=%p [fight+0x1C8]=%08X (null container 04DD5F8C)\n", fsm, fight, hnd);
+            Entity* pl = w->GetPlayer();
+            const int n = (int)w->m_CharacterList.GetSize();
+            int hits = 0;
+            char* bases[2] = { fight, fsm }; const int lens[2] = { 0x800, 0x400 }; const char* names[2] = { "fight", "fsm" };
+            for (int b = 0; b < 2 && hits < 16; ++b) {
+                if (!readable(bases[b], lens[b])) continue;
+                for (int off = 0; off < lens[b] && hits < 16; off += 4) {
+                    const uint32_t v = *(uint32_t*)(bases[b] + off);
+                    if (v < 0x10000u) continue;
+                    for (int i = 0; i < n; ++i) {
+                        Entity** sl = w->m_CharacterList.GetElement(i); Entity* e = sl ? *sl : nullptr;
+                        if (!readable(e, 0xCC) || e == pl) continue;
+                        if (*(uint32_t*)((char*)e + 0xC8) == v || (uint32_t)e == v) {
+                            const uint32_t w9c = *(uint32_t*)((char*)e + 0x9C);
+                            L("[FI] diag hit: [%s+0x%03X]=%08X == %s of ent=%p role=%u kind=%u\n", names[b], off, v,
+                              (uint32_t)e == v ? "Entity*" : "handle [E+0xC8]", (void*)e, (w9c & 0x1F8) >> 3, w9c & 7);
+                            ++hits; break;
+                        }
+                    }
+                }
+            }
+            if (!hits) L("[FI] diag: no dword in fight[0,0x800) / fsm[0,0x400) equals a character handle or pointer\n");
         }
     }
     auto pub = [&](uint8_t op) {
