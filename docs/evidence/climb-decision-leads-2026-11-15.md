@@ -108,6 +108,27 @@ Climb reproduced with the Pilot (stick offset re-learned per attempt: `goto ... 
    element id); `+8` changed 0x07831600 -> 0x01124100 when the hands moved to new targets (packed element id? UNVERIFIED);
    the entity ObjectID stayed 0x0000000A0D0158CD and the grab point followed Edward along the ledge (34.87 -> 34.20).
 
+10. **Climbing context chart** (run 8744, hooks on vtable 0x026D4638 slots 11-16 and the state-entry dispatcher):
+    slot 12 `sub_1583760` = **Enter** (called from 0x0052E025, the engine's context transition, with context id 0x1E):
+    allocates the 0x530 data block (`sub_156ADD0(this+0x2C)`), pushes state 1 and runs state entries (`sub_1581910(state)`,
+    22 states) through default transitions until a stable state (bitmask `byte_2992A90`); Enter takes no target. Slot 14
+    `sub_1577B20` = **Exit** (B drop; called from 0x0052C34B). Slot 15 = per-frame dispatch (`sub_1583780` ->
+    `sub_1581EE0` transition evaluation). Recorded sequences: drop = EXIT, (brief re-grab ENTER 12 13 EXIT); wall-run grab =
+    ENTER, states 1, 11 (state 11 sets data+0x98 / +0x91 = 1). States 20 / 21 (`sub_1574EB0` / `sub_1570EE0`) are callers of
+    the move base ctor.
+11. **Where the shimmy decision runs** (static xref chain, every level has one caller): `sub_1581EE0` (chart transitions)
+    -> `sub_156FE40` -> `sub_156B840` (per-frame climbing update: capsule radius/height adjustments, then the sequencer) ->
+    **`sub_17E8520`** (method of the 0x1C0-byte object built by `sub_17E8500` off the climbing block, = ClimbingSequencer,
+    UNVERIFIED name) -> `sub_1B66C10` -> `sub_1B66310` -> `sub_1B64320` (shimmy) / `sub_1B65920` -> `sub_1B61C40`. So the
+    decision runs inside the Climbing context itself, not in the player's behaviour task (an earlier hypothesis, refuted).
+    The sequencer runs only when byte `+0x90` of the climbing scope is set; it is told `+0x91` && `[scope+8]+0x14 != 0`.
+12. **Commands**: interface 0x026D4588 slots are requests that post chart events: `sub_59C660(id)` = PostEvent (appends to
+    the queue at +0x20 unless queued). Slot 0 `sub_156F1E0(a2, a3)`: in state 11 and if the sequencer's +0xD0 is set,
+    `sub_1567A60` computes a target (`sub_16EC080`) and posts event 15; slot 2 `sub_156F260`: in state 11, posts event 10.
+    These are the climbing analog of IHumanGround - a native command seam usable on a replica (UNVERIFIED in game).
+13. **Input**: `[scope+8]` = Human+0x1A40; its +0x0C went 0 -> 1.0 while the stick was held right and back to 0 on release
+    (+0x14 stayed 1.0). No direction vector there; where the sequencer reads the direction is not found yet.
+
 So a shimmy step is fully described by **(definition index, position on the guidance)** plus the guidance it lies on; that
 is what R4.3 would send. UNVERIFIED: that the definition table is identical in both games (same assets, so expected), how
 the replica side reaches the table (the generator's inputs), and the other 11 move types (climb up, jump, ...).
