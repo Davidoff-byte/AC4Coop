@@ -7326,6 +7326,9 @@ bool Phase1_SetEntityHost(int host) {
     return prev == want;
 }
 int Phase1_EntityHostState() { return g_entHost; }
+// Set every player frame (OnFrameInner): GetTickCount() while a save is loaded, 0 on the title menu.
+static volatile LONG g_inSaveTick = 0;
+bool Phase1_InSave() { const LONG t = g_inSaveTick; return t != 0 && (DWORD)GetTickCount() - (DWORD)t < 1000; }
 
 // ---- [Coop] StateProbe (default 0; live; read-only; <= 4000 lines per process) ----------------------------------
 // docs/evidence/guard-statechart-2026-11-13.md: the second writer on mirrored guards is the Human context
@@ -11838,6 +11841,11 @@ static void OnFrameInner(Human* updatedHuman) {
     if (!isPlayerUpdate(base(), updatedHuman)) { HumanUpdateThreadProbe(false); OwnOverlapNote(updatedHuman); return; }
     HumanUpdateThreadProbe(true);
     InterlockedExchange(&s_playerWorkTid, (LONG)GetCurrentThreadId());
+    {   // "loaded into a save" for the co-op panel: the same test as EntitySyncTick's world gate (the title menu has
+        // m_CharacterList == 1). Published with a heartbeat; Phase1_InSave() reads it from the render thread.
+        World* w = World::GetCurrentWorld();
+        InterlockedExchange(&g_inSaveTick, (w && w->m_CharacterList.GetSize() >= 2) ? (LONG)GetTickCount() : 0);
+    }
     Pilot::OnPlayerFrame(updatedHuman);   // [Pilot] Enabled only: publish the player + m_CharacterList
 
     ProbeIdentityOnce();

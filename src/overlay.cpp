@@ -17,6 +17,7 @@
 // phase1.cpp: the co-op role ([Overlay] RoleFromPanel). Set once per process; -1 = not picked yet.
 bool Phase1_SetEntityHost(int host);
 int  Phase1_EntityHostState();
+bool Phase1_InSave();   // a save is loaded (player frame with m_CharacterList >= 2 in the last second)
 #pragma comment(lib, "dxguid.lib")
 
 namespace {
@@ -251,7 +252,14 @@ void OnPresent(IDXGISwapChain* sc) {
     }
     // toggle: polled key state (works whatever input API the game uses), only while the game window is in front
     const bool down = (GetAsyncKeyState(g_key) & 0x8000) != 0 && GetForegroundWindow() == g_hwnd;
-    if (down && !g_keyWas) SetOpen(!g_open);
+    // Only inside a loaded save (owner's rule): F10 on the title / save menus does nothing, and the panel closes when
+    // the save unloads (back to the menu, or a load screen without a player frame for 1 s).
+    const bool inSave = Phase1_InSave();
+    if (down && !g_keyWas) {
+        if (g_open || inSave) SetOpen(!g_open);
+        else { static DWORD s_last = 0; if (GetTickCount() - s_last > 2000) { s_last = GetTickCount(); Log("[Overlay] F10 ignored: not in a loaded save\n"); } }
+    }
+    if (g_open && !inSave) { SetOpen(false); Log("[Overlay] panel closed: the save is no longer loaded\n"); }
     g_keyWas = down;
 
     QMsg q[256]; int qn = 0; int dx = 0, dy = 0; BYTE btn[3]; bool btnSeen, sawWm; OverlayUi::Status st; bool stDirty;
