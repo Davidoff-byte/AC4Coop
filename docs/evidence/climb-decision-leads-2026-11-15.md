@@ -172,6 +172,38 @@ Climb reproduced with the Pilot (stick offset re-learned per attempt: `goto ... 
     724 WallingImpulsion_Standard) does not match the sampled `sub_1D659D0` arguments (648 / 652 / 657 = DropHidingSpot /
     CarryObject..., and values up to 53252) - either a different id space or NPC calls (no player filter yet).
 
+18. **Wall-run entry seam** (static + live):
+    - `sub_1D659D0(code)` decodes a transition: low 10 bits = target; < 0x284 (644) a ground-chart state, >= 644 a context
+      transition to (target - 644) via `sub_52DFF0` (so 652 = Walling 8, 648 = Ground 4).
+    - The Walling transition is taken in `sub_1D6B3E0` (= **IHumanGround slot 22**, via `sub_1D7BDE0`) when a Walling event
+      is queued (`sub_15DFE50`): event 127 in ground sub-state 4 (223 / 241 / 237 in sub-states 67 / 76 / 75); it installs
+      the Walling entry function at chart+0x120, calls it with (a2, a3, a4) and requests 652.
+    - All five events are posted only by `sub_1D5D920` (= **IHumanGround slot 21** via `sub_1D5E5C0`): in sub-state 4,
+      if `sub_1CE0A40` (flags bits 6-11 of the current action, selected by scope +0x424 / +0x42C) then `sub_1CED250`; a
+      result of 2 posts 127.
+    - Player: the free-run handler `sub_1AEE4F0` (11.5 KB, prologue found by scan; no boundary in the idb before) calls
+      slot 21 twice per try (0x01AF121B mode 0, 0x01AF1255 mode 1) with (out 28 B, out 16 B, &handle, &mode, &direction),
+      and on success slot 22 (out 28 B, out 16 B, byte task-scope+0x2205). Live (run 22432): 98 slot-21 calls for the
+      player only, 11 returned 1.
+19. **Replica enters Walling and Climbing natively** (run 27100, asi 6bdb586c, NativeReplica / Parkour / FreeRun = 1,
+    host-p14-state-2 x4): while the peer's newest packet says context 8 or 30 and the replica is on the ground, the
+    replica's own IHumanGround slot 21 (mode 0 and 1, direction to the peer) and on success slot 22 (buffers from slot 21,
+    flag 0). Result: six applies logged `slot 22 -> replica ctx now 8`; windows show the replica's own contexts {4, 8, 30}
+    (3D error mean 0.61 m, max 1.43 in the first pass) and {9, 30} - the replica wall-ran and grabbed with a target produced
+    by its own engine (the crash class of entering 30 without a target did not occur; no crash). Defect: after it climbed,
+    the pass-reset teleport did not hold and repeated every frame (132 snaps).
+20. **Exits are the open problem** (same flags, host-p14-state-2):
+    | run (pid) | asi | snap handling | result |
+    |---|---|---|---|
+    | 32368 | 3bff907d | ExitCurrentContext (0x0052C330, exit half only) on the player thread, 250 ms limit | replica stayed in context 9 (beam) and was pulled back after each teleport; 64 snaps, no crash |
+    | 32668 | 9601f2d5 | TransitToContext(4) (0x0052DF90) on the player thread | first exit worked (30 -> 4, teleport held); then crash: write fault 0x0059AB4F (state-stack push) under 0x0052DFE6 - cross-thread chart change (UNVERIFIED cause) |
+    | 33576 | c9db19e7 | TransitToContext(4) deferred to the puppet's own update | crash in the nav location update: 0x0179CDF0 -> 0x01793290 -> 0x00624440 -> 0x00411EE0 swaps a null handle at [[[svc+0x84]+4]+0x40] (asi frames = the PuppetNavService tick) |
+    | 8812 | d091acb3 | + guard on [[svc+0x84]+0x40] (wrong field, null normally) | navigation blocked from the start; no applies, no crash |
+    | 33432 | d86705b2 | guard corrected to [[[svc+0x84]+4]+0x40] | two applies -> context 8, then after a deferred exit from context 9: crash, read fault 0x009113BF (null+8) on an engine thread, no asi frame |
+    Reading: entering Walling / Climbing through slots 21/22 is native and works; forcing the replica OUT of a beam / climb
+    context (TransitToContext(4)) is not safe even on its own thread. Next: never force exits - let the replica leave
+    climbing natively (climbing commands / the climbing intention seam) and only snap once it is back on the ground.
+
 So a shimmy step is fully described by **(definition index, position on the guidance)** plus the guidance it lies on; that
 is what R4.3 would send. UNVERIFIED: that the definition table is identical in both games (same assets, so expected), how
 the replica side reaches the table (the generator's inputs), and the other 11 move types (climb up, jump, ...).

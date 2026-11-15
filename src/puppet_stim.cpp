@@ -237,6 +237,20 @@ void NavServiceTick(void* pup)
                 Log("[PupNav] svc=%p already started (+0xA=%u)\n", svc, (unsigned)*(const uint16_t*)(svc + 0xA));
             }
         }
+        // Run 33576 crashed inside this call after the native replica left a beam context (NativeReplicaFreeRun): 0x0179CDF0
+        // -> 0x01793290 -> 0x00624440(ecx = [svc+0x84]) -> first call 0x00411EE0 with ecx = [[svc+0x84]+4] (return
+        // 0x00624453 on the crash stack) swaps the handle at its +0x40, which was null, and released it (write fault
+        // 0x00411F22, data 4; AC4Coop_crashctx_33576_1.txt). Skip while [[[svc+0x84]+4]+0x40] is null. (A first version
+        // tested [[svc+0x84]+0x40], which is null normally, and blocked all updates - run 8812.)
+        {
+            const char* nctx = *(const char* const*)(svc + 0x84);
+            const char* n4 = nctx ? *(const char* const*)(nctx + 4) : nullptr;
+            if (!n4 || !*(void* const*)(n4 + 0x40)) {
+                static LONG s_locSkip = 0;
+                if (++s_locSkip <= 10) Log("[PupNav] location update skipped: [[svc+0x84]+4]=%p, +0x40 null\n", n4);
+                return;
+            }
+        }
         Hook::CallClassMethod<void, char*>(VA_NAVSVC_LOCATE, svc);
         if ((++g_nsTicks % 300) == 1) {
             const float* p = (const float*)(svc + 0x10C);

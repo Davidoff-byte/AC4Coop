@@ -1611,7 +1611,10 @@ static int   s_nrOn = -1;
 static float s_nrSnapM = 3.0f;
 // The newest packet's locomotion intention (set where packets are drained), 100 ms ahead of the interpolated state.
 static volatile float g_nrLatestDest = 0.0f; static volatile bool g_nrLatestSprint = false;
-static volatile uint8_t g_nrLatestMvt = 0;   // newest packet's HumanGroundData destMvt (+0x125, IHumanGround slot 3)
+static volatile uint8_t g_nrLatestMvt = 0;
+static volatile int g_nrLatestCtx = 4;     // newest packet's contextId
+static volatile LONG s_nrWallTries = 0, s_nrWallOk = 0;
+static volatile LONG s_nrExitReq = 0;   // set by the snap path, served on the puppet's own update   // newest packet's HumanGroundData destMvt (+0x125, IHumanGround slot 3)
 static int s_nrFreeRun = -1;                 // [Coop] NativeReplicaFreeRun (default 0), read once
 static volatile LONG s_nrFrCalls = 0;
 static float s_nrBlendMps = 1.5f;   // [Coop] NativeReplicaBlendCmS / 100 (0 = no blended correction)
@@ -1671,6 +1674,7 @@ struct NrStats {
     float wBoost; float sBoost; int wBoostFrames;                        // part of it applied under the start boost
     int pkN; float pkSum, pkMax; uint32_t repCtxMask, peerCtxMask;       // R4.1 window: off-ground frames, 3D error
     uint64_t stuckSince; uint32_t stuckSnaps, pkSnaps;                   // R4.1 stuck timer / snap counts (session)
+    uint64_t lastSnapMs; uint32_t ctxExits;                              // snap rate limit; context exits before a snap
 };
 static NrStats s_nr = {};
 static float NrPct(const NrStats& st, float q) {
@@ -1703,7 +1707,28 @@ static bool NativeReplicaDrive(Entity* pe, Human* h, HumanDataBundle* b, const P
         stuck = st.stuckSince && nowMs - st.stuckSince > 4000;
         wantSnap = d3 > s_nrPkSnapM || stuck;
     } else { st.stuckSince = 0; wantSnap = d > s_nrSnapM || fabsf(ez) > 2.0f; }
-    if (wantSnap) {
+    // Run 27100: once the replica climbs natively (context 30), a teleport does not hold (the climbing context places the
+    // body itself) and the snap repeated every frame (#3-#34+, 132 in total). So: at most one snap per 250 ms, and
+    // leave a non-ground context first (AIActor::ExitCurrentContext, as the DriveContext path uses on the puppet).
+    if (wantSnap && st.init && nowMs - st.lastSnapMs < 250) wantSnap = false;
+    if (wantSnap && st.init) {
+        {
+            const int rc0 = h->GetCurrentContextID(MAIN_AI_TRACK);
+            // Run 32368: ExitCurrentContext (0x0052C330, only the exit half) left the replica reporting context 9 (a beam) and
+            // the beam pulled it back after every teleport. TransitToContext(4) = 0x0052DF90: factory gets Ground, the
+            // current context's Exit (vt+0x34) runs, then the new one is entered.
+            // Run 32668 crashed (write fault 0x0059AB4F in a chart state-stack push under 0x0052DFE6 = TransitToContext)
+            // after this call ran here, on the PLAYER's update thread, while the puppet's chart runs on its own thread.
+            // So only request it; NativeReplicaNavTick (puppet's own update) performs it, and the teleport waits.
+            if (rc0 > 0 && rc0 != 4) {
+                InterlockedExchange(&s_nrExitReq, 1); ++st.ctxExits;
+                if (st.ctxExits <= 20) L("[Replica] snap deferred: replica in context %d, exit requested on its own update\n", rc0);
+                wantSnap = false;
+            }
+        }
+    }
+    if (wantSnap || !st.init) {
+        st.lastSnapMs = nowMs;
         HookMath::Transform mm = m;
         pe->SetGlobalMatrixInternal(&mm, true);       // physics warp: the replica is a body
         st.init = true; ++st.snaps; snapped = true; st.stuckSince = 0;
@@ -1825,6 +1850,15 @@ static bool NativeReplicaDrive(Entity* pe, Human* h, HumanDataBundle* b, const P
 // plus a 2 s keepalive. Run 22720 (v4, 250 ms keepalive): an unchanged walk-to-peer re-issued every 250 ms never moved
 // the replica (0.0 m for 6 s at 1.2-1.8 m error); v3 (400 ms) settled within 0.04-0.34 m. Cause UNVERIFIED.
 static void NativeReplicaNavTick(Entity* e) {
+    if (s_nrOn == 1 && e && s_nrExitReq && InterlockedExchange(&s_nrExitReq, 0)) {   // see the snap path (run 32668)
+        Human* xh = AIEntityHelper::GetHuman(e);
+        if (xh) {
+            const int c0 = xh->GetCurrentContextID(MAIN_AI_TRACK);
+            if (c0 > 0 && c0 != 4) xh->TransitToContext(4);
+            static int s_xl = 0;
+            if (++s_xl <= 20) L("[Replica] own update: context %d -> TransitToContext(4) -> now %d\n", c0, xh->GetCurrentContextID(MAIN_AI_TRACK));
+        }
+    }
     if (s_nrOn != 1 || !e || !s_nrNavOk) return;
     NrTarget t;
     AcquireSRWLockShared(&s_nrTgtLock); t = s_nrTgt; ReleaseSRWLockShared(&s_nrTgtLock);
@@ -1856,6 +1890,37 @@ static void NativeReplicaNavTick(Entity* e) {
             if (InterlockedIncrement(&s_nrFrCalls) <= 3)
                 L("[Replica] free-run intention: mvt=%u sprint=%d speed=%.2f dir=(%.2f,%.2f)\n", (unsigned)g_nrLatestMvt,
                   g_nrLatestSprint ? 1 : 0, sp, dir[0], dir[1]);
+            // Wall-run request: IHumanGround slot 21 (0x01D5E5C0) = the ground chart's "try wall run": lazily creates the FSM,
+            // then sub_1D5D920 (in ground sub-state 4: precondition sub_1CE0A40 on the current action's flags, then
+            // sub_1CED250; result 2 posts event 127, which sub_1D6B3E0 turns into transition 652 = context 8 Walling).
+            // The player's free-run handler sub_1AEE4F0 calls it twice per try (0x01AF121B / 0x01AF1255) with
+            // (out 28 B, out 16 B, &handle, &mode {0, then 1}, &direction Vector4). Live (run 22432): 98 calls, 11 returned 1.
+            // Here: while the peer's newest packet says Walling (8) and the replica's own context is still Ground (4).
+            Human* hh = h;
+            const int rctx = hh ? hh->GetCurrentContextID(MAIN_AI_TRACK) : -1;
+            if ((g_nrLatestCtx == 8 || g_nrLatestCtx == 30) && rctx == 4) {   // Walling, or already Climbing (replica lags)
+                alignas(16) uint8_t out28[32] = {}; alignas(16) uint8_t out16[16] = {};
+                int* hout = (int*)0x04DD5F8C;   // the engine's shared invalid handle container, as the caller seeds v633
+                alignas(16) float wdir[4] = { dir[0], dir[1], 0.0f, 0.0f };
+                int mode0 = 0, mode1 = 1;
+                typedef char (__thiscall* Wall_t)(void*, void*, void*, int**, int*, const float*);
+                const char r0 = ((Wall_t)vt[21])(ig, out28, out16, &hout, &mode0, wdir);
+                const char r1 = ((Wall_t)vt[21])(ig, out28, out16, &hout, &mode1, wdir);
+                InterlockedIncrement(&s_nrWallTries);
+                if (r0 || r1) InterlockedIncrement(&s_nrWallOk);
+                // Apply: IHumanGround slot 22 (0x01D7BDE0 -> sub_1D6B3E0): if event 127 is queued, installs the Walling entry
+                // function, calls it with (a2, a3, a4) and transitions to 652 (context 8). The player's handler calls it
+                // after a successful mode-0 slot 21 with the same two buffers and the byte at its task scope +0x2205
+                // (meaning UNVERIFIED; 0 here) - sub_1AEE4F0, call at decompile line ~2247 (vt+0x58).
+                if (r0 || r1) {   // the player applies after mode 0; mode 1 alone is tried here too (run 17384 had only r1)
+                    typedef void (__thiscall* WallApply_t)(void*, void*, void*, int);
+                    ((WallApply_t)vt[22])(ig, out28, out16, 0);
+                    L("[Replica] wall-run apply (slot 22) -> replica ctx now %d\n", hh->GetCurrentContextID(MAIN_AI_TRACK));
+                }
+                if (s_nrWallTries <= 12 || r0 || r1)
+                    L("[Replica] wall-run try #%ld: slot21 -> %d / %d (replica ctx %d, dir (%.2f,%.2f))\n", s_nrWallTries,
+                      (int)r0, (int)r1, rctx, dir[0], dir[1]);
+            }
         }
     }
     const uint64_t now = GetTickCount64();
@@ -1874,8 +1939,10 @@ static void NativeReplicaNavTick(Entity* e) {
     {
         char* nctx = *(char**)(svc + 0x84);
         char* obj = readable(nctx, 0x10) ? *(char**)(nctx + 0xC) : nullptr;
-        if (!readable(obj, 0xCC) || !*(void* const*)(obj + 0xC8)) {
-            if (InterlockedIncrement(&s_nrNavSkip) <= 5) L("[Replica] nav skipped: [svc+0x84]=%p [+0xC]=%p, +0xC8 null\n", nctx, obj);
+        // Same object, second torn-down field (run 33576): [[[svc+0x84]+4]+0x40] null crashed the location update.
+        char* n4 = readable(nctx, 8) ? *(char**)(nctx + 4) : nullptr;
+        if (!readable(obj, 0xCC) || !*(void* const*)(obj + 0xC8) || !readable(n4, 0x44) || !*(void* const*)(n4 + 0x40)) {
+            if (InterlockedIncrement(&s_nrNavSkip) <= 5) L("[Replica] nav skipped: [svc+0x84]=%p [+0xC]=%p [+4]=%p (+0xC8 / +0x40 null)\n", nctx, obj, n4);
             return;
         }
     }
@@ -11741,7 +11808,7 @@ static void OnFrameInner(Human* updatedHuman) {
         static PlayerState s_lastRaw; static bool s_haveLastRaw = false;
         static int s_plpOn = 0; static uint64_t s_plpNext = 0;
         { const uint64_t t = GetTickCount64(); if (t >= s_plpNext) { s_plpNext = t + 2000; s_plpOn = GetPrivateProfileIntA("Coop", "PeerLastPacket", 0, Paths::Ini()) != 0; } }
-        if (gotRaw) { s_lastRaw = raw; s_haveLastRaw = true; g_nrLatestDest = raw.destSpeed; g_nrLatestSprint = raw.sprint; g_nrLatestMvt = raw.destMvt; }
+        if (gotRaw) { s_lastRaw = raw; s_haveLastRaw = true; g_nrLatestDest = raw.destSpeed; g_nrLatestSprint = raw.sprint; g_nrLatestMvt = raw.destMvt; g_nrLatestCtx = raw.contextId; }
         const bool haveRaw = s_plpOn ? s_haveLastRaw : gotRaw;
         if (!gotRaw && haveRaw) raw = s_lastRaw;
 
