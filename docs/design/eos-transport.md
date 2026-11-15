@@ -130,6 +130,24 @@ The host accepts the first peer that requests a connection. Two players today, m
 3. In-game panel (ImGui) drives the bridge over a local control protocol (HOST / JOIN code / STATUS / LEAVE); the mod
    starts and stops the bridge process; the launcher installs it.
 
+## Bridge slice 1 results (2026-11-15, commit 2fc5427, owner's two PCs in different hemispheres)
+- **Local check, no peer:** `udpIn=920 tooBig=20 noRemote=900`. Every probe datagram reached the bridge; the 1400 B ones
+  were dropped as designed.
+- **Two-PC run:** here `eos_bridge host` (bridge port 47910, game port 47811) + `udp_probe.py`; there
+  `eos_bridge join GKX3MM --echo`. Host log: `peer 000209b6… asks -> accept: EOS_Success`, `connection established …:
+  RELAYED (new)`.
+
+  | phase | lost | RTT median / p95 |
+  |---|---|---|
+  | 576 B @60 Hz | 0 / 600 | 411.2 / 420.4 ms |
+  | 1170 B @30 Hz | 0 / 300 | 413.3 / 428.8 ms |
+  | 1400 B oversize | 20 / 20 dropped by the bridge (by design) | — |
+
+  Bridge counters: `udpIn=920 udpOut=900 p2pIn=900 p2pOut=900 tooBig=20 noRemote=0 sendFail=0`. `VERDICT: PASS`.
+- **Reading:** the local-UDP data path through two bridges adds no loss. RTT is ~10 ms over the spike's direct-path run,
+  within route noise (this link was relayed). Next is slice 2 (the mod over the bridge), which needs the entity chunk
+  limit at 1170 B or less and a game on both PCs.
+
 ## Open items
 - The owner sets the client policy on the Epic portal (Connect / Lobbies / P2P only) before a public build.
 - EOS terms and the SDK licence for redistributing `EOSSDK-Win32-Shipping.dll` with a game mod: read before release.
