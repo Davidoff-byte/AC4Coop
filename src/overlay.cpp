@@ -326,11 +326,18 @@ HRESULT STDMETHODCALLTYPE h_ResizeBuffers(IDXGISwapChain* sc, UINT n, UINT w, UI
 struct DiOrig { void* state; void* data; };
 DiOrig g_diA{}, g_diW{};
 struct DevType { void* dev; BYTE type; } g_devs[16]; int g_ndev = 0;
-BYTE DeviceType(IDirectInputDevice8A* d) {   // DI8DEVTYPE_MOUSE 0x12, _KEYBOARD 0x13 (low byte of dwDevType)
+// DI8DEVTYPE_MOUSE 0x12, _KEYBOARD 0x13 (low byte of dwDevType). A W device must be asked with DIDEVICEINSTANCEW: the A
+// struct size is rejected, which classified every device as 0 and kept the panel cursor dead (live run 2026-11-15 17:49).
+// Each device is logged once with its type and the state size the game reads, so the next run shows what it uses.
+BYTE DeviceType(IDirectInputDevice8A* d, bool wide, DWORD stateSize) {
     for (int i = 0; i < g_ndev; ++i) if (g_devs[i].dev == d) return g_devs[i].type;
-    DIDEVICEINSTANCEA di{}; di.dwSize = sizeof(di);
-    BYTE t = SUCCEEDED(d->GetDeviceInfo(&di)) ? (BYTE)(di.dwDevType & 0xFF) : 0;
+    HRESULT hr; DWORD devType = 0;
+    if (wide) { DIDEVICEINSTANCEW di{}; di.dwSize = sizeof(di); hr = ((IDirectInputDevice8W*)d)->GetDeviceInfo(&di); devType = di.dwDevType; }
+    else      { DIDEVICEINSTANCEA di{}; di.dwSize = sizeof(di); hr = d->GetDeviceInfo(&di); devType = di.dwDevType; }
+    const BYTE t = SUCCEEDED(hr) ? (BYTE)(devType & 0xFF) : 0;
     if (g_ndev < 16) g_devs[g_ndev++] = DevType{ d, t };
+    Log("[Overlay] dinput device %p (%s) GetDeviceInfo hr=0x%08lx type=0x%02x%s, first read size %lu\n", (void*)d, wide ? "W" : "A",
+        hr, t, t == DI8DEVTYPE_MOUSE ? " MOUSE" : t == DI8DEVTYPE_KEYBOARD ? " KEYBOARD" : "", stateSize);
     return t;
 }
 template <DiOrig* O>
@@ -339,7 +346,7 @@ struct DiHooks {
         InterlockedIncrement(&c_diState);
         const HRESULT hr = ((HRESULT(STDMETHODCALLTYPE*)(IDirectInputDevice8A*, DWORD, LPVOID))O->state)(d, n, p);
         if (g_open && SUCCEEDED(hr) && p) {
-            if (DeviceType(d) == DI8DEVTYPE_MOUSE && n >= sizeof(DIMOUSESTATE)) {
+            if (DeviceType(d, O == &g_diW, n) == DI8DEVTYPE_MOUSE && n >= sizeof(DIMOUSESTATE)) {
                 const DIMOUSESTATE* ms = (const DIMOUSESTATE*)p;
                 EnterCriticalSection(&g_cs); g_diDx += ms->lX; g_diDy += ms->lY; memcpy(g_diBtn, ms->rgbButtons, 3); g_diBtnSeen = true; LeaveCriticalSection(&g_cs);
             }
@@ -351,7 +358,7 @@ struct DiHooks {
         InterlockedIncrement(&c_diData);
         const HRESULT hr = ((HRESULT(STDMETHODCALLTYPE*)(IDirectInputDevice8A*, DWORD, LPDIDEVICEOBJECTDATA, LPDWORD, DWORD))O->data)(d, cb, od, n, f);
         if (g_open && SUCCEEDED(hr) && n && *n && od && !(f & DIGDD_PEEK)) {
-            if (DeviceType(d) == DI8DEVTYPE_MOUSE && cb >= sizeof(DIDEVICEOBJECTDATA)) {
+            if (DeviceType(d, O == &g_diW, cb) == DI8DEVTYPE_MOUSE && cb >= sizeof(DIDEVICEOBJECTDATA)) {
                 EnterCriticalSection(&g_cs);
                 for (DWORD i = 0; i < *n; ++i) {
                     const DIDEVICEOBJECTDATA* e = (const DIDEVICEOBJECTDATA*)((const BYTE*)od + i * cb);
