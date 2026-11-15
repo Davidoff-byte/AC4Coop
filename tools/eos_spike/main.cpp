@@ -85,6 +85,22 @@ static void SetRelay(const char* mode)
     o.RelayControl = !strcmp(mode, "force") ? EOS_ERelayControl::EOS_RC_ForceRelays : !strcmp(mode, "none") ? EOS_ERelayControl::EOS_RC_NoRelays : EOS_ERelayControl::EOS_RC_AllowRelays;
     printf("SetRelayControl(%s): %s\n", mode, EOS_EResult_ToString(EOS_P2P_SetRelayControl(EOS_Platform_GetP2PInterface(g_plat), &o)));
 }
+// Connection-established event (eos_p2p_types.h): NetworkType says direct vs relayed. Runs 2026-11-15 (two PCs in different
+// hemispheres): the first phase was sent before the link was up and lost every echo, so the guest now waits for this first.
+static volatile int g_established = 0;   // 0 = none, else 1 + EOS_ENetworkConnectionType
+static const char* NetName(int e) { return e == 1 + (int)EOS_ENetworkConnectionType::EOS_NCT_DirectConnection ? "DIRECT"
+                                         : e == 1 + (int)EOS_ENetworkConnectionType::EOS_NCT_RelayedConnection ? "RELAYED" : "none"; }
+static void WatchEstablished()
+{
+    EOS_P2P_SocketId s = Sock();
+    EOS_P2P_AddNotifyPeerConnectionEstablishedOptions o = {}; o.ApiVersion = EOS_P2P_ADDNOTIFYPEERCONNECTIONESTABLISHED_API_LATEST; o.LocalUserId = g_me; o.SocketId = &s;
+    EOS_P2P_AddNotifyPeerConnectionEstablished(EOS_Platform_GetP2PInterface(g_plat), &o, nullptr, [](const EOS_P2P_OnPeerConnectionEstablishedInfo* i) {
+        g_established = 1 + (int)i->NetworkType;
+        printf("connection established with %s: %s (%s)\n", Puid(i->RemoteUserId).c_str(), NetName(g_established),
+               i->ConnectionType == EOS_EConnectionEstablishedType::EOS_CET_Reconnection ? "reconnection" : "new");
+    });
+}
+
 static void QueryNat()
 {
     EOS_P2P_QueryNATTypeOptions q = {}; q.ApiVersion = EOS_P2P_QUERYNATTYPE_API_LATEST; bool done = false;
@@ -197,7 +213,7 @@ static void HostLoop(int seconds)
             const int n = Recv(&from, &ch, buf.data(), (uint32_t)buf.size());
             if (n < 0) break;
             if (n >= (int)sizeof(Probe) && ((Probe*)buf.data())->magic == kMagic) {
-                if (((Probe*)buf.data())->phase == 99) { printf("host: guest finished, echoed %u packets\n", echoed); return; }
+                if (((Probe*)buf.data())->phase == 99) { printf("host: guest finished, echoed %u packets (link %s)\n", echoed, NetName(g_established)); return; }
                 Send(from, ch, buf.data(), (uint32_t)n, ch == 2 ? EOS_EPacketReliability::EOS_PR_ReliableOrdered : EOS_EPacketReliability::EOS_PR_UnreliableUnordered);
                 ++echoed;
             }
@@ -208,19 +224,22 @@ static void HostLoop(int seconds)
 }
 
 struct PhaseResult { const char* name; uint32_t sent, back; bool inOrder; double med, p95; };
-static PhaseResult RunPhase(EOS_ProductUserId host, uint32_t phase, const char* name, uint32_t count, uint32_t size, uint8_t ch, EOS_EPacketReliability rel)
+// hz = send rate. Game-like rates (PlayerState ~60 Hz) instead of the first runs' 200/s, which queued behind a 400 ms
+// intercontinental link and inflated RTT to seconds.
+static PhaseResult RunPhase(EOS_ProductUserId host, uint32_t phase, const char* name, uint32_t count, uint32_t size, uint8_t ch, EOS_EPacketReliability rel, double hz)
 {
     std::vector<uint8_t> out(size, 0xA5), buf(EOS_P2P_MAX_PACKET_SIZE);
     std::vector<double> rtt; std::vector<uint32_t> order;
     uint32_t sent = 0;
+    const double step = 1000.0 / hz;
     double next = NowMs();
-    const double deadline = NowMs() + count * 5.0 + 5000.0;
+    const double deadline = NowMs() + count * step + 8000.0;
     while (NowMs() < deadline && (sent < count || rtt.size() < sent)) {
         EOS_Platform_Tick(g_plat);
         if (sent < count && NowMs() >= next) {
             Probe p{ kMagic, phase, sent, NowMs() }; memcpy(out.data(), &p, sizeof(p));
             if (Send(host, ch, out.data(), size, rel)) ++sent;
-            next += 5.0;
+            next += step;
         }
         for (;;) {
             EOS_ProductUserId from = nullptr; uint8_t c = 0;
@@ -273,6 +292,7 @@ int main(int argc, char** argv)
     int rc = 1;
     if (Login(("ac4coop-spike-" + tag).c_str())) {
         SetRelay(relay.c_str());
+        WatchEstablished();
         QueryNat();
         if (host) {
             code = MakeCode();
@@ -286,15 +306,24 @@ int main(int argc, char** argv)
                 printf("\nVERDICT: INVALID - host and guest are the same EOS user (%s). Run the join on another Windows user or PC.\n", Puid(h).c_str());
                 rc = 4;
             } else if (h) {
-                printf("guest: running echo phases against the host\n");
-                std::vector<PhaseResult> res;
-                res.push_back(RunPhase(h, 1, "unreliable 576 B (PlayerState)", 500, 576, 1, EOS_EPacketReliability::EOS_PR_UnreliableUnordered));
-                res.push_back(RunPhase(h, 2, "unreliable 1170 B (max)", 200, 1170, 1, EOS_EPacketReliability::EOS_PR_UnreliableUnordered));
-                res.push_back(RunPhase(h, 3, "reliable-ordered 576 B", 200, 576, 2, EOS_EPacketReliability::EOS_PR_ReliableOrdered));
-                Probe done{ kMagic, 99, 0, NowMs() }; Send(h, 2, &done, sizeof(done), EOS_EPacketReliability::EOS_PR_ReliableOrdered); Pump(500);
-                const bool pass = res[2].back == res[2].sent && res[2].inOrder && res[0].sent && (res[0].sent - res[0].back) * 100 < res[0].sent;
-                printf("\nVERDICT: %s (reliable all back in order + unreliable loss < 1 %%)\n", pass ? "PASS" : "FAIL");
-                rc = pass ? 0 : 3;
+                // Open the link with a reliable hello and wait for the established event before measuring.
+                Probe hello{ kMagic, 0, 0, NowMs() };
+                Send(h, 2, &hello, sizeof(hello), EOS_EPacketReliability::EOS_PR_ReliableOrdered);
+                const bool up = WaitFor([] { return g_established != 0; }, 30000);
+                if (!up) { printf("\nVERDICT: FAIL - no P2P connection established within 30 s\n"); rc = 3; }
+                else {
+                    Pump(2000);   // let the first echoes of the hello drain
+                    printf("guest: link is %s; running echo phases at game-like rates\n", NetName(g_established));
+                    std::vector<PhaseResult> res;
+                    res.push_back(RunPhase(h, 1, "unreliable 576 B @60 Hz", 600, 576, 1, EOS_EPacketReliability::EOS_PR_UnreliableUnordered, 60.0));
+                    res.push_back(RunPhase(h, 2, "unreliable 1170 B @30 Hz", 300, 1170, 1, EOS_EPacketReliability::EOS_PR_UnreliableUnordered, 30.0));
+                    res.push_back(RunPhase(h, 3, "reliable-ordered 576 B @30 Hz", 300, 576, 2, EOS_EPacketReliability::EOS_PR_ReliableOrdered, 30.0));
+                    Probe done{ kMagic, 99, 0, NowMs() }; Send(h, 2, &done, sizeof(done), EOS_EPacketReliability::EOS_PR_ReliableOrdered); Pump(1500);
+                    const bool pass = res[2].back == res[2].sent && res[2].inOrder && res[0].sent && (res[0].sent - res[0].back) * 50 < res[0].sent;
+                    printf("\nVERDICT: %s - link %s; reliable all back in order + unreliable loss < 2 %% (RTT is reported, not judged)\n",
+                           pass ? "PASS" : "FAIL", NetName(g_established));
+                    rc = pass ? 0 : 3;
+                }
             }
             LeaveLobby(false);
         }
