@@ -82,6 +82,16 @@ Climb reproduced with the Pilot (stick offset re-learned per attempt: `goto ... 
    (D70 = 1, D90 = 2, DB0 = 3, DD0 = 4, DF0 = 5, E10 = 6, E30 = 7), then floats (+0x0C, +0x10) and a pointer (+0x14).
    One direction used definitions 2 / 4 / 6, the other 1 / 5 / 3.
 
+7. **Names (PS3 DWARF, cu 297, `ClimbingSequencer::CoreMovementDefinition`, DIE 0x6FE8E73, 32 B)** - same layout as the PC
+   records: +0 `m_CycleType`, +4/+8 left/right `HandRestriction`, +0x0C idealStepDistance, +0x10 maxStepDistance, +0x14
+   `m_CycleDefinitionList` (array ptr + count/cap), +0x1C `m_SwingMode`. `CoreMovementDefinition::Type`: 1 HorizontalLeft,
+   2 HorizontalRight, 3 DiagonalUpLeft, 4 DiagonalUpRight, 5 DiagonalDownLeft, 6 DiagonalDownRight, 7/8 VerticalUp/Down_60,
+   9/10 VerticalUp/Down_90, 11-16 VerticalUp/Down_VCrack{Center,LeftSide,RightSide}, 17-20 diagonal VCrack variants,
+   21/22 VerticalUp/Down_120. The live candidates match: one shimmy direction offered 2/4/6 (HorizontalRight, DiagonalUpRight,
+   DiagonalDownRight), the other 1/5/3 (HorizontalLeft, DiagonalDownLeft, DiagonalUpLeft), best first. Guidance types
+   (`TargetedGuidance::Type`): 1 HorizontalLedge, 2 HorizontalPole, 3/4 VerticalCrackLeft/Right, 5 HangFork.
+   `HandsConfiguration::Type`: 1 OneHandLeft ... 3 Closed, 4 OpenedHorizontal, 5-8 opened diagonal/vertical.
+
 So a shimmy step is fully described by **(definition index, position on the guidance)** plus the guidance it lies on; that
 is what R4.3 would send. UNVERIFIED: that the definition table is identical in both games (same assets, so expected), how
 the replica side reaches the table (the generator's inputs), and the other 11 move types (climb up, jump, ...).
