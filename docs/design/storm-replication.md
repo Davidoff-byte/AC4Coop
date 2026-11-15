@@ -126,6 +126,41 @@ any two-machine run.
 Order: S0 → S1 + S2 (static, can run in parallel) → S3 → S4 → S5 → S6 → S7 → S8 → S9 → S10.
 S5 and S6 can start on S2's results without waiting for all of S1.
 
+## 4a. Results of S0-S2 (2026-11-15) and what they change
+
+Evidence: `docs/evidence/s0-two-copy-rig-2026-11-15.md`, `s1-mp-transition-replication-2026-11-15.md`,
+`s2-sp-intent-seams-2026-11-15.md`. S1 and S2 are static. The 22 SP slot-to-VA entries below were re-read from the exe
+bytes, and all match. What each function does is a strong lead until the S2 live probes run.
+
+- **S0 (PASS):** `tools/two_copy.ps1` completed 3 consecutive runs. The pilot frame cap (`boot --fps 60`) preceded 4 lost
+  copies in 7 runs, so boot now defaults to `--fps 0`.
+- **S1, the MP duplica reruns transitions; it does not play animation (verified in MP):**
+  - The master records (context id, 1-based transition index). The duplica's `NetProcessReceivedTransitions` (NetPlayer
+    vt[18], 0x4FAEE8) calls that context's transition function from a table filled by HumanGround slot 15.
+  - Ground transitions carry no additional info (slots 28/29 empty).
+  - Ledge/climb transitions carry a 0x148-B wire struct, converted to a 0x1A0-B runtime struct: geometry vec4s, action ids,
+    and four limb items, each with a **ref-counted handle to a world object** that the duplica resolves to its own object.
+  - Custom action: data goes to a pending block at HumanGround+0x180, consumed as statechart events 0x49/0x4A.
+  - MP to SP matches by structure (strong lead): TransitToContext 0x52DF90, GetCurrentContextID 0x52C2E0, GetContext
+    0x52C360, SetTargetAction 0x6625D0.
+  - No index-to-SP-transition-function map yet: byte matching against SP found nothing.
+- **S2, SP entry points (strong lead):**
+  - IHumanGround 0x026E7DC0: DoJumpToTarget2 4; Can/DoEnterLadder 17/18; Can/DoEnterWallingVertical 21/22;
+    Can/DoEnterFight 75/76; Can/DoEnterFightAttackOnGround 104/105; Set/Get/ReleaseFightFocusTarget 106-108;
+    Can/DoExitFight 112/113; Attack 154; PerformCombo 160; Can/DoEnterClimb 382/383.
+  - Jump-to-target, custom action and assassinate live on sibling interfaces: HumanGround+0x14 (vt 0x026E7DB8), +0x70
+    (vt 0x026E79B8), +0x74 (vt 0x026E7998).
+  - **Contract:** a Do works only right after its Can succeeded, because Can records the transition id the Do checks.
+    Each Do also checks the current state. Can/DoAttackNow are dead on PC.
+- **What changes in the plan:**
+  - **S6 drives entries through Can/Do pairs, not TransitToContext.** TransitToContext 0x52DF90 takes only an id and skips
+    the pending-transition record a native entry writes into the target context. That fits the climb/ledge crash.
+  - For climb/ledge, the limb object handles need netIds or a re-query of the geometry on the replica (S1 section 4).
+  - **AI-off seam candidate:** skip the behaviour component's single-threaded update (0x55DEF0) for the replica only,
+    keeping the actor update (0x54CB90 → Human::Update 0x16FA7D0) running. `sub_52DF80` is the native context FSM, which
+    is the wrong layer. UNVERIFIED where the scheduler reads the enabled bit.
+  - **Next:** the S2 live probes on Edward (Can/Do pairs per slot, from the player's own update, hook 0x016FAACD), then S3.
+
 ## 5. What stops now
 - **New NativeReplica parkour work** (`NativeReplicaParkour`, `ClimbIntent`, `ClimbMoves`, `WallEntry`). With the replica
   on, the peer's actions never reach the puppet; S6 replaces the follow-by-navigation approach. Keep the flags, default 0.

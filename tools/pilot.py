@@ -603,7 +603,7 @@ def main():
     x.add_argument('--speed', type=float, default=1.0); x.add_argument('--sec', type=float, default=1.0)
     x = sub.add_parser('route'); x.add_argument('x', type=float); x.add_argument('y', type=float)
     x = sub.add_parser('boot'); x.add_argument('--pulses', type=int, default=6); x.add_argument('--wait', type=float, default=5)
-    x.add_argument('--settle', type=float, default=60); x.add_argument('--fps', type=float, default=60)
+    x.add_argument('--settle', type=float, default=60); x.add_argument('--fps', type=float, default=0)   # 0: no Present patch (cap preceded 4 lost copies in 7 two-copy runs, docs/evidence/s0-two-copy-rig-2026-11-15.md)
     x = sub.add_parser('teleport'); x.add_argument('x', type=float); x.add_argument('y', type=float); x.add_argument('z', type=float)
     x.add_argument('--yaw', type=float)
     x = sub.add_parser('fps'); x.add_argument('n', type=float, nargs='?')
