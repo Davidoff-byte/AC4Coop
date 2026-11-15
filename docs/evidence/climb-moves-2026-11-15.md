@@ -146,3 +146,29 @@ default 0, re-read every 2 s). Solo replay only; not two-machine tested.
   wall/geometry test `sub_1CED250` runs (result 2 posts event 127). So the request needs the action being played to
   carry a wall-run flag. UNVERIFIED: that only run/sprint actions carry these bits, and what +0x424 / +0x42C select
   (gait / leading foot are guesses) - consistent with the replica's tries failing at 1.3-1.5 m/s.
+
+## Wall-run request on the replica: facing and the ground sub-state
+- Contact-point target (asi `eb620a23...`, pid 13188): the replica navigates to the peer's position on its first Walling
+  frame (the wall's foot) and requests within 2 m of it; the log carries the replica's speed. Tries at 4-5.8 m/s near the
+  contact point all failed; the one success came at 0.01 m/s facing (0.93, 0.35) - another wall face than the peer's
+  (-0.41, -0.91). Speed is not what decides.
+- Static (IDA): for ground sub-state 4 the request (`sub_1D5D920`) calls `sub_1CED250`, which ignores the direction the
+  caller passes: it queries `sub_1DD27F0` from the entity's own position and facing (`*(matrix+0x10)` = row 1) with a reach
+  of 1.5 m, or ~1.97 m when the mode argument is 1. Slot 21's wrapper `0x01D5E5C0` returns `sub_1D5D920(...) == 2` with
+  ecx = [interface+0x90] (0x01D5E60C / 0x01D5E620).
+- Matrix convention verified live on Edward (pid 32684): walking -x gave row 1 = (-1, 0, 0), row 0 = (0, 1, 0); walking +y
+  gave row 1 = (0, 1, 0), row 0 = (1, 0, 0). Forward = row 1, right = (hy, -hx).
+- Facing (asi `8b1b4416...`, pid 32684): within 1.5 m of the contact point the replica is turned to the peer's heading
+  (physics-warp matrix write). 16 frames faced; tries while facing still failed; pass 2 had one success in the peer's
+  direction (-0.43, -0.89).
+- Diagnostic (asi `4d761f4c...`, pid 17948; reads the sub-state and calls the precondition `sub_1CE0A40` directly, unit
+  added): during the whole approach the replica's ground chart was in **sub-state 115**, not 4 - 300 of 300 tries were
+  refused before the precondition. Sub-state 4 appeared only after the replica stopped; then 73 precondition-false and
+  ~1500 wall-test-failed (replica standing at the wall foot while the peer climbed). UNVERIFIED: that 115 is the NPC's
+  navigation-follow state and that IHumanGround drives the replica in sub-state 4 (would also explain R3's "NPC ignores
+  IHumanGround": navigation was always active).
+- Final-approach experiment (in the committed code, **built but not run**, asi `cf23de28...`): within 4 m of the contact
+  point, one NavigateToPosition Stop at the replica's own position, then no navigation; the FreeRun block drives
+  IHumanGround with free-run (slot 3 = 1), sprint, speed 1.0 and the direction to the wall. Not run: the game exited
+  ~2 s after start on three launches (store-layer restart, docs/evidence/single-instance-guard-2026-11-15.md; Ubisoft
+  Connect had not been running), and the owner was using the PC.

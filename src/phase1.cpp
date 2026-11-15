@@ -1822,9 +1822,14 @@ static NrTarget s_nrTgt = {};
 // Replays showed the replica starting its own wall run from wherever it was and landing on a beam the peer never used
 // in ~50 % of 2 s windows (docs/evidence/climb-moves-2026-11-15.md).
 static SRWLOCK s_nrWsLock = SRWLOCK_INIT;
-static struct NrWallStart { float x, y, z, hx, hy; uint64_t ms; bool valid; } s_nrWs = {};
+static struct NrWallStart { float x, y, z, hx, hy; uint64_t ms; bool valid; float cx, cy, cz; } s_nrWs = {};   // c = peer position on its first Walling frame (at the wall)
 static int s_nrWeOn = 0;
-static volatile LONG s_nrWeStarts = 0, s_nrWeNav = 0, s_nrWeTries = 0, s_nrWeHeld = 0;static volatile LONG s_nrNavCalls = 0, s_nrNavFail = 0, s_nrNavSkip = 0;
+static volatile LONG s_nrWeStarts = 0, s_nrWeNav = 0, s_nrWeTries = 0, s_nrWeHeld = 0, s_nrWeFace = 0;
+// Final approach (within 4 m of the peer's contact point, peer on the wall, replica on the ground): navigation is stopped
+// and the replica is driven through IHumanGround like the player. Run 17948: while navigation moved the replica its ground
+// chart was in sub-state 115, and the wall-run request (sub_1D5D920) acts only in sub-state 4 - 300 of 300 tries during
+// the approach were refused there; sub-state 4 appeared only after it stopped. UNVERIFIED: that 115 = navigation-follow.
+static volatile LONG g_nrWeApproach = 0, s_nrWeStops = 0;static volatile LONG s_nrNavCalls = 0, s_nrNavFail = 0, s_nrNavSkip = 0;
 // 1 only while the last ApplyRemoteState took the replica path with the behaviour enabled and settled (g_switchCd 0).
 static volatile LONG s_nrNavOk = 0;
 struct NrStats {
@@ -1978,22 +1983,39 @@ static bool NativeReplicaDrive(Entity* pe, Human* h, HumanDataBundle* b, const P
         if (pc == 4 || pc == 2) { s_gx = m.M41; s_gy = m.M42; s_gz = m.M43; if (fx * fx + fy * fy > 0.25f) { s_ghx = fx; s_ghy = fy; } s_haveG = true; }
         if (pc == 8 && s_prevPc != 8 && (s_prevPc == 4 || s_prevPc == 2 || s_prevPc == 6) && s_haveG) {
             AcquireSRWLockExclusive(&s_nrWsLock);
-            s_nrWs = { s_gx, s_gy, s_gz, s_ghx, s_ghy, tn, true };
+            s_nrWs = { s_gx, s_gy, s_gz, s_ghx, s_ghy, tn, true, m.M41, m.M42, m.M43 };
             ReleaseSRWLockExclusive(&s_nrWsLock);
             InterlockedIncrement(&s_nrWeStarts);
-            L("[Replica] wall entry: peer wall-run start (%.2f,%.2f,%.2f) heading (%.2f,%.2f)\n", s_gx, s_gy, s_gz, s_ghx, s_ghy);
+            L("[Replica] wall entry: peer wall-run start (%.2f,%.2f,%.2f) heading (%.2f,%.2f) contact (%.2f,%.2f,%.2f)\n", s_gx, s_gy, s_gz, s_ghx, s_ghy, m.M41, m.M42, m.M43);
         }
         s_prevPc = pc;
     }
     // While the replica is still on the ground and the peer's wall-run start is fresh (< 5 s): go to the start point first.
     bool weNav = false;
+    InterlockedExchange(&g_nrWeApproach, 0);   // set again below while on the final approach
     if (pkFrame && s_nrWeOn && h->GetCurrentContextID(MAIN_AI_TRACK) == 4) {
         NrWallStart ws; AcquireSRWLockShared(&s_nrWsLock); ws = s_nrWs; ReleaseSRWLockShared(&s_nrWsLock);
         if (ws.valid && GetTickCount64() - ws.ms < 5000) {
-            const float wx = ws.x - px, wy = ws.y - py, wd = sqrtf(wx * wx + wy * wy);
-            // at the start: keep running through it along the peer's direction (the wall run needs the run-up)
-            t.x = wd > 1.0f ? ws.x : ws.x + ws.hx * 3.0f; t.y = wd > 1.0f ? ws.y : ws.y + ws.hy * 3.0f; t.z = ws.z;
+            // Go to the peer's wall contact point (its position on its first Walling frame: at the wall's foot, reachable
+            // by navigation) and keep that target. Run 31524: a target past the start lay inside the wall, navigation
+            // routed around it and the replica slowed to 1.3-1.5 m/s.
+            t.x = ws.cx; t.y = ws.cy; t.z = ws.z;
             t.hx = ws.hx; t.hy = ws.hy; t.speed = 10;
+            // Face the peer's wall: the ground wall-run test ignores the direction argument of IHumanGround slot 21 and
+            // queries from the entity's own position and facing (sub_1CED250: matrix row 1 = *(matrix+0x10), reach 1.5 m
+            // or 1.97 m by the mode argument, then sub_1DD27F0). Run 13188: tries at 4-5.8 m/s failed near the contact
+            // point and the one that succeeded faced another wall (0.93, 0.35) vs the peer's (-0.41, -0.91). Within 1.5 m
+            // of the contact point: rows = right (hy, -hx, 0), forward (hx, hy, 0), up (0, 0, 1), position kept.
+            const float fcx = ws.cx - px, fcy = ws.cy - py;
+            InterlockedExchange(&g_nrWeApproach, (fcx * fcx + fcy * fcy < 16.0f && (g_nrLatestCtx == 8 || g_nrLatestCtx == 30)) ? 1 : 0);
+            if (fcx * fcx + fcy * fcy < 2.25f && (g_nrLatestCtx == 8 || g_nrLatestCtx == 30)) {
+                HookMath::Transform mm = pe->m_GlobalMatrix;
+                mm.M11 = ws.hy; mm.M12 = -ws.hx; mm.M13 = 0.0f;
+                mm.M21 = ws.hx; mm.M22 = ws.hy;  mm.M23 = 0.0f;
+                mm.M31 = 0.0f;  mm.M32 = 0.0f;   mm.M33 = 1.0f;
+                pe->SetGlobalMatrixInternal(&mm, true);
+                InterlockedIncrement(&s_nrWeFace);
+            }
             weNav = true; InterlockedIncrement(&s_nrWeNav);
         }
     }
@@ -2194,7 +2216,7 @@ static void NativeReplicaNavTick(Entity* e) {
             }
         }
         static uint64_t s_weLog = 0;
-        if (s_nrWeOn && s_nrWeStarts && tn >= s_weLog) { s_weLog = tn + 2000; L("[Replica] wall entry: starts=%ld nav frames=%ld tries at start=%ld held (not there yet)=%ld\n", s_nrWeStarts, s_nrWeNav, s_nrWeTries, s_nrWeHeld); }
+        if (s_nrWeOn && s_nrWeStarts && tn >= s_weLog) { s_weLog = tn + 2000; L("[Replica] wall entry: starts=%ld nav frames=%ld tries at start=%ld held (not there yet)=%ld faced=%ld nav stops=%ld\n", s_nrWeStarts, s_nrWeNav, s_nrWeTries, s_nrWeHeld, s_nrWeFace, s_nrWeStops); }
         static uint64_t s_bmLog = 0;
         if (s_bmOn && tn >= s_bmLog && s_bmFrames) { s_bmLog = tn + 2000; L("[Replica] beam steer: frames=%ld left beam=%ld replica ctx %d peer ctx %d\n", s_bmFrames, s_bmLeft, bctx, (int)g_nrLatestCtx); }
     }
@@ -2221,9 +2243,10 @@ static void NativeReplicaNavTick(Entity* e) {
             const float px = e->m_GlobalMatrix.M41, py = e->m_GlobalMatrix.M42;
             float ddx = t.x - px, ddy = t.y - py; const float dl = sqrtf(ddx * ddx + ddy * ddy);
             alignas(16) float dir[4] = { dl > 1e-3f ? ddx / dl : t.hx, dl > 1e-3f ? ddy / dl : t.hy, 0.0f, 0.0f };
-            const float sp = g_nrLatestDest > 1.0f ? 1.0f : g_nrLatestDest < 0.0f ? 0.0f : g_nrLatestDest;
-            ((void (__thiscall*)(void*, int))vt[3])(ig, (int)g_nrLatestMvt);
-            ((void (__thiscall*)(void*, int))vt[32])(ig, g_nrLatestSprint ? 1 : 0);
+            const bool appr = g_nrWeApproach != 0;   // final wall approach: full free-run sprint toward the wall
+            const float sp = appr ? 1.0f : g_nrLatestDest > 1.0f ? 1.0f : g_nrLatestDest < 0.0f ? 0.0f : g_nrLatestDest;
+            ((void (__thiscall*)(void*, int))vt[3])(ig, appr ? 1 : (int)g_nrLatestMvt);
+            ((void (__thiscall*)(void*, int))vt[32])(ig, (appr || g_nrLatestSprint) ? 1 : 0);
             ((void (__thiscall*)(void*, float))vt[1])(ig, sp);
             ((void (__thiscall*)(void*, const float*))vt[0])(ig, dir);
             if (InterlockedIncrement(&s_nrFrCalls) <= 3)
@@ -2237,15 +2260,20 @@ static void NativeReplicaNavTick(Entity* e) {
             // Here: while the peer's newest packet says Walling (8) and the replica's own context is still Ground (4).
             Human* hh = h;
             const int rctx = hh ? hh->GetCurrentContextID(MAIN_AI_TRACK) : -1;
+            static float s_vpx = 0, s_vpy = 0, s_rspd = 0; static LARGE_INTEGER s_vq = {};
+            { LARGE_INTEGER q, f; QueryPerformanceCounter(&q); QueryPerformanceFrequency(&f);
+              const float vdt = s_vq.QuadPart ? (float)((double)(q.QuadPart - s_vq.QuadPart) / (double)f.QuadPart) : 0.0f;
+              if (vdt > 1e-3f && vdt < 0.25f) { const float vx = (px - s_vpx) / vdt, vy = (py - s_vpy) / vdt; s_rspd += 0.3f * (sqrtf(vx * vx + vy * vy) - s_rspd); }
+              s_vpx = px; s_vpy = py; s_vq = q; }
             // NativeReplicaWallEntry: only within 1 m of the peer's wall-run start, in the peer's direction; a start older
             // than 5 s falls back to trying from anywhere (the previous behaviour).
             bool weAllow = true;
             if (s_nrWeOn && (g_nrLatestCtx == 8 || g_nrLatestCtx == 30) && rctx == 4) {
                 NrWallStart ws; AcquireSRWLockShared(&s_nrWsLock); ws = s_nrWs; ReleaseSRWLockShared(&s_nrWsLock);
                 if (ws.valid && GetTickCount64() - ws.ms < 5000) {
-                    const float wx = ws.x - px, wy = ws.y - py;
-                    if (wx * wx + wy * wy > 1.0f) { weAllow = false; InterlockedIncrement(&s_nrWeHeld); }
-                    else { dir[0] = ws.hx; dir[1] = ws.hy; InterlockedIncrement(&s_nrWeTries); }
+                    const float wx = ws.cx - px, wy = ws.cy - py, wl = sqrtf(wx * wx + wy * wy);
+                    if (wl > 2.0f) { weAllow = false; InterlockedIncrement(&s_nrWeHeld); }   // within 2 m of the contact point
+                    else { if (wl > 0.3f) { dir[0] = wx / wl; dir[1] = wy / wl; } else { dir[0] = ws.hx; dir[1] = ws.hy; } InterlockedIncrement(&s_nrWeTries); }
                 }
             }
             if (weAllow && (g_nrLatestCtx == 8 || g_nrLatestCtx == 30) && rctx == 4) {   // Walling, or already Climbing (replica lags)
@@ -2254,10 +2282,27 @@ static void NativeReplicaNavTick(Entity* e) {
                 alignas(16) float wdir[4] = { dir[0], dir[1], 0.0f, 0.0f };
                 int mode0 = 0, mode1 = 1;
                 typedef char (__thiscall* Wall_t)(void*, void*, void*, int**, int*, const float*);
+                // Diagnostics: which half of the request fails. Slot 21 (0x01D5E5C0) returns sub_1D5D920(...) == 2 with
+                // ecx = [interface+0x90] (0x01D5E60C); sub_1D5D920 needs ground sub-state *(u16*)(*(fsm+0x118)+6) == 4,
+                // then the action-flag precondition sub_1CE0A40(ecx = *(fsm+0xC)), then the wall test sub_1CED250.
+                static LONG s_wdNoFsm = 0, s_wdSub = 0, s_wdPre = 0, s_wdTest = 0, s_wdOk = 0;
+                int wdSub = -1, wdPre = -1;
+                {
+                    char* fsm = readable((char*)ig + 0x90, 4) ? *(char**)((char*)ig + 0x90) : nullptr;
+                    char* ss = readable(fsm, 0x11C) ? *(char**)(fsm + 0x118) : nullptr;
+                    void* scope = readable(fsm, 0x10) ? *(void**)(fsm + 0xC) : nullptr;
+                    if (readable(ss, 8) && readable(scope, 0x430)) {
+                        wdSub = *(const uint16_t*)(ss + 6);
+                        if (wdSub == 4) wdPre = ((char (__thiscall*)(void*))0x01CE0A40)(scope) ? 1 : 0;
+                    }
+                }
                 const char r0 = ((Wall_t)vt[21])(ig, out28, out16, &hout, &mode0, wdir);
                 const char r1 = ((Wall_t)vt[21])(ig, out28, out16, &hout, &mode1, wdir);
                 InterlockedIncrement(&s_nrWallTries);
                 if (r0 || r1) InterlockedIncrement(&s_nrWallOk);
+                if (wdSub < 0) ++s_wdNoFsm; else if (wdSub != 4) ++s_wdSub; else if (!wdPre) ++s_wdPre; else if (!(r0 || r1)) ++s_wdTest; else ++s_wdOk;
+                static uint64_t s_wdLog = 0; const uint64_t wdn = GetTickCount64();
+                if (wdn >= s_wdLog) { s_wdLog = wdn + 2000; L("[Replica] wall-run request diag: no fsm=%ld sub-state!=4=%ld precondition false=%ld wall test failed=%ld ok=%ld (last sub-state %d pre %d)\n", s_wdNoFsm, s_wdSub, s_wdPre, s_wdTest, s_wdOk, wdSub, wdPre); }
                 // Apply: IHumanGround slot 22 (0x01D7BDE0 -> sub_1D6B3E0): if event 127 is queued, installs the Walling entry
                 // function, calls it with (a2, a3, a4) and transitions to 652 (context 8). The player's handler calls it
                 // after a successful mode-0 slot 21 with the same two buffers and the byte at its task scope +0x2205
@@ -2268,14 +2313,17 @@ static void NativeReplicaNavTick(Entity* e) {
                     L("[Replica] wall-run apply (slot 22) -> replica ctx now %d\n", hh->GetCurrentContextID(MAIN_AI_TRACK));
                 }
                 if (s_nrWallTries <= 12 || r0 || r1)
-                    L("[Replica] wall-run try #%ld: slot21 -> %d / %d (replica ctx %d, dir (%.2f,%.2f))\n", s_nrWallTries,
-                      (int)r0, (int)r1, rctx, dir[0], dir[1]);
+                    L("[Replica] wall-run try #%ld: slot21 -> %d / %d (replica ctx %d, dir (%.2f,%.2f), speed %.2f m/s)\n", s_nrWallTries,
+                      (int)r0, (int)r1, rctx, dir[0], dir[1], s_rspd);
             }
         }
     }
+    static bool s_weStopped = false; bool weStopNow = false;
+    if (g_nrWeApproach) { if (s_weStopped) return; weStopNow = true; }   // IHumanGround drives the replica (FreeRun block)
+    else s_weStopped = false;
     const uint64_t now = GetTickCount64();
     const float dx = t.x - s_x, dy = t.y - s_y;
-    if (s_ent == (void*)e && t.speed == s_speed && dx * dx + dy * dy < 0.5f * 0.5f && now - s_ms < 2000) return;
+    if (!weStopNow && s_ent == (void*)e && t.speed == s_speed && dx * dx + dy * dy < 0.5f * 0.5f && now - s_ms < 2000) return;
     char* aic = readable((char*)e + 0xE8, 4) ? *(char**)((char*)e + 0xE8) : nullptr;
     char* svc = (aic && readable(aic + 0x94, 4)) ? *(char**)(aic + 0x94) : nullptr;
     if (!readable(svc, 0x110) || *(const unsigned*)svc != kNavSvcVt ||
@@ -2298,6 +2346,11 @@ static void NativeReplicaNavTick(Entity* e) {
     }
     alignas(16) float pos[4] = { t.x, t.y, t.z, 1.0f };
     alignas(16) float dir[4] = { t.hx, t.hy, 0.0f, 0.0f };
+    if (weStopNow) {   // one Stop request at the replica's own position (NavigationSpeed 1 = Stop, PS3 cu 12, DIE 0x2C411B)
+        pos[0] = e->m_GlobalMatrix.M41; pos[1] = e->m_GlobalMatrix.M42; pos[2] = e->m_GlobalMatrix.M43;
+        t.speed = 1; s_weStopped = true; InterlockedIncrement(&s_nrWeStops);
+        L("[Replica] wall entry: final approach - navigation stopped, IHumanGround drives\n");
+    }
     typedef int (__thiscall* NavTo_t)(void*, const float*, int, int, int, float, int, const float*, void*, float, int, float, float);
     const int ok = ((NavTo_t)kNavigateToPosition)(svc, pos, t.speed, 0, 1, 0.5f, 0, dir, nullptr, 0.985f, -1, 4.5f, 1.0f);
     InterlockedIncrement(&s_nrNavCalls);

@@ -1061,6 +1061,15 @@
    "size": 12,
    "status": "unknown"
   },
+  "01CE0A40": {
+   "addr": "01CE0A40",
+   "claimed_at": null,
+   "name": "HumanGround_WallRunActionAllowed",
+   "owner": null,
+   "receipts": [],
+   "size": 172,
+   "status": "unknown"
+  },
   "01D51690": {
    "addr": "01D51690",
    "claimed_at": null,
