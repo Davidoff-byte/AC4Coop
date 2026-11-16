@@ -7611,7 +7611,7 @@ int __cdecl OwnerDamageShouldBlock(unsigned int svc, int value) {
         if (cur < 0 || maxL < 1) return 0;                       // a local corpse, or not a valid service: engine as usual
         if (value >= cur) { InterlockedIncrement(&s_odPassedHeal); return 0; }   // heal / init / no change: not damage
         const int dmg = cur - (value < 0 ? -1 : value);           // a kill (value < 0) asks for the whole remaining life
-        uint32_t pm = (uint32_t)((dmg * 1000 + maxL - 1) / maxL); if (pm < 1) pm = 1;
+        uint32_t pm = (uint32_t)((dmg * 1000 + maxL / 2) / maxL); if (pm < 1) pm = 1;   // nearest (ceil here + ceil on the host gave 6 for 5)
         const LONG h = InterlockedIncrement(&s_odHead) - 1;
         if (h - s_odTail >= 64) { InterlockedIncrement(&s_odDropped); return 1; }
         OdReq& r = s_odRing[h & 63]; r.objId = objId; r.permille = pm; InterlockedExchange(&r.ready, 1);
@@ -7642,9 +7642,9 @@ static void OwnerDamageGuestPump() {
 // Host, player frame (from the intent drain): apply the delta of a guard's running total, owner decides death.
 static void OwnerDamageHostApply(uint64_t objId, uint32_t total) {
     if (s_odOn != 1 || g_entHost != 1) return;
-    static struct { uint64_t objId; uint32_t last; } seen[256]; static int nSeen = 0;
+    static struct { uint64_t objId; uint32_t last; int applied; } seen[256]; static int nSeen = 0;
     int k = -1; for (int i = 0; i < nSeen; ++i) if (seen[i].objId == objId) { k = i; break; }
-    if (k < 0) { if (nSeen >= 256) return; k = nSeen++; seen[k].objId = objId; seen[k].last = 0; }
+    if (k < 0) { if (nSeen >= 256) return; k = nSeen++; seen[k].objId = objId; seen[k].last = 0; seen[k].applied = 0; }
     if (total <= seen[k].last) return;                            // replay / duplicate: nothing new
     const uint32_t delta = total - seen[k].last; seen[k].last = total;
     // The host's own capture map first (objId -> entity, as ApplyPeerHealth): the engine registry does not resolve these
@@ -7658,7 +7658,12 @@ static void OwnerDamageHostApply(uint64_t objId, uint32_t total) {
         if (!HostHpSvcValid(svc)) { InterlockedIncrement(&s_odHostUnres); return; }
         const int cur = (int)*(int16_t*)(svc + 0x5C), maxL = (int)*(int16_t*)(svc + 0x5E);
         if (cur < 0) return;                                      // already dead here
-        const int dmg = (int)((delta * (uint32_t)maxL + 999) / 1000);
+        // Damage from the running total, rounded once: target = round(total * max / 1000), applied = what this guard has
+        // already taken from requests; no per-hit rounding error accumulates (run 13072: 5 requested, 6 applied per hit).
+        const int target = (int)((total * (uint32_t)maxL + 500) / 1000);
+        const int dmg = target - seen[k].applied;
+        if (dmg <= 0) return;
+        seen[k].applied = target;
         const int want = cur - dmg;
         if (want <= 0) {
             const bool killed = KillGuardEntity(e);               // the proven host kill (kill relay path)
@@ -7693,6 +7698,11 @@ __declspec(naked) static void OwnerDamageDetour() {
     }
 }
 void Phase1_OwnerDamageInstall() {
+    // Read the session-start defaults that follow [Coop] FightIntents NOW (DllMain), not lazily: a lazy first read can
+    // land after a test runner restored the ini (run 13072: DamageRelay read FightIntents=0 after the restore, so copies
+    // never showed the host's health).
+    (void)DamageRelayEnabled(); (void)BindLockOn(); (void)WideBindRadiusM();
+    L("[OD] session defaults: DamageRelay=%d BindLock=%d BindRadiusM=%.0f\n", DamageRelayEnabled(), BindLockOn() ? 1 : 0, (double)WideBindRadiusM());
     if (!OwnerDamageOn()) { L("[OD] OwnerDamage=0: SetLife not hooked\n"); return; }
     static const BYTE kPro[6] = { 0x55, 0x8B, 0xEC, 0x56, 0x8B, 0xF1 };
     BYTE* site = (BYTE*)(GameModuleBase + (0x019FB4C0 - 0x00400000));
