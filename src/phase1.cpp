@@ -7647,10 +7647,14 @@ static void OwnerDamageHostApply(uint64_t objId, uint32_t total) {
     if (k < 0) { if (nSeen >= 256) return; k = nSeen++; seen[k].objId = objId; seen[k].last = 0; }
     if (total <= seen[k].last) return;                            // replay / duplicate: nothing new
     const uint32_t delta = total - seen[k].last; seen[k].last = total;
-    Entity* e = ResolveEntityById(objId);
+    // The host's own capture map first (objId -> entity, as ApplyPeerHealth): the engine registry does not resolve these
+    // runtime-minted F000xxxx ids (run 13664: ResolveEntityById(F00036E1) missed for a guard the host was sending).
+    unsigned int ment = 0, mhp = 0;
+    Entity* e = ObjMapFind(objId, &ment, &mhp) ? (Entity*)ment : ResolveEntityById(objId);
     if (!readable(e, 0x80)) { InterlockedIncrement(&s_odHostUnres); L("[OD] host objId=%016llX unresolved (+%u)\n", (unsigned long long)objId, delta); return; }
     __try {
-        const unsigned int svc = FindHealthInAI((unsigned int)AIEntityHelper::GetEntityAI(e));
+        unsigned int svc = HostHpSvcValid(mhp) ? mhp : 0;
+        if (!svc) svc = FindHealthInAI((unsigned int)AIEntityHelper::GetEntityAI(e));
         if (!HostHpSvcValid(svc)) { InterlockedIncrement(&s_odHostUnres); return; }
         const int cur = (int)*(int16_t*)(svc + 0x5C), maxL = (int)*(int16_t*)(svc + 0x5E);
         if (cur < 0) return;                                      // already dead here
@@ -7843,7 +7847,11 @@ static uint64_t FiCanonicalId(Entity* e) {
 }
 static Entity* FiResolve(uint64_t id) {
     if (!id) return nullptr;
-    if (g_entHost == 1) return ResolveEntityById(id);
+    if (g_entHost == 1) {   // host: its capture map first; the registry misses runtime-minted ids (S9 run 13664)
+        unsigned int ment = 0, mhp = 0;
+        if (ObjMapFind(id, &ment, &mhp) && ment) return (Entity*)ment;
+        return ResolveEntityById(id);
+    }
     unsigned int e = GuestObjFind(id);
     if (!e) e = GuestObjFindResolve(id);
     return (Entity*)e;
