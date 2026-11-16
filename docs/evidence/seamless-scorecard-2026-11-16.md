@@ -66,3 +66,20 @@ every run.
 - **The puppet's maxD varies from run to run** (0.33 – 0.63 m on the same move script). The new 3D / frame-time numbers
   show the two latest runs had a real pop: 0.52-0.56 m in one 17 ms frame (32 m/s, about 4× a sprint). Earlier "pops"
   of 0.5 m were partly the metric (XZ + |dY| overstates diagonal moves by up to 41%).
+
+## Where the puppet's largest frames happen (runs 28388/22128 and 33500/26780, asi 82d491fe)
+`[Smooth]` now names the largest frame's context (and the previous frame's), and which interpolation path produced it.
+
+| run | window maxima (3D m / frame ms / m/s / context / path) |
+|---|---|
+| 28388/22128 | 0.12/17/7 ctx4; **0.37/34/14 ctx9**; 0.16/19/9 ctx30; 0.33/35/14 ctx6→4; **0.29/17/17 ctx6** |
+| 33500/26780 | 0.12/18/7 ctx4; 0.19/17/11 ctx6; 0.06/18/4 ctx10; 0.15/17/9 ctx30; **0.26/16/16 ctx6** |
+
+- All are path `i` (interpolated between two samples); none is extrapolation, hold or clamp.
+- The largest frames are in the air (ctx 6) and in free-run (ctx 9), at 14-17 m/s, or come from a 34 ms frame.
+  Air at 16-17 m/s is plausible for a fall, but whether these frames are pops is **not settled**. The interpolation is
+  linear between 20 Hz samples, so a curved jump path is cut into chords, which a ballistic or curve-aware
+  interpolation would fix. UNVERIFIED that this is the cause.
+- Both runs pass the 0.5 m bar (0.40 and 0.28 m). Over the 8 scorecard runs today the bar passed 5 times and failed
+  3 times (0.549-0.631). In the two failures with the 3D metric, the frame was 0.52-0.56 m in 17 ms; their context was
+  not recorded yet.

@@ -11773,8 +11773,16 @@ static double   s_appliedMax    = 0.0;
 // frame: the true 3D distance of the largest frame, that frame's duration, and the largest per-frame speed.
 static double   s_appliedMax3 = 0.0, s_appliedMaxDtMs = 0.0, s_appliedMaxV = 0.0;
 static uint64_t s_appliedLastUs = 0;
-static void NoteAppliedPos(float x, float y, float z) {
+static int      s_appliedMaxCtx = -1, s_appliedMaxPrevCtx = -1; static char s_appliedMaxPath = '-';   // the largest frame's context + path
+static void NoteAppliedPos(float x, float y, float z, int ctx = -1) {
     const uint64_t nowUs = OwnNowUs();
+    // Which interpolation path produced THIS frame: the counter that moved since the last call (i interp, h hold,
+    // e extrapolate, c clamp, t equal-time). Several can move in one frame; the first non-interp one is reported.
+    static uint32_t s_pI = 0, s_pH = 0, s_pE = 0, s_pC = 0, s_pT = 0; static int s_prevCtx = -1;
+    char path = '-';
+    if (s_holdFrames != s_pH) path = 'h'; else if (s_extrapFrames != s_pE) path = 'e'; else if (s_clampFrames != s_pC) path = 'c';
+    else if (s_eqTFrames != s_pT) path = 't'; else if (s_interpFrames != s_pI) path = 'i';
+    s_pI = s_interpFrames; s_pH = s_holdFrames; s_pE = s_extrapFrames; s_pC = s_clampFrames; s_pT = s_eqTFrames;
     if (s_appliedValid) {
         float dx = x - s_appliedPos[0], dy = y - s_appliedPos[1], dz = z - s_appliedPos[2];
         double d = (double)sqrtf(dx * dx + dz * dz) + (double)fabsf(dy);
@@ -11782,11 +11790,11 @@ static void NoteAppliedPos(float x, float y, float z) {
         if (d > s_appliedMax) s_appliedMax = d;
         const double d3 = (double)sqrtf(dx * dx + dy * dy + dz * dz);
         const double dtMs = s_appliedLastUs && nowUs > s_appliedLastUs ? (double)(nowUs - s_appliedLastUs) / 1000.0 : 0.0;
-        if (d3 > s_appliedMax3) { s_appliedMax3 = d3; s_appliedMaxDtMs = dtMs; }
+        if (d3 > s_appliedMax3) { s_appliedMax3 = d3; s_appliedMaxDtMs = dtMs; s_appliedMaxCtx = ctx; s_appliedMaxPrevCtx = s_prevCtx; s_appliedMaxPath = path; }
         if (dtMs >= 4.0 && d3 / (dtMs / 1000.0) > s_appliedMaxV) s_appliedMaxV = d3 / (dtMs / 1000.0);
         ++s_appliedFrames;
     }
-    s_appliedPos[0] = x; s_appliedPos[1] = y; s_appliedPos[2] = z; s_appliedValid = 1; s_appliedLastUs = nowUs;
+    s_appliedPos[0] = x; s_appliedPos[1] = y; s_appliedPos[2] = z; s_appliedValid = 1; s_appliedLastUs = nowUs; s_prevCtx = ctx;
 }
 
 static void norm3(float* v) {
@@ -12916,10 +12924,11 @@ static void OnFrameInner(Human* updatedHuman) {
             // interpolation path produced it. This is the before/after signal - not an opinion.
             {
                 double avgD = s_appliedFrames ? s_appliedSum / (double)s_appliedFrames : 0.0;
-                L("[Smooth] frames=%u hold=%u ext=%u clamp=%u eqT=%u drop=%u wipe=%u extra=%u avgD=%.4f maxD=%.4f maxD3=%.4f dtAtMax=%.1fms maxV=%.1f\n",
+                L("[Smooth] frames=%u hold=%u ext=%u clamp=%u eqT=%u drop=%u wipe=%u extra=%u avgD=%.4f maxD=%.4f maxD3=%.4f dtAtMax=%.1fms maxV=%.1f atMax=ctx%d<-ctx%d/%c\n",
                   s_interpFrames, s_holdFrames, s_extrapFrames, s_clampFrames, s_eqTFrames,
-                  s_reorderDrops, s_wipeCount, s_batchExtra, avgD, s_appliedMax, s_appliedMax3, s_appliedMaxDtMs, s_appliedMaxV);
-                s_appliedMax3 = s_appliedMaxDtMs = s_appliedMaxV = 0.0;
+                  s_reorderDrops, s_wipeCount, s_batchExtra, avgD, s_appliedMax, s_appliedMax3, s_appliedMaxDtMs, s_appliedMaxV,
+                  s_appliedMaxCtx, s_appliedMaxPrevCtx, s_appliedMaxPath);
+                s_appliedMax3 = s_appliedMaxDtMs = s_appliedMaxV = 0.0; s_appliedMaxCtx = s_appliedMaxPrevCtx = -1; s_appliedMaxPath = '-';
                 s_interpFrames = s_holdFrames = s_extrapFrames = s_clampFrames = 0;
                 s_eqTFrames = s_reorderDrops = s_wipeCount = s_batchExtra = 0;
                 s_appliedFrames = 0; s_appliedSum = 0.0; s_appliedMax = 0.0;
@@ -13480,7 +13489,7 @@ static void OnFrameInner(Human* updatedHuman) {
                                 pr.matrix.M21 = sm.M21; pr.matrix.M22 = sm.M22; pr.matrix.M23 = sm.M23;
                                 pr.matrix.M31 = sm.M31; pr.matrix.M32 = sm.M32; pr.matrix.M33 = sm.M33;
                                 Phase1::ApplyRemoteState(pr);
-                                NoteAppliedPos(pr.matrix.M41, pr.matrix.M42, pr.matrix.M43);
+                                NoteAppliedPos(pr.matrix.M41, pr.matrix.M42, pr.matrix.M43, (int)pr.contextId);
                                 placedOnDeck = true;
                                 if (!s_passengerWasOn) {
                                     s_passengerWasOn = true;
@@ -13499,7 +13508,7 @@ static void OnFrameInner(Human* updatedHuman) {
                             L("[Ship] passenger: peer off ship -> normal placement\n");
                         }
                         Phase1::ApplyRemoteState(remote);
-                        NoteAppliedPos(remote.matrix.M41, remote.matrix.M42, remote.matrix.M43);
+                        NoteAppliedPos(remote.matrix.M41, remote.matrix.M42, remote.matrix.M43, (int)remote.contextId);
                     }
                 }
             }
