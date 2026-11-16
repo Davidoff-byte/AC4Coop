@@ -72,3 +72,16 @@ EnterFight, then the pad sequence (`real_fight.py`).
   - `ApplyRelayedHealth` writes the host's absolute life clamped to the local max. With different maxes (36 vs 30 seen
     earlier) the copy's proportion is off. The host max is not on the wire.
   - A partial hit from real combat was not captured.
+
+## More non-lethal hits, and the max-life question (2026-11-16 afternoon, host 29420 / guest 23296, asi 67a20fa2)
+- `pilot.py lifehit ENT 5` on the guest's linked copies:
+  - soldiers (max 36), 2 of 4 linked; the other 2 were unlinked bodies, so not blocked;
+  - pirates at (110,-72) (max 50), 8 of 8 linked.
+- Every blocked hit was applied exactly on the host. For example `[OD] host apply objId=F0006F4B ... life 50 -> 45 (max 50,
+  +100 permille)`, and for an already hurt one `F0007113 life 10 -> 5`. The copy then showed the host's value:
+  `[Mirror] hp relay ... life 50 -> 45 (host 45 of max-seen 50, local max 50)`.
+- **Different max life:** in 10 of 10 linked pairs the max was equal on both sides (36/36, 50/50). Links have
+  required the same archetype since the BindLock work, so the earlier 36-vs-30 case may not happen now (not proven).
+- The host max is not on the wire. `ApplyRelayedHealth` now keeps the highest Life the host sent per guard as its max,
+  and can scale to the local max behind **`[Coop] HpRelayScale`** (default 0). This is a heuristic: a guard first seen
+  already hurt reads as full until a higher value arrives. Not exercised live, because no mismatch occurred.

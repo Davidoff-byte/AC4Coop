@@ -6553,14 +6553,29 @@ static void ApplyRelayedHealth(uint64_t objId, Entity* e, const EntityState& es)
         if (cur < 0) return;                                  // never revive a corpse
         if ((*(unsigned int*)(svc + 0x60) & 0x01000000u) != 0) return;   // engine dead flag
         const int maxLife = (int)*(int16_t*)(svc + 0x5E);     // HostHpSvcValid proved 1..2000
-        int want = relayed;
+        // Scale to the local max. The host's max is not on the wire (EntityState carries Life only; adding it is a
+        // protocol change), so the host max is taken as the highest Life the host has sent for this guard: guards
+        // start and regenerate to full. HEURISTIC, labelled: a guard first seen already hurt reads as full here until
+        // the host sends a higher value. Seen before: host 36 vs guest body 30 (s9-owner-damage-2026-11-16.md).
+        static struct { uint64_t objId; int hostMax; } s_hmax[256]; static int s_hmaxN = 0, s_hmaxNext = 0;
+        int hk = -1;
+        for (int i = 0; i < s_hmaxN; ++i) if (s_hmax[i].objId == objId) { hk = i; break; }
+        if (hk < 0) { hk = (s_hmaxN < 256) ? s_hmaxN++ : (s_hmaxNext++ & 255); s_hmax[hk].objId = objId; s_hmax[hk].hostMax = 0; }
+        if (relayed > s_hmax[hk].hostMax) s_hmax[hk].hostMax = relayed;
+        const int hostMax = s_hmax[hk].hostMax;
+        // [Coop] HpRelayScale (default 0, read once): the scaling is behind a flag until a max mismatch is seen live. Run
+        // 29420/23296 (asi 67a20fa2): 10 of 10 linked pairs had equal max (36/36, 50/50) since links match archetype.
+        static int s_scale = -1;
+        if (s_scale < 0) s_scale = GetPrivateProfileIntA("Coop", "HpRelayScale", 0, Paths::Ini()) != 0 ? 1 : 0;
+        int want = (s_scale == 1 && hostMax > 0 && hostMax != maxLife) ? (relayed * maxLife + hostMax / 2) / hostMax : relayed;
+        if (want < 1) want = 1;                               // alive on the host: never 0 here (death has its own lane)
         if (want > maxLife) want = maxLife;                   // already at/over max: no write
         if (want <= 0 || want == cur) return;                 // idempotent: one write per real change
         t_odRelay = 1; ((int (__thiscall*)(void*, int))0x19FB4C0)((void*)svc, want); t_odRelay = 0;   // CSrvNPCHealth::SetLife
         static int s_hpRelayLines = 0;
         if (s_hpRelayLines < 20) { ++s_hpRelayLines;
-            L("[Mirror] hp relay objId=%llu ent=%08X life %d -> %d (host %d, local max %d)\n",
-              (unsigned long long)objId, ent, cur, want, relayed, maxLife); }
+            L("[Mirror] hp relay objId=%llu ent=%08X life %d -> %d (host %d of max-seen %d, local max %d)\n",
+              (unsigned long long)objId, ent, cur, want, relayed, hostMax, maxLife); }
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
