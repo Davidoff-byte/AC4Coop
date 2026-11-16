@@ -52,5 +52,9 @@ Both crashes are guest `0xC0000005` with WER dumps, read with cdb (x86, no symbo
 - The heap-corruption assert (32460): one occurrence; no repeat in these 16 runs.
 
 ## Decision (owner, 2026-11-16)
-Both flags now default to 1 (src/phase1.cpp PabOn / MirrorActionsDeferred and the config table). The D: test install's explicit`nPuppetActionsOwnUpdate=0 was changed to 1. An explicit 0 in an ini still turns either off.
+Both flags now default to 1 (src/phase1.cpp PabOn / MirrorActionsDeferred and the config table). The D: test install's explicit
+`PuppetActionsOwnUpdate=0` was changed to 1. An explicit 0 in an ini still turns either off.
+- Check after the change (commit bfa6e4c, asi c2b7253b...): one two-copy run with neither flag set in `-Set` logged
+  `CFG Coop.MirrorActionsDeferred=1 (default)` and `PuppetActionsOwnUpdate=1` on both copies (4236 / 25736), and finished with
+  no crash.
 
