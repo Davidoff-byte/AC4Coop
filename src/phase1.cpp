@@ -3873,6 +3873,154 @@ static void BoardableTestTick() {
     }
 }
 
+// ---- Ship field probe: [Coop] ShipFields (default 0), READ-ONLY -------------------------------
+// Every offset below is REFLECTION-VERIFIED against the engine's own property table (2026-11-16):
+//   GcLShip (classinfo 0x028F0C38, size 0xB70)
+//     +0xCC   SailState                       Enum (0 Up, 1 Half, 2 Full, 3 AnimusTravel, 4 Count)
+//     +0x13C  BoardingDecisionMenuMask        U32
+//     +0x148  CachedShipAIDectionSettings     ObjectPtr -> ShipAIDetectionSettings
+//     +0x14C  OverriddenShipAIDectionSettings Handle    -> ShipAIDetectionSettings
+//     +0x399  IsPlayerDrivable                Bool
+//     +0x39A  CaptainAtWheel                  Bool
+//     +0x39E  IsPlayerSoloBoarding            Bool
+//     +0x3A9  IsBoardable                     Bool (the engine's own setter sub_1207960 writes it)
+//     +0x3AB  IsAbortBoardingAllowed          Bool
+//     +0x68   HealthOverride                  Reference -> ShipHealthData
+//   ShipHealthData: +0x8 HullHealth, +0xC ReinforcedHullDamageReducer, +0x10 AmmoDamageTakenModifier
+//   ShipAIDetectionSettings: Day ShipAIDetection at +0x8, HighSecurityZone at +0x40 (0x38 B each)
+//   ShipAIDetection: +0x4 DetectionConeAngle, +0x8 DetectionConeRange, +0x10 DetectionMaxTime,
+//                    +0x2C AggroTime
+//   PerceptionHandler (classinfo 0x0295E2B8): +0x5C ActivePerceptionValues Handle,
+//     +0x60 ActiveDetectionValues Handle, +0x64 PerceptionValuesOverrideStack,
+//     +0x6C DetectionValuesOverrideStack
+// This tick writes NOTHING. Every value goes through readable(); a null pointer logs null.
+// UNVERIFIED: the DEREF FORM of the three reference-typed slots (+0x148 ObjectPtr, +0x14C Handle,
+// +0x68 Reference). A wrong form surfaces as an unreadable pointer (logged as null), never a fault.
+// No wire change: sail sync would touch PlayerState / NET_PROTO_VER 16 and is deliberately NOT here;
+// the probe only reports sail=%d with the enum name so the next pass has the data.
+static int s_shipFields = -1;
+static inline int ShipFieldsOn() {
+    if (s_shipFields < 0) s_shipFields = GetPrivateProfileIntA("Coop", "ShipFields", 0, Paths::Ini()) != 0 ? 1 : 0;
+    return s_shipFields;
+}
+// SailState names, so the probe's data is self-describing without a table lookup.
+static const char* SailStateName(int v) {
+    switch (v) {
+    case 0: return "Up";
+    case 1: return "Half";
+    case 2: return "Full";
+    case 3: return "AnimusTravel";
+    case 4: return "Count";
+    default: return "?";
+    }
+}
+// ShipHealthData for a GcLShip (+0x68 HealthOverride, a 4-byte reference), or null when the target does
+// not validate as a readable ShipHealthData (through +0x10).
+static void* ShipHealthDataOf(void* gcl) {
+    if (!gcl || !readable((char*)gcl + 0x68, 4)) return nullptr;
+    void* hd = *(void**)((char*)gcl + 0x68);
+    return readable(hd, 0x14) ? hd : nullptr;
+}
+// ShipAIDetectionSettings for a GcLShip: cached ObjectPtr (+0x148) preferred, else the override Handle
+// (+0x14C, resolved through handleDeref). Null unless both inline ShipAIDetection blocks read.
+static void* ShipAIDetOf(void* gcl) {
+    if (!gcl) return nullptr;
+    void* p = readable((char*)gcl + 0x148, 4) ? *(void**)((char*)gcl + 0x148) : nullptr;
+    if (!readable(p, 0x40 + 0x38)) {
+        void* hc = readable((char*)gcl + 0x14C, 4) ? *(void**)((char*)gcl + 0x14C) : nullptr;
+        p = hc ? handleDeref(hc) : nullptr;
+    }
+    return readable(p, 0x40 + 0x38) ? p : nullptr;
+}
+// One probe line for a ship entity. Read-only; a null/unreadable GcLShip logs null, never derefs.
+static void ShpFLogOne(const char* who, void* ent) {
+    __try {
+        void* gcl = ent ? ShipGcLObj(ent) : nullptr;
+        if (gcl && !readable((char*)gcl + 0x3AC, 1)) gcl = nullptr;
+        const int  sail  = gcl ? *(int*)((char*)gcl + 0xCC) : -1;
+        const uint32_t mask = gcl ? *(uint32_t*)((char*)gcl + 0x13C) : 0u;
+        const int  drv   = gcl ? (int)*(unsigned char*)((char*)gcl + 0x399) : 0;
+        const int  cap   = gcl ? (int)*(unsigned char*)((char*)gcl + 0x39A) : 0;
+        const int  solo  = gcl ? (int)*(unsigned char*)((char*)gcl + 0x39E) : 0;
+        const int  board = gcl ? (int)*(unsigned char*)((char*)gcl + 0x3A9) : 0;
+        const int  abort = gcl ? (int)*(unsigned char*)((char*)gcl + 0x3AB) : 0;
+        void* aiDet = gcl ? (readable((char*)gcl + 0x148, 4) ? *(void**)((char*)gcl + 0x148) : nullptr) : nullptr;
+        void* aiHc  = gcl ? (readable((char*)gcl + 0x14C, 4) ? *(void**)((char*)gcl + 0x14C) : nullptr) : nullptr;
+        void* hpRaw = gcl ? (readable((char*)gcl + 0x68, 4) ? *(void**)((char*)gcl + 0x68) : nullptr) : nullptr;
+        void* hull  = gcl ? ShipHealthDataOf(gcl) : nullptr;
+        L("[ShpF] who=%s ent=%p gcl=%p sail=%d(%s) mask=%08X drivable=%d captain=%d solo=%d boardable=%d abort=%d aiDet=%p aiOvr=%p hp=%p hull=%p\n",
+          who, ent, gcl, sail, SailStateName(sail), mask, drv, cap, solo, board, abort, aiDet, aiHc, hpRaw, hull);
+        void* ai = gcl ? ShipAIDetOf(gcl) : nullptr;
+        if (ai) {
+            const char* d = (const char*)ai + 0x8;               // Day ShipAIDetection
+            L("[ShpF] who=%s cone=%.1f range=%.1f maxTime=%.1f aggro=%.1f\n", who,
+              *(float*)(d + 0x4), *(float*)(d + 0x8), *(float*)(d + 0x10), *(float*)(d + 0x2C));
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        L("[ShpF] who=%s EXCEPTION code=0x%08X\n", who, GetExceptionCode());
+    }
+}
+// Does the puppet carry a PerceptionHandler? Components are walked exactly as FindComponentByVtable does
+// (entity+0x60 array, entity+0x66 authoritative count). The reflection table gives the classinfo
+// (0x0295E2B8), not the vtable, so both plausible slots are tried: +0 (which is the vtable for the
+// classes we match elsewhere) and the word just below it (classinfo back-pointer). If neither matches,
+// every component's vtable is enumerated so the next pass can name it.
+static void PercProbePuppet() {
+    Entity* p = g_puppet;
+    if (!p) { L("[Perc] puppet=null\n"); return; }
+    __try {
+        if (!readable(p, 0x68)) { L("[Perc] puppet=%p entity unreadable - skipped\n", p); return; }
+        const unsigned short n = *(unsigned short*)((uint8_t*)p + 0x66);
+        void** arr = *(void***)((uint8_t*)p + 0x60);
+        if (!n || n > 96 || !readable(arr, 4u * n)) { L("[Perc] puppet=%p comps=%u unreadable\n", p, (unsigned)n); return; }
+        void* handler = nullptr;
+        for (unsigned short i = 0; i < n; ++i) {
+            void* c = arr[i];
+            if (!readable(c, 4)) continue;
+            if (*(uint32_t*)c == 0x0295E2B8u) { handler = c; break; }
+            if (readable((char*)c - 4, 4) && *(uint32_t*)((char*)c - 4) == 0x0295E2B8u) { handler = c; break; }
+        }
+        if (!handler) {
+            L("[Perc] puppet=%p handler=null comps=%u\n", p, (unsigned)n);
+            for (unsigned short i = 0; i < n && i < 8; ++i) {
+                void* c = arr[i];
+                const uint32_t vt = (c && readable(c, 4)) ? *(uint32_t*)c : 0u;
+                const uint32_t ci = (c && readable((char*)c - 4, 4)) ? *(uint32_t*)((char*)c - 4) : 0u;
+                L("[Perc]   comp[%u]=%p vt=%08X before=%08X\n", (unsigned)i, c, vt, ci);
+            }
+            return;
+        }
+        if (!readable((char*)handler + 0x70, 1)) { L("[Perc] puppet=%p handler=%p unreadable\n", p, handler); return; }
+        void* pv = *(void**)((char*)handler + 0x5C);   // ActivePerceptionValues Handle
+        void* dv = *(void**)((char*)handler + 0x60);   // ActiveDetectionValues Handle
+        void* ps = *(void**)((char*)handler + 0x64);   // PerceptionValuesOverrideStack
+        void* ds = *(void**)((char*)handler + 0x6C);   // DetectionValuesOverrideStack
+        // UNVERIFIED: the stacks' own layout is not in the reflection table; the first dword is reported
+        // as a candidate count and nothing is inferred beyond that.
+        const unsigned pu = (ps && readable(ps, 4)) ? *(unsigned*)ps : 0u;
+        const unsigned du = (ds && readable(ds, 4)) ? *(unsigned*)ds : 0u;
+        L("[Perc] puppet=%p handler=%p percVals=%p detVals=%p stacks=%u/%u\n", p, handler, pv, dv, pu, du);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        L("[Perc] EXCEPTION code=0x%08X\n", GetExceptionCode());
+    }
+}
+// Called from OnFrameInner. Returns immediately when the flag is off, so the default path is unchanged.
+static void ShipFieldsTick() {
+    if (!ShipFieldsOn()) return;
+    static DWORD s_next = 0;
+    const DWORD now = GetTickCount();
+    if (now < s_next) return;
+    s_next = now + 1000;
+    __try {
+        void* local = (void*)GetLocalShip();
+        ShpFLogOne("local", local);
+        if (g_ghostShip) ShpFLogOne("ghost", g_ghostShip);
+        PercProbePuppet();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        L("[ShpF] EXCEPTION code=0x%08X\n", GetExceptionCode());
+    }
+}
+
 // Choose a naval-list ship to duplicate as the peer's class. Walks [mgr+0x3E8] (handle containers,
 // stride 0xD0, count u16 @ +0x3EE).
 //
@@ -12933,6 +13081,7 @@ static void DumpConfigOnce()
         { "Coop", "PuppetParkX", 0 }, { "Coop", "PuppetPhysics", 0 }, { "Coop", "RegisterPad1", 0 },
         { "Coop", "RelevanceRadiusM", 250 }, { "Coop", "ReloadBuilder", 1 }, { "Coop", "SceneAwareExact", 0 },
         { "Coop", "SeekOnSwitch", 1 }, { "Coop", "SkelAttach", 0 }, { "Coop", "ShipDump", 0 }, { "Coop", "ShipDumpFloats", 0 },
+        { "Coop", "ShipFields", 0 },
         { "Coop", "ShipGhost", 0 }, { "Coop", "ShipGhostSelfTest", 0 }, { "Coop", "ShipHPSync", 0 },
         { "Coop", "ShipPassenger", 0 }, { "Coop", "ShipRelevanceRadiusM", 1000 }, { "Coop", "ShipSync", 1 },
         { "Coop", "ShipTest", 0 }, { "Coop", "ShipTestFracPct", 45 }, { "Coop", "ShipTestRadiusM", 250 },
@@ -13342,6 +13491,8 @@ static void OnFrameInner(Human* updatedHuman) {
     // F8 live test (no-op unless [Coop] BoardableTest=1). Must sit ABOVE the Net::Enabled() block: that block always
     // returns, so anything after it never runs in a networked session (first placement, 19788a1, never fired).
     BoardableTestTick();
+    // Ship field probe: [Coop] ShipFields (default 0), read-only; returns at once when off.
+    ShipFieldsTick();
     if (Net::Enabled()) {
         EntitySyncTick();   // host broadcasts entity transforms; peer mirrors them (synced worlds)
         // Capture only succeeds in a real playable world (not title/whiteroom). Require it to be
