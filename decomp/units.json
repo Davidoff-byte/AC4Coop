@@ -746,6 +746,15 @@
    "size": 72,
    "status": "claimed"
   },
+  "010EFC30": {
+   "addr": "010EFC30",
+   "claimed_at": null,
+   "name": "FightDamageEventNew",
+   "owner": null,
+   "receipts": [],
+   "size": 172,
+   "status": "unknown"
+  },
   "01207960": {
    "addr": "01207960",
    "claimed_at": null,
@@ -1021,6 +1030,15 @@
    ],
    "size": 56,
    "status": "claimed"
+  },
+  "018BD690": {
+   "addr": "018BD690",
+   "claimed_at": null,
+   "name": "FightDamageEventInit",
+   "owner": null,
+   "receipts": [],
+   "size": 240,
+   "status": "unknown"
   },
   "018DAC60": {
    "addr": "018DAC60",

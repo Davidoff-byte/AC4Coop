@@ -23,6 +23,10 @@ ap.add_argument('--x', type=float, default=30.0)
 ap.add_argument('--y', type=float, default=-75.0)
 ap.add_argument('--sec', type=float, default=40.0)
 ap.add_argument('--counter', action='store_true')
+ap.add_argument('--mode', choices=['mixed', 'counter-only', 'none'], default='mixed',
+                help='counter-only: B only after engaging (a counter is then the only way to hurt a soldier); none: no buttons')
+ap.add_argument('--provoke', type=int, default=4, help='counter-only: X strikes first, to start the fight (0 = none)')
+ap.add_argument('--no-goto', action='store_true', help='fight where the player stands (no walk, no slot EnterFight)')
 a = ap.parse_args()
 
 p = pilot.Pilot(a.pid)
@@ -57,16 +61,16 @@ def hold(sec, **kw):
 subprocess_goto = [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pilot.py'), '--pid', str(a.pid),
                    'goto', str(a.x), str(a.y), '--run', '--timeout', '60']
 import subprocess  # noqa: E402
-print(subprocess.run(subprocess_goto, capture_output=True, text=True).stdout.strip().splitlines()[-1:], flush=True)
-
-me, near = soldiers(15.0)
-if not near:
-    print('no soldier within 15 m', flush=True)
-    sys.exit(2)
-d, tgt = near[0]
-st = p.ctl_send_u32(13, [0, 75, 76, 1 | (1 << 8), tgt['ent']])
-print(f'engage ent={tgt["ent"]:08X} d={d:.1f} m slot EnterFight status {st} soldiers in 15 m: {len(near)}', flush=True)
-time.sleep(0.3)
+if not a.no_goto:
+    print(subprocess.run(subprocess_goto, capture_output=True, text=True).stdout.strip().splitlines()[-1:], flush=True)
+    me, near = soldiers(15.0)
+    if not near:
+        print('no soldier within 15 m', flush=True)
+        sys.exit(2)
+    d, tgt = near[0]
+    st = p.ctl_send_u32(13, [0, 75, 76, 1 | (1 << 8), tgt['ent']])
+    print(f'engage ent={tgt["ent"]:08X} d={d:.1f} m slot EnterFight status {st} soldiers in 15 m: {len(near)}', flush=True)
+    time.sleep(0.3)
 
 t0 = time.time(); beat = 0; last_t = None
 while time.time() - t0 < a.sec:
@@ -79,6 +83,19 @@ while time.time() - t0 < a.sec:
         # world-space stick toward the target is camera-relative in the game; keep the stick neutral and let the fight
         # system's target lock aim the attack (as real_fight.py did)
     beat += 1
+    if a.mode == 'none':
+        time.sleep(0.6)
+        continue
+    if a.mode == 'counter-only':
+        # 4 strikes start the fight (guards only engage after being hit); a strike is ~4 of 36 life (111 permille), so a
+        # lethal request after these can only be a counter kill
+        if beat <= a.provoke:
+            hold(0.12, buttons=X); time.sleep(0.48)
+            if beat == a.provoke: print(f'{time.time() - t0:5.1f}s counter-only from here', flush=True)
+            continue
+        hold(0.12, buttons=B)
+        time.sleep(0.18)
+        continue
     if a.counter and beat % 4 == 0:
         hold(0.12, buttons=B)
     else:

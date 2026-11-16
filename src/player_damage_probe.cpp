@@ -33,13 +33,14 @@ void* Phase1_PuppetEntity();
 void Phase1_PuppetHitPosted(uintptr_t attacker, int damage, uint32_t contact, uint32_t subtype, uint32_t f18, uint8_t flags);
 
 #include "player_damage_probe.h"
+#include "attack_forward.h"
 
 namespace {
 
 const uintptr_t VT_FDE = 0x02700720, VT_DE = 0x027214B8;
 
 bool g_installed = false;   // probe counters / report
-bool g_probe = false, g_relay = false, g_relayIni = false;   // g_relay: ini AND the H1 hook is in (the sending side)
+bool g_probe = false, g_relay = false, g_relayIni = false, g_atkFwd = false;   // g_relay: ini AND the H1 hook is in (the sending side)
 DWORD g_t1 = 0, g_t2 = 0, g_t3 = 0, g_t4 = 0;
 
 volatile uintptr_t g_pup = 0, g_pl = 0;
@@ -129,6 +130,46 @@ int __fastcall H1(void* ev, void* /*edx*/, void* recv)
                 const bool fde = vt == VT_FDE;
                 Count(w, fde ? C_FDE_POST : C_DE_POST);
                 if (!r) Count(w, fde ? C_FDE_NOL : C_DE_NOL);
+                // Attack-forwarding RE (2026-11-16): who posts a FightDamageEvent to the local player, per phase (FDE+0x54),
+                // and the whole event once per (phase, caller). Frames from RtlCaptureStackBackTrace (the game's code keeps
+                // ebp frames); [0] is this wrapper's caller inside 0x64A020 / 0x64D8C0.
+                if (fde && w == 1 && g_probe) {
+                    static LONG s_bt = 0;
+                    if (InterlockedIncrement(&s_bt) <= 120) {
+                        void* fr[8] = {}; const USHORT n = RtlCaptureStackBackTrace(0, 8, fr, nullptr);
+                        const uint32_t ph = *(const uint32_t*)((const char*)ev + 0x54);
+                        Line("bt FDE->player ph=%u ev=%p n=%u %08X %08X %08X %08X %08X %08X", ph, ev, n, (unsigned)(uintptr_t)fr[1],
+                             (unsigned)(uintptr_t)fr[2], (unsigned)(uintptr_t)fr[3], (unsigned)(uintptr_t)fr[4], (unsigned)(uintptr_t)fr[5],
+                             (unsigned)(uintptr_t)fr[6]);
+                        static uintptr_t s_dumped[16]; static int s_nd = 0;
+                        const uintptr_t key = (uintptr_t)fr[2] ^ (ph << 28);
+                        bool seen = false; for (int i = 0; i < s_nd; ++i) if (s_dumped[i] == key) seen = true;
+                        if (!seen && s_nd < 16) {
+                            s_dumped[s_nd++] = key;
+                            const uint32_t* d = (const uint32_t*)ev;
+                            for (int row = 0; row < 0x170 / 4; row += 8)
+                                Line("dump ph=%u +%03X: %08X %08X %08X %08X %08X %08X %08X %08X", ph, row * 4, d[row], d[row + 1], d[row + 2],
+                                     d[row + 3], d[row + 4], d[row + 5], d[row + 6], d[row + 7]);
+                        }
+                    }
+                }
+                if (fde && w == 0 && g_atkFwd && *(const uint32_t*)((const char*)ev + 8) != 35) {
+                    const uintptr_t ah = *(const uintptr_t*)((const char*)ev + 0x58);
+                    const uintptr_t aat = ah && *(const int*)(ah + 8) < 0 ? *(const uintptr_t*)ah : 0;
+                    if (aat && *(const uintptr_t*)(aat + 0xC8) == ah) {
+                        AtkFields af; AttackForward_Capture(ev, af);
+                        af.dmg = 0;
+                        if (af.phase) {   // same gate and call as the hit-phase block below (0x18644D0 lines 343-360)
+                            const char* ff = (const char*)ev;
+                            const uint32_t ty = *(const uint32_t*)(ff + 8), su = *(const uint32_t*)(ff + 0x10);
+                            if (*(const uint8_t*)(ff + 333) && ty != 26 && *(const uint32_t*)(aat + 0x5C) && !*(const uint8_t*)(ff + 323)) {
+                                typedef int(__thiscall* DmgFn)(void*, uint32_t, void*, void*, uint32_t, void*, void*);
+                                af.dmg = ((DmgFn)0x0199A160)(*(void* const*)0x04E25974, ty, recv, (void*)aat, su, (void*)(ff + 304), (void*)ff);
+                            }
+                        }
+                        Phase1_PuppetAttackPosted(aat, af);
+                    }
+                }
                 if (fde && *(const uint32_t*)((const char*)ev + 0x54) == 1) {
                     // hit phase (0x186B390): every one is logged. FDE+0x58 = attacker handle; entity = [h+8] < 0 ? [h] : 0
                     // (0x186B3C6..0x186B3D3 `mov edi,[esi+8]; sar edi,1Fh; and edi,[esi]`).
@@ -154,7 +195,9 @@ int __fastcall H1(void* ev, void* /*edx*/, void* recv)
                     // [Coop] PlayerDamageRelay: the puppet has no fight / health services, so this hit stops here (probe
                     // runs 25140 / 19900: 0 fight-interactions, 0 DamageEvents for the puppet vs 1:1 for the player). Hand it
                     // to the puppet's owner. calc matched the engine's DamageEvent damage on 6/6 player hits (run 25140).
-                    if (g_relay && w == 0 && calc > 0 && attHc == h)
+                    // With [Coop] AttackForward the owner resolves non-35 hits natively (the forwarded phase-1 event); only
+                    // type 35 (the contact poster sub_1D1A4A0, which this forward does not rebuild) stays on the relay.
+                    if (g_relay && w == 0 && calc > 0 && attHc == h && !(g_atkFwd && type != 35))
                         Phase1_PuppetHitPosted(att, calc, *(const uint32_t*)(f + 0x20), subt, *(const uint32_t*)(f + 0x18),
                                                *(const uint8_t*)(f + 0x1C));
                 }
@@ -290,7 +333,8 @@ void PlayerDamageProbe::Init()
     const int fi = GetPrivateProfileIntA("Coop", "FightIntents", 0, Paths::Ini()) != 0 ? 1 : 0;
     g_relayIni = GetPrivateProfileIntA("Coop", "PlayerDamageRelay", fi, Paths::Ini()) != 0;
     g_relay = g_relayIni;
-    if (!g_probe && !g_relay) return;
+    g_atkFwd = GetPrivateProfileIntA("Coop", "AttackForward", 0, Paths::Ini()) != 0;   // default 0 until verified live
+    if (!g_probe && !g_relay && !g_atkFwd) return;
     static const BYTE p1[6] = { 0x55, 0x8B, 0xEC, 0x8B, 0x4D, 0x08 };
     static const BYTE p2[8] = { 0x55, 0x8B, 0xEC, 0x51, 0x56, 0x8B, 0x75, 0x08 };
     static const BYTE p3[12] = { 0x53, 0x8B, 0xDC, 0x83, 0xEC, 0x08, 0x83, 0xE4, 0xF0, 0x83, 0xC4, 0x04 };
@@ -311,6 +355,55 @@ void PlayerDamageProbe::Init()
 }
 
 bool PlayerDamageProbe::RelayOn() { return g_relayIni; }
+bool AttackForward_On() { return g_atkFwd; }
+
+void AttackForward_Capture(const void* ev, AtkFields& a)
+{
+    const char* f = (const char*)ev;
+    auto B = [&](int o) { return *(const uint8_t*)(f + o); };
+    auto D = [&](int o) { return *(const uint32_t*)(f + o); };
+    a.phase = (uint8_t)D(0x54); a.type = (uint8_t)D(0x08); a.sub = (uint8_t)D(0x10);
+    a.b331 = B(0x14B); a.b328 = B(0x148); a.b322 = B(0x142); a.b323 = B(0x143); a.b324 = B(0x144); a.b325 = B(0x145);
+    a.b326 = B(0x146); a.b327 = B(0x147); a.b329 = B(0x149); a.b330 = B(0x14A); a.b361 = B(0x169); a.b308 = B(0x134); a.b1C = B(0x1C);
+    a.f336 = D(0x150); a.f60 = D(0x60); a.f5C = D(0x5C); a.f50 = D(0x50); a.f110 = D(0x110); a.f124 = D(0x124); a.f128 = D(0x128);
+    a.f120 = D(0x120); a.f11C = D(0x11C); a.f114 = D(0x114); a.f130 = D(0x130);
+    memcpy(a.dir, f + 0x30, 16); memcpy(a.pos, f + 0x40, 16);
+}
+
+// The owner-side rebuild, as sub_16551A0 does it (ida_batch fa2): new FDE (sub_10EFC30: cdecl, 0x170 bytes, ctor 0x18C9470),
+// sub_18BD690 (thiscall, 8 args, retn 20h, fa3), the copied fields, phase at +0x54, then sub_64D8C0(fde, victim) as
+// sub_18DA720 posts it (the second event sub_18DA720 sends to the attacker side when fde+0x90 != 0 is not rebuilt).
+static int AfFaultNote(EXCEPTION_POINTERS* ep)
+{
+    static LONG s_n = 0;
+    if (InterlockedIncrement(&s_n) <= 12) {
+        char line[200];
+        const EXCEPTION_RECORD* r = ep->ExceptionRecord;
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[AF] post fault code=%08X at=%08X rw=%u addr=%08X\n", (unsigned)r->ExceptionCode,
+                    (unsigned)(uintptr_t)r->ExceptionAddress, r->NumberParameters > 0 ? (unsigned)r->ExceptionInformation[0] : 0u,
+                    r->NumberParameters > 1 ? (unsigned)r->ExceptionInformation[1] : 0u);
+        Phase1_LogLine(line);
+    }
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+bool AttackForward_Post(void* victim, void* attacker, const AtkFields& a)
+{
+    __try {
+        char* f = ((char* (__cdecl*)())0x010EFC30)();
+        if (!f) return false;
+        float dir[4], pos[4]; memcpy(dir, a.dir, 16); memcpy(pos, a.pos, 16);
+        ((void* (__thiscall*)(void*, int, int, int, void*, void*, char, char, void*))0x018BD690)(
+            f, a.type, a.sub, (int)a.f336, dir, pos, (char)a.b331, (char)a.b328, attacker);
+        auto SB = [&](int o, uint8_t v) { *(uint8_t*)(f + o) = v; };
+        auto SD = [&](int o, uint32_t v) { *(uint32_t*)(f + o) = v; };
+        SD(0x60, a.f60); SB(0x146, a.b326); SB(0x147, a.b327); SD(0x110, a.f110); SB(0x14A, a.b330); SB(0x142, a.b322);
+        SB(0x145, a.b325); SB(0x149, a.b329); SD(0x124, a.f124); SD(0x128, a.f128); SD(0x120, a.f120); SD(0x50, a.f50);
+        SB(0x169, a.b361); SB(0x143, a.b323); SB(0x144, a.b324); SD(0x11C, a.f11C); SD(0x114, a.f114);
+        SD(0x130, a.f130); SB(0x134, a.b308); SD(0x5C, a.f5C); SD(0x54, a.phase ? 1u : 0u); SB(0x1C, a.b1C);   // +0x1C as seen at post time on the host
+        ((void(__thiscall*)(void*, void*))0x0064D8C0)(f, victim);
+        return true;
+    } __except (AfFaultNote(GetExceptionInformation())) { return false; }
+}
 
 int PlayerDamageProbe::FormatReport(char* out, int cap)
 {

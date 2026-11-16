@@ -345,6 +345,9 @@ enum IntentChannel : uint8_t {
     IC_FIGHT     = 5,   // player avatar fight decisions ([Coop] FightIntents, docs/design/s7-fight-intents.md)
     IC_DAMAGE    = 6,   // guest -> host damage request on a host-owned guard ([Coop] OwnerDamage, S9): running total
     IC_PDAMAGE   = 7,   // host -> owner: a guard's hit on that player's puppet ([Coop] PlayerDamageRelay): running total
+    IC_ATK_A     = 8,   // host -> owner: [Coop] AttackForward part A (seq, bytes, f336, f60, f5C)
+    IC_ATK_B     = 9,   //                part B (seq, f110 f124 f128 f120 f11C f114 f130)
+    IC_ATK_C     = 10,  //                part C (seq, dir xy, pos xyz, f50)
     IC_LIMIT     = 16,  // ids 1..15 are legal on the wire, so a later build can add a channel without a
                         // layout change; the receiver delivers a channel id it does not name
 };

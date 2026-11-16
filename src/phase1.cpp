@@ -9,6 +9,7 @@
 #include "guard_sight.h"
 #include "event_probe.h"
 #include "player_damage_probe.h"
+#include "attack_forward.h"
 #include "../third_party/minhook/include/MinHook.h"
 #include "puppet_stim.h"
 #include "pilot.h"
@@ -8176,12 +8177,159 @@ static void PlayerDamageReport() {
       s_pdrSeen, s_pdrDup, s_pdrDropped, s_pdrTx, s_pdrRx, s_pdrApplied, s_pdrFail, s_pdrBase, pl ? PdrPlayerLife(pl) : -1);
 }
 
+// ---- [Coop] AttackForward (default 0, read once at load in player_damage_probe.cpp) ------------------------------------
+// Host forwards attacks (user's choice 2026-11-16, over "copies fight locally"): every FightDamageEvent a host guard posts to
+// the puppet (warning phase 0 from the melee poster sub_16551A0, hit phase 1) is sent to the puppet's owner, who re-posts a
+// native one from its linked copy of that guard to its own player (AttackForward_Post). The owner's engine then runs the
+// warning handler (sub_185DA80: the defence / counter side) and the hit resolution (sub_18644D0: block, parry, damage,
+// hurt reaction) itself. Type 35 (the contact poster sub_1D1A4A0) is not forwarded and stays on PlayerDamageRelay.
+// Wire: three intent messages per event (IC_ATK_A/B/C, 32 bytes each, wireId = the guard's canonical id, joined by seq).
+// Rate: hits always (one per guard per 150 ms: each hit is posted twice), warnings at most every 150 ms per guard; the
+// owner re-posts the latest warning every frame while it is < 250 ms old (the host posts it every frame, run 29284: 113 in
+// one fight). A guard idle 2 s is forgotten on the lane (ForgetIntents) so a rejoin does not replay an old hit.
+#pragma pack(push, 1)
+struct AfA { uint32_t seq; uint8_t phase, type, sub, b331, b328, b322, b323, b324, b325, b326, b327, b329, b330, b361, b308, b1C; uint32_t f336, f60, f5C; };
+struct AfB { uint32_t seq; uint32_t f110, f124, f128, f120, f11C, f114, f130; };
+struct AfC { uint32_t seq; float dx, dy; int32_t dmg; float px, py, pz; uint32_t f50; };   // dir z is 0 in every dump (+0x38); its slot carries the damage
+#pragma pack(pop)
+static_assert(sizeof(AfA) == 32 && sizeof(AfB) == 32 && sizeof(AfC) == 32, "IC_ATK_* payloads are wire layouts");
+static int s_afOn = -1;
+static bool AfOn() { if (s_afOn < 0) s_afOn = AttackForward_On() ? 1 : 0; return s_afOn == 1; }
+struct AfQ { uintptr_t att; AtkFields a; };
+static AfQ s_afQ[64]; static LONG s_afHead = 0, s_afTail = 0; static SRWLOCK s_afLock = SRWLOCK_INIT;
+static struct { uintptr_t att; ULONGLONG ms0, ms1; } s_afRecent[16]; static int s_afRecentI = 0;
+static volatile LONG s_afSeen[2] = {}, s_afTx[2] = {}, s_afRx[2] = {}, s_afPost[2] = {}, s_afUnres = 0, s_afFail = 0, s_afDropped = 0, s_afFallback = 0;
+
+// Host, any thread (the attacker's event post).
+void Phase1_PuppetAttackPosted(uintptr_t att, const AtkFields& a) {
+    if (!AfOn() || g_entHost != 1) return;
+    const int ph = a.phase ? 1 : 0;
+    InterlockedIncrement(&s_afSeen[ph]);
+    const ULONGLONG now = GetTickCount64();
+    AcquireSRWLockExclusive(&s_afLock);
+    int k = -1;
+    for (int i = 0; i < 16; ++i) if (s_afRecent[i].att == att) { k = i; break; }
+    if (k < 0) { k = s_afRecentI; s_afRecentI = (s_afRecentI + 1) & 15; s_afRecent[k].att = att; s_afRecent[k].ms0 = s_afRecent[k].ms1 = 0; }
+    ULONGLONG& last = ph ? s_afRecent[k].ms1 : s_afRecent[k].ms0;
+    if (now - last >= 150) {
+        last = now;
+        if (s_afHead - s_afTail < 64) { s_afQ[s_afHead & 63].att = att; s_afQ[s_afHead & 63].a = a; ++s_afHead; }
+        else InterlockedIncrement(&s_afDropped);
+    }
+    ReleaseSRWLockExclusive(&s_afLock);
+}
+
+// Host, player frame.
+static void AttackForwardHostPump() {
+    if (s_afOn != 1 || g_entHost != 1) return;
+    static uint32_t s_seq = 0;
+    static struct { uint64_t id; ULONGLONG ms; } s_live[32]; static int s_liveN = 0;
+    const ULONGLONG now = GetTickCount64();
+    for (;;) {
+        AfQ q;
+        AcquireSRWLockExclusive(&s_afLock);
+        const bool any = s_afTail != s_afHead;
+        if (any) { q = s_afQ[s_afTail & 63]; ++s_afTail; }
+        ReleaseSRWLockExclusive(&s_afLock);
+        if (!any) break;
+        const uint64_t id = FiCanonicalId((Entity*)q.att);
+        if (!id) continue;
+        const AtkFields& a = q.a; const uint32_t seq = ++s_seq;
+        AfA pa = { seq, a.phase, a.type, a.sub, a.b331, a.b328, a.b322, a.b323, a.b324, a.b325, a.b326, a.b327, a.b329, a.b330, a.b361, a.b308, a.b1C, a.f336, a.f60, a.f5C };
+        AfB pb = { seq, a.f110, a.f124, a.f128, a.f120, a.f11C, a.f114, a.f130 };
+        AfC pc = { seq, a.dir[0], a.dir[1], a.dmg, a.pos[0], a.pos[1], a.pos[2], a.f50 };
+        const uint32_t t = (uint32_t)GetTickCount();
+        const bool ok = Net::PublishIntent(0, id, IC_ATK_A, t, &pa, 32) && Net::PublishIntent(0, id, IC_ATK_B, t, &pb, 32)
+                     && Net::PublishIntent(0, id, IC_ATK_C, t, &pc, 32);
+        InterlockedIncrement(&s_afTx[a.phase ? 1 : 0]);
+        static LONG s_lines = 0;
+        if ((a.phase || s_lines < 40) && InterlockedIncrement(&s_lines) <= 300)
+            L("[AF] tx %s guard=%016llX seq=%u type=%u sub=%u ok=%d\n", a.phase ? "HIT" : "warn", (unsigned long long)id, seq, a.type, a.sub, ok ? 1 : 0);
+        int k = -1; for (int i = 0; i < s_liveN; ++i) if (s_live[i].id == id) { k = i; break; }
+        if (k < 0 && s_liveN < 32) { k = s_liveN++; s_live[k].id = id; }
+        if (k >= 0) s_live[k].ms = now;
+    }
+    for (int i = 0; i < s_liveN;) {   // idle 2 s: drop the persisted values so a rejoin does not replay an old hit
+        if (now - s_live[i].ms > 2000) { Net::ForgetIntents(0, s_live[i].id); s_live[i] = s_live[--s_liveN]; } else ++i;
+    }
+}
+
+// Owner (guest): assemble the three parts, then keep / post the attack.
+static struct { uint64_t id; uint32_t seq; uint8_t mask; AtkFields a; } s_afAsm[16]; static int s_afAsmI = 0;
+static struct { uint64_t id; unsigned int ent; AtkFields a; ULONGLONG ms; bool live; } s_afAct[16];
+static void AttackForwardOwnerDeliver(uint64_t id, const AtkFields& a) {
+    const int ph = a.phase ? 1 : 0;
+    InterlockedIncrement(&s_afRx[ph]);
+    World* w = World::GetCurrentWorld();
+    Entity* pl = w ? w->GetPlayer() : nullptr;
+    Entity* att = FiResolve(id);
+    if (!pl || !att || att == pl || !readable(att, 0xCC) || *(uint32_t*)att != 0x01E4CE90u) {
+        InterlockedIncrement(&s_afUnres);
+        static LONG s_ul = 0;
+        // No body to attack from: a hit still lands, as PlayerDamageRelay would apply it (native DamageEvent, no attacker).
+        bool fb = false;
+        if (ph && pl && a.dmg > 0) fb = PlayerDamage_PostDamageEvent(pl, nullptr, a.dmg, 1, a.sub, 0, a.b1C);
+        if (fb) InterlockedIncrement(&s_afFallback);
+        if (InterlockedIncrement(&s_ul) <= 30) L("[AF] owner: guard %016llX has no linked copy here (%s%s)\n", (unsigned long long)id, ph ? "HIT" : "warning lost",
+                                                ph ? (fb ? " -> applied as a DamageEvent" : " lost") : "");
+        return;
+    }
+    int k = -1, freeK = -1;
+    for (int i = 0; i < 16; ++i) { if (s_afAct[i].live && s_afAct[i].id == id) { k = i; break; } if (!s_afAct[i].live && freeK < 0) freeK = i; }
+    if (k < 0) k = freeK >= 0 ? freeK : 0;
+    s_afAct[k].id = id; s_afAct[k].ent = (unsigned int)att; s_afAct[k].a = a; s_afAct[k].ms = GetTickCount64(); s_afAct[k].live = (ph == 0);
+    const bool ok = AttackForward_Post(pl, att, a);
+    InterlockedIncrement(ok ? &s_afPost[ph] : &s_afFail);
+    if (ph) L("[AF] owner HIT posted guard=%016llX copy=%08X type=%u sub=%u ok=%d | life %d\n", (unsigned long long)id, (unsigned)att, a.type, a.sub, ok ? 1 : 0, PdrPlayerLife(pl));
+}
+static void AttackForwardOwnerRx(const Net::IntentMsg& m) {
+    if (s_afOn != 1 || g_entHost == 1 || m.len != 32) return;
+    uint32_t seq; memcpy(&seq, m.payload, 4);
+    int k = -1;
+    for (int i = 0; i < 16; ++i) if (s_afAsm[i].mask && s_afAsm[i].id == m.wireId && s_afAsm[i].seq == seq) { k = i; break; }
+    if (k < 0) { k = s_afAsmI; s_afAsmI = (s_afAsmI + 1) & 15; s_afAsm[k].id = m.wireId; s_afAsm[k].seq = seq; s_afAsm[k].mask = 0; }
+    AtkFields& a = s_afAsm[k].a;
+    if (m.channel == IC_ATK_A) {
+        AfA p; memcpy(&p, m.payload, 32);
+        a.phase = p.phase; a.type = p.type; a.sub = p.sub; a.b331 = p.b331; a.b328 = p.b328; a.b322 = p.b322; a.b323 = p.b323;
+        a.b324 = p.b324; a.b325 = p.b325; a.b326 = p.b326; a.b327 = p.b327; a.b329 = p.b329; a.b330 = p.b330; a.b361 = p.b361;
+        a.b308 = p.b308; a.b1C = p.b1C; a.f336 = p.f336; a.f60 = p.f60; a.f5C = p.f5C; s_afAsm[k].mask |= 1;
+    } else if (m.channel == IC_ATK_B) {
+        AfB p; memcpy(&p, m.payload, 32);
+        a.f110 = p.f110; a.f124 = p.f124; a.f128 = p.f128; a.f120 = p.f120; a.f11C = p.f11C; a.f114 = p.f114; a.f130 = p.f130; s_afAsm[k].mask |= 2;
+    } else {
+        AfC p; memcpy(&p, m.payload, 32);
+        a.dir[0] = p.dx; a.dir[1] = p.dy; a.dir[2] = 0; a.dir[3] = 0; a.dmg = p.dmg; a.pos[0] = p.px; a.pos[1] = p.py; a.pos[2] = p.pz; a.pos[3] = 0;
+        a.f50 = p.f50; s_afAsm[k].mask |= 4;
+    }
+    if (s_afAsm[k].mask == 7) { s_afAsm[k].mask = 0; AttackForwardOwnerDeliver(m.wireId, a); }
+}
+// Owner, player frame: re-post each live warning every frame while it is < 250 ms old (the host's poster runs per frame).
+static void AttackForwardOwnerTick() {
+    if (s_afOn != 1 || g_entHost == 1) return;
+    World* w = World::GetCurrentWorld();
+    Entity* pl = w ? w->GetPlayer() : nullptr;
+    if (!pl) return;
+    const ULONGLONG now = GetTickCount64();
+    for (int i = 0; i < 16; ++i) {
+        if (!s_afAct[i].live) continue;
+        if (now - s_afAct[i].ms > 250 || GuestObjEntGone(s_afAct[i].ent) || MirrorKilledLocally((void*)s_afAct[i].ent)) { s_afAct[i].live = false; continue; }
+        if (AttackForward_Post(pl, (void*)s_afAct[i].ent, s_afAct[i].a)) InterlockedIncrement(&s_afPost[0]); else InterlockedIncrement(&s_afFail);
+    }
+}
+static void AttackForwardReport() {
+    if (s_afOn != 1) return;
+    L("[AF] stats seen warn/hit=%ld/%ld tx=%ld/%ld dropped=%ld | rx=%ld/%ld posted=%ld/%ld unresolved=%ld (hits applied as DamageEvent %ld) failed=%ld\n",
+      s_afSeen[0], s_afSeen[1], s_afTx[0], s_afTx[1], s_afDropped, s_afRx[0], s_afRx[1], s_afPost[0], s_afPost[1], s_afUnres, s_afFallback, s_afFail);
+}
+
 // Receiver part 1, the local player's frame: drain the lane (the only consumer) and queue IC_FIGHT for the puppet.
 static void FightIntentDrain() {
     const bool fi = FightIntentsOn();
-    if (!fi && !(OwnerDamageOn() && Net::IntentLaneOn()) && !(PdrOn() && Net::IntentLaneOn())) return;
+    if (!fi && !(OwnerDamageOn() && Net::IntentLaneOn()) && !(PdrOn() && Net::IntentLaneOn()) && !(AfOn() && Net::IntentLaneOn())) return;
     Net::IntentMsg m;
     while (Net::PollIntent(m)) {
+        if (m.channel == IC_ATK_A || m.channel == IC_ATK_B || m.channel == IC_ATK_C) { AttackForwardOwnerRx(m); continue; }   // [Coop] AttackForward
         if (m.channel == IC_PDAMAGE && m.wireId == kPdrWire && m.len == sizeof(PdrPayload)) {   // [Coop] PlayerDamageRelay
             PdrPayload p; memcpy(&p, m.payload, sizeof(p));
             PlayerDamageOwnerApply(p, (m.flags & IF_BASE) != 0);
@@ -12818,7 +12966,7 @@ static void OnFrameInner(Human* updatedHuman) {
         InterlockedExchange(&g_inSaveTick, (w && w->m_CharacterList.GetSize() >= 2) ? (LONG)GetTickCount() : 0);
     }
     Pilot::OnPlayerFrame(updatedHuman);   // [Pilot] Enabled only: publish the player + m_CharacterList
-    __try { FightIntentSend(updatedHuman); FightIntentDrain(); OwnerDamageGuestPump(); PlayerDamageHostPump(); SpawnerIdProbeTick(); }   // [Coop] FightIntents / OwnerDamage / SpawnerIdProbe only
+    __try { FightIntentSend(updatedHuman); FightIntentDrain(); OwnerDamageGuestPump(); PlayerDamageHostPump(); AttackForwardHostPump(); AttackForwardOwnerTick(); SpawnerIdProbeTick(); }   // [Coop] FightIntents / OwnerDamage / SpawnerIdProbe only
     __except (EXCEPTION_EXECUTE_HANDLER) { static int s_fe = 0; if (s_fe < 10) { ++s_fe; L("[FI] EXCEPTION 0x%08X in send/drain\n", GetExceptionCode()); } }
 
     ProbeIdentityOnce();
@@ -13023,6 +13171,7 @@ static void OnFrameInner(Human* updatedHuman) {
                 if (!g_entHost) { BindReport(); TakeoverSweep(); }   // guest only: the guest objId table is the link table
                 OwnerDamageReport();
                 PlayerDamageReport();
+                AttackForwardReport();
                 OwnReport();
                 L("[Mirror] actions on=%d calls=%u deferred=%d queued=%u applied=%ld expired=%ld noSlot=%u\n",
                   MirrorActionsEnabled() ? 1 : 0, s_mirrorActionCalls, MirrorActionsDeferred() ? 1 : 0, s_maqQueued,
