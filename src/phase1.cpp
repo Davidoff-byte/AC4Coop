@@ -6508,11 +6508,16 @@ static void CorpseLatchTick();
 //     "unchanged" and treating it as damage would kill every guard on the first quiet snapshot.
 // Everything is behind [Coop] DamageRelay (default 0). With the key off this is one static int test per
 // matched entity and no engine access at all, so the build behaves exactly as before it existed.
+// Default follows [Coop] FightIntents since 2026-11-16 (S9: copies show the owner's health), ini overrides.
 static int DamageRelayEnabled() {
     static int s = -1;
-    if (s < 0) s = GetPrivateProfileIntA("Coop", "DamageRelay", 0, Paths::Ini()) != 0 ? 1 : 0;
+    if (s < 0) {
+        const int fi = GetPrivateProfileIntA("Coop", "FightIntents", 0, Paths::Ini()) != 0 ? 1 : 0;
+        s = GetPrivateProfileIntA("Coop", "DamageRelay", fi, Paths::Ini()) != 0 ? 1 : 0;
+    }
     return s;
 }
+extern __declspec(thread) int t_odRelay;   // [Coop] OwnerDamage: our own SetLife writes pass its SetLife detour
 
 static void ApplyRelayedHealth(uint64_t objId, Entity* e, const EntityState& es) {
     if (!DamageRelayEnabled()) return;
@@ -6550,7 +6555,7 @@ static void ApplyRelayedHealth(uint64_t objId, Entity* e, const EntityState& es)
         int want = relayed;
         if (want > maxLife) want = maxLife;                   // already at/over max: no write
         if (want <= 0 || want == cur) return;                 // idempotent: one write per real change
-        ((int (__thiscall*)(void*, int))0x19FB4C0)((void*)svc, want);   // CSrvNPCHealth::SetLife
+        t_odRelay = 1; ((int (__thiscall*)(void*, int))0x19FB4C0)((void*)svc, want); t_odRelay = 0;   // CSrvNPCHealth::SetLife
         static int s_hpRelayLines = 0;
         if (s_hpRelayLines < 20) { ++s_hpRelayLines;
             L("[Mirror] hp relay objId=%llu ent=%08X life %d -> %d (host %d, local max %d)\n",
@@ -7560,6 +7565,149 @@ static void PuppetOwnClear() {
 }
 
 // Frame hook, every Human's update (any thread).
+// ---- [Coop] OwnerDamage: S9 "causer requests, owner decides" for host-owned guards ---------------------------------------
+// Default follows [Coop] FightIntents (ini overrides), read once. AU-RW ACU-RE-0092 / AVATAR_SPEC D-series: the attacker's
+// machine never writes the victim's health; it requests, the owner applies and decides death, copies show the owner's value.
+// GUEST: every NPC life write goes through CSrvNPCHealth::SetLife 0x19FB4C0 (the only NPC life setter, vtable slot +0x40;
+// ops/evidence/character-health-setter.md). A detour there blocks any LOWERING of a linked copy's life that is not our own
+// relay write, and queues the drop as a fraction of the copy's max (the two worlds disagree on max: 36 vs 30). The player
+// frame publishes the running total per guard on IC_DAMAGE (a total, so a lane replay is harmless). HOST: applies the delta
+// scaled to its own max with SetLife, or KillGuardEntity when life would reach <= 0; DamageRelay (same default) then shows
+// the host's value on the copy and the death lane kills it there. Counted on the [OD] lines.
+static int s_odOn = -1;
+static bool OwnerDamageOn() {
+    if (s_odOn < 0) {
+        const int fi = GetPrivateProfileIntA("Coop", "FightIntents", 0, Paths::Ini()) != 0 ? 1 : 0;
+        s_odOn = GetPrivateProfileIntA("Coop", "OwnerDamage", fi, Paths::Ini()) != 0 ? 1 : 0;
+    }
+    return s_odOn == 1;
+}
+__declspec(thread) int t_odRelay = 0;   // our own SetLife write (ApplyRelayedHealth, host apply): never blocked
+struct OdCopy { volatile unsigned int svc; uint64_t objId; };
+static OdCopy s_odCopy[128]; static volatile LONG s_odCopyN = 0;
+struct OdReq { uint64_t objId; uint32_t permille; volatile LONG ready; };
+static OdReq s_odRing[64]; static volatile LONG s_odHead = 0, s_odTail = 0;
+static volatile LONG s_odBlocked = 0, s_odPassedHeal = 0, s_odDropped = 0, s_odTx = 0, s_odHostApplied = 0, s_odHostKills = 0, s_odHostUnres = 0;
+
+// Guest, ApplyGuards (player thread): remember the linked copy's health service and the host id it answers to.
+static void OwnerDamageNoteCopy(Entity* e, uint64_t objId) {
+    if (!OwnerDamageOn() || g_entHost == 1 || !e || !objId) return;
+    unsigned int svc = CachedHealthForEntity((unsigned int)e);
+    if (!HostHpSvcValid(svc)) svc = FindHealthInAI((unsigned int)AIEntityHelper::GetEntityAI(e));
+    if (!HostHpSvcValid(svc)) return;
+    const LONG n = s_odCopyN;
+    for (LONG i = 0; i < n; ++i) if (s_odCopy[i].svc == svc) { s_odCopy[i].objId = objId; return; }
+    if (n < 128) { s_odCopy[n].objId = objId; s_odCopy[n].svc = svc; InterlockedExchange(&s_odCopyN, n + 1); }
+}
+
+// Detour decision, any thread: 1 = block this SetLife(svc, value) (it is replaced by a request to the owner).
+int __cdecl OwnerDamageShouldBlock(unsigned int svc, int value) {
+    if (s_odOn != 1 || t_odRelay) return 0;
+    __try {
+        const LONG n = s_odCopyN; uint64_t objId = 0;
+        for (LONG i = 0; i < n; ++i) if (s_odCopy[i].svc == svc) { objId = s_odCopy[i].objId; break; }
+        if (!objId) return 0;
+        const int cur = (int)*(int16_t*)(svc + 0x5C), maxL = (int)*(int16_t*)(svc + 0x5E);
+        if (cur < 0 || maxL < 1) return 0;                       // a local corpse, or not a valid service: engine as usual
+        if (value >= cur) { InterlockedIncrement(&s_odPassedHeal); return 0; }   // heal / init / no change: not damage
+        const int dmg = cur - (value < 0 ? -1 : value);           // a kill (value < 0) asks for the whole remaining life
+        uint32_t pm = (uint32_t)((dmg * 1000 + maxL - 1) / maxL); if (pm < 1) pm = 1;
+        const LONG h = InterlockedIncrement(&s_odHead) - 1;
+        if (h - s_odTail >= 64) { InterlockedIncrement(&s_odDropped); return 1; }
+        OdReq& r = s_odRing[h & 63]; r.objId = objId; r.permille = pm; InterlockedExchange(&r.ready, 1);
+        InterlockedIncrement(&s_odBlocked);
+        return 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+// Guest, player frame: fold queued drops into a running total per guard and publish it.
+static void OwnerDamageGuestPump() {
+    if (s_odOn != 1 || g_entHost == 1) return;
+    static struct { uint64_t objId; uint32_t total; } tot[128]; static int nTot = 0;
+    while (s_odTail != s_odHead) {
+        OdReq& r = s_odRing[s_odTail & 63];
+        if (!InterlockedCompareExchange(&r.ready, 0, 0)) break;      // producer has the slot but not filled yet
+        const uint64_t objId = r.objId; const uint32_t pm = r.permille;
+        InterlockedExchange(&r.ready, 0); InterlockedIncrement(&s_odTail);
+        int k = -1; for (int i = 0; i < nTot; ++i) if (tot[i].objId == objId) { k = i; break; }
+        if (k < 0) { if (nTot >= 128) continue; k = nTot++; tot[k].objId = objId; tot[k].total = 0; }
+        tot[k].total += pm;
+        const uint32_t payload[2] = { tot[k].total, pm };
+        const bool ok = Net::PublishIntent(0, objId, IC_DAMAGE, (uint32_t)GetTickCount(), payload, (uint8_t)sizeof(payload));
+        InterlockedIncrement(&s_odTx);
+        L("[OD] tx objId=%016llX +%u permille total=%u ok=%d\n", (unsigned long long)objId, pm, tot[k].total, ok ? 1 : 0);
+    }
+}
+
+// Host, player frame (from the intent drain): apply the delta of a guard's running total, owner decides death.
+static void OwnerDamageHostApply(uint64_t objId, uint32_t total) {
+    if (s_odOn != 1 || g_entHost != 1) return;
+    static struct { uint64_t objId; uint32_t last; } seen[256]; static int nSeen = 0;
+    int k = -1; for (int i = 0; i < nSeen; ++i) if (seen[i].objId == objId) { k = i; break; }
+    if (k < 0) { if (nSeen >= 256) return; k = nSeen++; seen[k].objId = objId; seen[k].last = 0; }
+    if (total <= seen[k].last) return;                            // replay / duplicate: nothing new
+    const uint32_t delta = total - seen[k].last; seen[k].last = total;
+    Entity* e = ResolveEntityById(objId);
+    if (!readable(e, 0x80)) { InterlockedIncrement(&s_odHostUnres); L("[OD] host objId=%016llX unresolved (+%u)\n", (unsigned long long)objId, delta); return; }
+    __try {
+        const unsigned int svc = FindHealthInAI((unsigned int)AIEntityHelper::GetEntityAI(e));
+        if (!HostHpSvcValid(svc)) { InterlockedIncrement(&s_odHostUnres); return; }
+        const int cur = (int)*(int16_t*)(svc + 0x5C), maxL = (int)*(int16_t*)(svc + 0x5E);
+        if (cur < 0) return;                                      // already dead here
+        const int dmg = (int)((delta * (uint32_t)maxL + 999) / 1000);
+        const int want = cur - dmg;
+        if (want <= 0) {
+            const bool killed = KillGuardEntity(e);               // the proven host kill (kill relay path)
+            InterlockedIncrement(&s_odHostKills);
+            L("[OD] host kill objId=%016llX ent=%p life %d -> dead (+%u permille, killed=%d)\n", (unsigned long long)objId, (void*)e, cur, delta, killed ? 1 : 0);
+        } else {
+            t_odRelay = 1; ((int (__thiscall*)(void*, int))0x19FB4C0)((void*)svc, want); t_odRelay = 0;   // CSrvNPCHealth::SetLife
+            InterlockedIncrement(&s_odHostApplied);
+            L("[OD] host apply objId=%016llX ent=%p life %d -> %d (max %d, +%u permille)\n", (unsigned long long)objId, (void*)e, cur, want, maxL, delta);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { t_odRelay = 0; }
+}
+
+// The SetLife detour (prologue 55 8B EC 56 8B F1, 6 bytes; ops/evidence/character-health-setter.md, combat_observe.cpp
+// site 2). Entry: ECX = CSrvHealth*, [esp] = ret, [esp+4] = value. Blocked: return value (SetLife returns it), ret 4.
+static DWORD g_odTramp = 0;
+__declspec(naked) static void OwnerDamageDetour() {
+    __asm {
+        pushad
+        mov  eax, [esp + 36]
+        push eax
+        push ecx
+        call OwnerDamageShouldBlock
+        add  esp, 8
+        test eax, eax
+        popad
+        jnz  od_blocked
+        jmp  dword ptr [g_odTramp]
+    od_blocked:
+        mov  eax, [esp + 4]
+        ret  4
+    }
+}
+void Phase1_OwnerDamageInstall() {
+    if (!OwnerDamageOn()) { L("[OD] OwnerDamage=0: SetLife not hooked\n"); return; }
+    static const BYTE kPro[6] = { 0x55, 0x8B, 0xEC, 0x56, 0x8B, 0xF1 };
+    BYTE* site = (BYTE*)(GameModuleBase + (0x019FB4C0 - 0x00400000));
+    if (memcmp(site, kPro, 6) != 0) { L("[OD] SetLife prologue mismatch (another hook, e.g. CombatObserve?) - not installed\n"); s_odOn = 0; return; }
+    BYTE* t = (BYTE*)VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!t) { s_odOn = 0; return; }
+    memcpy(t, kPro, 6); t[6] = 0x68; *(DWORD*)(t + 7) = (DWORD)(uintptr_t)(site + 6); t[11] = 0xC3;   // push resume; ret
+    FlushInstructionCache(GetCurrentProcess(), t, 12);
+    g_odTramp = (DWORD)(uintptr_t)t;
+    const bool ok = Hook::DetourFunc(site, (DWORD)(uintptr_t)&OwnerDamageDetour, 6);
+    if (!ok) s_odOn = 0;
+    L("[OD] OwnerDamage=1 (default follows FightIntents): SetLife 0x19FB4C0 hooked=%d\n", ok ? 1 : 0);
+}
+static void OwnerDamageReport() {
+    if (s_odOn != 1) return;
+    L("[OD] stats copies=%ld blocked=%ld passedHeal=%ld dropped=%ld tx=%ld | host applied=%ld kills=%ld unresolved=%ld\n",
+      s_odCopyN, s_odBlocked, s_odPassedHeal, s_odDropped, s_odTx, s_odHostApplied, s_odHostKills, s_odHostUnres);
+}
+
 // ---- [Coop] SpawnerIdProbe (default 0): guard <-> SceneSpawner identity, read-only -------------------------------------
 // The probe proposed in docs/evidence/guard-spawner-id-2026-11-13.md section 6 (branch claude/optimistic-satoshi-0a0b33,
 // cae66f8, static): SceneSpawningComponent vtable 0x026900B8, SceneSpawner S = C+0x10, owner (layout entity) = *(C+8),
@@ -7772,9 +7920,16 @@ static void FightIntentSend(Human* player) {
 
 // Receiver part 1, the local player's frame: drain the lane (the only consumer) and queue IC_FIGHT for the puppet.
 static void FightIntentDrain() {
-    if (!FightIntentsOn()) return;
+    const bool fi = FightIntentsOn();
+    if (!fi && !(OwnerDamageOn() && Net::IntentLaneOn())) return;
     Net::IntentMsg m;
     while (Net::PollIntent(m)) {
+        if (m.channel == IC_DAMAGE && m.len == 8) {   // [Coop] OwnerDamage: running damage total for a host guard
+            uint32_t tot = 0; memcpy(&tot, m.payload, 4);
+            OwnerDamageHostApply(m.wireId, tot);
+            continue;
+        }
+        if (!fi) continue;
         if (m.channel != IC_FIGHT || m.wireId != kFiAvatarWire || m.len != sizeof(FightIntentPayload)) continue;
         FightIntentPayload f; memcpy(&f, m.payload, sizeof(f));
         if (f.op < FI_ENTER || f.op > FI_EXIT) continue;
@@ -8454,7 +8609,8 @@ static void ApplyGuards(const EntityPacket& pkt) {
             // behaviour/anim graph pop.
             if (!locallyDead && bestBhv && readable(bestBhv, 0x40) && ((Component*)bestBhv)->GetEnabled())
                 ((Component*)bestBhv)->SetEnabled(false);
-            if (!locallyDead) TakeoverNote(best);   // [Coop] BindLock: remembered so an unlink returns it to its AI
+            if (!locallyDead) { TakeoverNote(best);   // [Coop] BindLock: remembered so an unlink returns it to its AI
+                                OwnerDamageNoteCopy(best, es.objId); }   // [Coop] OwnerDamage: its health service -> host id
             Human* bh = AIEntityHelper::GetHuman(best);
             if (!locallyDead && bh && readable(bh, 4)) {
                 CharacterController* cc = (CharacterController*)bh->GetCharacterComponent();
@@ -12285,7 +12441,7 @@ static void DumpConfigOnce()
         { "Coop", "StageLog", 0 }, { "Coop", "SyncEnemiesOnly", 1 }, { "Coop", "SyncMaxEntities", 32 },
         { "Coop", "SyncRadiusM", 60 }, { "Coop", "TransformProbe", 0 }, { "Coop", "VPadEnable", 0 },
         { "Coop", "VPadTest", 0 }, { "Coop", "WatchDeadBit", 0 }, { "Coop", "WatchTarget", 0 },
-        { "Coop", "HookFrame", 1 }, { "Coop", "HookPad", 1 }, { "Coop", "HookWindowed", 1 }, { "Coop", "ActMatchProbe", 0 }, { "Coop", "FightIntents", 0 }, { "Coop", "SpawnerIdProbe", 0 },
+        { "Coop", "HookFrame", 1 }, { "Coop", "HookPad", 1 }, { "Coop", "HookWindowed", 1 }, { "Coop", "ActMatchProbe", 0 }, { "Coop", "FightIntents", 0 }, { "Coop", "SpawnerIdProbe", 0 }, { "Coop", "OwnerDamage", 0 },
         { "Coop", "HookMultiInstance", 1 },
         { "Display", "Borderless", 0 }, { "Display", "ForceWindowedMs", 5000 }, { "Display", "Fullscreen", 0 },
         { "Net", "Enabled", 0 }, { "Net", "InterpDelayMs", 100 }, { "Net", "InterpMaxExtrapMs", 100 },
@@ -12320,7 +12476,7 @@ static void OnFrameInner(Human* updatedHuman) {
         InterlockedExchange(&g_inSaveTick, (w && w->m_CharacterList.GetSize() >= 2) ? (LONG)GetTickCount() : 0);
     }
     Pilot::OnPlayerFrame(updatedHuman);   // [Pilot] Enabled only: publish the player + m_CharacterList
-    __try { FightIntentSend(updatedHuman); FightIntentDrain(); SpawnerIdProbeTick(); }   // [Coop] FightIntents / SpawnerIdProbe only
+    __try { FightIntentSend(updatedHuman); FightIntentDrain(); OwnerDamageGuestPump(); SpawnerIdProbeTick(); }   // [Coop] FightIntents / OwnerDamage / SpawnerIdProbe only
     __except (EXCEPTION_EXECUTE_HANDLER) { static int s_fe = 0; if (s_fe < 10) { ++s_fe; L("[FI] EXCEPTION 0x%08X in send/drain\n", GetExceptionCode()); } }
 
     ProbeIdentityOnce();
@@ -12521,6 +12677,7 @@ static void OnFrameInner(Human* updatedHuman) {
                       s_bindUnmatched, (s_bindMinD < 1e8f) ? sqrtf(s_bindMinD) : -1.0f);
                 WideBindReport();
                 if (!g_entHost) { BindReport(); TakeoverSweep(); }   // guest only: the guest objId table is the link table
+                OwnerDamageReport();
                 OwnReport();
                 L("[Mirror] actions on=%d calls=%u deferred=%d queued=%u applied=%ld expired=%ld noSlot=%u\n",
                   MirrorActionsEnabled() ? 1 : 0, s_mirrorActionCalls, MirrorActionsDeferred() ? 1 : 0, s_maqQueued,

@@ -36,6 +36,7 @@
 #include "react_probe.h"
 #include "guard_poi.h"
 #include "fight_probe.h"
+void Phase1_OwnerDamageInstall();   // phase1.cpp: [Coop] OwnerDamage SetLife detour (S9)
 #include "action_guard.h"
 #include "deref_guard.h"
 #include "combat_observe.h"
@@ -653,6 +654,10 @@ BOOL APIENTRY DllMain(HMODULE hMod, DWORD reason, LPVOID)
         // ([Coop] CombatObserve=0) -- with the flag at 0 this is one GetPrivateProfileIntA and one
         // int test: no log file, no allocation, no VirtualProtect, no detour, no thread.
         CombatObserve::Init();
+
+        // S9 owner-decides damage ([Coop] OwnerDamage, default follows FightIntents): SetLife detour, after CombatObserve so
+        // a CombatObserve hook on the same site is detected (prologue check) instead of stacked.
+        Phase1_OwnerDamageInstall();
 
         // Menu probe (boot straight into the world, part B): observation-only hooks on the title-menu save path.
         // [Coop] MenuProbe, default 0 -> one GetPrivateProfileIntA, nothing patched.
