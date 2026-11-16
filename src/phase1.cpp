@@ -3829,10 +3829,15 @@ static Entity* GetLocalShip() {
 // and the mission condition BoardingCondition reads obj->vtbl[+408]() && obj->vtbl[+368]() (u8 predicates).
 // This test does exactly the action's call on the NEAREST non-local AI ship within 200 m, once, and logs the byte
 // and both predicates before and after. Question answered live: does the flag alone make the ship boardable?
-static void BoardableTestTick() {
+// mode 0 = [Coop] BoardableTest: one-shot, verbose BEFORE/AFTER + both predicates (unchanged behaviour).
+// mode 1 = [Coop] BoardingForce: repeats on the same 2 s cadence, compact one-line log, never touches s_done
+//          (the one-shot test's state must survive being called in the other mode).
+static void BoardableTestTick(int mode) {
     static int s_on = -1, s_done = 0; static DWORD s_next = 0;
-    if (s_on < 0) s_on = GetPrivateProfileIntA("Coop", "BoardableTest", 0, Paths::Ini()) != 0 ? 1 : 0;
-    if (!s_on || s_done) return;
+    if (mode == 0) {
+        if (s_on < 0) s_on = GetPrivateProfileIntA("Coop", "BoardableTest", 0, Paths::Ini()) != 0 ? 1 : 0;
+        if (!s_on || s_done) return;
+    }
     const DWORD now = GetTickCount();
     if (now < s_next) return;
     s_next = now + 2000;                                       // look every 2 s until one ship qualifies
@@ -3854,26 +3859,32 @@ static void BoardableTestTick() {
         }
         if (!best) return;
         void* obj = ((void* (__cdecl*)(void*))0x0122BA20)((void*)best);
-        if (!readable(obj, 0x548) || !readable(*(void**)obj, 0x1A0)) { L("[Board] ship=%p obj=%p unreadable - skipped\n", best, obj); s_done = 1; return; }
+        if (!readable(obj, 0x548) || !readable(*(void**)obj, 0x1A0)) { L("[Board] ship=%p obj=%p unreadable - skipped\n", best, obj); if (mode == 0) s_done = 1; return; }
         typedef unsigned char (__thiscall* Pred)(void*);
         void** vt = *(void***)obj;
         const unsigned char b0 = *((unsigned char*)obj + 0x3A9), m0 = *((unsigned char*)obj + 0x540);
-        const unsigned char p408a = ((Pred)vt[408 / 4])(obj), p368a = ((Pred)vt[368 / 4])(obj);
-        L("[Board] BEFORE ship=%p obj=%p dist=%.1f +0x3A9=%u +0x540=%u pred408=%u pred368=%u\n",
-          best, obj, sqrtf(bestD2), b0, m0, p408a, p368a);
+        if (mode == 0) {
+            const unsigned char p408a = ((Pred)vt[408 / 4])(obj), p368a = ((Pred)vt[368 / 4])(obj);
+            L("[Board] BEFORE ship=%p obj=%p dist=%.1f +0x3A9=%u +0x540=%u pred408=%u pred368=%u\n",
+              best, obj, sqrtf(bestD2), b0, m0, p408a, p368a);
+        }
         ((void (__thiscall*)(void*, unsigned char))0x01207960)(obj, 1);                  // SetBoardable(obj, 1)
         const unsigned char b1 = *((unsigned char*)obj + 0x3A9), m1 = *((unsigned char*)obj + 0x540);
-        const unsigned char p408b = ((Pred)vt[408 / 4])(obj), p368b = ((Pred)vt[368 / 4])(obj);
-        L("[Board] AFTER  ship=%p +0x3A9=%u +0x540=%u pred408=%u pred368=%u\n", best, b1, m1, p408b, p368b);
-        L("[E] ev=boardable-set ok=%d\n", (b1 == 1) ? 1 : 0);
-        s_done = 1;
+        if (mode == 0) {
+            const unsigned char p408b = ((Pred)vt[408 / 4])(obj), p368b = ((Pred)vt[368 / 4])(obj);
+            L("[Board] AFTER  ship=%p +0x3A9=%u +0x540=%u pred408=%u pred368=%u\n", best, b1, m1, p408b, p368b);
+            L("[E] ev=boardable-set ok=%d\n", (b1 == 1) ? 1 : 0);
+            s_done = 1;
+        } else {
+            L("[Board] ent=%p was=%d now=%d (IsBoardable +0x3A9)\n", best, (int)b0, (int)b1);
+        }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         L("[Board] EXCEPTION code=0x%08X\n", GetExceptionCode());
-        s_done = 1;
+        if (mode == 0) s_done = 1;
     }
 }
 
-// ---- Ship field probe: [Coop] ShipFields (default 0), READ-ONLY -------------------------------
+// ---- Ship field family: [Coop] ShipFields / HelmBoth / BoardingForce / ShipTuning -------------
 // Every offset below is REFLECTION-VERIFIED against the engine's own property table (2026-11-16):
 //   GcLShip (classinfo 0x028F0C38, size 0xB70)
 //     +0xCC   SailState                       Enum (0 Up, 1 Half, 2 Full, 3 AnimusTravel, 4 Count)
@@ -3893,15 +3904,34 @@ static void BoardableTestTick() {
 //   PerceptionHandler (classinfo 0x0295E2B8): +0x5C ActivePerceptionValues Handle,
 //     +0x60 ActiveDetectionValues Handle, +0x64 PerceptionValuesOverrideStack,
 //     +0x6C DetectionValuesOverrideStack
-// This tick writes NOTHING. Every value goes through readable(); a null pointer logs null.
+// Nothing below writes unless its own flag is on, and every write is readable()-checked and SEH-wrapped.
 // UNVERIFIED: the DEREF FORM of the three reference-typed slots (+0x148 ObjectPtr, +0x14C Handle,
 // +0x68 Reference). A wrong form surfaces as an unreadable pointer (logged as null), never a fault.
-// No wire change: sail sync would touch PlayerState / NET_PROTO_VER 16 and is deliberately NOT here;
-// the probe only reports sail=%d with the enum name so the next pass has the data.
+// No wire change: sail sync is out of scope here (PlayerState/NET_PROTO_VER untouched).
 static int s_shipFields = -1;
 static inline int ShipFieldsOn() {
     if (s_shipFields < 0) s_shipFields = GetPrivateProfileIntA("Coop", "ShipFields", 0, Paths::Ini()) != 0 ? 1 : 0;
     return s_shipFields;
+}
+static int s_helmBoth = -1;
+static inline int HelmBothOn() {
+    if (s_helmBoth < 0) s_helmBoth = GetPrivateProfileIntA("Coop", "HelmBoth", 0, Paths::Ini()) != 0 ? 1 : 0;
+    return s_helmBoth;
+}
+static int s_boardingForce = -1;
+static inline int BoardingForceOn() {
+    if (s_boardingForce < 0) s_boardingForce = GetPrivateProfileIntA("Coop", "BoardingForce", 0, Paths::Ini()) != 0 ? 1 : 0;
+    return s_boardingForce;
+}
+static int s_shipTuning = -1;
+static inline int ShipTuningOn() {
+    if (s_shipTuning < 0) s_shipTuning = GetPrivateProfileIntA("Coop", "ShipTuning", 0, Paths::Ini()) != 0 ? 1 : 0;
+    return s_shipTuning;
+}
+static int s_shipTuningWrite = -1;
+static inline int ShipTuningWriteOn() {
+    if (s_shipTuningWrite < 0) s_shipTuningWrite = GetPrivateProfileIntA("Coop", "ShipTuningWrite", 0, Paths::Ini()) != 0 ? 1 : 0;
+    return s_shipTuningWrite;
 }
 // SailState names, so the probe's data is self-describing without a table lookup.
 static const char* SailStateName(int v) {
@@ -3960,11 +3990,56 @@ static void ShpFLogOne(const char* who, void* ent) {
         L("[ShpF] who=%s EXCEPTION code=0x%08X\n", who, GetExceptionCode());
     }
 }
-// Does the puppet carry a PerceptionHandler? Components are walked exactly as FindComponentByVtable does
-// (entity+0x60 array, entity+0x66 authoritative count). The reflection table gives the classinfo
-// (0x0295E2B8), not the vtable, so both plausible slots are tried: +0 (which is the vtable for the
-// classes we match elsewhere) and the word just below it (classinfo back-pointer). If neither matches,
-// every component's vtable is enumerated so the next pass can name it.
+// Feature 2: write the three helm flags, then read them back. The readback IS the result - it says
+// whether the engine keeps them or overwrites them on its next update. Local ship only.
+static void HelmWriteAndLog(void* ent) {
+    __try {
+        void* gcl = ent ? ShipGcLObj(ent) : nullptr;
+        if (!gcl || !readable((char*)gcl + 0x39F, 1)) { L("[Helm] ent=%p gcl=null (skip)\n", ent); return; }
+        *(unsigned char*)((char*)gcl + 0x399) = 1;   // IsPlayerDrivable
+        *(unsigned char*)((char*)gcl + 0x39A) = 1;   // CaptainAtWheel
+        *(unsigned char*)((char*)gcl + 0x39E) = 1;   // IsPlayerSoloBoarding
+        L("[Helm] ent=%p drivable=%d captain=%d solo=%d (readback)\n", ent,
+          (int)*(unsigned char*)((char*)gcl + 0x399),
+          (int)*(unsigned char*)((char*)gcl + 0x39A),
+          (int)*(unsigned char*)((char*)gcl + 0x39E));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        L("[Helm] EXCEPTION code=0x%08X\n", GetExceptionCode());
+    }
+}
+// Feature 4: read ShipHealthData + the Day ShipAIDetection values; write only with the second opt-in.
+// The writes are idempotent (the value just read is written back) - this pass tests WRITABILITY and
+// whether the engine restores the field, not a gameplay effect. No verified meaning is assumed.
+static void ShipTuningLog(void* ent) {
+    const int write = ShipTuningWriteOn();
+    __try {
+        void* gcl = ent ? ShipGcLObj(ent) : nullptr;
+        void* hd  = gcl ? ShipHealthDataOf(gcl) : nullptr;
+        void* ai  = gcl ? ShipAIDetOf(gcl) : nullptr;
+        const float hull = hd ? *(float*)((char*)hd + 0x8) : 0.0f;
+        const float red  = hd ? *(float*)((char*)hd + 0xC) : 0.0f;
+        const float ammo = hd ? *(float*)((char*)hd + 0x10) : 0.0f;
+        const char* d = ai ? (const char*)ai + 0x8 : nullptr;
+        const float cone = d ? *(float*)(d + 0x4) : 0.0f;
+        const float rng  = d ? *(float*)(d + 0x8) : 0.0f;
+        const float mxt  = d ? *(float*)(d + 0x10) : 0.0f;
+        const float agg  = d ? *(float*)(d + 0x2C) : 0.0f;
+        L("[Tune] ent=%p hp=%p hull=%.1f reducer=%.1f ammoMod=%.1f aiDet=%p cone=%.1f range=%.1f maxTime=%.1f aggro=%.1f\n",
+          ent, hd, hull, red, ammo, ai, cone, rng, mxt, agg);
+        if (!write || !hd || !ai) return;
+        *(float*)((char*)hd + 0x8) = hull;            // ShipHealthData.HullHealth (writeback)
+        *(float*)(d + 0x8)         = rng;             // Day ShipAIDetection.DetectionConeRange (writeback)
+        L("[Tune] wrote hp=%p hull=%.1f, aiDet=%p dayRange=%.1f; readback hull=%.1f range=%.1f\n",
+          hd, hull, ai, rng, *(float*)((char*)hd + 0x8), *(float*)(d + 0x8));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        L("[Tune] EXCEPTION code=0x%08X\n", GetExceptionCode());
+    }
+}
+// Feature 1b: does the puppet carry a PerceptionHandler? Components are walked exactly as
+// FindComponentByVtable does (entity+0x60 array, entity+0x66 authoritative count). The reflection table
+// gives the classinfo (0x0295E2B8), not the vtable, so both plausible slots are tried: +0 (which is the
+// vtable for the classes we match elsewhere) and the word just below it (classinfo back-pointer).
+// If neither matches, every component's vtable is enumerated so the next pass can name it.
 static void PercProbePuppet() {
     Entity* p = g_puppet;
     if (!p) { L("[Perc] puppet=null\n"); return; }
@@ -4004,18 +4079,27 @@ static void PercProbePuppet() {
         L("[Perc] EXCEPTION code=0x%08X\n", GetExceptionCode());
     }
 }
-// Called from OnFrameInner. Returns immediately when the flag is off, so the default path is unchanged.
+// Called from OnFrameInner. Returns immediately when every flag in the family is off, so with the
+// defaults the plugin behaves exactly as before.
 static void ShipFieldsTick() {
-    if (!ShipFieldsOn()) return;
+    const int probe = ShipFieldsOn(), helm = HelmBothOn(), board = BoardingForceOn(), tune = ShipTuningOn();
+    if (!probe && !helm && !board && !tune) return;
+    // BoardingForce reuses the F8 test's own calls (sub_122BA20 -> sub_1207960); mode 1 keeps its 2 s gate
+    // and never sets the one-shot test's s_done. With both on they share that gate, so one may lose a tick.
+    if (board) BoardableTestTick(1);
     static DWORD s_next = 0;
     const DWORD now = GetTickCount();
     if (now < s_next) return;
     s_next = now + 1000;
     __try {
         void* local = (void*)GetLocalShip();
-        ShpFLogOne("local", local);
-        if (g_ghostShip) ShpFLogOne("ghost", g_ghostShip);
-        PercProbePuppet();
+        if (probe) {
+            ShpFLogOne("local", local);
+            if (g_ghostShip) ShpFLogOne("ghost", g_ghostShip);
+            PercProbePuppet();
+        }
+        if (helm) HelmWriteAndLog(local);
+        if (tune) ShipTuningLog(local);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         L("[ShpF] EXCEPTION code=0x%08X\n", GetExceptionCode());
     }
@@ -13081,7 +13165,8 @@ static void DumpConfigOnce()
         { "Coop", "PuppetParkX", 0 }, { "Coop", "PuppetPhysics", 0 }, { "Coop", "RegisterPad1", 0 },
         { "Coop", "RelevanceRadiusM", 250 }, { "Coop", "ReloadBuilder", 1 }, { "Coop", "SceneAwareExact", 0 },
         { "Coop", "SeekOnSwitch", 1 }, { "Coop", "SkelAttach", 0 }, { "Coop", "ShipDump", 0 }, { "Coop", "ShipDumpFloats", 0 },
-        { "Coop", "ShipFields", 0 },
+        { "Coop", "ShipFields", 0 }, { "Coop", "HelmBoth", 0 }, { "Coop", "BoardingForce", 0 },
+        { "Coop", "ShipTuning", 0 }, { "Coop", "ShipTuningWrite", 0 },
         { "Coop", "ShipGhost", 0 }, { "Coop", "ShipGhostSelfTest", 0 }, { "Coop", "ShipHPSync", 0 },
         { "Coop", "ShipPassenger", 0 }, { "Coop", "ShipRelevanceRadiusM", 1000 }, { "Coop", "ShipSync", 1 },
         { "Coop", "ShipTest", 0 }, { "Coop", "ShipTestFracPct", 45 }, { "Coop", "ShipTestRadiusM", 250 },
@@ -13490,8 +13575,9 @@ static void OnFrameInner(Human* updatedHuman) {
     }
     // F8 live test (no-op unless [Coop] BoardableTest=1). Must sit ABOVE the Net::Enabled() block: that block always
     // returns, so anything after it never runs in a networked session (first placement, 19788a1, never fired).
-    BoardableTestTick();
-    // Ship field probe: [Coop] ShipFields (default 0), read-only; returns at once when off.
+    BoardableTestTick(0);
+    // Ship field family: [Coop] ShipFields / HelmBoth / BoardingForce / ShipTuning, all default 0.
+    // Returns immediately when every one is off, so the default path is unchanged.
     ShipFieldsTick();
     if (Net::Enabled()) {
         EntitySyncTick();   // host broadcasts entity transforms; peer mirrors them (synced worlds)
