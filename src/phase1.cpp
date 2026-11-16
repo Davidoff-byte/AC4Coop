@@ -2432,7 +2432,7 @@ static bool PabOn() {
     const uint64_t now = GetTickCount64();
     if (now >= s_pabNext) {
         s_pabNext = now + 2000;
-        const int v = GetPrivateProfileIntA("Coop", "PuppetActionsOwnUpdate", 0, Paths::Ini()) != 0 ? 1 : 0;
+        const int v = GetPrivateProfileIntA("Coop", "PuppetActionsOwnUpdate", 1, Paths::Ini()) != 0 ? 1 : 0;
         if (v != s_pabOnCache) L("[PupAct] PuppetActionsOwnUpdate=%d (was %d)\n", v, s_pabOnCache);
         s_pabOnCache = v;
     }
@@ -2947,7 +2947,7 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
                   s.ctx.swim.aiSwim[0], s.ctx.swim.aiSwim[2], s.ctx.swim.aiSwim[3], s.ctx.swim.aiSwim[4], s.ctx.swim.aiSwim[6]);
         }
 
-        // [Coop] PuppetActionsOwnUpdate (default 0, live): review 2026-11-14 (part 1, finding 1). ApplyRemoteState runs in
+        // [Coop] PuppetActionsOwnUpdate (default 1 since 2026-11-16: crash-soak-2026-11-16.md, OFF 2/8 action-update crashes, ON 0/8): review 2026-11-14 (part 1, finding 1). ApplyRemoteState runs in
         // the PLAYER's Human update (OnFrameInner), so these writes into the puppet's ActionComponent can overlap the
         // puppet's own update on another worker thread (s_ovlDriven measures exactly that). With the flag on, the latest
         // state is queued and PuppetActionBlock runs from OwnDrain on the puppet's OWN update, like MirrorActionsDeferred
@@ -6707,7 +6707,7 @@ static bool MirrorActionsEnabled() {
 }
 static unsigned s_mirrorActionCalls = 0;   // SetTargetAction calls issued on mirrored guards (5 s window)
 
-// ---- [Coop] MirrorActionsDeferred (default 0; re-read every 2 s) ------------------------------------------------
+// ---- [Coop] MirrorActionsDeferred (default 1 since 2026-11-16, crash-soak-2026-11-16.md; re-read every 2 s) ------------------------------------------------
 // ROOT CAUSE this addresses (three crashes, 2026-11-12, builds 949810E4 / CBCF01BA / B00EA69B):
 //   * every crash is a call through the ActionEvaluator a body's CURRENT evaluator blends from (evaluator+0x1F4,
 //     i.e. m_BlendInEvaluator+0x114), after that previous evaluator was destroyed;
@@ -6731,7 +6731,7 @@ static bool MirrorActionsDeferred() {
     const uint64_t now = GetTickCount64();
     if (now >= s_next) {
         s_next = now + 2000;
-        const int v = GetPrivateProfileIntA("Coop", "MirrorActionsDeferred", 0, Paths::Ini()) != 0 ? 1 : 0;
+        const int v = GetPrivateProfileIntA("Coop", "MirrorActionsDeferred", 1, Paths::Ini()) != 0 ? 1 : 0;
         if (v != s_v) L("[Mirror] MirrorActionsDeferred=%d (was %d)\n", v, s_v);
         s_v = v;
     }
@@ -12269,7 +12269,7 @@ static void DumpConfigOnce()
         { "Coop", "GuestKillMirror", 1 }, { "Coop", "HookSgm", 1 }, { "Coop", "HostileOnly", 0 },
         { "Coop", "HybridLoco", 1 }, { "Coop", "IdentityBand", 0 }, { "Coop", "IdResolver", 1 },
         { "Coop", "InstallHooks", 1 }, { "Coop", "IntegratePuppet", 0 }, { "Coop", "KillTrace", 1 },
-        { "Coop", "KrLog", 0 }, { "Coop", "LegacyPadIdHook", 1 }, { "Coop", "MirrorActions", 1 }, { "Coop", "MirrorActionsDeferred", 0 }, { "Coop", "OwnPhysicsMs", 0 }, { "Coop", "OwnUpdateGuards", 0 }, { "Coop", "OwnUpdatePuppet", 0 }, { "Coop", "MinBlendInMs", 100 },
+        { "Coop", "KrLog", 0 }, { "Coop", "LegacyPadIdHook", 1 }, { "Coop", "MirrorActions", 1 }, { "Coop", "MirrorActionsDeferred", 1 }, { "Coop", "OwnPhysicsMs", 0 }, { "Coop", "OwnUpdateGuards", 0 }, { "Coop", "OwnUpdatePuppet", 0 }, { "Coop", "MinBlendInMs", 100 },
         { "Coop", "NetStrictPeer", 1 }, { "Coop", "NullReturnObserver", 1 }, { "Coop", "Probe", 0 },
         { "Coop", "PuppetParkX", 0 }, { "Coop", "PuppetPhysics", 0 }, { "Coop", "RegisterPad1", 0 },
         { "Coop", "RelevanceRadiusM", 250 }, { "Coop", "ReloadBuilder", 1 }, { "Coop", "SceneAwareExact", 0 },
@@ -12281,7 +12281,7 @@ static void DumpConfigOnce()
         { "Coop", "FloatProbe", 0 }, { "Coop", "FootOffsetFix", 0 }, { "Coop", "GuardActionGate", 0 }, { "Coop", "GuardExtrapMs", 100 },
         { "Coop", "GuardInterpBuffer", 0 }, { "Coop", "GuardInterpDelayMs", 120 }, { "Coop", "GuardPhaseLock", 0 },
         { "Coop", "GuardSeesPuppet", 0 }, { "Coop", "PuppetActionReassert", 0 }, { "Coop", "PuppetHostTime", 0 },
-        { "Coop", "AlertQueryAsPlayer", 0 }, { "Coop", "ConflictNullGuard", 0 }, { "Coop", "ConflictKeepPuppet", 0 }, { "Coop", "GuardPoiFightTarget", 0 }, { "Coop", "FightOrderPuppet", 0 }, { "Coop", "DespawnLeaveFight", 0 }, { "Coop", "FightKeepOnConflictEnd", 0 }, { "Coop", "FightStateProbe", 0 }, { "Coop", "PuppetNavService", 0 }, { "Coop", "NativeReplica", 0 }, { "Coop", "NativeReplicaSnapCm", 300 }, { "Coop", "NativeReplicaBlendCmS", 150 }, { "Coop", "NativeReplicaStartBoostCmS", 400 }, { "Coop", "NativeReplicaParkour", 0 }, { "Coop", "NativeReplicaFreeRun", 0 }, { "Coop", "NativeReplicaClimbIntent", 0 }, { "Coop", "NativeReplicaClimbMoves", 0 }, { "Coop", "NativeReplicaClimbChoice", 0 }, { "Coop", "NativeReplicaBeam", 0 }, { "Coop", "NativeReplicaWallEntry", 0 }, { "Coop", "NativeReplicaClimbNoSnap", 0 }, { "Coop", "NativeReplicaParkourSnapCm", 800 }, { "Coop", "FightProbe", 0 }, { "Coop", "PeerLastPacket", 0 }, { "Coop", "PuppetActionsOwnUpdate", 0 }, { "Coop", "DetectKeepTarget", 0 }, { "Coop", "GuardPlayerOfInterest", 0 }, { "Coop", "EventProbe", 0 }, { "Coop", "ReactProbe", 0 }, { "Coop", "FightSkipPuppet", 0 }, { "Coop", "NavNullGuard", 0 }, { "Coop", "PuppetStimMode", 1 }, { "Coop", "PuppetStimSeq", 0 }, { "Coop", "PuppetStimSource", 0 }, { "Coop", "SightProbe", 0 }, { "Coop", "StateProbe", 0 }, { "Coop", "StuckProbe", 0 },
+        { "Coop", "AlertQueryAsPlayer", 0 }, { "Coop", "ConflictNullGuard", 0 }, { "Coop", "ConflictKeepPuppet", 0 }, { "Coop", "GuardPoiFightTarget", 0 }, { "Coop", "FightOrderPuppet", 0 }, { "Coop", "DespawnLeaveFight", 0 }, { "Coop", "FightKeepOnConflictEnd", 0 }, { "Coop", "FightStateProbe", 0 }, { "Coop", "PuppetNavService", 0 }, { "Coop", "NativeReplica", 0 }, { "Coop", "NativeReplicaSnapCm", 300 }, { "Coop", "NativeReplicaBlendCmS", 150 }, { "Coop", "NativeReplicaStartBoostCmS", 400 }, { "Coop", "NativeReplicaParkour", 0 }, { "Coop", "NativeReplicaFreeRun", 0 }, { "Coop", "NativeReplicaClimbIntent", 0 }, { "Coop", "NativeReplicaClimbMoves", 0 }, { "Coop", "NativeReplicaClimbChoice", 0 }, { "Coop", "NativeReplicaBeam", 0 }, { "Coop", "NativeReplicaWallEntry", 0 }, { "Coop", "NativeReplicaClimbNoSnap", 0 }, { "Coop", "NativeReplicaParkourSnapCm", 800 }, { "Coop", "FightProbe", 0 }, { "Coop", "PeerLastPacket", 0 }, { "Coop", "PuppetActionsOwnUpdate", 1 }, { "Coop", "DetectKeepTarget", 0 }, { "Coop", "GuardPlayerOfInterest", 0 }, { "Coop", "EventProbe", 0 }, { "Coop", "ReactProbe", 0 }, { "Coop", "FightSkipPuppet", 0 }, { "Coop", "NavNullGuard", 0 }, { "Coop", "PuppetStimMode", 1 }, { "Coop", "PuppetStimSeq", 0 }, { "Coop", "PuppetStimSource", 0 }, { "Coop", "SightProbe", 0 }, { "Coop", "StateProbe", 0 }, { "Coop", "StuckProbe", 0 },
         { "Coop", "StageLog", 0 }, { "Coop", "SyncEnemiesOnly", 1 }, { "Coop", "SyncMaxEntities", 32 },
         { "Coop", "SyncRadiusM", 60 }, { "Coop", "TransformProbe", 0 }, { "Coop", "VPadEnable", 0 },
         { "Coop", "VPadTest", 0 }, { "Coop", "WatchDeadBit", 0 }, { "Coop", "WatchTarget", 0 },

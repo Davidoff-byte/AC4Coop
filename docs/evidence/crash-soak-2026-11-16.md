@@ -50,3 +50,7 @@ Both crashes are guest `0xC0000005` with WER dumps, read with cdb (x86, no symbo
 - Whether the ON arm adds visible lag to guard or puppet actions (the alias is applied one body-update later).
 - The boot-time exits without dumps (10104, 27008, 29188).
 - The heap-corruption assert (32460): one occurrence; no repeat in these 16 runs.
+
+## Decision (owner, 2026-11-16)
+Both flags now default to 1 (src/phase1.cpp PabOn / MirrorActionsDeferred and the config table). The D: test install's explicit`nPuppetActionsOwnUpdate=0 was changed to 1. An explicit 0 in an ini still turns either off.
+
