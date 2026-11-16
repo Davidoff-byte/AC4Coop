@@ -10,6 +10,7 @@ D: Steam install.
 | approach v1 27840/22656 (66f3d23) | 94.9% FAIL | 81.6% | 0.516 m FAIL | 11.55 m | **10.37 m** FAIL | 13.6% |
 | approach v2 29364/18436 (447549c) | 98.9% | 83.5% | 0.505 m FAIL | 11.86 m | **2.02 m** FAIL | 11.0% |
 | per-frame guards 27448/26876 (a5a7bb4, OwnUpdateGuards=1) | 96.6% | 87.7% | **1.178 m** FAIL | 11.95 m | **11.78 m** FAIL | 16.2% |
+| per-frame + re-seed 17916/15912 (asi 785cec66, OwnUpdateGuards=1) | 99.7% | 86.1% | 0.621 m FAIL | 15.23 m | **15.24 m** FAIL | 7.8% |
 
 Host's puppet of the idle guest: 100% ground, max frame move 0.013 m, in every run. Double links 0 and both copies alive in
 every run.
@@ -27,6 +28,17 @@ every run.
   the approach code stays on both paths.
 - `guard max error` stays about 12 m by design: during an approach the body is still on its way. The step metric is the
   visible one.
+
+## Per-frame mode: a second mover (run 17916/15912)
+- Re-seed fix: an own-mode record that is stale (not published for 300 ms) or > 1.5 m from the body starts from the
+  body's real position. 28 re-seeds. It did not help: the largest step was 15.24 m.
+- The own-mode probe gives the reason. Between two of our writes, something else moved a linked body **8 times, mean
+  10.3 m, max 69.1 m**, with `legacyWrites=0` (`[Own] ... guard frames=1622 moved=8 mean=10.338 max=69.083`). Our next
+  write puts it back, and that is the "step".
+- Not ours: `DriveCachedMirrors` has no caller, and the legacy write is off in own mode. Candidates: the engine moving
+  or recycling the body (despawn and respawn of the same Human far away), or physics. **UNVERIFIED**.
+  Next: log the body's position delta with the Human's spawn or recycle state on a `moved` event.
+- `OwnUpdateGuards` stays 0.
 
 ## Next for smoothness
 - Make the per-frame path the only writer for a linked body, and re-score.

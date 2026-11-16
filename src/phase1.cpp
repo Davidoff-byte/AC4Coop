@@ -7084,7 +7084,7 @@ static volatile LONG s_gFrames = 0, s_gMoved = 0, s_gWrites = 0, s_gActFrames = 
 static volatile LONG64 s_gMoveSumUm = 0;
 static volatile LONG s_pFrames = 0, s_pMoved = 0, s_pWrites = 0, s_pMoveMaxUm = 0;
 static volatile LONG64 s_pMoveSumUm = 0;
-static unsigned s_gLegacyWrites = 0, s_gStarvedFallback = 0;
+static unsigned s_gLegacyWrites = 0, s_gStarvedFallback = 0, s_ownReseeds = 0;
 
 static int OwnFind(unsigned int human) {             // caller holds the lock
     for (int i = 0; i < s_ownN; ++i) if (s_own[i].human == human) return i;
@@ -7246,6 +7246,17 @@ static void OwnPublish(Human* h, Entity* e, const float* pos, const float* quat,
         const bool changed = std::memcmp(o.toPos, pos, 12) != 0 || std::memcmp(o.toQuat, quat, 16) != 0;
         if (changed) {
             float cp[3], cq[4]; OwnSample(o, now, cp, cq);
+            // Start from where the body really is when this record is stale (not published for 300 ms: unlinked and
+            // re-linked, AI moved it meanwhile) or something else moved it > 1.5 m from our sample (legacy write while
+            // starved). Otherwise the next frame writes the old sample: a pop of the gap. Same rule as the legacy
+            // BindApproachStep stale-entry fix (447549c: 10.37 -> 2.02 m). Run a5a7bb4 (own mode) had an 11.78 m step.
+            if (readable(e, 0x80)) {
+                const float ax = e->m_GlobalMatrix.M41, ay = e->m_GlobalMatrix.M42, az = e->m_GlobalMatrix.M43;
+                const float gx = ax - cp[0], gy = ay - cp[1], gz = az - cp[2];
+                if (now - o.lastPubUs > 300000 || gx * gx + gy * gy + gz * gz > 2.25f) {
+                    cp[0] = ax; cp[1] = ay; cp[2] = az; ++s_ownReseeds;
+                }
+            }
             const float dx = pos[0] - cp[0], dy = pos[1] - cp[1], dz = pos[2] - cp[2];
             uint64_t dur = now - o.lastPubUs;
             if (dur < 50000) dur = 50000;
@@ -8418,9 +8429,9 @@ static void OwnReport() {
     const LONG64 psum = InterlockedExchange64(&s_pMoveSumUm, 0);
     const LONG ov = InterlockedExchange(&s_ovl, 0), ovd = InterlockedExchange(&s_ovlDriven, 0);
     L("[Own] guards=%d puppet=%d | overlap=%ld driven=%ld | guard frames=%ld moved=%ld (%.1f%%) mean=%.3f max=%.3f writes=%ld "
-      "legacyWrites=%u starved=%u actFrames=%ld actMis=%ld (%.1f%%) bodies=%ld | puppet frames=%ld moved=%ld (%.1f%%) mean=%.3f max=%.3f writes=%ld\n",
+      "legacyWrites=%u starved=%u reseeds=%u actFrames=%ld actMis=%ld (%.1f%%) bodies=%ld | puppet frames=%ld moved=%ld (%.1f%%) mean=%.3f max=%.3f writes=%ld\n",
       s_ownG, s_ownP, ov, ovd, gf, gm, gf ? 100.0 * gm / gf : 0.0, gm ? (double)gsum / gm / 1e6 : 0.0, gmax / 1e6, gw,
-      s_gLegacyWrites, s_gStarvedFallback, gaf, gam, gaf ? 100.0 * gam / gaf : 0.0, (long)s_ownN,
+      s_gLegacyWrites, s_gStarvedFallback, s_ownReseeds, gaf, gam, gaf ? 100.0 * gam / gaf : 0.0, (long)s_ownN,
       pf, pm, pf ? 100.0 * pm / pf : 0.0, pm ? (double)psum / pm / 1e6 : 0.0, pmax / 1e6, pw);
     s_gLegacyWrites = 0; s_gStarvedFallback = 0;
     const LONG cf = InterlockedExchange(&s_cxFrames, 0), cg = InterlockedExchange(&s_cxGround, 0);
