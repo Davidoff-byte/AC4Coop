@@ -8325,6 +8325,7 @@ static void TakeoverNote(Entity* e) {
     for (int i = 0; i < s_toN; ++i) if (s_toEnt[i] == (unsigned int)e) return;
     if (s_toN < 256) s_toEnt[s_toN++] = (unsigned int)e;
 }
+static float s_bindMaxStep = 0.0f; static LONG s_bindApproaches = 0;   // [Bind] pop metric, used by BindApproachStep (below)
 static void TakeoverSweep() {
     if (!BindLockOn()) return;
     World* w = World::GetCurrentWorld(); Entity* player = w ? w->GetPlayer() : nullptr;
@@ -8351,7 +8352,36 @@ static void TakeoverSweep() {
         }
         if (drop) s_toEnt[i] = s_toEnt[--s_toN]; else ++i;
     }
-    L("[Bind] takeover takenOver=%d returnedToAI=%ld dropped(bodyGone=%ld deadLocally=%ld)\n", taken, s_toReturned, s_toGone, s_toDead);
+    L("[Bind] takeover takenOver=%d returnedToAI=%ld dropped(bodyGone=%ld deadLocally=%ld) | approaches=%ld maxStep=%.2f m\n",
+      taken, s_toReturned, s_toGone, s_toDead, s_bindApproaches, (double)s_bindMaxStep);
+    s_bindMaxStep = 0.0f;
+}
+
+// Bind approach + pop metric ([Coop] BindLock on). A gap of 1.5..30 m between a linked body and its host guard is closed
+// over kBindApproachMs with a smoothstep from where the body stood; 30 m or more is a real jump and still snaps.
+static const uint64_t kBindApproachMs = 800;
+static struct { unsigned int ent; float start[3]; uint64_t t0, dur; } s_bap[128]; static int s_bapN = 0;
+static bool BindApproachStep(unsigned int ent, float cx, float cy, float cz, const float* target, float* out) {
+    if (!BindLockOn()) return false;
+    const uint64_t now = GetTickCount64();
+    int k = -1; for (int i = 0; i < s_bapN; ++i) if (s_bap[i].ent == ent) { k = i; break; }
+    const float dx = target[0] - cx, dy = target[1] - cy, dz = target[2] - cz, d = sqrtf(dx * dx + dy * dy + dz * dz);
+    if (k < 0) {
+        if (d <= 1.5f || d >= 30.0f || s_bapN >= 128) return false;
+        k = s_bapN++; s_bap[k].ent = ent; s_bap[k].start[0] = cx; s_bap[k].start[1] = cy; s_bap[k].start[2] = cz; s_bap[k].t0 = now;
+        const uint64_t byRun = (uint64_t)(d / 5.0f * 1000.0f);    // close the gap at about running speed, not a 15 m/s slide
+        s_bap[k].dur = byRun > kBindApproachMs ? byRun : kBindApproachMs;
+        InterlockedIncrement(&s_bindApproaches);
+    }
+    float t = (float)(now - s_bap[k].t0) / (float)s_bap[k].dur;
+    if (t >= 1.0f) { s_bap[k] = s_bap[--s_bapN]; return false; }   // done: the normal write puts it on target
+    const float e = t * t * (3.0f - 2.0f * t);                      // smoothstep
+    for (int i = 0; i < 3; ++i) out[i] = s_bap[k].start[i] + (target[i] - s_bap[k].start[i]) * e;
+    return true;
+}
+static void BindNoteStep(float cx, float cy, float cz, const float* w) {
+    const float dx = w[0] - cx, dy = w[1] - cy, dz = w[2] - cz, d = sqrtf(dx * dx + dy * dy + dz * dz);
+    if (d < 30.0f && d > s_bindMaxStep) s_bindMaxStep = d;          // >= 30 m is a deliberate snap (teleport), not a pop
 }
 
 static void ApplyGuards(const EntityPacket& pkt) {
@@ -8689,13 +8719,21 @@ static void ApplyGuards(const EntityPacket& pkt) {
                 }
                 if (bh && !s_selfTestMode) OwnPublish(bh, (Entity*)best, es.pos, es.quat, es.actionAlias, es.anim, pkt.hostMs);
                 const bool ownWrites = bh && !s_selfTestMode && OwnGuardsOn() && !OwnStarved(bh);
+                // [Coop] BindLock: a body linked up to BindRadiusM away from its host guard used to SNAP there (scorecard
+                // 2026-11-16: guard maxErr 11.99 m = a visible teleport). Now it eases in over kBindApproachMs; while an
+                // approach runs the body is written every packet, even when the host guard stands still.
+                const float bcx = best->m_GlobalMatrix.M41, bcy = best->m_GlobalMatrix.M42, bcz = best->m_GlobalMatrix.M43;
+                float wpos[3] = { es.pos[0], es.pos[1], es.pos[2] };
+                const bool approaching = BindApproachStep((unsigned int)best, bcx, bcy, bcz, es.pos, wpos);
+                if (approaching) moved = true;
                 if (moved && !ownWrites) {
                     HookMath::Quaternion q; q.x=es.quat[0]; q.y=es.quat[1]; q.z=es.quat[2]; q.w=es.quat[3];
                     HookMath::Transform m;
                     HookMath::ToMatrix(&q, &m);
-                    m.M41 = es.pos[0]; m.M42 = es.pos[1]; m.M43 = es.pos[2];
+                    m.M41 = wpos[0]; m.M42 = wpos[1]; m.M43 = wpos[2];
+                    BindNoteStep(bcx, bcy, bcz, wpos);
                     // A capsule push per snapshot was pure jitter; only a jump (>5 m) needs physics.
-                    bool bigJump = (dp > 25.0f);
+                    bool bigJump = !approaching && (dp > 25.0f);
                     if (!s_selfTestMode) {
                         ((Entity*)best)->SetGlobalMatrixInternal(&m, bigJump);
                         if (bh) OwnNoteLegacyWrite(bh, es.pos);

@@ -28,6 +28,7 @@ THRESH = {
     'smooth_maxD_m': 0.50,       # largest single-frame puppet move in a window (a pop)
     'bind_maxErr_m': 1.00,       # linked guard position error vs host
     'apply_hz_min': 25.0,        # puppet apply calls per second (frame-rate proxy)
+    'guard_step_m': 1.00,        # largest single position write of a linked guard (a pop), [Bind] takeover maxStep
 }
 OFFGROUND = {6, 7, 8, 9, 10, 30}
 
@@ -66,6 +67,8 @@ def side(game, pid):
         if m: r['nobod'][0] += int(m.group(1)); r['nobod'][1] += int(m.group(2))
         m = re.search(r'\[Bind\] lock=\d+ linked=\d+ doubleNow=(\d+)', s)
         if m: r['double'] = max(r['double'], int(m.group(1)))
+        m = re.search(r'\[Bind\] takeover .*maxStep=([\d.]+)', s)
+        if m: r['step'] = max(r.get('step', 0.0), float(m.group(1)))
         if s.startswith('[FI] stats'): r['fi'] = s
         if s.startswith('[OD] stats'): r['od'] = s
     return r
@@ -98,6 +101,8 @@ def report(h, g):
     ok, nb = g['nobod']
     if ok + nb: row('guest guards: records with no body', f'{pct(nb, ok + nb):.1f}% ({nb}/{ok + nb})')
     row('guest guards: double links (max)', str(g['double']), '0', g['double'] == 0)
+    if 'step' in g:
+        row('guest guards: largest write step', f"{g['step']:.2f} m", f"<={THRESH['guard_step_m']}", g['step'] <= THRESH['guard_step_m'])
     for tag, s in (('host', h), ('guest', g)):
         if s['fi']: row(f'{tag} fight intents', s['fi'].replace('[FI] stats ', ''))
         if s['od']: row(f'{tag} owner damage', s['od'].replace('[OD] stats ', ''))
