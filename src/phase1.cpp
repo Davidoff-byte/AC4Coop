@@ -7325,8 +7325,8 @@ static bool GuardPlaceOn() {
     return s_gpOn == 1;
 }
 static volatile LONG s_plFrames = 0, s_plWrites = 0, s_plApproachStarts = 0, s_plSnaps = 0, s_plMoved = 0, s_plMovedMaxMm = 0,
-                     s_plStuck = 0, s_plStepMaxMm = 0, s_plStepsOver = 0, s_plResets = 0, s_plReseeds = 0, s_plNoSample = 0;
-static volatile LONG s_plMovedLines = 0, s_plSnapLines = 0;
+                     s_plStuck = 0, s_plStepMaxMm = 0, s_plStepsOver = 0, s_plStepMaxFastMm = 0, s_plStepsOverSlow = 0, s_plWritesSlow = 0, s_plResets = 0, s_plReseeds = 0, s_plNoSample = 0;
+static volatile LONG s_plMovedLines = 0, s_plSnapLines = 0, s_plRecycled = 0;
 
 static void OwnPublish(Human* h, Entity* e, const float* pos, const float* quat, uint32_t alias, const GuardAnim& anim,
                        uint32_t hostMs, uint64_t objId) {
@@ -7342,7 +7342,7 @@ static void OwnPublish(Human* h, Entity* e, const float* pos, const float* quat,
         OwnBody& o = s_own[i];
         if (o.objId != objId || o.unlinked) {
             o.objId = objId; o.unlinked = 0; o.linkUs = now; o.ringN = 0; o.ringHead = 0;
-            o.plApproach = 1; o.plHave = 0; o.plStuck = 0; o.plStuckN = 0; o.lastWriteUs = now; o.haveWrite = false;
+            o.plApproach = 1; o.plHave = 0; o.plStuckN = 0; o.lastWriteUs = now;   // plStuck survives: ApplyGuards takes it o.haveWrite = false;
             o.lastPubUs = now;
             InterlockedIncrement(&s_plResets);
         } else if (now - o.lastPubUs > 300000) {
@@ -7431,11 +7431,11 @@ static void OwnUnlinkEnt(unsigned int ent) {
 }
 // GuardPlace: true once when this body's writer found that its writes do not stick (the body stays put away from the
 // position written); ApplyGuards then releases the link exactly like the legacy BindStuck path.
-static bool OwnPlaceTakeStuck(Human* h) {
-    bool st = false;
+static int OwnPlaceTakeStuck(Human* h) {   // 0 none, 1 writes do not stick, 2 recycled by the engine
+    int st = 0;
     AcquireSRWLockExclusive(&s_ownLock);
     const int i = OwnFind((unsigned int)h);
-    if (i >= 0 && s_own[i].plStuck) { s_own[i].plStuck = 0; s_own[i].plStuckN = 0; st = true; }
+    if (i >= 0 && s_own[i].plStuck) { st = s_own[i].plStuck; s_own[i].plStuck = 0; s_own[i].plStuckN = 0; }
     ReleaseSRWLockExclusive(&s_ownLock);
     return st;
 }
@@ -8763,6 +8763,23 @@ static void GuardPlaceWrite(Human* h, Entity* e, OwnBody& o, uint64_t now) {
                   o.plLast[0], o.plLast[1], o.plLast[2]);
             }
             if (md > 1.5f) approach = 1;
+            // Recycled body (run 20472, 2026-11-16): the guest engine parks a linked body at the world origin and
+            // re-spawns it elsewhere (same address, drive flag set again), or keeps putting it back on one spot
+            // (three bodies of one host guard at (26.2,-61.7,6.9), 34-37 m from our writes). Chasing it drags an NPC
+            // across the map. A jump of > 5 m away from our write, or a body at the origin, ends the link at once
+            // (ApplyGuards releases it and keeps the body out of linking for 120 s).
+            const bool atOrigin = bx * bx + by * by + bz * bz < 1.0f;
+            if (md > 5.0f || atOrigin) {
+                InterlockedIncrement(&s_plRecycled);
+                AcquireSRWLockExclusive(&s_ownLock);
+                const int jr = OwnFind((unsigned int)h);
+                if (jr >= 0 && s_own[jr].objId == o.objId) { s_own[jr].plStuck = 2; s_own[jr].unlinked = 1; }
+                ReleaseSRWLockExclusive(&s_ownLock);
+                if (InterlockedIncrement(&s_plSnapLines) <= 20)
+                    L("[Place] recycled ent=%08X objId=%016llX body=(%.1f,%.1f,%.1f) %.1f m from our write: link ends\n", o.ent,
+                      (unsigned long long)o.objId, bx, by, bz, md);
+                return;
+            }
         }
         const float sx = bx - o.plPrevBody[0], sy = by - o.plPrevBody[1], sz = bz - o.plPrevBody[2];
         const float gx = tp[0] - bx, gy = tp[1] - by, gz = tp[2] - bz;
@@ -8795,6 +8812,7 @@ static void GuardPlaceWrite(Human* h, Entity* e, OwnBody& o, uint64_t now) {
         }
         const float vmax = vt * 1.5f > 9.0f ? vt * 1.5f : 9.0f;
         float step = vmax * (float)(double)dtUs * 1e-6f;
+        if (step > 0.4f) step = 0.4f;                    // per write: under the 0.5 m pop bar even after a long frame
         if (gap > 1e-4f) {
             if (step >= gap - 0.3f) { step = gap; approach = 0; }   // arrived: the next frame places it
             const float f = step / gap;
@@ -8806,6 +8824,11 @@ static void GuardPlaceWrite(Human* h, Entity* e, OwnBody& o, uint64_t now) {
         if (!snap) {
             OwnAtomicMax(&s_plStepMaxMm, (LONG)(sd * 1000.0f));
             if (sd > 0.5f) InterlockedIncrement(&s_plStepsOver);
+            // split by this body's update gap: > 100 ms since our last write = the engine did not update the body
+            // (distance LOD), so any writer steps by speed x gap; <= 100 ms = a step at frame rate (a pop if large)
+            const bool slow = o.plHave && now - o.plLastUs > 100000;
+            if (slow) { InterlockedIncrement(&s_plWritesSlow); if (sd > 0.5f) InterlockedIncrement(&s_plStepsOverSlow); }
+            else OwnAtomicMax(&s_plStepMaxFastMm, (LONG)(sd * 1000.0f));
             BindNoteStep(bx, by, bz, w, o.ent, "place", approach, o.objId);
         }
     }
@@ -9287,11 +9310,12 @@ static void PlaceReport() {
       s_plBandRec[2], s_plBandLinked[2], sh(s_plBandRec[2], s_plBandLinked[2]),
       s_plErrN ? s_plErrSum / s_plErrN : 0.0, (double)s_plErrMax, s_plErrN, s_plFrozen, orphans);
     L("[Place] writer frames=%ld writes=%ld resets=%ld reseeds=%ld approachStarts=%ld snaps=%ld noSample=%ld | movedByOther=%ld max=%.2f m | "
-      "stuck=%ld | maxStep=%.3f m steps>0.5=%ld\n",
+      "stuck=%ld recycled=%ld | maxStep=%.3f m steps>0.5=%ld | gap<=100ms maxStep=%.3f m | gap>100ms writes=%ld steps>0.5=%ld\n",
       InterlockedExchange(&s_plFrames, 0), InterlockedExchange(&s_plWrites, 0), InterlockedExchange(&s_plResets, 0),
       InterlockedExchange(&s_plReseeds, 0), InterlockedExchange(&s_plApproachStarts, 0), InterlockedExchange(&s_plSnaps, 0),
       InterlockedExchange(&s_plNoSample, 0), InterlockedExchange(&s_plMoved, 0), InterlockedExchange(&s_plMovedMaxMm, 0) / 1000.0,
-      InterlockedExchange(&s_plStuck, 0), InterlockedExchange(&s_plStepMaxMm, 0) / 1000.0, InterlockedExchange(&s_plStepsOver, 0));
+      InterlockedExchange(&s_plStuck, 0), InterlockedExchange(&s_plRecycled, 0), InterlockedExchange(&s_plStepMaxMm, 0) / 1000.0, InterlockedExchange(&s_plStepsOver, 0),
+      InterlockedExchange(&s_plStepMaxFastMm, 0) / 1000.0, InterlockedExchange(&s_plWritesSlow, 0), InterlockedExchange(&s_plStepsOverSlow, 0));
     for (int b = 0; b < 3; ++b) { s_plBandRec[b] = 0; s_plBandLinked[b] = 0; }
     s_plErrSum = 0.0; s_plErrN = 0; s_plErrMax = 0.0f; s_plFrozen = 0;
 }
@@ -9632,26 +9656,29 @@ static void ApplyGuards(const EntityPacket& pkt) {
                         for (int k = 0; k < 4; ++k) s_last[slot].quat[k] = es.quat[k];
                     }
                 }
-                if (bh && !s_selfTestMode) OwnPublish(bh, (Entity*)best, es.pos, es.quat, es.actionAlias, es.anim, pkt.hostMs, es.objId);
-                if (bh && CombatTiming::On()) {   // [Coop] CombatTimingProbe
-                    CombatTiming::ScopeBody(bh, best, es.objId);
-                    CombatTiming::GuestGuardRx(es.objId, best, es.actionAlias, es.anim.ratioQ, pkt.hostMs);
-                }
                 const bool place = bh && !s_selfTestMode && GuardPlaceOn();
-                const bool ownWrites = bh && !s_selfTestMode && (OwnGuardsOn() || place) && !OwnStarved(bh);
-                // [Coop] GuardPlace: the body's own writer found its writes do not stick -> release, as the legacy rule.
-                if (place && BindLockOn() && OwnPlaceTakeStuck(bh)) {
+                // [Coop] GuardPlace: the body's own writer found its writes do not stick, or the engine recycled the body
+                // -> release, as the legacy rule. Checked BEFORE OwnPublish, which would otherwise re-link the same body.
+                const int plRel = (place && BindLockOn()) ? OwnPlaceTakeStuck(bh) : 0;
+                if (plRel) {
                     BindStuckReject((unsigned int)best);
                     GuestObjForget(es.objId);
                     if (slotIdx != SYNC_SLOT_NONE && s_guestSlot[slotIdx].ent == (unsigned int)best) {
                         s_guestSlot[slotIdx].used = 0; s_guestSlot[slotIdx].ent = 0; s_guestSlot[slotIdx].objId = 0;
                     }
                     InterlockedIncrement(&s_stuckReleased);
-                    L("[Bind] stuck body ent=%08X objId=%016llX released (place writer: 30 frames unmoved) at (%.1f,%.1f,%.1f), host guard at (%.1f,%.1f,%.1f) [released=%ld]\n",
-                      (unsigned int)best, (unsigned long long)es.objId, best->m_GlobalMatrix.M41, best->m_GlobalMatrix.M42,
+                    L("[Bind] stuck body ent=%08X objId=%016llX released (place writer: %s) at (%.1f,%.1f,%.1f), host guard at (%.1f,%.1f,%.1f) [released=%ld]\n",
+                      (unsigned int)best, (unsigned long long)es.objId, plRel == 2 ? "recycled by the engine" : "30 frames unmoved",
+                      best->m_GlobalMatrix.M41, best->m_GlobalMatrix.M42,
                       best->m_GlobalMatrix.M43, es.pos[0], es.pos[1], es.pos[2], s_stuckReleased);
                     continue;
                 }
+                if (bh && !s_selfTestMode) OwnPublish(bh, (Entity*)best, es.pos, es.quat, es.actionAlias, es.anim, pkt.hostMs, es.objId);
+                if (bh && CombatTiming::On()) {   // [Coop] CombatTimingProbe
+                    CombatTiming::ScopeBody(bh, best, es.objId);
+                    CombatTiming::GuestGuardRx(es.objId, best, es.actionAlias, es.anim.ratioQ, pkt.hostMs);
+                }
+                const bool ownWrites = bh && !s_selfTestMode && (OwnGuardsOn() || place) && !OwnStarved(bh);
                 PlaceNoteLinked(best, es, place && ownWrites ? (OwnPlaceApproaching(bh) ? 1 : 0)
                                                              : (BindApproachActive((unsigned int)best) ? 1 : 0));
                 // [Coop] BindLock: a body linked up to BindRadiusM away from its host guard used to SNAP there (scorecard
