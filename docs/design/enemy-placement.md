@@ -3,8 +3,14 @@
 Goal: every host guard near either player has exactly one body on the guest. That body stands where the host's guard
 stands and moves smoothly. It is never frozen, missing, doubled, teleporting or popping.
 
-Status: slice A is built behind `[Coop] GuardPlace` (default 0). The live result is in
-`docs/evidence/enemy-placement-2026-11-16.md`. Stages B-D are designs only.
+Status: slice A is built behind `[Coop] GuardPlace` (default 0) and tested live on the two-copy rig: 7 of 8 bars
+pass. The largest write step is 0.65 m against a 0.50 m bar (baseline 1.49 m). Results are in
+`docs/evidence/enemy-placement-2026-11-16.md`. Stages B0-D are designs only.
+
+**Live finding that reorders the plan:** the guest engine **recycles linked bodies**. It parks one at the world origin
+and re-spawns it elsewhere, sometimes at the same address with fresh state. That is the 69 m "second mover", the
+"stuck spots" and most of the body-gone churn (24-209 releases per 110 s run). Slice A now ends such a link at once.
+The root fix is new stage **B0: keep linked bodies from being recycled.** This is RE: find the despawn decision.
 
 ## 1. How guards reach the guest today (code at 856e912, `src/phase1.cpp`)
 
@@ -175,6 +181,26 @@ often.
 - **It does nothing for guards near the guest.** That is stage B.
 - UNVERIFIED: that 35 m hides the move. The game has no camera RE yet. A frustum test would be the right gate.
 
+### A3. Recycled-body release (built, part of `GuardPlace`)
+
+- At frame start, a body that is more than 5 m from our last write, or that sits at the world origin, ends its link.
+- ApplyGuards takes that before it feeds a sample, so the same body is not re-linked. It uses the BindStuck release:
+  the body is forgotten and kept out of linking for 120 s.
+- The approach step per write is capped at 0.4 m.
+
+### B0. Keep linked bodies alive (RE, not built)
+
+- **Data (run 20472):** a linked body was moved to (0,0,0), then appeared elsewhere 36 ms later with
+  `m_DriveEntity` = 1 again.
+- Several bodies of one host guard kept being put back on one spot.
+- **Hypothesis (UNVERIFIED):** the population system despawns NPCs far from the guest player (30-60 m here) and
+  re-spawns them through a pool.
+- **Next RE:**
+  - the despawn counterpart of `SpawningRequest::Spawn` (RVA 0x39B8D0, hooked by `DisableSpawns`);
+  - the pool that hands back an entity at the origin.
+- **Goal:** a linked body is never chosen for despawn while linked. That is a cheaper fix than proxies for the churn,
+  and it keeps the body's outfit.
+
 ### B. Proxies from a creation record (not built)
 
 **Why:** the no-archetype share is a guest population difference. No amount of binding radius fixes it. AU-RW and ACU
@@ -206,8 +232,10 @@ itself create replicas from a record for spawned NPCs.
 
 ### C. Replica gate (RE, not built)
 
-- In legacy mode a taken-over body moves by itself between writes (about 50% of frames). Slice A's probe names when
-  and how far.
+- In legacy mode a taken-over body moves by itself between writes (about 50% of frames).
+- With `GuardPlace` the moved-by-other events drop to 22-79 per run. The large ones are recycling (B0).
+- The small ones (0.5-0.7 m, every frame, at ctx 46/47) are a body put back on the same spot each frame, a scripted
+  context. UNVERIFIED.
 - The candidates are the animation's root motion through the character controller, and physics. **UNVERIFIED.**
 - Next: in IDA, read what `CharacterController::m_DriveEntity` gates, and which update writes `m_GlobalMatrix` for an
   NPC whose BhvGenericNPC is disabled (xrefs of `SetGlobalMatrixInternal` reached from the per-Human update

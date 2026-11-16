@@ -87,11 +87,15 @@ def side(game, pid):
             n = int(v[9]); p['errw'] += float(v[7]) * n; p['errn'] += n; p['errmax'] = max(p['errmax'], float(v[8]))
             p['frozen'] += int(v[10]); p['orph'].append(int(v[11]))
             continue
-        m = re.search(r'\[Place\] writer .*movedByOther=(\d+) max=([\d.]+) m \| stuck=(\d+) \| maxStep=([\d.]+) m steps>0.5=(\d+)', s)
+        m = re.search(r'\[Place\] writer .*movedByOther=(\d+) max=([\d.]+) m \| stuck=(\d+)(?: recycled=\d+)? \| maxStep=([\d.]+) m steps>0.5=(\d+)', s)
         if m:
             w = r.setdefault('placew', [0, 0.0, 0, 0.0, 0])
             w[0] += int(m.group(1)); w[1] = max(w[1], float(m.group(2))); w[2] += int(m.group(3)); w[3] = max(w[3], float(m.group(4)))
             w[4] += int(m.group(5))
+            m2 = re.search(r'gap<=100ms maxStep=([\d.]+) m \| gap>100ms writes=(\d+) steps>0.5=(\d+)', s)
+            if m2:
+                w2 = r.setdefault('placew2', [0.0, 0, 0])
+                w2[0] = max(w2[0], float(m2.group(1))); w2[1] += int(m2.group(2)); w2[2] += int(m2.group(3))
             continue
         if s.startswith('[FI] stats'): r['fi'] = s
         if s.startswith('[OD] stats'): r['od'] = s
@@ -149,6 +153,8 @@ def report(h, g):
         if p['orph']: row('guest-only fighters < 40 m (orphans), max per window', str(max(p['orph'])))
     w = g.get('placew')
     if w: row('place writer: moved-by-other / max / stuck / maxStep / steps>0.5', f'{w[0]} / {w[1]:.2f} m / {w[2]} / {w[3]:.3f} m / {w[4]}')
+    w2 = g.get('placew2')
+    if w2: row('place writer: maxStep at frame rate / writes after >100 ms gap / of them >0.5 m', f'{w2[0]:.3f} m / {w2[1]} / {w2[2]}')
     for tag, s in (('host', h), ('guest', g)):
         if s['fi']: row(f'{tag} fight intents', s['fi'].replace('[FI] stats ', ''))
         if s['od']: row(f'{tag} owner damage', s['od'].replace('[OD] stats ', ''))
