@@ -44,3 +44,31 @@ EnterFight, then the pad sequence (`real_fight.py`).
   push. None was observed.
 - **Damage the host deals to its own guards** is unchanged (the host is the owner).
 - **Repeatability:** n = 1.
+
+## Non-lethal hits (2026-11-16 03:40-04:10)
+- Real pad fights on the guest landed no hit in three rounds (pids 24256/28060). `passedHeal=13` shows the detour saw only
+  life increases (regeneration) and let them through.
+- Test command `pilot.py lifehit ENT DMG` (kCmdLifeHit, commit 67e1358): calls the real `CSrvNPCHealth::SetLife(life - DMG)`
+  on ENT's health service from the guest's player frame, unmarked, as a combat hit calls it. Only the caller differs from a
+  real hit.
+- **First attempt (asi 3e15f7fa), two defects:**
+  - Rounding: 5 requested, 6 applied per hit (the guest rounded the fraction up and the host rounded the damage up). Host
+    36 → 30 → 24 → 18.
+  - The copy did not follow: `DamageRelay` was read lazily after the runner's ini restore, and the install ini also had an
+    explicit `DamageRelay=0` left from earlier testing.
+- **Fixes (commit 605f382, asi 7e7078f7):**
+  - the guest rounds to the nearest permille; the host applies `round(total x max / 1000) - already applied`;
+  - the FightIntents-following defaults (DamageRelay, BindLock, BindRadiusM) are read at plugin start
+    (`[OD] session defaults` line);
+  - the install ini's `DamageRelay=0` was changed to 1 (owner's S9 decision; an explicit 0 still turns it off).
+- **Result (host 25972, guest 9580, linked copy 38852080 ↔ host guard F0003713, three `lifehit 5`):**
+  | hit | guest | host | guest copy |
+  |---|---|---|---|
+  | 1 | `life 36 -> requested 31 -> now 36` (blocked), `tx +139 permille total=139` | `life 36 -> 31 (max 36)` | `hp relay ... life 36 -> 31 (host 31, local max 36)` |
+  | 2 | blocked, total=278 | `31 -> 26` | `31 -> 26` |
+  | 3 | blocked, total=417 | `26 -> 21` | `26 -> 21` |
+  **PASS:** exact damage, owner-applied, and the copy shows the owner's value after each hit.
+- **Still open:**
+  - `ApplyRelayedHealth` writes the host's absolute life clamped to the local max. With different maxes (36 vs 30 seen
+    earlier) the copy's proportion is off. The host max is not on the wire.
+  - A partial hit from real combat was not captured.
