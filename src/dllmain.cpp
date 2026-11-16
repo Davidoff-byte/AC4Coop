@@ -30,6 +30,7 @@
 #include "action_writer.h"
 #include "guard_sight.h"
 #include "event_probe.h"
+#include "player_damage_probe.h"
 #include "puppet_stim.h"
 #include "pilot.h"
 #include "probe_server.h"
@@ -634,6 +635,7 @@ BOOL APIENTRY DllMain(HMODULE hMod, DWORD reason, LPVOID)
 
         // Event probe on sub_64A020 (observation only): which events shooting / attacking posts. [Coop] EventProbe, default 0.
         EventProbe::Init();
+        PlayerDamageProbe::Init();   // [Coop] PlayerDamageProbe, default 0: damage-chain hit counters (puppet vs player)
 
         // Host: no fight orders for the co-op puppet (sub_13F22E0). [Coop] FightSkipPuppet, hook only when the key exists.
         PuppetStim::Init();

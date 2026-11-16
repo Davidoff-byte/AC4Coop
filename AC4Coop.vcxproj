@@ -134,6 +134,7 @@
     <ClCompile Include="src\action_guard.cpp" />
     <ClCompile Include="src\action_writer.cpp" />
     <ClCompile Include="src\event_probe.cpp" />
+    <ClCompile Include="src\player_damage_probe.cpp" />
     <ClCompile Include="src\puppet_stim.cpp" />
     <ClCompile Include="src\pilot.cpp" />
     <ClCompile Include="src\pilot_world.cpp" />

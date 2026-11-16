@@ -269,6 +269,15 @@
    "size": 41,
    "status": "unknown"
   },
+  "0064D8C0": {
+   "addr": "0064D8C0",
+   "claimed_at": null,
+   "name": "EventPostLocked",
+   "owner": null,
+   "receipts": [],
+   "size": 65,
+   "status": "unknown"
+  },
   "00657BE0": {
    "addr": "00657BE0",
    "claimed_at": "2026-11-08T12:12:53Z",
@@ -668,6 +677,15 @@
    "size": 101,
    "status": "unknown"
   },
+  "01029240": {
+   "addr": "01029240",
+   "claimed_at": null,
+   "name": "DamageEventNew",
+   "owner": null,
+   "receipts": [],
+   "size": 152,
+   "status": "unknown"
+  },
   "01038330": {
    "addr": "01038330",
    "claimed_at": "2026-11-08T16:48:59Z",
@@ -1013,6 +1031,15 @@
    "size": 686,
    "status": "unknown"
   },
+  "0199A160": {
+   "addr": "0199A160",
+   "claimed_at": null,
+   "name": "FightDamageCompute",
+   "owner": null,
+   "receipts": [],
+   "size": 1900,
+   "status": "unknown"
+  },
   "019FB4C0": {
    "addr": "019FB4C0",
    "claimed_at": "2026-11-08T12:06:28Z",
@@ -1050,6 +1077,15 @@
    "owner": null,
    "receipts": [],
    "size": 818,
+   "status": "unknown"
+  },
+  "01B86E40": {
+   "addr": "01B86E40",
+   "claimed_at": null,
+   "name": "DamageEventInit",
+   "owner": null,
+   "receipts": [],
+   "size": 332,
    "status": "unknown"
   },
   "01CB91B0": {

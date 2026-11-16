@@ -21,6 +21,7 @@ journal and handoff in `docs/archive/`. Update it in the same PR as any change t
 | event layer | exactly-once delivery under 30 % loss | `tools/event_peer.py` selftest (`05eb0c6`), Python only |
 | two copies on one PC | two `AC4BFSP.exe` running at once, both started directly from the exe (no Steam), with `proxy/version` `version.dll` | live 2026-11-15, pids 25788 + 26200 (`docs/evidence/single-instance-guard-2026-11-15.md`); render and co-op between them not yet checked |
 | fight decisions (S7 slice 1) | `[Coop] FightIntents` (default 0): fight enter / attack / exit with target on the intention lane drive the puppet's own FSM | same-PC two copies 2026-11-15: enter/exit 3/3, one real attack (`docs/evidence/s7-fight-intents-2026-11-15.md`); needs the target bound by the entity lane |
+| guards hitting the other player | `[Coop] PlayerDamageRelay` (default follows FightIntents): a guard's hit on the puppet (lost there: the puppet has no fight/health services) is scored with the engine's `sub_199A160` and posted as a native DamageEvent on the owner's player | same-PC two copies 2026-11-16: 13/13 hits applied, native death and respawn, no double hits (`docs/evidence/player-damage-relay-2026-11-16.md`); no hurt reaction, the owner's block/counter not consulted |
 
 ## Measured negatives
 - Guards do not perceive the other player's body, with or without collision. `docs/ops/P6-RESULT.md`, `RUN-2026-11-10-X2b`.

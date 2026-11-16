@@ -8,6 +8,7 @@
 #include "action_writer.h"
 #include "guard_sight.h"
 #include "event_probe.h"
+#include "player_damage_probe.h"
 #include "../third_party/minhook/include/MinHook.h"
 #include "puppet_stim.h"
 #include "pilot.h"
@@ -7985,12 +7986,133 @@ static void FightIntentSend(Human* player) {
     s_inFight = inFight; s_attack = attack;
 }
 
+// ---- [Coop] PlayerDamageRelay (default follows FightIntents, read once at load in player_damage_probe.cpp) ------------
+// Probe runs 25140 / 19900 (asi 687115e4 / 080e30fe, docs/evidence/player-damage-relay-2026-11-16.md): a guard's hit on
+// the puppet is posted (FightDamageEvent hit phase, FDE+0x54 == 1, attacker handle FDE+0x58) and then lost - the puppet
+// runs no CSHumanFightInteractions slot 18 / DamageEvent / CSDamage (0 of 44 hits; the player: 6 of 6). So the machine
+// that holds the puppet scores the hit with the engine's own sub_199A160 (equal to the player's DamageEvent damage on 6/6)
+// and sends it to the puppet's owner, who posts a native DamageEvent to its own player (PlayerDamage_PostDamageEvent):
+// "causer requests, owner decides" for players. Stage 1: only the host sends (it owns the guards).
+// Wire: IC_PDAMAGE on the avatar wire id 'AVATARO2', a running total + hit count, so a lane replay (IF_BASE) to a rejoined
+// peer is harmless: an owner with no state adopts a replayed total with count > 1 as its baseline.
+bool PlayerDamage_PostDamageEvent(void* victim, void* attacker, int damage, uint32_t contact, uint32_t subtype, uint32_t f18, uint8_t flags);
+static const uint64_t kPdrWire = 0x4156415441524F32ull;   // 'AVATARO2'
+#pragma pack(push, 1)
+struct PdrPayload { uint32_t total, count; uint64_t attacker; uint16_t damage; uint8_t contact, subtype, flags, f18; uint16_t pad; };
+#pragma pack(pop)
+static_assert(sizeof(PdrPayload) == 24, "IC_PDAMAGE payload is a wire layout");
+static int s_pdrOn = -1;
+static bool PdrOn() {
+    if (s_pdrOn < 0) s_pdrOn = PlayerDamageProbe::RelayOn() ? 1 : 0;   // read once at load (DllMain), never after a runner's ini restore
+    return s_pdrOn == 1;
+}
+struct PdrHit { uintptr_t att; int dmg; uint8_t contact, sub, flags, f18; };
+static PdrHit s_pdrQ[32]; static LONG s_pdrHead = 0, s_pdrTail = 0;
+static SRWLOCK s_pdrLock = SRWLOCK_INIT;
+static struct { uintptr_t att; ULONGLONG ms; } s_pdrRecent[8]; static int s_pdrRecentI = 0;
+static volatile LONG s_pdrSeen = 0, s_pdrDup = 0, s_pdrTx = 0, s_pdrRx = 0, s_pdrApplied = 0, s_pdrFail = 0, s_pdrBase = 0, s_pdrDropped = 0;
+
+// Host, any thread (the attacker's event post, player_damage_probe.cpp H1). Each hit is posted twice ~16 ms apart (run
+// 25140: pairs 17 ms apart, same attacker; distinct hits of one attacker >= 1.7 s apart): one hit per attacker per 150 ms.
+void Phase1_PuppetHitPosted(uintptr_t att, int dmg, uint32_t contact, uint32_t subtype, uint32_t f18, uint8_t flags) {
+    if (!PdrOn() || g_entHost != 1 || dmg <= 0) return;
+    InterlockedIncrement(&s_pdrSeen);
+    const ULONGLONG now = GetTickCount64();
+    AcquireSRWLockExclusive(&s_pdrLock);
+    bool dup = false;
+    for (int i = 0; i < 8; ++i) if (s_pdrRecent[i].att == att && now - s_pdrRecent[i].ms < 150) { dup = true; s_pdrRecent[i].ms = now; break; }
+    if (!dup) {
+        s_pdrRecent[s_pdrRecentI].att = att; s_pdrRecent[s_pdrRecentI].ms = now; s_pdrRecentI = (s_pdrRecentI + 1) & 7;
+        if (s_pdrHead - s_pdrTail < 32) {
+            PdrHit& q = s_pdrQ[s_pdrHead & 31];
+            q.att = att; q.dmg = dmg; q.contact = (uint8_t)contact; q.sub = (uint8_t)subtype; q.flags = flags; q.f18 = (uint8_t)f18;
+            ++s_pdrHead;
+        } else InterlockedIncrement(&s_pdrDropped);
+    }
+    ReleaseSRWLockExclusive(&s_pdrLock);
+    if (dup) InterlockedIncrement(&s_pdrDup);
+}
+
+// Host, player frame: publish queued hits as the running total.
+static void PlayerDamageHostPump() {
+    if (s_pdrOn != 1 || g_entHost != 1) return;
+    static uint32_t s_total = 0, s_count = 0;
+    for (;;) {
+        PdrHit h;
+        AcquireSRWLockExclusive(&s_pdrLock);
+        const bool any = s_pdrTail != s_pdrHead;
+        if (any) { h = s_pdrQ[s_pdrTail & 31]; ++s_pdrTail; }
+        ReleaseSRWLockExclusive(&s_pdrLock);
+        if (!any) break;
+        PdrPayload p = {};
+        s_total += (uint32_t)h.dmg; ++s_count;
+        p.total = s_total; p.count = s_count; p.attacker = FiCanonicalId((Entity*)h.att);
+        p.damage = (uint16_t)h.dmg; p.contact = h.contact; p.subtype = h.sub; p.flags = h.flags; p.f18 = h.f18;
+        const bool ok = Net::PublishIntent(0, kPdrWire, IC_PDAMAGE, (uint32_t)GetTickCount(), &p, (uint8_t)sizeof(p));
+        InterlockedIncrement(&s_pdrTx);
+        L("[PDR] tx hit #%u attacker=%08X id=%016llX damage=%d total=%u contact=%u sub=%u flags=%02X ok=%d\n", s_count,
+          (unsigned)h.att, (unsigned long long)p.attacker, h.dmg, s_total, h.contact, h.sub, h.flags, ok ? 1 : 0);
+    }
+}
+
+// The local player's health service (CSrvPlayerHealth, vtable 0x0269BBF8 = SetLife slot 16 at 0x269BC38 minus 0x40,
+// docs/evidence/player-damage-path-2026-11-16.md Q3), found as FindHealthInAI finds the NPC one. Life int16 at +0x5C.
+// -1 when not found (then the log just lacks the value).
+static int PdrPlayerLife(Entity* pl) {
+    __try {
+        const unsigned int ai = (unsigned int)AIEntityHelper::GetEntityAI(pl);
+        if (!ai || !readable((void*)ai, 0x78)) return -1;
+        const unsigned int arr = *(unsigned int*)(ai + 0x70), n = *(unsigned short*)(ai + 0x76);
+        if (!arr || !readable((void*)arr, 4) || n == 0 || n > 64) return -1;
+        for (unsigned int k = 0; k < n; ++k) {
+            const unsigned int svc = *(unsigned int*)(arr + k * 4);
+            if (svc && readable((void*)svc, 0x70) && *(unsigned int*)svc == 0x0269BBF8u) return (int)*(int16_t*)(svc + 0x5C);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return -1;
+}
+
+// Owner (guest), player frame, from the lane drain: apply the new part of the total to the local player, natively.
+static void PlayerDamageOwnerApply(const PdrPayload& p, bool base) {
+    if (s_pdrOn != 1 || g_entHost == 1) return;
+    static bool s_have = false; static uint32_t s_last = 0;
+    InterlockedIncrement(&s_pdrRx);
+    if (!s_have) {
+        s_have = true;
+        if (base && p.count > 1) { s_last = p.total; InterlockedIncrement(&s_pdrBase); L("[PDR] baseline total=%u count=%u (replay, not applied)\n", p.total, p.count); return; }
+    }
+    if (p.total <= s_last) return;
+    const int dmg = (int)(p.total - s_last); s_last = p.total;
+    World* w = World::GetCurrentWorld();
+    Entity* pl = w ? w->GetPlayer() : nullptr;
+    if (!pl) { InterlockedIncrement(&s_pdrFail); return; }
+    Entity* att = FiResolve(p.attacker);
+    if (att == pl) att = nullptr;
+    const int before = PdrPlayerLife(pl);
+    const bool ok = PlayerDamage_PostDamageEvent(pl, att, dmg, p.contact, p.subtype, p.f18, p.flags);
+    InterlockedIncrement(ok ? &s_pdrApplied : &s_pdrFail);
+    L("[PDR] owner apply hit #%u damage=%d attacker id=%016llX -> local %08X | life before %d posted=%d\n", p.count, dmg,
+      (unsigned long long)p.attacker, (unsigned)att, before, ok ? 1 : 0);
+}
+static void PlayerDamageReport() {
+    if (s_pdrOn != 1) return;
+    World* w = World::GetCurrentWorld();
+    Entity* pl = w ? w->GetPlayer() : nullptr;
+    L("[PDR] stats seen=%ld dup=%ld dropped=%ld tx=%ld | rx=%ld applied=%ld failed=%ld baseline=%ld | local life=%d\n",
+      s_pdrSeen, s_pdrDup, s_pdrDropped, s_pdrTx, s_pdrRx, s_pdrApplied, s_pdrFail, s_pdrBase, pl ? PdrPlayerLife(pl) : -1);
+}
+
 // Receiver part 1, the local player's frame: drain the lane (the only consumer) and queue IC_FIGHT for the puppet.
 static void FightIntentDrain() {
     const bool fi = FightIntentsOn();
-    if (!fi && !(OwnerDamageOn() && Net::IntentLaneOn())) return;
+    if (!fi && !(OwnerDamageOn() && Net::IntentLaneOn()) && !(PdrOn() && Net::IntentLaneOn())) return;
     Net::IntentMsg m;
     while (Net::PollIntent(m)) {
+        if (m.channel == IC_PDAMAGE && m.wireId == kPdrWire && m.len == sizeof(PdrPayload)) {   // [Coop] PlayerDamageRelay
+            PdrPayload p; memcpy(&p, m.payload, sizeof(p));
+            PlayerDamageOwnerApply(p, (m.flags & IF_BASE) != 0);
+            continue;
+        }
         if (m.channel == IC_DAMAGE && m.len == 8) {   // [Coop] OwnerDamage: running damage total for a host guard
             uint32_t tot = 0; memcpy(&tot, m.payload, 4);
             OwnerDamageHostApply(m.wireId, tot);
@@ -12545,7 +12667,7 @@ static void DumpConfigOnce()
         { "Coop", "FloatProbe", 0 }, { "Coop", "FootOffsetFix", 0 }, { "Coop", "GuardActionGate", 0 }, { "Coop", "GuardExtrapMs", 100 },
         { "Coop", "GuardInterpBuffer", 0 }, { "Coop", "GuardInterpDelayMs", 120 }, { "Coop", "GuardPhaseLock", 0 },
         { "Coop", "GuardSeesPuppet", 0 }, { "Coop", "PuppetActionReassert", 0 }, { "Coop", "PuppetHostTime", 0 },
-        { "Coop", "AlertQueryAsPlayer", 0 }, { "Coop", "ConflictNullGuard", 0 }, { "Coop", "ConflictKeepPuppet", 0 }, { "Coop", "GuardPoiFightTarget", 0 }, { "Coop", "FightOrderPuppet", 0 }, { "Coop", "DespawnLeaveFight", 0 }, { "Coop", "FightKeepOnConflictEnd", 0 }, { "Coop", "FightStateProbe", 0 }, { "Coop", "PuppetNavService", 0 }, { "Coop", "NativeReplica", 0 }, { "Coop", "NativeReplicaSnapCm", 300 }, { "Coop", "NativeReplicaBlendCmS", 150 }, { "Coop", "NativeReplicaStartBoostCmS", 400 }, { "Coop", "NativeReplicaParkour", 0 }, { "Coop", "NativeReplicaFreeRun", 0 }, { "Coop", "NativeReplicaClimbIntent", 0 }, { "Coop", "NativeReplicaClimbMoves", 0 }, { "Coop", "NativeReplicaClimbChoice", 0 }, { "Coop", "NativeReplicaBeam", 0 }, { "Coop", "NativeReplicaWallEntry", 0 }, { "Coop", "NativeReplicaClimbNoSnap", 0 }, { "Coop", "NativeReplicaParkourSnapCm", 800 }, { "Coop", "FightProbe", 0 }, { "Coop", "PeerLastPacket", 0 }, { "Coop", "PuppetActionsOwnUpdate", 1 }, { "Coop", "DetectKeepTarget", 0 }, { "Coop", "GuardPlayerOfInterest", 0 }, { "Coop", "EventProbe", 0 }, { "Coop", "ReactProbe", 0 }, { "Coop", "FightSkipPuppet", 0 }, { "Coop", "NavNullGuard", 0 }, { "Coop", "PuppetStimMode", 1 }, { "Coop", "PuppetStimSeq", 0 }, { "Coop", "PuppetStimSource", 0 }, { "Coop", "SightProbe", 0 }, { "Coop", "StateProbe", 0 }, { "Coop", "StuckProbe", 0 },
+        { "Coop", "AlertQueryAsPlayer", 0 }, { "Coop", "ConflictNullGuard", 0 }, { "Coop", "ConflictKeepPuppet", 0 }, { "Coop", "GuardPoiFightTarget", 0 }, { "Coop", "FightOrderPuppet", 0 }, { "Coop", "DespawnLeaveFight", 0 }, { "Coop", "FightKeepOnConflictEnd", 0 }, { "Coop", "FightStateProbe", 0 }, { "Coop", "PuppetNavService", 0 }, { "Coop", "NativeReplica", 0 }, { "Coop", "NativeReplicaSnapCm", 300 }, { "Coop", "NativeReplicaBlendCmS", 150 }, { "Coop", "NativeReplicaStartBoostCmS", 400 }, { "Coop", "NativeReplicaParkour", 0 }, { "Coop", "NativeReplicaFreeRun", 0 }, { "Coop", "NativeReplicaClimbIntent", 0 }, { "Coop", "NativeReplicaClimbMoves", 0 }, { "Coop", "NativeReplicaClimbChoice", 0 }, { "Coop", "NativeReplicaBeam", 0 }, { "Coop", "NativeReplicaWallEntry", 0 }, { "Coop", "NativeReplicaClimbNoSnap", 0 }, { "Coop", "NativeReplicaParkourSnapCm", 800 }, { "Coop", "FightProbe", 0 }, { "Coop", "PeerLastPacket", 0 }, { "Coop", "PuppetActionsOwnUpdate", 1 }, { "Coop", "DetectKeepTarget", 0 }, { "Coop", "GuardPlayerOfInterest", 0 }, { "Coop", "EventProbe", 0 }, { "Coop", "PlayerDamageProbe", 0 }, { "Coop", "ReactProbe", 0 }, { "Coop", "FightSkipPuppet", 0 }, { "Coop", "NavNullGuard", 0 }, { "Coop", "PuppetStimMode", 1 }, { "Coop", "PuppetStimSeq", 0 }, { "Coop", "PuppetStimSource", 0 }, { "Coop", "SightProbe", 0 }, { "Coop", "StateProbe", 0 }, { "Coop", "StuckProbe", 0 },
         { "Coop", "StageLog", 0 }, { "Coop", "SyncEnemiesOnly", 1 }, { "Coop", "SyncMaxEntities", 32 },
         { "Coop", "SyncRadiusM", 60 }, { "Coop", "TransformProbe", 0 }, { "Coop", "VPadEnable", 0 },
         { "Coop", "VPadTest", 0 }, { "Coop", "WatchDeadBit", 0 }, { "Coop", "WatchTarget", 0 },
@@ -12584,7 +12706,7 @@ static void OnFrameInner(Human* updatedHuman) {
         InterlockedExchange(&g_inSaveTick, (w && w->m_CharacterList.GetSize() >= 2) ? (LONG)GetTickCount() : 0);
     }
     Pilot::OnPlayerFrame(updatedHuman);   // [Pilot] Enabled only: publish the player + m_CharacterList
-    __try { FightIntentSend(updatedHuman); FightIntentDrain(); OwnerDamageGuestPump(); SpawnerIdProbeTick(); }   // [Coop] FightIntents / OwnerDamage / SpawnerIdProbe only
+    __try { FightIntentSend(updatedHuman); FightIntentDrain(); OwnerDamageGuestPump(); PlayerDamageHostPump(); SpawnerIdProbeTick(); }   // [Coop] FightIntents / OwnerDamage / SpawnerIdProbe only
     __except (EXCEPTION_EXECUTE_HANDLER) { static int s_fe = 0; if (s_fe < 10) { ++s_fe; L("[FI] EXCEPTION 0x%08X in send/drain\n", GetExceptionCode()); } }
 
     ProbeIdentityOnce();
@@ -12786,6 +12908,7 @@ static void OnFrameInner(Human* updatedHuman) {
                 WideBindReport();
                 if (!g_entHost) { BindReport(); TakeoverSweep(); }   // guest only: the guest objId table is the link table
                 OwnerDamageReport();
+                PlayerDamageReport();
                 OwnReport();
                 L("[Mirror] actions on=%d calls=%u deferred=%d queued=%u applied=%ld expired=%ld noSlot=%u\n",
                   MirrorActionsEnabled() ? 1 : 0, s_mirrorActionCalls, MirrorActionsDeferred() ? 1 : 0, s_maqQueued,
@@ -12930,6 +13053,8 @@ static void OnFrameInner(Human* updatedHuman) {
             if (StateProbeHb(stb, sizeof(stb)) > 0) L("%s", stb);   // [Coop] StateProbe counters (both roles)
             char evb[512];
             if (EventProbe::FormatReport(evb, sizeof(evb)) > 0) L("%s\n", evb);   // [Coop] EventProbe
+            char pdb[768];
+            if (PlayerDamageProbe::FormatReport(pdb, sizeof(pdb)) > 0) L("%s\n", pdb);   // [Coop] PlayerDamageProbe
             char rpb[256];
             if (ReactProbe::FormatReport(rpb, sizeof(rpb)) > 0) L("%s\n", rpb);   // [Coop] ReactProbe
             char pob[512];   // keepPuppet + fightOrder tails need ~300 bytes
