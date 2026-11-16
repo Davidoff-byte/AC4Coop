@@ -29,6 +29,13 @@ THRESH = {
     'bind_maxErr_m': 1.00,       # linked guard position error vs host
     'apply_hz_min': 25.0,        # puppet apply calls per second (frame-rate proxy)
     'guard_step_m': 1.00,        # largest single position write of a linked guard (a pop), [Bind] takeover maxStep
+    # enemy placement (docs/design/enemy-placement.md section 5), set 2026-11-16 before the first [Place] run:
+    'place_step_m': 0.50,        # largest write step of a linked guard, same metric as guard_step_m, tighter bar
+    'place_nobody_near_pct': 5.0,   # alive host guards < 30 m from the guest player with no guest body
+    'place_nobody_all_pct': 12.0,   # all alive host guard records with no guest body
+    'place_err_mean_m': 0.35,    # settled links (>= 3 s, not approaching): body vs host's newest position, at apply
+    'place_err_max_m': 1.50,
+    'place_frozen': 0,           # links whose host guard moved > 1 m in >= 2 s while the body moved < 0.1 m
 }
 OFFGROUND = {6, 7, 8, 9, 10, 30}
 
@@ -71,6 +78,21 @@ def side(game, pid):
         if m: r['double'] = max(r['double'], int(m.group(1)))
         m = re.search(r'\[Bind\] takeover .*maxStep=([\d.]+)', s)
         if m: r['step'] = max(r.get('step', 0.0), float(m.group(1)))
+        m = re.search(r'\[Place\] on=(\d) band<30 rec=(\d+) linked=(\d+).*30-60 rec=(\d+) linked=(\d+).*>=60 rec=(\d+) linked=(\d+).*'
+                      r'settledErr mean=([\d.]+) max=([\d.]+) n=(\d+) \| frozen=(\d+) \| orphansNear=(\d+)', s)
+        if m:
+            v = m.groups(); p = r.setdefault('place', {'band': [[0, 0], [0, 0], [0, 0]], 'errw': 0.0, 'errn': 0, 'errmax': 0.0,
+                                                       'frozen': 0, 'orph': []})
+            for b in range(3): p['band'][b][0] += int(v[1 + 2 * b]); p['band'][b][1] += int(v[2 + 2 * b])
+            n = int(v[9]); p['errw'] += float(v[7]) * n; p['errn'] += n; p['errmax'] = max(p['errmax'], float(v[8]))
+            p['frozen'] += int(v[10]); p['orph'].append(int(v[11]))
+            continue
+        m = re.search(r'\[Place\] writer .*movedByOther=(\d+) max=([\d.]+) m \| stuck=(\d+) \| maxStep=([\d.]+) m steps>0.5=(\d+)', s)
+        if m:
+            w = r.setdefault('placew', [0, 0.0, 0, 0.0, 0])
+            w[0] += int(m.group(1)); w[1] = max(w[1], float(m.group(2))); w[2] += int(m.group(3)); w[3] = max(w[3], float(m.group(4)))
+            w[4] += int(m.group(5))
+            continue
         if s.startswith('[FI] stats'): r['fi'] = s
         if s.startswith('[OD] stats'): r['od'] = s
     return r
@@ -108,6 +130,25 @@ def report(h, g):
     row('guest guards: double links (max)', str(g['double']), '0', g['double'] == 0)
     if 'step' in g:
         row('guest guards: largest write step', f"{g['step']:.2f} m", f"<={THRESH['guard_step_m']}", g['step'] <= THRESH['guard_step_m'])
+    if 'step' in g:
+        row('guest guards: largest write step (placement bar)', f"{g['step']:.2f} m", f"<={THRESH['place_step_m']}", g['step'] <= THRESH['place_step_m'])
+    p = g.get('place')
+    if p:
+        names = ('<30 m', '30-60 m', '>=60 m')
+        for b in range(3):
+            rec, lk = p['band'][b]
+            if rec: row(f'guest guards {names[b]}: records with no body', f'{pct(rec - min(lk, rec), rec):.1f}% ({rec - min(lk, rec)}/{rec})',
+                        f"<={THRESH['place_nobody_near_pct']}" if b == 0 else '', (pct(rec - min(lk, rec), rec) <= THRESH['place_nobody_near_pct']) if b == 0 else None)
+        rec = sum(x[0] for x in p['band']); lk = sum(min(x[1], x[0]) for x in p['band'])
+        if rec: row('guest guards (alive, all bands): no body', f'{pct(rec - lk, rec):.1f}% ({rec - lk}/{rec})', f"<={THRESH['place_nobody_all_pct']}", pct(rec - lk, rec) <= THRESH['place_nobody_all_pct'])
+        if p['errn']:
+            mean = p['errw'] / p['errn']
+            row('guest guards: settled error mean', f"{mean:.2f} m (n={p['errn']})", f"<={THRESH['place_err_mean_m']}", mean <= THRESH['place_err_mean_m'])
+            row('guest guards: settled error max', f"{p['errmax']:.2f} m", f"<={THRESH['place_err_max_m']}", p['errmax'] <= THRESH['place_err_max_m'])
+        row('guest guards: frozen bodies', str(p['frozen']), f"<={THRESH['place_frozen']}", p['frozen'] <= THRESH['place_frozen'])
+        if p['orph']: row('guest-only fighters < 40 m (orphans), max per window', str(max(p['orph'])))
+    w = g.get('placew')
+    if w: row('place writer: moved-by-other / max / stuck / maxStep / steps>0.5', f'{w[0]} / {w[1]:.2f} m / {w[2]} / {w[3]:.3f} m / {w[4]}')
     for tag, s in (('host', h), ('guest', g)):
         if s['fi']: row(f'{tag} fight intents', s['fi'].replace('[FI] stats ', ''))
         if s['od']: row(f'{tag} owner damage', s['od'].replace('[OD] stats ', ''))
