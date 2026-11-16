@@ -102,6 +102,30 @@ the "beam" (`climb-moves-2026-11-15.md`, rounds 2-3).
   (the same error over many 2 s windows), while the peer shimmies. Hold-by-hold following (`NativeReplicaClimbMoves`) was
   off in this configuration. The next A/B is the gate plus moves.
 
+- **Gate plus hold-following, run 27616** (asi 976ec99f, `NativeReplicaClimbMoves=1`, 3 replays):
+  - every run had an entry; both climbing in 81 / 78 / 82 % of windows; the replica on a narrow object alone 4-5 %
+    (each time after the peer had left Climbing);
+  - but the on-wall error averaged 2.26 m (max 3.44 m) over 105 windows, frozen for long stretches;
+  - the replica reached only 2-4 of the peer's holds, and the 32-hold queue filled.
+- **Over ~70 s on the wall per run, no climb condition fired for the replica** except the gated 17 (logged non-zero
+  results: puppet id 17 × 3 at the end of each hang, after the peer left). So shimmy and up/down steps along the wall do
+  not come out of the condition table for the replica, or never start for it.
+  - F7's move trace puts move creation in separate builders (shimmy `0x01B65599` in `sub_1B64320`, vertical step
+    `0x01B61B4D`, corner `0x01B5DDBA`), driven by the climbing interface slots 37/38.
+  - Next: trace those builders for the player (who does shimmy) against the replica. That needs a player climb sample:
+    the scripted walk to the wall gets stuck at (71.5,-76.5) every run, so teleport the player instead.
+
+## Puppet spawn: the first build faults in 4 of 7 solo runs (not the climb work)
+- `[Phase1] EXCEPTION during resolve/build (code=0xC0000005)` happened in runs 4220, 26516, 28944 and 20696; not in 32644,
+  568 or 30324.
+  - It comes after the `dupSelector=` line and before `BuildEntityWithSelector rc=`, so the fault is inside
+    `EntityBuilder::BuildEntityWithSelector`.
+  - `selector.vtbl=00000000` is logged in every run, good ones too, so it is not the marker.
+- In 4220 and 26516 the retry spawned the puppet. In 28944 and 20696 the game died seconds later. WER dumps: an engine
+  worker at `0x004D98F9 lock xadd [ecx],edx` with ecx = 4 / 0xD6, a null-based refcount, via `0x004DD310` ← `0x0057E212`
+  / `0x0057E276`. No AC4Coop frame on the stack.
+  - UNVERIFIED: the half-built entity left by the faulted build is what the worker touches.
+
 ## Not done yet
 - The live condition id for the replica's Climbing → NarrowObject, and the gate values (`a1[58]`, `sub_666DC0`) for the
   replica vs the hanging player.
