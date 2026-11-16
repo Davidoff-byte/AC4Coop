@@ -43,3 +43,26 @@ every run.
 ## Next for smoothness
 - Make the per-frame path the only writer for a linked body, and re-score.
 - Puppet pop of about 0.5 m during free-running (guest's puppet of the moving host).
+
+## Guard pops, found and fixed (2026-11-16 afternoon)
+`[Bind] step` lines (≤ 40 per run) now log every write step > 3 m with the body's position and the target.
+
+| run (asi) | change | puppet maxD (3D / frame / peak speed) | guard largest write step | records with no body | stuck released |
+|---|---|---|---|---|---|
+| 31172/30600 (ccece73b) | metrics only | 0.345 (0.260 m / 18.8 ms / 15.9 m/s) | 12.71 m | 8.6% | - |
+| 21764/20240 (9335ced9) | step log | 0.326 | 8.17 m: **one body never moved**, (109.4,-73.4,2.0) for 25 writes while the targets went 3 → 8 m away | 10.4% | - |
+| 11048/23292 (2e343fb6) | stuck release v1 | 0.549 (0.429 m / 35.1 ms) | 7.17 m: one approach write (`approaching=1`, v2 approach eased from its start point after the body had moved) | 11.4% | 0 |
+| 14092/33460, 1600/32420 (5b44a204) | approach v3 (move toward the target from the body's current position, ≤ 9 m/s × time since its last write, capped at 0.1 s) | 0.336, 0.344 | **1.45, 1.47 m** | **52.5, 55.3%**: v1 released pirates idling about 1 m from their guard | 5, 5 |
+| 27780/29824, 21152/5020 (c8c3dd80) | stuck release v2 (only while the body is > 1.5 m off) | 0.631 (0.558 m / 17.3 ms / 32.2 m/s), 0.596 (0.518 / 16.9 / 31.5) | **1.48, 1.47 m** | 11.9, 18.3% | 0, 1 (the same spot, 2.3 m off) |
+
+- **Stuck bodies:** some bodies ignore position writes. One spot, (109.4,-73.4,2.0), recurred in 4 runs. What holds
+  the body there is **UNVERIFIED**; a scripted station is a guess. Before this change, such a body stood frozen while its
+  host guard walked away. Now, once a body is > 1.5 m off and has not moved for 6 writes, it is released to its own AI
+  and kept out of linking for 120 s (`[Bind] stuck body ... released`).
+- **Approach v3** cannot pop by construction: each write moves at most 0.9 m.
+- **What remains, about 1.5 m:** the hop of a running guard between legacy writes. A host guard at about 6 m/s, written
+  about every 0.25 s, moves 1.5 m per write. A per-frame writer would remove it, but own mode currently fights an
+  unknown external mover (section above).
+- **The puppet's maxD varies from run to run** (0.33 – 0.63 m on the same move script). The new 3D / frame-time numbers
+  show the two latest runs had a real pop: 0.52-0.56 m in one 17 ms frame (32 m/s, about 4× a sprint). Earlier "pops"
+  of 0.5 m were partly the metric (XZ + |dY| overstates diagonal moves by up to 41%).

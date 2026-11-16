@@ -60,6 +60,8 @@ def side(game, pid):
         m = re.search(r'\[Smooth\] frames=(\d+) hold=(\d+) ext=(\d+) clamp=(\d+).*avgD=([\d.]+) maxD=([\d.]+)', s)
         if m:
             fr, ho, ex, cl = map(int, m.groups()[:4]); r['smooth'].append((fr, ho, ex, cl, float(m.group(5)), float(m.group(6))))
+            m3 = re.search(r'maxD3=([\d.]+) dtAtMax=([\d.]+)ms maxV=([\d.]+)', s)   # added 2026-11-16, informational
+            if m3: r.setdefault('smooth3', []).append(tuple(map(float, m3.groups())))
             continue
         m = re.search(r'\[Sync\] bind sent=(\d+) bound=(\d+) unmatched=(\d+) meanErr=([\d.]+) maxErr=([\d.]+)', s)
         if m: r['bind'].append((float(m.group(4)), float(m.group(5)))); continue
@@ -95,6 +97,9 @@ def report(h, g):
             mx = max(x[5] for x in s['smooth'])
             row(f'{tag}: smoothing interpolated', f'{pct(fr - bad, fr):.1f}% of {fr}', f">={THRESH['smooth_interp_pct']}", pct(fr - bad, fr) >= THRESH['smooth_interp_pct'])
             row(f'{tag}: largest per-frame move', f'{mx:.3f} m', f"<={THRESH['smooth_maxD_m']}", mx <= THRESH['smooth_maxD_m'])
+            if s.get('smooth3'):   # no bar: tells a pop from a long frame (true 3D distance, its frame time, peak speed)
+                d3, dt, _ = max(s['smooth3']); v = max(x[2] for x in s['smooth3'])
+                row(f'{tag}: largest move 3D / frame time / peak speed', f'{d3:.3f} m in {dt:.1f} ms / {v:.1f} m/s')
     if g['bind']:
         mx = max(b[1] for b in g['bind']); mean = sum(b[0] for b in g['bind']) / len(g['bind'])
         row('guest guards: position error', f'mean {mean:.2f} m, max {mx:.2f} m', f"max<={THRESH['bind_maxErr_m']}", mx <= THRESH['bind_maxErr_m'])

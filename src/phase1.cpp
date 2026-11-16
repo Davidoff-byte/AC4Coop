@@ -4720,6 +4720,49 @@ static bool BindLockOn() {
     return s_bindLock == 1;
 }
 
+// ---- [Coop] BindLock: stuck bodies (2026-11-16) ------------------------------------------------------------------------
+// Run 21764/20240 (asi 9335ced9): a linked body stayed at (109.4,-73.4,2.0) through 25 writes while the targets walked
+// 3 -> 8 m away - the position writes did not stick (something re-places the body every frame; what is UNVERIFIED). The
+// guest then shows that guard frozen while the host's walks off. A body whose last 6 writes left it within 5 cm while
+// each write asked for > 0.5 m is released (link forgotten; TakeoverSweep hands it back to its AI) and kept out of
+// linking for 120 s, so the host guard can take another body.
+static struct { unsigned int ent; ULONGLONG until; } s_stuckRej[64]; static int s_stuckRejN = 0;
+static LONG s_stuckReleased = 0;
+static bool BindStuckRejected(unsigned int ent) {
+    const ULONGLONG now = GetTickCount64();
+    for (int i = 0; i < s_stuckRejN; ++i) if (s_stuckRej[i].ent == ent && now < s_stuckRej[i].until) return true;
+    return false;
+}
+static void BindStuckReject(unsigned int ent) {
+    const ULONGLONG until = GetTickCount64() + 120000;
+    for (int i = 0; i < s_stuckRejN; ++i) if (s_stuckRej[i].ent == ent) { s_stuckRej[i].until = until; return; }
+    int k = s_stuckRejN < 64 ? s_stuckRejN++ : 0;
+    if (s_stuckRejN >= 64) { for (int i = 1; i < 64; ++i) if (s_stuckRej[i].until < s_stuckRej[k].until) k = i; }
+    s_stuckRej[k].ent = ent; s_stuckRej[k].until = until;
+}
+static struct { unsigned int ent; float body[3], wrote[3]; int n; } s_stk[128]; static int s_stkN = 0;
+// v2 (same day): counts only while the body is > 1.5 m from the host guard (`target`), so a body idling ~1 m off at a
+// scripted spot is left linked (v1 released 5 such pirates per run and "records with no body" rose 10% -> 53%).
+static bool BindStuckNote(unsigned int ent, const float* body, const float* wrote, const float* target) {   // true: release now
+    int k = -1;
+    for (int i = 0; i < s_stkN; ++i) if (s_stk[i].ent == ent) { k = i; break; }
+    if (k < 0) {
+        k = s_stkN < 128 ? s_stkN++ : (int)(GetTickCount() & 127);
+        s_stk[k].ent = ent; s_stk[k].n = 0;
+        for (int j = 0; j < 3; ++j) { s_stk[k].body[j] = body[j]; s_stk[k].wrote[j] = wrote[j]; }
+        return false;
+    }
+    float mb = 0, gap = 0, off = 0;
+    for (int j = 0; j < 3; ++j) {
+        const float a = body[j] - s_stk[k].body[j], b = s_stk[k].wrote[j] - s_stk[k].body[j], c = target[j] - body[j];
+        mb += a * a; gap += b * b; off += c * c;
+    }
+    if (mb < 0.05f * 0.05f && gap > 0.3f * 0.3f && off > 1.5f * 1.5f) ++s_stk[k].n; else s_stk[k].n = 0;
+    for (int j = 0; j < 3; ++j) { s_stk[k].body[j] = body[j]; s_stk[k].wrote[j] = wrote[j]; }
+    if (s_stk[k].n >= 6) { s_stk[k].n = 0; return true; }
+    return false;
+}
+
 static void GuestObjAdd(uint64_t objId, unsigned int ent) {
     if (!objId) return;
     const bool lock = BindLockOn();
@@ -6652,6 +6695,7 @@ static void WideBindPrepass(const EntityPacket& pkt, World* world, Entity* playe
         if (!bhv) continue;
         if (GuestObjOfEnt((unsigned int)e)) continue;                    // already plays a host guard
         if (MirrorKilledLocally(e)) continue;
+        if (BindStuckRejected((unsigned int)e)) continue;                // its writes did not stick (released, 120 s)
         Cand& c = cand[nC++];
         c.e = e; c.taken = false;
         c.arch = (uint16_t)(*(uint32_t*)((char*)bhv + 0x14) & 0xFFFF);   // same field ApplyGuards compares
@@ -6876,7 +6920,7 @@ static bool OwnGuardsOn() {
     }
     return s_ownGOnce == 1;
 }
-static void BindNoteStep(float cx, float cy, float cz, const float* w);   // [Bind] pop metric, defined with BindApproachStep
+static void BindNoteStep(float cx, float cy, float cz, const float* w, unsigned int ent = 0, const char* via = "", int approaching = 0, uint64_t objId = 0);   // [Bind] pop metric, defined with BindApproachStep
 static float s_bindMaxStep = 0.0f; static LONG s_bindApproaches = 0;    // [Bind] pop metric (OwnPublish, BindApproachStep)
 static bool OwnPuppetOn() { return OwnFlag("OwnUpdatePuppet", &s_ownP, &s_ownPNext) != 0; }
 // ---- [Coop] GuardAnimFull (default 0; re-read every 2 s) --------------------------------------------------------
@@ -8385,7 +8429,7 @@ static void OwnDrain(Human* h) {
     m.M41 = pos[0]; m.M42 = pos[1]; m.M43 = pos[2];
     const int physMs = OwnPhysMs();
     const bool phys = o.snap || (physMs > 0 && now - o.lastPhysUs >= (uint64_t)physMs * 1000ull);
-    if (!o.snap) BindNoteStep(e->m_GlobalMatrix.M41, e->m_GlobalMatrix.M42, e->m_GlobalMatrix.M43, pos);   // per-frame pop metric
+    if (!o.snap) BindNoteStep(e->m_GlobalMatrix.M41, e->m_GlobalMatrix.M42, e->m_GlobalMatrix.M43, pos, o.ent, "own", o.durUs > 300000 ? 1 : 0);   // per-frame pop metric
     e->SetGlobalMatrixInternal(&m, phys);
     InterlockedIncrement(&s_gWrites);
     if (FloatProbeOn()) FloatProbe(e);
@@ -8537,33 +8581,41 @@ static void TakeoverSweep() {
 }
 
 // Bind approach + pop metric ([Coop] BindLock on). A gap of 1.5..30 m between a linked body and its host guard is closed
-// over kBindApproachMs with a smoothstep from where the body stood; 30 m or more is a real jump and still snaps.
-static const uint64_t kBindApproachMs = 800;
-static struct { unsigned int ent; float start[3]; uint64_t t0, dur; } s_bap[128]; static int s_bapN = 0;
+// by moving toward it (v3 below); 30 m or more is a real jump and still snaps.
+// v3 (2026-11-16): move toward the target FROM WHERE THE BODY IS NOW, at most kBindApproachMS x the time since this
+// body's last write (capped at 100 ms). v2 eased from the position where the approach started; a body that moved
+// meanwhile (its AI still walking before the take-over, or writes paused) got a step of the difference - run 11048/23292:
+// one 7.17 m step with approaching=1. Moving from the current position cannot pop by construction: every write moves at
+// most 0.9 m. Ends within 0.3 m of the target (the normal write then places it); >= 30 m still snaps.
+static const float kBindApproachMS = 9.0f;   // m/s: faster than a running guard (~6) so it catches up, slower than a slide
+static struct { unsigned int ent; uint64_t lastUs; } s_bap[128]; static int s_bapN = 0;
 static bool BindApproachStep(unsigned int ent, float cx, float cy, float cz, const float* target, float* out) {
     if (!BindLockOn()) return false;
-    const uint64_t now = GetTickCount64();
+    const uint64_t now = OwnNowUs();
     int k = -1; for (int i = 0; i < s_bapN; ++i) if (s_bap[i].ent == ent) { k = i; break; }
     const float dx = target[0] - cx, dy = target[1] - cy, dz = target[2] - cz, d = sqrtf(dx * dx + dy * dy + dz * dz);
-    // An expired entry left by an earlier link of the same body (released mid-approach, then re-linked to another guard:
-    // run 22656, a 10.3 m snap) is dropped and the gap judged fresh; a finished approach has ~0 gap and does not restart.
-    if (k >= 0 && now - s_bap[k].t0 >= s_bap[k].dur) { s_bap[k] = s_bap[--s_bapN]; k = -1; }
+    if (k >= 0 && (d <= 0.3f || d >= 30.0f)) { s_bap[k] = s_bap[--s_bapN]; return false; }   // arrived, or a real jump
     if (k < 0) {
         if (d <= 1.5f || d >= 30.0f || s_bapN >= 128) return false;
-        k = s_bapN++; s_bap[k].ent = ent; s_bap[k].start[0] = cx; s_bap[k].start[1] = cy; s_bap[k].start[2] = cz; s_bap[k].t0 = now;
-        const uint64_t byRun = (uint64_t)(d / 5.0f * 1000.0f);    // close the gap at about running speed, not a 15 m/s slide
-        s_bap[k].dur = byRun > kBindApproachMs ? byRun : kBindApproachMs;
+        k = s_bapN++; s_bap[k].ent = ent; s_bap[k].lastUs = now - 50000;
         InterlockedIncrement(&s_bindApproaches);
     }
-    float t = (float)(now - s_bap[k].t0) / (float)s_bap[k].dur;
-    if (t >= 1.0f) { s_bap[k] = s_bap[--s_bapN]; return false; }   // done: the normal write puts it on target
-    const float e = t * t * (3.0f - 2.0f * t);                      // smoothstep
-    for (int i = 0; i < 3; ++i) out[i] = s_bap[k].start[i] + (target[i] - s_bap[k].start[i]) * e;
+    uint64_t dtUs = now - s_bap[k].lastUs; if (dtUs > 100000) dtUs = 100000;
+    s_bap[k].lastUs = now;
+    float step = kBindApproachMS * (float)(double)dtUs * 1e-6f;
+    if (step > d) step = d;
+    const float f = step / d;
+    out[0] = cx + dx * f; out[1] = cy + dy * f; out[2] = cz + dz * f;
     return true;
 }
-static void BindNoteStep(float cx, float cy, float cz, const float* w) {
+static void BindNoteStep(float cx, float cy, float cz, const float* w, unsigned int ent, const char* via, int approaching, uint64_t objId) {
     const float dx = w[0] - cx, dy = w[1] - cy, dz = w[2] - cz, d = sqrtf(dx * dx + dy * dy + dz * dz);
     if (d < 30.0f && d > s_bindMaxStep) s_bindMaxStep = d;          // >= 30 m is a deliberate snap (teleport), not a pop
+    // Which writes are the pops (2026-11-16: 12.71 m in the legacy mode, 15.24 m in own mode, cause unknown). <= 40 lines.
+    static LONG s_stepLines = 0;
+    if (d > 3.0f && d < 30.0f && InterlockedIncrement(&s_stepLines) <= 40)
+        L("[Bind] step %.2f m via=%s ent=%08X objId=%016llX approaching=%d body=(%.1f,%.1f,%.1f) -> (%.1f,%.1f,%.1f)\n", d, via, ent,
+          (unsigned long long)objId, approaching, cx, cy, cz, w[0], w[1], w[2]);
 }
 
 static void ApplyGuards(const EntityPacket& pkt) {
@@ -8606,7 +8658,7 @@ static void ApplyGuards(const EntityPacket& pkt) {
                     gs.lastPktMs = nowMs;
                 }
                 if (gs.used && gs.ent) {
-                    Component* sb = MirrorCandidateBhv((Entity*)gs.ent, player);
+                    Component* sb = BindStuckRejected(gs.ent) ? nullptr : MirrorCandidateBhv((Entity*)gs.ent, player);
                     if (sb) { best = (Entity*)gs.ent; bestBhv = sb; via = "sticky"; }
                     else {
                         // Body died, despawned or the address was reused: drop the binding.
@@ -8681,6 +8733,7 @@ static void ApplyGuards(const EntityPacket& pkt) {
                     for (int u = 0; u < usedN; ++u) if (usedEnt[u] == (unsigned int)e) { taken = true; break; }
                     if (taken) { ++s_bindRejTaken; continue; }
                 }
+                if (BindStuckRejected((unsigned int)e)) { ++s_bindRejTaken; continue; }   // [Coop] BindLock stuck body
                 // Stable binding: once an objId is tied to a local entity, keep that body - but only while
                 // the body is plausibly still the same one. If it sits far from where the host says the
                 // entity is, the address was freed and reused, so forget the binding and re-match.
@@ -8902,7 +8955,7 @@ static void ApplyGuards(const EntityPacket& pkt) {
                 if (bh && !s_selfTestMode) OwnPublish(bh, (Entity*)best, es.pos, es.quat, es.actionAlias, es.anim, pkt.hostMs);
                 const bool ownWrites = bh && !s_selfTestMode && OwnGuardsOn() && !OwnStarved(bh);
                 // [Coop] BindLock: a body linked up to BindRadiusM away from its host guard used to SNAP there (scorecard
-                // 2026-11-16: guard maxErr 11.99 m = a visible teleport). Now it eases in over kBindApproachMs; while an
+                // 2026-11-16: guard maxErr 11.99 m = a visible teleport). Now it moves in (BindApproachStep); while an
                 // approach runs the body is written every packet, even when the host guard stands still.
                 const float bcx = best->m_GlobalMatrix.M41, bcy = best->m_GlobalMatrix.M42, bcz = best->m_GlobalMatrix.M43;
                 float wpos[3] = { es.pos[0], es.pos[1], es.pos[2] };
@@ -8913,7 +8966,19 @@ static void ApplyGuards(const EntityPacket& pkt) {
                     HookMath::Transform m;
                     HookMath::ToMatrix(&q, &m);
                     m.M41 = wpos[0]; m.M42 = wpos[1]; m.M43 = wpos[2];
-                    BindNoteStep(bcx, bcy, bcz, wpos);
+                    const float bodyNow[3] = { bcx, bcy, bcz };
+                    if (BindLockOn() && !s_selfTestMode && BindStuckNote((unsigned int)best, bodyNow, wpos, es.pos)) {
+                        BindStuckReject((unsigned int)best);
+                        GuestObjForget(es.objId);
+                        if (slotIdx != SYNC_SLOT_NONE && s_guestSlot[slotIdx].ent == (unsigned int)best) {   // and the sticky slot
+                            s_guestSlot[slotIdx].used = 0; s_guestSlot[slotIdx].ent = 0; s_guestSlot[slotIdx].objId = 0;
+                        }
+                        InterlockedIncrement(&s_stuckReleased);
+                        L("[Bind] stuck body ent=%08X objId=%016llX released: 6 writes left it at (%.1f,%.1f,%.1f), host guard at (%.1f,%.1f,%.1f) [released=%ld]\n",
+                          (unsigned int)best, (unsigned long long)es.objId, bcx, bcy, bcz, es.pos[0], es.pos[1], es.pos[2], s_stuckReleased);
+                        continue;   // this record has no body now; the next snapshot binds another
+                    }
+                    BindNoteStep(bcx, bcy, bcz, wpos, (unsigned int)best, "legacy", approaching ? 1 : 0, es.objId);
                     // A capsule push per snapshot was pure jitter; only a jump (>5 m) needs physics.
                     bool bigJump = !approaching && (dp > 25.0f);
                     if (!s_selfTestMode) {
@@ -11704,15 +11769,24 @@ static double   s_appliedSum    = 0.0;
 static double   s_appliedMax    = 0.0;
 
 // Call right after ApplyRemoteState: measures how far the puppet target moved since the last frame.
+// maxD keeps its original formula (XZ + |dY|; the scorecard bar is set on it). Added 2026-11-16 to tell a pop from a long
+// frame: the true 3D distance of the largest frame, that frame's duration, and the largest per-frame speed.
+static double   s_appliedMax3 = 0.0, s_appliedMaxDtMs = 0.0, s_appliedMaxV = 0.0;
+static uint64_t s_appliedLastUs = 0;
 static void NoteAppliedPos(float x, float y, float z) {
+    const uint64_t nowUs = OwnNowUs();
     if (s_appliedValid) {
         float dx = x - s_appliedPos[0], dy = y - s_appliedPos[1], dz = z - s_appliedPos[2];
         double d = (double)sqrtf(dx * dx + dz * dz) + (double)fabsf(dy);
         s_appliedSum += d;
         if (d > s_appliedMax) s_appliedMax = d;
+        const double d3 = (double)sqrtf(dx * dx + dy * dy + dz * dz);
+        const double dtMs = s_appliedLastUs && nowUs > s_appliedLastUs ? (double)(nowUs - s_appliedLastUs) / 1000.0 : 0.0;
+        if (d3 > s_appliedMax3) { s_appliedMax3 = d3; s_appliedMaxDtMs = dtMs; }
+        if (dtMs >= 4.0 && d3 / (dtMs / 1000.0) > s_appliedMaxV) s_appliedMaxV = d3 / (dtMs / 1000.0);
         ++s_appliedFrames;
     }
-    s_appliedPos[0] = x; s_appliedPos[1] = y; s_appliedPos[2] = z; s_appliedValid = 1;
+    s_appliedPos[0] = x; s_appliedPos[1] = y; s_appliedPos[2] = z; s_appliedValid = 1; s_appliedLastUs = nowUs;
 }
 
 static void norm3(float* v) {
@@ -12842,9 +12916,10 @@ static void OnFrameInner(Human* updatedHuman) {
             // interpolation path produced it. This is the before/after signal - not an opinion.
             {
                 double avgD = s_appliedFrames ? s_appliedSum / (double)s_appliedFrames : 0.0;
-                L("[Smooth] frames=%u hold=%u ext=%u clamp=%u eqT=%u drop=%u wipe=%u extra=%u avgD=%.4f maxD=%.4f\n",
+                L("[Smooth] frames=%u hold=%u ext=%u clamp=%u eqT=%u drop=%u wipe=%u extra=%u avgD=%.4f maxD=%.4f maxD3=%.4f dtAtMax=%.1fms maxV=%.1f\n",
                   s_interpFrames, s_holdFrames, s_extrapFrames, s_clampFrames, s_eqTFrames,
-                  s_reorderDrops, s_wipeCount, s_batchExtra, avgD, s_appliedMax);
+                  s_reorderDrops, s_wipeCount, s_batchExtra, avgD, s_appliedMax, s_appliedMax3, s_appliedMaxDtMs, s_appliedMaxV);
+                s_appliedMax3 = s_appliedMaxDtMs = s_appliedMaxV = 0.0;
                 s_interpFrames = s_holdFrames = s_extrapFrames = s_clampFrames = 0;
                 s_eqTFrames = s_reorderDrops = s_wipeCount = s_batchExtra = 0;
                 s_appliedFrames = 0; s_appliedSum = 0.0; s_appliedMax = 0.0;
