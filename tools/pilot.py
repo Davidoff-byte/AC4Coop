@@ -393,6 +393,15 @@ def cmd_hg(p, a):
     return 0 if st == 0 else 3
 
 
+def cmd_lifehit(p, a):
+    """S9 test (kCmdLifeHit 14): CSrvNPCHealth::SetLife(life - dmg) on ENT from the player's frame, unmarked like a combat
+    hit. On a linked copy with [Coop] OwnerDamage the write is blocked (life unchanged) and sent to the host as a request."""
+    st = p.ctl_send_u32(14, [int(a.ent, 16) & 0xFFFFFFFF, a.dmg])
+    before, after = struct.unpack('<2i', ctypes.string_at(p.ctl + 116, 8))
+    print(f'status {st} | life before {before} after {after}')
+    return 0 if st == 0 else 3
+
+
 def cmd_intent(p, a):
     before = p.read()['pos']
     end = time.time() + a.sec
@@ -641,6 +650,7 @@ def main():
     x.add_argument('--speed', type=float, default=1.0); x.add_argument('--sec', type=float, default=1.0)
     x = sub.add_parser('hg'); x.add_argument('--iface', type=int, default=0); x.add_argument('--can', type=int)
     x.add_argument('--do', type=int); x.add_argument('--arg', action='append'); x.add_argument('--puppet', action='store_true')
+    x = sub.add_parser('lifehit'); x.add_argument('ent'); x.add_argument('dmg', type=int)
     x = sub.add_parser('route'); x.add_argument('x', type=float); x.add_argument('y', type=float)
     x = sub.add_parser('boot'); x.add_argument('--pulses', type=int, default=6); x.add_argument('--wait', type=float, default=5)
     x.add_argument('--settle', type=float, default=60); x.add_argument('--fps', type=float, default=0)   # 0: no Present patch (cap preceded 4 lost copies in 7 two-copy runs, docs/evidence/s0-two-copy-rig-2026-11-15.md)

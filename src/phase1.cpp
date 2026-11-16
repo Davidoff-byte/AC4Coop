@@ -7706,6 +7706,24 @@ void Phase1_OwnerDamageInstall() {
     if (!ok) s_odOn = 0;
     L("[OD] OwnerDamage=1 (default follows FightIntents): SetLife 0x19FB4C0 hooked=%d\n", ok ? 1 : 0);
 }
+// Test-only (Pilot kCmdLifeHit, [Pilot] Enabled): a damage write on `ent` through the real CSrvNPCHealth::SetLife, NOT
+// marked as our relay - the same call a combat hit makes, so on a linked copy the OwnerDamage detour sees and blocks it.
+// Returns 0 ok, -1 no valid health service; *before / *after = Life (+0x5C) around the call.
+int Phase1_TestLifeHit(void* ent, int dmg, int* before, int* after) {
+    if (!ent || dmg <= 0) return -1;
+    __try {
+        unsigned int svc = CachedHealthForEntity((unsigned int)ent);
+        if (!HostHpSvcValid(svc)) svc = FindHealthInAI((unsigned int)AIEntityHelper::GetEntityAI((Entity*)ent));
+        if (!HostHpSvcValid(svc)) return -1;
+        const int cur = (int)*(int16_t*)(svc + 0x5C);
+        *before = cur;
+        ((int (__thiscall*)(void*, int))0x19FB4C0)((void*)svc, cur - dmg);   // CSrvNPCHealth::SetLife, as combat calls it
+        *after = (int)*(int16_t*)(svc + 0x5C);
+        L("[OD] test lifehit ent=%p svc=%08X life %d -> requested %d -> now %d\n", ent, svc, cur, cur - dmg, *after);
+        return 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return -2; }
+}
+
 static void OwnerDamageReport() {
     if (s_odOn != 1) return;
     L("[OD] stats copies=%ld blocked=%ld passedHeal=%ld dropped=%ld tx=%ld | host applied=%ld kills=%ld unresolved=%ld\n",

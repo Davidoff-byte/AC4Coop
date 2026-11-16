@@ -25,6 +25,7 @@
 #include <cstddef>
 
 void Phase1_LogLine(const char* s);
+int Phase1_TestLifeHit(void* ent, int dmg, int* before, int* after);   // phase1.cpp, S9 test (kCmdLifeHit)
 
 // tools/pilot.py mirrors these layouts (PAD_FMT / CHAR_FMT / HDR_FMT); the compiler checks them here (LESSONS.md §1).
 static_assert(sizeof(Pilot::PilotPad) == 40, "PilotPad layout changed: update tools/pilot.py");
@@ -586,6 +587,11 @@ void RunCommand(Entity* pl)
         }
     } else if (c->cmd == kCmdHgCall) {
         status = HgCall(c, g_human, "HG", g_hgW);
+    } else if (c->cmd == kCmdLifeHit) {
+        uint32_t u[2]; memcpy(u, c->f, sizeof(u));
+        int before = 0, after = 0;
+        status = Phase1_TestLifeHit((void*)(uintptr_t)u[0], (int)u[1], &before, &after);
+        const int32_t r[2] = { before, after }; memcpy(c->res, r, sizeof(r)); c->rcount = 2;
     } else if (c->cmd == kCmdStop) {
         g_goto.on = false; g_intentUntil = 0; g_climbUntil = 0; if (c->reserved[0] == 1) c->reserved[0] = 4;
     } else if (c->cmd >= kCmdRay && c->cmd <= kCmdSense) {
