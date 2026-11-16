@@ -8366,6 +8366,9 @@ static bool BindApproachStep(unsigned int ent, float cx, float cy, float cz, con
     const uint64_t now = GetTickCount64();
     int k = -1; for (int i = 0; i < s_bapN; ++i) if (s_bap[i].ent == ent) { k = i; break; }
     const float dx = target[0] - cx, dy = target[1] - cy, dz = target[2] - cz, d = sqrtf(dx * dx + dy * dy + dz * dz);
+    // An expired entry left by an earlier link of the same body (released mid-approach, then re-linked to another guard:
+    // run 22656, a 10.3 m snap) is dropped and the gap judged fresh; a finished approach has ~0 gap and does not restart.
+    if (k >= 0 && now - s_bap[k].t0 >= s_bap[k].dur) { s_bap[k] = s_bap[--s_bapN]; k = -1; }
     if (k < 0) {
         if (d <= 1.5f || d >= 30.0f || s_bapN >= 128) return false;
         k = s_bapN++; s_bap[k].ent = ent; s_bap[k].start[0] = cx; s_bap[k].start[1] = cy; s_bap[k].start[2] = cz; s_bap[k].t0 = now;
