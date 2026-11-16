@@ -7689,6 +7689,7 @@ struct OdCopy { volatile unsigned int svc; uint64_t objId; };
 static OdCopy s_odCopy[128]; static volatile LONG s_odCopyN = 0;
 struct OdReq { uint64_t objId; uint32_t permille; volatile LONG ready; };
 static OdReq s_odRing[64]; static volatile LONG s_odHead = 0, s_odTail = 0;
+static volatile LONG s_odCorpse = 0;   // guest: requests not sent because the copy is already a corpse here
 static volatile LONG s_odBlocked = 0, s_odPassedHeal = 0, s_odDropped = 0, s_odTx = 0, s_odHostApplied = 0, s_odHostKills = 0, s_odHostUnres = 0;
 
 // Guest, ApplyGuards (player thread): remember the linked copy's health service and the host id it answers to.
@@ -7731,6 +7732,9 @@ static void OwnerDamageGuestPump() {
         if (!InterlockedCompareExchange(&r.ready, 0, 0)) break;      // producer has the slot but not filled yet
         const uint64_t objId = r.objId; const uint32_t pm = r.permille;
         InterlockedExchange(&r.ready, 0); InterlockedIncrement(&s_odTail);
+        // A copy the host already killed (death applied here) is a corpse: strikes on it ask for nothing. Run 4240/12996:
+        // 7 lethal requests for F000B3EE after its death arrived, all "unresolved" on the host.
+        { const unsigned int ce = GuestObjFind(objId); if (ce && MirrorKilledLocally((void*)ce)) { InterlockedIncrement(&s_odCorpse); continue; } }
         int k = -1; for (int i = 0; i < nTot; ++i) if (tot[i].objId == objId) { k = i; break; }
         if (k < 0) { if (nTot >= 128) continue; k = nTot++; tot[k].objId = objId; tot[k].total = 0; }
         tot[k].total += pm;
@@ -7838,8 +7842,8 @@ int Phase1_TestLifeHit(void* ent, int dmg, int* before, int* after) {
 
 static void OwnerDamageReport() {
     if (s_odOn != 1) return;
-    L("[OD] stats copies=%ld blocked=%ld passedHeal=%ld dropped=%ld tx=%ld | host applied=%ld kills=%ld unresolved=%ld\n",
-      s_odCopyN, s_odBlocked, s_odPassedHeal, s_odDropped, s_odTx, s_odHostApplied, s_odHostKills, s_odHostUnres);
+    L("[OD] stats copies=%ld blocked=%ld passedHeal=%ld dropped=%ld corpse=%ld tx=%ld | host applied=%ld kills=%ld unresolved=%ld\n",
+      s_odCopyN, s_odBlocked, s_odPassedHeal, s_odDropped, s_odCorpse, s_odTx, s_odHostApplied, s_odHostKills, s_odHostUnres);
 }
 
 // ---- [Coop] SpawnerIdProbe (default 0): guard <-> SceneSpawner identity, read-only -------------------------------------
@@ -13163,7 +13167,8 @@ static void OnFrameInner(Human* updatedHuman) {
             if (StateProbeHb(stb, sizeof(stb)) > 0) L("%s", stb);   // [Coop] StateProbe counters (both roles)
             char evb[512];
             if (EventProbe::FormatReport(evb, sizeof(evb)) > 0) L("%s\n", evb);   // [Coop] EventProbe
-            char pdb[768];
+            { int SenseGuardReport(char*, int); char sgb[200]; if (SenseGuardReport(sgb, sizeof(sgb)) > 0) L("%s\n", sgb); }   // [Coop] SenseOwnerGuard
+            char pdb[1100];
             if (PlayerDamageProbe::FormatReport(pdb, sizeof(pdb)) > 0) L("%s\n", pdb);   // [Coop] PlayerDamageProbe
             char rpb[256];
             if (ReactProbe::FormatReport(rpb, sizeof(rpb)) > 0) L("%s\n", rpb);   // [Coop] ReactProbe

@@ -48,8 +48,8 @@ __declspec(thread) int t_victim = 0;   // 1 puppet, 2 player: inside an H2 call 
 
 // [who][counter]: who 0 = puppet, 1 = player
 enum { C_FDE_POST, C_FDE_NOL, C_FDE_HIT, C_DE_POST, C_DE_NOL, C_H2, C_H2_HIT, C_H3, C_H3_SKIP, C_H4, C_N };
-volatile LONG g_c[2][C_N];      // window
-volatile LONG g_tot[2][C_N];    // session
+volatile LONG g_c[3][C_N];      // window   [who]: 0 puppet, 1 player, 2 the player's target (FDE attacker == player)
+volatile LONG g_tot[3][C_N];    // session
 LONG g_lines = 0;
 LONG g_kindLogged = 0;
 
@@ -104,7 +104,16 @@ void Line(const char* fmt, ...)
     Phase1_LogLine(b);
 }
 
-const char* WhoName(int w) { return w == 0 ? "puppet" : "player"; }
+const char* WhoName(int w) { return w == 0 ? "puppet" : w == 1 ? "player" : "player-target"; }
+// FDE+0x58 attacker handle -> entity ([h+8] < 0 ? [h] : 0, 0x186B3C6..0x186B3D3); 2 when it is the local player.
+int WhoByAttacker(const void* fde)
+{
+    const uintptr_t h = *(const uintptr_t*)((const char*)fde + 0x58);
+    if (!h) return -1;
+    const uintptr_t att = (*(const int*)(h + 8) < 0) ? *(const uintptr_t*)h : 0;
+    Refresh();
+    return (att && att == g_pl) ? 2 : -1;
+}
 
 // H1: call-through wrapper (fastcall = ecx event, edx unused, stack recv; callee pops 4 = the original's retn 4).
 typedef int(__thiscall* Vt9Fn)(void* ev, void* recv);
@@ -112,7 +121,8 @@ int __fastcall H1(void* ev, void* /*edx*/, void* recv)
 {
     const int r = ((Vt9Fn)g_t1)(ev, recv);
     __try {
-        const int w = Who((uintptr_t)recv);
+        int w = Who((uintptr_t)recv);
+        if (w < 0 && ev && recv && *(const uintptr_t*)ev == VT_FDE) w = WhoByAttacker(ev);   // the player's own strikes
         if (w >= 0 && ev) {
             const uintptr_t vt = *(const uintptr_t*)ev;
             if (vt == VT_FDE || vt == VT_DE) {
@@ -138,8 +148,8 @@ int __fastcall H1(void* ev, void* /*edx*/, void* recv)
                         typedef int(__thiscall* DmgFn)(void*, uint32_t, void*, void*, uint32_t, void*, void*);
                         calc = ((DmgFn)0x0199A160)(*(void* const*)0x04E25974, type, recv, (void*)att, subt, (void*)(f + 304), (void*)f);
                     }
-                    Line("hit-post %s ev=%p type=%u sub=%u b333=%u b323=%u calc=%d +C=%d +1C=%08X +20=%u attacker=%08X (hc %s) listener=%08X",
-                         WhoName(w), ev, type, subt, b333, b323, calc, *(const int*)(f + 0xC), *(const uint32_t*)(f + 0x1C),
+                    Line("hit-post %s recv=%p ev=%p type=%u sub=%u b333=%u b323=%u calc=%d +C=%d +1C=%08X +20=%u attacker=%08X (hc %s) listener=%08X",
+                         WhoName(w), recv, ev, type, subt, b333, b323, calc, *(const int*)(f + 0xC), *(const uint32_t*)(f + 0x1C),
                          *(const uint32_t*)(f + 0x20), (unsigned)att, attHc == h ? "==+58" : "!=+58", (unsigned)r);
                     // [Coop] PlayerDamageRelay: the puppet has no fight / health services, so this hit stops here (probe
                     // runs 25140 / 19900: 0 fight-interactions, 0 DamageEvents for the puppet vs 1:1 for the player). Hand it
@@ -149,7 +159,7 @@ int __fastcall H1(void* ev, void* /*edx*/, void* recv)
                                                *(const uint8_t*)(f + 0x1C));
                 }
                 // one line per (who, class, listener found) per 2 s at most
-                static ULONGLONG last[2][2][2];
+                static ULONGLONG last[3][2][2];
                 const ULONGLONG now = GetTickCount64();
                 ULONGLONG& l = last[w][fde ? 0 : 1][r ? 1 : 0];
                 if (now - l > 2000) {
@@ -172,15 +182,16 @@ void __fastcall H2(void* self, void* /*edx*/, void* fde)
         const uintptr_t fi = *(const uintptr_t*)((const char*)self + 0x74);
         const uintptr_t victim = fi ? *(const uintptr_t*)(fi + 8) : 0;
         w = Who(victim);
+        if (w < 0 && victim) w = WhoByAttacker(fde);
         if (w >= 0) {
             Count(w, C_H2);
             const uint32_t ph = *(const uint32_t*)((const char*)fde + 0x54);
             if (ph == 1) Count(w, C_H2_HIT);
-            static ULONGLONG last[2];
+            static ULONGLONG last[3];
             const ULONGLONG now = GetTickCount64();
             if (ph == 1 || now - last[w] > 1000) {
                 last[w] = now;
-                Line("fight-interactions %s fde=%p +54=%u +C=%d +20=%u +1C=%08X", WhoName(w), fde, ph,
+                Line("fight-interactions %s victim=%08X fde=%p +54=%u +C=%d +20=%u +1C=%08X", WhoName(w), (unsigned)victim, fde, ph,
                      *(const int*)((const char*)fde + 0xC), *(const uint32_t*)((const char*)fde + 0x20),
                      *(const uint32_t*)((const char*)fde + 0x1C));
             }
@@ -305,7 +316,7 @@ int PlayerDamageProbe::FormatReport(char* out, int cap)
 {
     if (!g_installed || cap < 64) return 0;
     int n = 0;
-    for (int w = 0; w < 2 && n >= 0 && n < cap - 8; ++w) {
+    for (int w = 0; w < 3 && n >= 0 && n < cap - 8; ++w) {
         LONG c[C_N];
         for (int i = 0; i < C_N; ++i) c[i] = InterlockedExchange(&g_c[w][i], 0);
         const int k = _snprintf_s(out + n, cap - n, _TRUNCATE,

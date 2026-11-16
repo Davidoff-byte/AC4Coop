@@ -635,7 +635,8 @@ BOOL APIENTRY DllMain(HMODULE hMod, DWORD reason, LPVOID)
 
         // Event probe on sub_64A020 (observation only): which events shooting / attacking posts. [Coop] EventProbe, default 0.
         EventProbe::Init();
-        PlayerDamageProbe::Init();   // [Coop] PlayerDamageProbe, default 0: damage-chain hit counters (puppet vs player)
+        PlayerDamageProbe::Init();   // [Coop] PlayerDamageProbe (default 0) / PlayerDamageRelay (default follows FightIntents)
+        { void SenseGuardInit(); SenseGuardInit(); }   // [Coop] SenseOwnerGuard, default 1: sight check with a non-object owner
 
         // Host: no fight orders for the co-op puppet (sub_13F22E0). [Coop] FightSkipPuppet, hook only when the key exists.
         PuppetStim::Init();
