@@ -6847,7 +6847,20 @@ static int OwnFlag(const char* key, int* cache, uint64_t* next) {
     return *cache;
 }
 static int s_ownG = 0, s_ownP = 0; static uint64_t s_ownGNext = 0, s_ownPNext = 0;
-static bool OwnGuardsOn() { return OwnFlag("OwnUpdateGuards", &s_ownG, &s_ownGNext) != 0; }
+// [Coop] OwnUpdateGuards: since 2026-11-16 the default follows [Coop] FightIntents and it is read ONCE (session start):
+// linked guards are written every frame on their own update, blended (scorecard: per-packet writes moved guards in
+// 0.5-2 m hops at ~4 Hz). ini overrides. OwnFlag is no longer used for it (its 2 s re-read follows ini rewrites).
+static int s_ownGOnce = -1;
+static bool OwnGuardsOn() {
+    if (s_ownGOnce < 0) {
+        const int fi = GetPrivateProfileIntA("Coop", "FightIntents", 0, Paths::Ini()) != 0 ? 1 : 0;
+        s_ownGOnce = GetPrivateProfileIntA("Coop", "OwnUpdateGuards", fi, Paths::Ini()) != 0 ? 1 : 0;
+        L("[Own] OwnUpdateGuards=%d (default follows FightIntents=%d; read once)\n", s_ownGOnce, fi);
+    }
+    return s_ownGOnce == 1;
+}
+static void BindNoteStep(float cx, float cy, float cz, const float* w);   // [Bind] pop metric, defined with BindApproachStep
+static float s_bindMaxStep = 0.0f; static LONG s_bindApproaches = 0;    // [Bind] pop metric (OwnPublish, BindApproachStep)
 static bool OwnPuppetOn() { return OwnFlag("OwnUpdatePuppet", &s_ownP, &s_ownPNext) != 0; }
 // ---- [Coop] GuardAnimFull (default 0; re-read every 2 s) --------------------------------------------------------
 // Proto 13: drive a mirrored guard's animation the way ApplyRemoteState drives the puppet off the ground (phase1.cpp
@@ -7196,6 +7209,18 @@ static void OwnPublish(Human* h, Entity* e, const float* pos, const float* quat,
         for (int k = 0; k < 4; ++k) n.fromQuat[k] = n.toQuat[k] = quat[k];
         n.t0Us = now; n.durUs = 0; n.lastPubUs = now; n.snap = true; n.alias = alias; n.aliasSinceUs = now;
         n.anim = anim; n.animUs = now;
+        // [Coop] BindLock: a body linked 1.5..30 m from its host guard eases in from where it stands (as the legacy
+        // BindApproachStep), instead of being placed on the target on its first frame.
+        if (BindLockOn() && readable(e, 0x80)) {
+            const float cx = e->m_GlobalMatrix.M41, cy = e->m_GlobalMatrix.M42, cz = e->m_GlobalMatrix.M43;
+            const float dx = pos[0] - cx, dy = pos[1] - cy, dz = pos[2] - cz, d = sqrtf(dx * dx + dy * dy + dz * dz);
+            if (d > 1.5f && d < 30.0f) {
+                n.fromPos[0] = cx; n.fromPos[1] = cy; n.fromPos[2] = cz;
+                const uint64_t byRun = (uint64_t)(d / 5.0f * 1000000.0f);
+                n.durUs = byRun > 800000ull ? byRun : 800000ull; n.snap = false;
+                InterlockedIncrement(&s_bindApproaches);
+            }
+        }
         if (hostMs) OwnRingPush(n, hostUs, pos, quat, alias, anim);
         InterlockedIncrement(&s_ownN);
     } else if (i >= 0) {
@@ -7208,7 +7233,12 @@ static void OwnPublish(Human* h, Entity* e, const float* pos, const float* quat,
             uint64_t dur = now - o.lastPubUs;
             if (dur < 50000) dur = 50000;
             if (dur > 250000) dur = 250000;
-            if (dx * dx + dy * dy + dz * dz > 25.0f) {          // > 5 m: place, do not glide (legacy bigJump rule)
+            const float d2 = dx * dx + dy * dy + dz * dz;
+            if (d2 > 25.0f && BindLockOn() && d2 < 900.0f) {    // [Coop] BindLock: 5..30 m (e.g. a re-link) eases in at ~5 m/s
+                const uint64_t byRun = (uint64_t)(sqrtf(d2) / 5.0f * 1000000.0f);
+                dur = byRun > 800000ull ? byRun : 800000ull;
+                InterlockedIncrement(&s_bindApproaches);
+            } else if (d2 > 25.0f) {                             // > 5 m: place, do not glide (legacy bigJump rule)
                 for (int k = 0; k < 3; ++k) cp[k] = pos[k];
                 for (int k = 0; k < 4; ++k) cq[k] = quat[k];
                 o.snap = true;
@@ -7701,7 +7731,7 @@ void Phase1_OwnerDamageInstall() {
     // Read the session-start defaults that follow [Coop] FightIntents NOW (DllMain), not lazily: a lazy first read can
     // land after a test runner restored the ini (run 13072: DamageRelay read FightIntents=0 after the restore, so copies
     // never showed the host's health).
-    (void)DamageRelayEnabled(); (void)BindLockOn(); (void)WideBindRadiusM();
+    (void)DamageRelayEnabled(); (void)BindLockOn(); (void)WideBindRadiusM(); (void)OwnGuardsOn();
     L("[OD] session defaults: DamageRelay=%d BindLock=%d BindRadiusM=%.0f\n", DamageRelayEnabled(), BindLockOn() ? 1 : 0, (double)WideBindRadiusM());
     if (!OwnerDamageOn()) { L("[OD] OwnerDamage=0: SetLife not hooked\n"); return; }
     static const BYTE kPro[6] = { 0x55, 0x8B, 0xEC, 0x56, 0x8B, 0xF1 };
@@ -8206,6 +8236,7 @@ static void OwnDrain(Human* h) {
     m.M41 = pos[0]; m.M42 = pos[1]; m.M43 = pos[2];
     const int physMs = OwnPhysMs();
     const bool phys = o.snap || (physMs > 0 && now - o.lastPhysUs >= (uint64_t)physMs * 1000ull);
+    if (!o.snap) BindNoteStep(e->m_GlobalMatrix.M41, e->m_GlobalMatrix.M42, e->m_GlobalMatrix.M43, pos);   // per-frame pop metric
     e->SetGlobalMatrixInternal(&m, phys);
     InterlockedIncrement(&s_gWrites);
     if (FloatProbeOn()) FloatProbe(e);
@@ -8325,7 +8356,6 @@ static void TakeoverNote(Entity* e) {
     for (int i = 0; i < s_toN; ++i) if (s_toEnt[i] == (unsigned int)e) return;
     if (s_toN < 256) s_toEnt[s_toN++] = (unsigned int)e;
 }
-static float s_bindMaxStep = 0.0f; static LONG s_bindApproaches = 0;   // [Bind] pop metric, used by BindApproachStep (below)
 static void TakeoverSweep() {
     if (!BindLockOn()) return;
     World* w = World::GetCurrentWorld(); Entity* player = w ? w->GetPlayer() : nullptr;
