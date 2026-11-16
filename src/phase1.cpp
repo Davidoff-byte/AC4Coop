@@ -13329,6 +13329,7 @@ static void OnFrameInner(Human* updatedHuman) {
             char evb[512];
             if (EventProbe::FormatReport(evb, sizeof(evb)) > 0) L("%s\n", evb);   // [Coop] EventProbe
             { int SenseGuardReport(char*, int); char sgb[200]; if (SenseGuardReport(sgb, sizeof(sgb)) > 0) L("%s\n", sgb); }   // [Coop] SenseOwnerGuard
+            { int TraversalProbeReport(char*, int); char trb[200]; if (TraversalProbeReport(trb, sizeof(trb)) > 0) L("%s\n", trb); }   // [Coop] TraversalProbe
             char pdb[1100];
             if (PlayerDamageProbe::FormatReport(pdb, sizeof(pdb)) > 0) L("%s\n", pdb);   // [Coop] PlayerDamageProbe
             char rpb[256];
