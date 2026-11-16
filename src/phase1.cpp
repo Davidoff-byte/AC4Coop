@@ -6853,9 +6853,10 @@ static int s_ownG = 0, s_ownP = 0; static uint64_t s_ownGNext = 0, s_ownPNext = 
 static int s_ownGOnce = -1;
 static bool OwnGuardsOn() {
     if (s_ownGOnce < 0) {
-        const int fi = GetPrivateProfileIntA("Coop", "FightIntents", 0, Paths::Ini()) != 0 ? 1 : 0;
-        s_ownGOnce = GetPrivateProfileIntA("Coop", "OwnUpdateGuards", fi, Paths::Ini()) != 0 ? 1 : 0;
-        L("[Own] OwnUpdateGuards=%d (default follows FightIntents=%d; read once)\n", s_ownGOnce, fi);
+        // Default 0 again (2026-11-16): with it on, the scorecard got WORSE (guard step 11.78 m, puppet maxD 1.18 m vs
+        // 2.02 / 0.51 off), likely the legacy write (OwnStarved) and the per-frame blend fighting. UNVERIFIED cause.
+        s_ownGOnce = GetPrivateProfileIntA("Coop", "OwnUpdateGuards", 0, Paths::Ini()) != 0 ? 1 : 0;
+        L("[Own] OwnUpdateGuards=%d (default 0; read once)\n", s_ownGOnce);
     }
     return s_ownGOnce == 1;
 }
