@@ -1,7 +1,7 @@
 # AC4 Black Flag co-op
 
 A native C++ plugin that adds two-player co-op to **Assassin's Creed IV Black Flag** (2013,
-AnvilNext, PC 1.05). Loaded through a `dinput8.dll` ASI loader; everything is offsets and detours
+AnvilNext, PC 1.08, md5 `2058342866688f780c8b34526a65bc35`). Loaded through a `dinput8.dll` ASI loader; everything is offsets and detours
 against `AC4BFSP.exe` (45,056,040 B, sha256 `bc11ad79…ab5150`). No engine source.
 
 ## Before you run this: which game build
@@ -23,11 +23,10 @@ $e = "C:\...\Assassin's Creed IV Black Flag\AC4BFSP.exe"
 ```
 
 - **Match** → every offset applies. Proceed.
-- **Mismatch** — including a different patch level (our reference build is 1.05; **a 1.08 install is a
-  different binary until its hash proves otherwise**) → the build gate in `known_builds.txt` keeps the
-  plugin resident, logs `UNKNOWN_BUILD`, and **installs no patches**. By design: it will not crash the
-  game, and it will not do anything either. `[Coop] ForceUnknownBuild=1` bypasses the gate and is a
-  good way to crash.
+- **Mismatch** — any other build, including a different patch level → the build gate in
+  `known_builds.txt` keeps the plugin resident, logs `UNKNOWN_BUILD`, and **installs no patches**. By
+  design: it will not crash the game, and it will not do anything either. `[Coop] ForceUnknownBuild=1`
+  bypasses the gate and is a good way to crash.
 
 Porting to another build is a job, not a flag. Start with:
 
@@ -99,7 +98,7 @@ Reading order for a newcomer: `docs/ops/JOURNAL-2026-10-30.md` →
 
 | needed | why | where from |
 |---|---|---|
-| **AC4 Black Flag PC 1.05** — `AC4BFSP.exe` 45,056,040 B, sha256 `bc11ad79…ab5150` | every offset targets this exact binary | you must own the game |
+| **AC4 Black Flag PC 1.08** — `AC4BFSP.exe` 45,056,040 B, sha256 `bc11ad79…ab5150`, md5 `20583428…65bc35` | every offset targets this exact binary | you must own the game |
 | **`dinput8.dll`** — an ASI loader | loads `AC4Coop.asi` into the process | not shipped here; any ASI loader works |
 | **`known_builds.txt`** | the build gate refuses to patch a binary it does not recognise | included in this repo |
 | **PS3 debug build `scimitar_final.elf`** (0.52 GB, DWARF) | only for the reverse-engineering work; not needed to build or run | you must provide it — see `docs/ops/PS3-SYMBOLS.md` |
