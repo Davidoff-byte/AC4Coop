@@ -27,10 +27,11 @@
 
 void Phase1_LogLine(const char* s);
 void* Phase1_PuppetEntity();
+int Phase1_PeerContextId();   // phase1.cpp: the peer's newest contextId
 
 namespace {
 DWORD g_tE = 0, g_tN = 0, g_tT = 0;
-bool g_on = false;
+bool g_on = false, g_log = false;   // g_log: [Coop] TraversalProbe (the [TR] lines); g_on: any hook installed
 volatile uintptr_t g_plH = 0, g_pupH = 0;
 volatile ULONGLONG g_next = 0;
 volatile LONG g_lines = 0, g_cnt[2][3] = {};
@@ -140,9 +141,32 @@ __declspec(naked) void DetT()
 DWORD g_tC = 0;
 volatile LONG g_cond[2] = {};
 typedef int(__thiscall* CondFn)(void*, uint32_t, int);
+// [Coop] NativeReplicaClimbExitGate (default 0, read at load): the native replica leaves Climbing only the way its peer
+// did. Run 4220 (asi 723b1157): the replica's Climbing -> NarrowObject came from condition 17 (sub_156FF80, the
+// transfer-to-narrow-object test) with zero climbing input on the replica, while the peer kept hanging. The player fires the
+// same condition in a free-run (run 4220: 8 -> 30 -> 9 at 191846083), so it is native behaviour, not a fault. Gate: for the
+// puppet only, condition 17 is not evaluated (returns 0, as when it does not apply) while the peer's context is still
+// Climbing (30); once the peer has left Climbing it runs as usual. Skipped BEFORE the call, so none of its side effects run.
+bool g_exitGate = false;
+volatile LONG g_gated = 0;
 int __fastcall DetC(void* list, void* /*edx*/, uint32_t id, int arg)
 {
+    if (g_exitGate && (id & 0xFFFF) == 17) {
+        __try {
+            Refresh();
+            const uintptr_t hu = *(const uintptr_t*)(*(const uintptr_t*)list + 4);
+            if (hu && hu == g_pupH && Phase1_PeerContextId() == 30) {
+                if (InterlockedIncrement(&g_gated) <= 20) {
+                    char line[160];
+                    _snprintf_s(line, sizeof(line), _TRUNCATE, "[TR] t=%llu puppet climb-cond 17 held: peer still climbing (gated %ld)\n", NowMs(), g_gated);
+                    Phase1_LogLine(line);
+                }
+                return 0;
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
     const int r = ((CondFn)g_tC)(list, id, arg);
+    if (!g_log) return r;   // installed for the gate only: no logging
     if (!r) return r;
     __try {
         Refresh();
@@ -184,19 +208,28 @@ bool Install(uintptr_t va, const BYTE* pro, int n, void* det, DWORD* slot, const
 
 void TraversalProbeInit()
 {
-    if (!GetPrivateProfileIntA("Coop", "TraversalProbe", 0, Paths::Ini())) return;
-    static const BYTE pE[7] = { 0x0F, 0xB6, 0x81, 0x00, 0x01, 0x00, 0x00 };
-    static const BYTE pN[10] = { 0x55, 0x8B, 0xEC, 0x0F, 0xB6, 0x81, 0x00, 0x01, 0x00, 0x00 };
-    g_on |= Install(0x0052C330, pE, 7, (void*)&DetE, &g_tE, "Exit");
-    g_on |= Install(0x0052DFF0, pN, 10, (void*)&DetN, &g_tN, "Enter");
-    g_on |= Install(0x0052DF90, pN, 10, (void*)&DetT, &g_tT, "TransitToContext");
+    g_log = GetPrivateProfileIntA("Coop", "TraversalProbe", 0, Paths::Ini()) != 0;
+    g_exitGate = GetPrivateProfileIntA("Coop", "NativeReplicaClimbExitGate", 0, Paths::Ini()) != 0;
+    if (!g_log && !g_exitGate) return;
+    if (g_log) {
+        static const BYTE pE[7] = { 0x0F, 0xB6, 0x81, 0x00, 0x01, 0x00, 0x00 };
+        static const BYTE pN[10] = { 0x55, 0x8B, 0xEC, 0x0F, 0xB6, 0x81, 0x00, 0x01, 0x00, 0x00 };
+        g_on |= Install(0x0052C330, pE, 7, (void*)&DetE, &g_tE, "Exit");
+        g_on |= Install(0x0052DFF0, pN, 10, (void*)&DetN, &g_tN, "Enter");
+        g_on |= Install(0x0052DF90, pN, 10, (void*)&DetT, &g_tT, "TransitToContext");
+    }
     static const BYTE pC[7] = { 0x55, 0x8B, 0xEC, 0x0F, 0xB7, 0x45, 0x08 };
-    g_on |= Install(0x01581EE0, pC, 7, (void*)&DetC, &g_tC, "ClimbCondition");
+    const bool c = Install(0x01581EE0, pC, 7, (void*)&DetC, &g_tC, "ClimbCondition");
+    g_on |= c;
+    if (!c) g_exitGate = false;
+    char line[96];
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[TR] TraversalProbe=%d NativeReplicaClimbExitGate=%d\n", g_log ? 1 : 0, g_exitGate ? 1 : 0);
+    Phase1_LogLine(line);
 }
 
 int TraversalProbeReport(char* out, int cap)
 {
     if (!g_on) return 0;
-    return _snprintf_s(out, cap, _TRUNCATE, "[TR] counts player E/N/T=%ld/%ld/%ld puppet E/N/T=%ld/%ld/%ld lines=%ld",
-                       g_cnt[0][0], g_cnt[0][1], g_cnt[0][2], g_cnt[1][0], g_cnt[1][1], g_cnt[1][2], g_lines);
+    return _snprintf_s(out, cap, _TRUNCATE, "[TR] counts player E/N/T=%ld/%ld/%ld puppet E/N/T=%ld/%ld/%ld lines=%ld | exit gate held=%ld",
+                       g_cnt[0][0], g_cnt[0][1], g_cnt[0][2], g_cnt[1][0], g_cnt[1][1], g_cnt[1][2], g_lines, g_gated);
 }

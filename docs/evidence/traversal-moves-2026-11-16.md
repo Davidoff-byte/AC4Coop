@@ -70,6 +70,38 @@ the "beam" (`climb-moves-2026-11-15.md`, rounds 2-3).
   - So the move is gated by the **current climb animation** and a mode field `a1[58]`. **UNVERIFIED** what the mode
     field means and what sets it (a climb "intent" written from input is the lead).
 
+## 5. The replica's hang → narrow object, live: condition 17, and the exit gate
+- **Run 4220** (asi 723b1157, 3 replays, probe on):
+  - The replica entered at 191726542 (8 → 30) and left at 191728441 through
+    `[TR] puppet climb-cond id=17 -> context 9` (30 → 9), about 1.9 s later.
+  - During the hang its climbing input was **zero**: `climb intent ... v=(0.00,0.00) speed 0.00 | real=0 derived=0`, with an
+    on-wall error of 0.20 m.
+  - **The player fires the same condition**: 8 → 30 at 191843287, then `player climb-cond id=17 -> context 9` at 191846083,
+    during the move script's free-run (RT + A + stick). So the transfer is native free-run behaviour, not a fault.
+- Condition 17 (`sub_156FF80`) gets the Walling and NarrowObject contexts (`sub_52C360(8/9)`) and runs `sub_156BD20` on a
+  helper it caches (`sub_156B480(1)`: 0x70 bytes, `this+0x1C`). In the disasm the helper is `ecx` (0x0156FFE3).
+  - `sub_156BD20` first requires `sub_155C9B0(helper)`, then switches on helper+0x58 (cases 2 and 5-9) and checks
+    helper+0x24 == 10.
+  - Why the replica's helper qualifies while the hanging recorded peer did not is **not established** (the helper's
+    state, not our input).
+- **`[Coop] NativeReplicaClimbExitGate`** (default 0, `src/traversal_probe.cpp`):
+  - for the puppet only, condition 17 is not evaluated while the peer's newest context is still Climbing (30). The hook
+    returns 0 before calling it, as when it does not apply, so none of its side effects run;
+  - once the peer has left Climbing, it runs as usual.
+- **Run 32644** (asi 976ec99f, 3 replays, gate on, `0:0:0:1:1`):
+
+| run | wall entry | after the entry | both climbing (all windows) | replica on a narrow object alone |
+|---|---|---|---|---|
+| 1 | 8 → 30 at 197353081 | condition 17 held (7,220 times over the run); **30 for ~68 s**, then 30 → 9 → 6 → 4 at 197420961, after the peer left Climbing | **78 %** | 4 % |
+| 2 | none | - | 0 % | 0 % |
+| 3 | 8 → 30 at 197535138 | **30 for ~73 s**, then 30 → 9 → 6 → 4 | **84 %** | 4 % |
+
+  Before the gate (runs 30324, 26516, 4220): both-climbing 0-5 %, and the replica on the narrow object within ~2 s of
+  every entry. **PASS** on the stated bar: no Climbing → NarrowObject while the peer climbs.
+- **New problem, now visible:** on the wall the replica keeps up badly. Its mean on-wall error is 1.1-2.5 m, often frozen
+  (the same error over many 2 s windows), while the peer shimmies. Hold-by-hold following (`NativeReplicaClimbMoves`) was
+  off in this configuration. The next A/B is the gate plus moves.
+
 ## Not done yet
 - The live condition id for the replica's Climbing → NarrowObject, and the gate values (`a1[58]`, `sub_666DC0`) for the
   replica vs the hanging player.

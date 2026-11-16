@@ -1720,6 +1720,7 @@ static float s_nrSnapM = 3.0f;
 static volatile float g_nrLatestDest = 0.0f; static volatile bool g_nrLatestSprint = false;
 static volatile uint8_t g_nrLatestMvt = 0;
 static volatile int g_nrLatestCtx = 4;     // newest packet's contextId
+int Phase1_PeerContextId() { return g_nrLatestCtx; }   // traversal_probe.cpp ([Coop] NativeReplicaClimbExitGate)
 static volatile bool g_nrClimbValid = false; static float g_nrClimbIn[3] = { 0, 0, 0 };   // newest packet's ClimbBlock
 static volatile LONG s_nrClimbReal = 0, s_nrClimbDerived = 0, s_nrClimbHold = 0, s_nrHoldPush = 0, s_nrHoldReached = 0, s_nrHoldDropped = 0;
 // [Coop] NativeReplicaClimbMoves: queue of the peer's climbing holds (hand midpoint per move, oldest first).
