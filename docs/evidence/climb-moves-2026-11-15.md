@@ -223,3 +223,30 @@ default 0, re-read every 2 s). Solo replay only; not two-machine tested.
 - Committed under `NativeReplicaWallEntry` (default 0): final-approach drive phases, no navigation while the replica is on
   a wall, neutral ground intention on a wall, hold-idle (no stick fallback when hold-following has no target), mode-0-only
   apply. None of them changes the 30 -> 9 outcome; kept as the measured configuration.
+
+## Round 3 (2026-11-16, taken over from the F7 session): the replica's behaviour statechart? No
+- **Flag:** `[Coop] NativeReplicaClimbBhvOff` (default 0, re-read every 2 s). While the peer is in ctx 30 and the puppet is
+  in replica mode, the puppet's behaviour component is disabled. Only the toggle changes: not `braindead`, our action
+  writes or the matrix path.
+- **Rig:** one host copy (pid 30324, asi 0039afa0 = feat/launcher 55bebad + this diff). host-climbmoves-1 is replayed
+  with `--as-proto 16 --player-only --adopt-world`, 4 runs of 90 s, F7's round-2 ini (`0:0:0:1:1`), modes 0/1/0/1.
+
+| run | ClimbBhvOff | wall entries | windows right after the entry (replica / peer contexts) | beam alone (all windows) |
+|---|---|---|---|---|
+| 1 | 0 | 1 | {4,8,30} / {4,8,30}, then **30+9** / 30, 9 / 30, 9 / 30 | 9 % |
+| 2 | 1 (`puppet behavior disabled (ctx=30)` logged right after the entry) | 1 | {4,8,30} / {4,8,30}, then **30+9** / 30, 9+4+6 / 30, 4 / 30 | 4 % |
+| 3 | 0 | 1 | {4,8} / {4,8,30}, 30+8 / 30, then **30+9** / 30, 9 / 30 | 7 % |
+| 4 | 1 | 0 (no wall-run success) | - | 0 % |
+
+- **Result:** in run 2 the behaviour was disabled before the hang, and the replica still went 30 -> 9 in the next
+  window, as in runs 1 and 3. **The behaviour statechart is not what lifts the hanging replica onto the beam.** This rests
+  on one entry with it off, whose outcome matched both baseline entries. The lower beam-alone shares in runs 2 and 4 come
+  from fewer windows on a wall, not from the hang holding.
+- This rig gives only one wall entry per run: later tries failed in sub-state 4 near standstill. The whole-run shares
+  are therefore noise; the per-entry sequence above is the measurement.
+- **Remaining candidates (UNVERIFIED):**
+  - the climbing chart's own continuation from a wall-run grab, when the NPC has no "stay" input (the peer's player held
+    the hang with its input);
+  - a climb request from the NPC's climbing logic itself.
+
+  The next step is RE of the 30 -> 9 transition: which event takes the hang to the beam, and who posts it.

@@ -2798,6 +2798,18 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
         // Retries every frame until the deferred AddToWorld has actually set the behavior component up.
         {
             int wantBhv = aiOff ? 0 : 1;
+            // [Coop] NativeReplicaClimbBhvOff (default 0, read once): test of F7's lead. A hanging native replica (ctx 30)
+            // moves onto the beam above within ~2 s while the peer keeps hanging, with navigation, ground intention and
+            // climbing input all ruled out (docs/evidence/climb-moves-2026-11-15.md, round 2). Lead, UNVERIFIED: the
+            // puppet's own behaviour statechart (enabled in replica mode). This disables it while the peer climbs (30);
+            // only the behaviour toggle changes - not `braindead`, our action writes or the matrix path.
+            static int s_cbo = -1; static uint64_t s_cboNext = 0;   // re-read every 2 s (A/B in one session, as abmoves.sh)
+            if (GetTickCount64() >= s_cboNext) {
+                s_cboNext = GetTickCount64() + 2000;
+                const int v = GetPrivateProfileIntA("Coop", "NativeReplicaClimbBhvOff", 0, Paths::Ini()) != 0 ? 1 : 0;
+                if (v != s_cbo) { s_cbo = v; L("[NR] NativeReplicaClimbBhvOff=%d\n", s_cbo); }
+            }
+            if (s_cbo == 1 && replica && s.contextId == 30) wantBhv = 0;
             if (g_bhvState != wantBhv) {
                 void* bhv = g_puppet->GetBehaviorComponent();
                 if (readable(bhv, 8)) {
