@@ -8378,6 +8378,34 @@ static uint32_t FiCall(void* ig, int slot, int n, uint32_t a0 = 0, uint32_t a1 =
     } __except (EXCEPTION_EXECUTE_HANDLER) { L("[FI] EXCEPTION 0x%08X in slot %d\n", GetExceptionCode(), slot); return 0; }
 }
 
+// [Coop] PuppetFightStim (default 1 since 2026-11-17; needs FightIntents; ids [Coop] PuppetFightStimIds, default "257"). docs/evidence/conflict-gate-2026-11-17.md
+// §5-7: guards start a fight only on a fight-trigger stimulus whose source is the target, and the replay-driven puppet emits
+// almost none. When the peer's fight enter / attack is applied to the puppet with a resolved guard, the puppet posts those
+// ids to that guard (PuppetStim::PostFightStim, the engine's 257 layout); while the puppet stays in fight it reposts to its
+// last target at most every PuppetFightStimMs (default 1000). Host only (FightIntentApply runs on the entity host).
+static int s_pfsOn = -1, s_pfsMs = 1000, s_pfsIds[4] = {}, s_pfsN = 0;
+static uint64_t s_pfsTarget = 0, s_pfsNext = 0;
+static LONG s_pfsPosted = 0, s_pfsTriggers = 0;
+static void PfsInit() {
+    if (s_pfsOn >= 0) return;
+    // Default 1 by the owner's decision (2026-11-17), on one PASS A/B (§7 round 3, n=1 per arm); no soak yet.
+    s_pfsOn = GetPrivateProfileIntA("Coop", "PuppetFightStim", 1, Paths::Ini()) != 0 ? 1 : 0;
+    s_pfsMs = GetPrivateProfileIntA("Coop", "PuppetFightStimMs", 1000, Paths::Ini());
+    char b[64]; GetPrivateProfileStringA("Coop", "PuppetFightStimIds", "257", b, sizeof(b), Paths::Ini());
+    for (char* s = b; *s && s_pfsN < 4; ) { s_pfsIds[s_pfsN++] = atoi(s); while (*s && *s != ',') ++s; if (*s) ++s; }
+    L("[PFS] PuppetFightStim=%d ids=%s every %d ms\n", s_pfsOn, b, s_pfsMs);
+}
+void* Phase1_PuppetEntity();
+static void PfsPost(Human*, Entity* guard, const char* why) {
+    // The source is the puppet ENTITY (its handle at +0xC8), not the Human component FightIntentApply receives.
+    void* pe = Phase1_PuppetEntity();
+    int n = 0;
+    for (int k = 0; k < s_pfsN; ++k) n += PuppetStim::PostFightStim(pe, guard, s_pfsIds[k]);
+    InterlockedExchangeAdd(&s_pfsPosted, n);
+    s_pfsNext = GetTickCount64() + (uint64_t)s_pfsMs;
+    if (InterlockedIncrement(&s_pfsTriggers) <= 40) L("[PFS] %s guard=%p posted=%d\n", why, (void*)guard, n);
+}
+
 // Receiver part 2, the puppet's own update: apply queued ops through the Can/Do slots; track the puppet's fight state.
 static void FightIntentApply(Human* pup) {
     if (s_fiOn != 1) return;
@@ -8414,8 +8442,20 @@ static void FightIntentApply(Human* pup) {
         }
         L("[FI] apply %s ent=%p can=%08X do=%08X puppet path before=%u/%u/%u/%u/%u/%u\n",
           f.op == FI_ENTER ? "enter" : f.op == FI_ATTACK ? "attack" : "exit", (void*)e, rc, rd, p[0], p[1], p[2], p[3], p[4], p[5]);
+        PfsInit();
+        if (s_pfsOn == 1 && e && (f.op == FI_ENTER || f.op == FI_ATTACK)) {
+            s_pfsTarget = f.target;
+            PfsPost(pup, e, f.op == FI_ENTER ? "enter" : "attack");
+        } else if (s_pfsOn == 1 && f.op == FI_EXIT) {
+            s_pfsTarget = 0;
+        }
     }
     if (FiPath(hg, p, nullptr)) InterlockedExchange(&s_fiPuppetFsm, p[2] == 163 ? 1 : 0);
+    // [Coop] PuppetFightStim repost: puppet still in fight (path[2]==163) with a remembered, resolvable target.
+    if (s_pfsOn == 1 && s_pfsTarget && s_fiPuppetFsm == 1 && GetTickCount64() >= s_pfsNext) {
+        Entity* g = FiResolve(s_pfsTarget);
+        if (readable(g, 0xCC)) PfsPost(pup, g, "repost"); else s_pfsTarget = 0;
+    }
     static uint64_t s_log = 0; const uint64_t now = GetTickCount64();
     if (now >= s_log) {
         s_log = now + 5000;
@@ -12940,7 +12980,7 @@ static void DumpConfigOnce()
         { "Coop", "FloatProbe", 0 }, { "Coop", "FootOffsetFix", 0 }, { "Coop", "GuardActionGate", 0 }, { "Coop", "GuardExtrapMs", 100 },
         { "Coop", "GuardInterpBuffer", 0 }, { "Coop", "GuardInterpDelayMs", 120 }, { "Coop", "GuardPhaseLock", 0 },
         { "Coop", "GuardSeesPuppet", 0 }, { "Coop", "PuppetActionReassert", 0 }, { "Coop", "PuppetHostTime", 0 },
-        { "Coop", "AlertQueryAsPlayer", 0 }, { "Coop", "ConflictNullGuard", 0 }, { "Coop", "ConflictKeepPuppet", 0 }, { "Coop", "GuardPoiFightTarget", 0 }, { "Coop", "FightOrderPuppet", 0 }, { "Coop", "DespawnLeaveFight", 0 }, { "Coop", "FightKeepOnConflictEnd", 0 }, { "Coop", "FightStateProbe", 0 }, { "Coop", "PuppetNavService", 0 }, { "Coop", "NativeReplica", 0 }, { "Coop", "NativeReplicaSnapCm", 300 }, { "Coop", "NativeReplicaBlendCmS", 150 }, { "Coop", "NativeReplicaStartBoostCmS", 400 }, { "Coop", "NativeReplicaParkour", 0 }, { "Coop", "NativeReplicaFreeRun", 0 }, { "Coop", "NativeReplicaClimbIntent", 0 }, { "Coop", "NativeReplicaClimbMoves", 0 }, { "Coop", "NativeReplicaClimbChoice", 0 }, { "Coop", "NativeReplicaBeam", 0 }, { "Coop", "NativeReplicaWallEntry", 0 }, { "Coop", "NativeReplicaClimbNoSnap", 0 }, { "Coop", "NativeReplicaParkourSnapCm", 800 }, { "Coop", "FightProbe", 0 }, { "Coop", "PeerLastPacket", 0 }, { "Coop", "PuppetActionsOwnUpdate", 1 }, { "Coop", "DetectKeepTarget", 0 }, { "Coop", "GuardPlayerOfInterest", 0 }, { "Coop", "EventProbe", 0 }, { "Coop", "PlayerDamageProbe", 0 }, { "Coop", "ReactProbe", 0 }, { "Coop", "FightSkipPuppet", 0 }, { "Coop", "NavNullGuard", 0 }, { "Coop", "PuppetStimMode", 1 }, { "Coop", "PuppetStimSeq", 0 }, { "Coop", "PuppetStimSource", 0 }, { "Coop", "SightProbe", 0 }, { "Coop", "StateProbe", 0 }, { "Coop", "StuckProbe", 0 },
+        { "Coop", "AlertQueryAsPlayer", 0 }, { "Coop", "ConflictNullGuard", 0 }, { "Coop", "ConflictKeepPuppet", 0 }, { "Coop", "GuardPoiFightTarget", 0 }, { "Coop", "FightOrderPuppet", 0 }, { "Coop", "DespawnLeaveFight", 0 }, { "Coop", "FightKeepOnConflictEnd", 0 }, { "Coop", "FightStateProbe", 0 }, { "Coop", "PuppetNavService", 0 }, { "Coop", "NativeReplica", 0 }, { "Coop", "NativeReplicaSnapCm", 300 }, { "Coop", "NativeReplicaBlendCmS", 150 }, { "Coop", "NativeReplicaStartBoostCmS", 400 }, { "Coop", "NativeReplicaParkour", 0 }, { "Coop", "NativeReplicaFreeRun", 0 }, { "Coop", "NativeReplicaClimbIntent", 0 }, { "Coop", "NativeReplicaClimbMoves", 0 }, { "Coop", "NativeReplicaClimbChoice", 0 }, { "Coop", "NativeReplicaBeam", 0 }, { "Coop", "NativeReplicaWallEntry", 0 }, { "Coop", "NativeReplicaClimbNoSnap", 0 }, { "Coop", "NativeReplicaParkourSnapCm", 800 }, { "Coop", "FightProbe", 0 }, { "Coop", "PeerLastPacket", 0 }, { "Coop", "PuppetActionsOwnUpdate", 1 }, { "Coop", "DetectKeepTarget", 0 }, { "Coop", "GuardPlayerOfInterest", 0 }, { "Coop", "EventProbe", 0 }, { "Coop", "PlayerDamageProbe", 0 }, { "Coop", "ReactProbe", 0 }, { "Coop", "FightSkipPuppet", 0 }, { "Coop", "NavNullGuard", 0 }, { "Coop", "PuppetStimMode", 1 }, { "Coop", "PuppetStimSeq", 0 }, { "Coop", "PuppetStimSource", 0 }, { "Coop", "PuppetFightStim", 1 }, { "Coop", "PuppetFightStimMs", 1000 }, { "Coop", "SightProbe", 0 }, { "Coop", "StateProbe", 0 }, { "Coop", "StuckProbe", 0 },
         { "Coop", "StageLog", 0 }, { "Coop", "SyncEnemiesOnly", 1 }, { "Coop", "SyncMaxEntities", 32 },
         { "Coop", "SyncRadiusM", 60 }, { "Coop", "TransformProbe", 0 }, { "Coop", "VPadEnable", 0 },
         { "Coop", "VPadTest", 0 }, { "Coop", "WatchDeadBit", 0 }, { "Coop", "WatchTarget", 0 },

@@ -118,6 +118,45 @@ int Fire(void* pup)
     return posted;
 }
 
+}  // namespace
+
+// ---- [Coop] PuppetFightStim (default 1) ------------------------------------------------------------------------
+// One fight-trigger stimulus from the puppet to one guard, built exactly as the engine builds stimulus 257 for the
+// player in sub_17B7A80 (decompiled 2026-11-17, docs/evidence/conflict-gate-2026-11-17.md §7):
+//   ev = sub_FA3260() (24-byte stimulus, vtable 0x026E47C4); +0x10 = id; +0x0C = receiver handle (receiver+0xC8,
+//   the decompile's +200); +0x08 = source handle; sub_64A020(ev, receiver). No receiver filter, no frame spreading:
+//   sub_17B7A80 posts directly to one receiver too.
+// Live basis (§5-6): the player's 257 drives reaction 026B1BF0 (fight start) -> sub_1343D30 -> sub_1342F70 ->
+// StartConflict; 8 and 257 from the puppet (PuppetStim mode 2) gave conflicts and guard hits on the puppet.
+int PuppetStim::PostFightStim(void* pup, void* receiver, int id)
+{
+    if (!pup || !receiver) return 0;
+    __try {
+        char* hs = *(char**)((char*)pup + 0xC8);
+        char* hr = *(char**)((char*)receiver + 0xC8);
+        if (!hs || !hr) return 0;
+        // Each handle must decode back to its own entity (entity = (h[2] >> 31) & h[0], as sub_1342F70 / sub_15AE100
+        // decode a holder): refuses a non-entity pointer (2026-11-17 A/B: a Human component passed as the source).
+        const int* a = (const int*)hs; const int* b = (const int*)hr;
+        if ((void*)(uintptr_t)((a[2] >> 31) & a[0]) != pup || (void*)(uintptr_t)((b[2] >> 31) & b[0]) != receiver) {
+            Log("[PFS] handle check failed src=%p recv=%p\n", pup, receiver);
+            return 0;
+        }
+        char* ev = (char*)((NewEvent_t)0x00FA3260)();
+        if (!ev) return 0;
+        *(uint32_t*)(ev + 0x10) = (uint32_t)id;
+        SetHandle(ev, 0x0C, hr);
+        SetHandle(ev, 0x08, hs);
+        ((Post_t)0x0064A020)(ev, receiver);
+        return 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("[PFS] EXCEPTION 0x%08X posting id %d\n", GetExceptionCode(), id);
+        return 0;
+    }
+}
+
+namespace {
+
 // ---- [Coop] FightSkipPuppet -------------------------------------------------------------------------------------
 // Run 7164 (build b2ad941, mode 2): guards reacted to the puppet's gunshot and the host's fight system enlisted the
 // puppet as a fighter. sub_161BD30 (fight member loop) -> sub_13F22E0(entity) -> nav service vt+64 -> sub_1780610

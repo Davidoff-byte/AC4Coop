@@ -240,6 +240,46 @@ void FightOrderAfterUpdate(char* fm)
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
+// ---- value 2 of ConflictKeepPuppet / FightKeepOnConflictEnd: keep the puppet's fight only while it is still engaged ----
+// Value 1 keeps the conflict for as long as the FightManager's target is the puppet, so on the host it never ends
+// (owner-driven pass 2026-11-17, docs/evidence/conflict-gate-2026-11-17.md §8-9: round held to the end of the log,
+// 76+ StartConflict retries, no hits). The engine's own end test in sub_17BFF50 (decompiled 2026-11-17, job w5) is:
+// no fighter targets the player (sub_1608F70) AND no entity of its list is within the squared radius
+// *(float*)(dword_4DE6D48 + 0x2AC) of the player (0x017C0180.., compare at decompile line 146). Value 2 applies the same
+// rule to the puppet: engaged = some member of the target's fight group whose own fight target is the puppet
+// (FightTargetIs, the sub_15DABC0 layout) stands within that radius of the puppet. Group walk as FightOrderAfterUpdate.
+volatile LONG g_ckReleased = 0;
+bool PuppetStillEngaged(const char* fm, const void* pup)
+{
+    const char* rec = *(const char* const*)(fm + 0x304);
+    if (!rec || EntOf(rec) != pup) return false;
+    const char* grp = *(const char* const*)(rec + 0x10);
+    const char* tun = *(const char* const*)0x04DE6D48;
+    if (!grp || !tun) return true;                       // cannot evaluate: keep (value 1 behaviour)
+    const float r2 = *(const float*)(tun + 0x2AC);
+    if (!(r2 > 1.0f && r2 < 1.0e6f)) return true;        // implausible tuning value: keep
+    const Entity* pe = (const Entity*)pup;
+    const uint16_t ns = *(const uint16_t*)(grp + 0x16);
+    const char* const* subs = *(const char* const* const*)(grp + 0x10);
+    for (uint16_t i = 0; i < ns && i < 64; ++i) {
+        const char* sub = subs[i];
+        if (!sub) continue;
+        const uint16_t nr = *(const uint16_t*)(sub + 0xE);
+        const char* const* recs = *(const char* const* const*)(sub + 8);
+        for (uint16_t j = 0; j < nr && j < 64; ++j) {
+            const char* r = recs[j];
+            if (!r) continue;
+            const void* e = EntOf(r);
+            if (!e || e == pup || !FightTargetIs(e, pup)) continue;
+            const Entity* ee = (const Entity*)e;
+            const float dx = ee->m_GlobalMatrix.M41 - pe->m_GlobalMatrix.M41, dy = ee->m_GlobalMatrix.M42 - pe->m_GlobalMatrix.M42,
+                        dz = ee->m_GlobalMatrix.M43 - pe->m_GlobalMatrix.M43;
+            if (dx * dx + dy * dy + dz * dz < r2) return true;
+        }
+    }
+    return false;
+}
+
 // ---- [Coop] FightKeepOnConflictEnd (default 0; installed when the key is present; read live) ---------------------
 // Run 26820 (build 2017a3a, ConflictKeepPuppet=1): the puppet was still dropped ~12 s after the shot through the same
 // action (FightProbe `from=0161F870 <00A00EB0 <00A0105A`): E50 has other posters than the call site ConflictKeepPuppet
@@ -259,14 +299,15 @@ void __cdecl DropActionWrap(void* a1, void* a2)
     InterlockedIncrement(&g_kcCalls);
     __try {
         const ULONGLONG now = GetTickCount64();
-        if (now >= g_kcNext) { g_kcNext = now + 2000; g_kcOn = GetPrivateProfileIntA("Coop", "FightKeepOnConflictEnd", 0, Paths::Ini()) != 0; }
+        if (now >= g_kcNext) { g_kcNext = now + 2000; g_kcOn = GetPrivateProfileIntA("Coop", "FightKeepOnConflictEnd", 0, Paths::Ini()); }
         if (g_kcOn && a1 && Phase1_IsEntityHost()) {
             void* pup = Phase1_PuppetEntity();
             const char* own = *(const char* const*)((const char*)a1 + 0xC);
             const char* w = own ? *(const char* const*)(own + 0x70) : nullptr;
             const char* fm = w ? *(const char* const*)(w + 0x8DC) : nullptr;
             const char* rec = fm ? *(const char* const*)(fm + 0x304) : nullptr;
-            if (pup && rec && EntOf(rec) == pup) { InterlockedIncrement(&g_kcSkipped); return; }
+            // value 1: always keep; value 2: keep only while a fighter that targets the puppet is still near it
+            if (pup && rec && EntOf(rec) == pup && (g_kcOn < 2 || PuppetStillEngaged(fm, pup))) { InterlockedIncrement(&g_kcSkipped); return; }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
     Hook::CallCdeclMethod<void, void*, void*>((unsigned long)Va(VA_DROP_ACTION), a1, a2);
@@ -365,7 +406,7 @@ char __fastcall KeepPuppetStub(void* fm, void* /*edx*/, void* ent)
     __try {
         InterlockedIncrement(&g_ckCalls);
         const ULONGLONG now = GetTickCount64();
-        if (now >= g_ckNext) { g_ckNext = now + 2000; g_ckOn = GetPrivateProfileIntA("Coop", "ConflictKeepPuppet", 0, Paths::Ini()) != 0; }
+        if (now >= g_ckNext) { g_ckNext = now + 2000; g_ckOn = GetPrivateProfileIntA("Coop", "ConflictKeepPuppet", 0, Paths::Ini()); }
         if (!g_ckOn || !fm || !Phase1_IsEntityHost()) return r;
         void* pup = Phase1_PuppetEntity();
         if (!pup) return r;
@@ -374,6 +415,10 @@ char __fastcall KeepPuppetStub(void* fm, void* /*edx*/, void* ent)
         const int* h = *(const int* const*)(rec + 0x14);                         // entity handle
         const void* e = h ? (const void*)(uintptr_t)((h[2] >> 31) & h[0]) : nullptr;
         if (e != pup) return r;
+        if (g_ckOn >= 2 && !PuppetStillEngaged((const char*)fm, pup)) {   // value 2: let the engine's own end test run
+            if (InterlockedIncrement(&g_ckReleased) <= 5) Phase1_LogLine("[Poi] ConflictKeepPuppet=2: no fighter near the puppet - conflict end allowed\n");
+            return r;
+        }
         InterlockedIncrement(&g_ckKept);
         return 1;
     } __except (EXCEPTION_EXECUTE_HANDLER) {}

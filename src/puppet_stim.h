@@ -12,4 +12,7 @@ namespace PuppetStim
     // [Coop] FightSkipPuppet (live; hook installed when the key is present): the host's fight system gives the
     // puppet no orders (sub_13F22E0 takes its no-AI exit for it).
     void Init();
+    // [Coop] PuppetFightStim: post one stimulus `id` with the puppet as source to `receiver`, laid out as the engine's
+    // sub_17B7A80 does it. Game thread only. Returns 1 when posted.
+    int PostFightStim(void* puppetEntity, void* receiver, int id);
 }
