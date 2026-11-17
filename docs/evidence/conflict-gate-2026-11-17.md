@@ -519,3 +519,16 @@ copies started; both are re-read every 2 s).
   - Lead: the reaction selection in `perception.md`. `CanReact` is `sub_1076110`, and the brief records that it is not
     reached while a fight is active.
 - Compare player and puppet at that selection point in one run, with the same rig.
+
+## 10. Unified build on `feat/launcher`: confirming pass
+- Commit `e6f97fa` ports PuppetFightStim (default 1) and value 2 of the keep flags onto `feat/launcher`; asi `62c7e5c7…`.
+- Owner-driven pass, host 37776, guest 23888; the ini has both keep flags at 2, `FightIntents=1`, `IntentLane=1`.
+- **Fight start:** 2 `[FI] apply enter`; 7/7 `[PFS]` posts succeeded; 4 `hit-post puppet` lines; 2 hits relayed by PDR and
+  2 `owner apply hit` on the guest.
+- **Fight end:** after the guest's last `[FI] apply exit`, 3 x `[Poi] ConflictKeepPuppet=2 … conflict end allowed`, each
+  followed by `[FightRm] PUPPET role=7 from=0161F870` (the engine's drop action); then no further fight lines for about
+  1,000 log lines, to the end of the run.
+- 0 exceptions; both copies alive at the end.
+- **Verdict: PASS (n = 1 on this build; 2 passes in total with §9).**
+- Not measured on this build: the round / team state (the `[PL] gate` probe is not on this branch) and release time
+  against distance.
