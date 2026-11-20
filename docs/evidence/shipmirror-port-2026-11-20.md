@@ -65,3 +65,33 @@ mirror while the cause is unknown. The branch is not merged into the deployed li
 
 Also worth fixing separately: the minidump tool returned `0x8007012B` and wrote 0 bytes, so every hang
 in an unattended run is currently undiagnosable. That is its own item.
+
+---
+
+## 6. UPDATE the same day: 2 of 3, and the proxy hypothesis is not supported
+
+Third run, identical flags (`ShipMirror=1`, `SailSync=1`, `SailTestCycle=1`), after adding a guard that
+refuses to apply a sail memento to a duplicate (mirror proxy or the ghost):
+
+```
+both copies alive after 90 s (host 28816, guest 25916)
+guest: mirror=32  sailRx=41  stats ok=40 stale=0 unresolved=0 bad=0 exc=0 local=40 refused=0
+```
+
+So the combination is **2 crashes in 3 runs**, not 2 of 2. And critically **`refused=0`**: the guard never
+fired, because `FiResolve` still did not hand sail a proxy. The hypothesis in the commit message for
+`b05a0b9` ("the guest now resolves host ships to proxies, and the setter faults on duplicates") is
+therefore **not supported by this run** — it remains a plausible hazard, but it is not what killed the two
+copies.
+
+What is still true:
+
+- the mirror creates proxies with the right classes (`classMiss=0`), and the guest applies sail mementos
+  `via=local` alongside it;
+- one copy died in 2 of 3 combined runs and 0 of 2 single-feature runs — a lead at n=3, not a cause;
+- the guard is kept because "the setter faults on a duplicated `GcLShip`" is independently recorded, but
+  it is **not** a fix for this crash.
+
+Next diagnostic, in order: (1) reproduce with mirror on and sail off for a 10-minute window, to see
+whether the crash is simply intermittent; (2) if it recurs, use the WOW64 minidump fallback (`b1a6584`)
+and read the stack instead of guessing.
