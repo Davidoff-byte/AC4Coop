@@ -14536,10 +14536,15 @@ static void __cdecl LogSetGlobalMatrix(uint32_t thisEnt) {
     // synced; Z = the LOCAL wave height, so it bobs up/down with the local water instead of sinking).
     if (g_ghostShip && g_ghostHasSync && thisEnt == (uint32_t)g_ghostShip) {
         float* m = (float*)g_sgmMatrix;   // full 4x4 (row-major: m[0..2],m[4..6],m[8..10]=rot; m[12..14]=trans)
-        float x = g_ghostSyncQuat[0], y = g_ghostSyncQuat[1], z = g_ghostSyncQuat[2], w = g_ghostSyncQuat[3];
-        m[0] = 1 - 2*(y*y + z*z);  m[1] = 2*(x*y - w*z);  m[2] = 2*(x*z + w*y);
-        m[4] = 2*(x*y + w*z);      m[5] = 1 - 2*(x*x + z*z);  m[6] = 2*(y*z - w*x);
-        m[8] = 2*(x*z - w*y);      m[9] = 2*(y*z + w*x);      m[10] = 1 - 2*(x*x + y*y);
+        // Use ToMatrix; never hand-build. The hand-built form used the TRANSPOSED off-diagonals, which
+        // only looked right because FromMatrix used to return the conjugate - two errors cancelling
+        // (audit 2026-11-20). One convention, one function.
+        HookMath::Quaternion q; q.x = g_ghostSyncQuat[0]; q.y = g_ghostSyncQuat[1];
+                                q.z = g_ghostSyncQuat[2]; q.w = g_ghostSyncQuat[3];
+        HookMath::Transform tm; HookMath::ToMatrix(&q, &tm);
+        m[0] = tm.M11;  m[1] = tm.M12;  m[2]  = tm.M13;
+        m[4] = tm.M21;  m[5] = tm.M22;  m[6]  = tm.M23;
+        m[8] = tm.M31;  m[9] = tm.M32;  m[10] = tm.M33;
         m[12] = g_ghostSyncPos[0]; m[13] = g_ghostSyncPos[1]; m[14] = g_localShipZ;
         { static int g_shipDriveLog = 0; if ((g_shipDriveLog++ & 0x3F) == 0)
             L("[ShipSync] driving ghost to (%.1f, %.1f, %.1f)\n", g_ghostSyncPos[0], g_ghostSyncPos[1], g_localShipZ); }
@@ -14553,10 +14558,14 @@ static void __cdecl LogSetGlobalMatrix(uint32_t thisEnt) {
         if (g_syncTargets[i].ent != thisEnt) continue;
         if (g_sgmPhysPtr) *(uint32_t*)g_sgmPhysPtr = 0;   // render-only: skip the physics update
         float* m = (float*)g_sgmMatrix;
-        float x = g_syncTargets[i].quat[0], y = g_syncTargets[i].quat[1], z = g_syncTargets[i].quat[2], w = g_syncTargets[i].quat[3];
-        m[0] = 1 - 2*(y*y + z*z);  m[1] = 2*(x*y - w*z);  m[2] = 2*(x*z + w*y);
-        m[4] = 2*(x*y + w*z);      m[5] = 1 - 2*(x*x + z*z);  m[6] = 2*(y*z - w*x);
-        m[8] = 2*(x*z - w*y);      m[9] = 2*(y*z + w*x);      m[10] = 1 - 2*(x*x + y*y);
+        // ToMatrix, never hand-build: the hand-built off-diagonals were transposed and only appeared
+        // correct while FromMatrix returned the conjugate (audit 2026-11-20).
+        HookMath::Quaternion q; q.x = g_syncTargets[i].quat[0]; q.y = g_syncTargets[i].quat[1];
+                                q.z = g_syncTargets[i].quat[2]; q.w = g_syncTargets[i].quat[3];
+        HookMath::Transform tm; HookMath::ToMatrix(&q, &tm);
+        m[0] = tm.M11;  m[1] = tm.M12;  m[2]  = tm.M13;
+        m[4] = tm.M21;  m[5] = tm.M22;  m[6]  = tm.M23;
+        m[8] = tm.M31;  m[9] = tm.M32;  m[10] = tm.M33;
         m[12] = g_syncTargets[i].pos[0]; m[13] = g_syncTargets[i].pos[1]; m[14] = g_syncTargets[i].pos[2];
         return;
     }
