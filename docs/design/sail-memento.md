@@ -90,6 +90,21 @@ Those are later slices; this one carries one enum.
 - The ship must be resolvable by `wireId` on the guest. If the ship's `wireId` is minted per machine
   (the `F000xxxx` concern in storm §3.1), identity falls back to `slot`+class and must be stated.
 
+### 7.1 Identity route: `wireId`, then the local ship
+
+- The consumer resolves the ship **by `wireId` first** and, if that returns no entity, by
+  **`GetLocalShip()`**. The log records which route applied: `via=wire` or `via=local` on both the
+  apply line and the RAW line, and a `local=` count on the 5 s stats line.
+- This is correct **only while both players share one ship** (`ShipCoop`: each PC keeps its own
+  Jackdaw, the follower keyframe-follows). The two Jackdaws are the same gameplay ship, so identity
+  does not require a `wireId` match.
+- **With two independent hulls the fallback would apply the host's state to the wrong hull.** That is
+  the point at which `c82a696` (the ship mirror) must be ported and the local fallback retired.
+- Measured basis: run 2 (2026-11-20, host pid 27920 / guest pid 21908, ASI `75cbf70c`) — the guest
+  received 22 `IC_SHIP` messages and resolved **zero**: `rx ship=0`, `unresolved=22`, `bad=0`,
+  `exc=0`. `FiResolve(wireId)` has no entity because the ship mirror (`c82a696`) is absent from this
+  base (`git merge-base --is-ancestor` against `feat/launcher` = NO).
+
 ## 8. Build order
 
 1. Add `IC_SHIP`, the 2-byte payload struct, and a `static_assert` on its size.

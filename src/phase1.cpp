@@ -8073,6 +8073,7 @@ static void SailPublishTick() {
 // Guest: resolve, freshness, apply. Counters are reported on a 5 s line, never per message.
 static struct { uint64_t wire; uint32_t lastSeq; uint8_t used; } s_sailRx[4];
 static LONG s_sailRxOk = 0, s_sailRxStale = 0, s_sailRxUnres = 0, s_sailRxBad = 0, s_sailRxExc = 0;
+static LONG s_sailRxLocal = 0;   // applies whose identity came from the local-ship fallback (via=local)
 
 // The ONE guarded setter call (the only correct write path - see the header above). Shared by the consumer
 // and the [Coop] SailTestCycle harness below so both take the identical resolve/guard/SEH route; the only
@@ -8093,12 +8094,22 @@ static int SailSetViaEngine(void* gcl, unsigned st, uint64_t wire) {
     return ok;
 }
 
-static Entity* SailResolveShip(uint64_t wire) {
+// Identity route: `wireId` first, then the LOCAL ship. Two Jackdaws are the same gameplay ship here
+// (docs/design/sail-memento.md 7), so a failed wireId lookup is not a "no entity" answer - the ship
+// mirror c82a696 is not in this base, and on `feat/launcher` the guest's own ship IS the follower's
+// target. `via` records which route was taken so the log can tell them apart. The fallback is correct
+// ONLY while both players share one hull; with two independent hulls it would apply the host's state to
+// the wrong ship. Both routes failing is an unresolved memento, as before.
+static Entity* SailResolveShip(uint64_t wire, bool* viaLocal) {
+    if (viaLocal) *viaLocal = false;
     Entity* e = FiResolve(wire);
     // The guest's copy of the peer's ship is the spawned ghost. UNVERIFIED: that g_ghostObjId is the
     // ghost's source objId; it is used only as a fallback, guarded by the pointer and the id match.
     if (!e && wire && g_ghostShip && (uint64_t)g_ghostObjId == wire) e = (Entity*)g_ghostShip;
-    return e;
+    if (e) return e;
+    e = GetLocalShip();
+    if (e) { if (viaLocal) *viaLocal = true; return e; }
+    return nullptr;
 }
 
 // One IC_SHIP message. Called from the lane's single consumer (FightIntentDrain): PollIntent's delivered
@@ -8108,7 +8119,9 @@ static void SailApplyMsg(const Net::IntentMsg& msg) {
     if (msg.len != sizeof(IntentShipMemento)) { ++s_sailRxBad; return; }
     const unsigned st = msg.payload[0];
     if (st >= kSailStateCount) { ++s_sailRxBad; return; }
-    Entity* ship = SailResolveShip(msg.wireId);
+    bool viaLocal = false;
+    Entity* ship = SailResolveShip(msg.wireId, &viaLocal);
+    const char* via = viaLocal ? "local" : "wire";
     void*   gcl  = ship ? ShipGcLObj(ship) : nullptr;
     if (!gcl) { ++s_sailRxUnres; return; }
     int slot = -1;                                        // per-key apply state (a memento is idempotent)
@@ -8133,14 +8146,14 @@ static void SailApplyMsg(const Net::IntentMsg& msg) {
             L("[Sail] EXCEPTION 0x%08X raw ship=%p wire=%016llu state=%u\n",
               GetExceptionCode(), gcl, (unsigned long long)msg.wireId, st);
         }
-        if (ok) { s_sailRx[slot].used = 1; s_sailRx[slot].wire = msg.wireId; s_sailRx[slot].lastSeq = msg.seq; ++s_sailRxOk; }
-        L("[Sail] rx RAW ship=%p %u->%u (setter skipped - control B)\n", gcl, before, st);
+        if (ok) { s_sailRx[slot].used = 1; s_sailRx[slot].wire = msg.wireId; s_sailRx[slot].lastSeq = msg.seq; ++s_sailRxOk; if (viaLocal) ++s_sailRxLocal; }
+        L("[Sail] rx RAW ship=%p %u->%u via=%s (setter skipped - control B)\n", gcl, before, st, via);
         return;
     }
     ok = SailSetViaEngine(gcl, st, msg.wireId);
-    if (ok) { s_sailRx[slot].used = 1; s_sailRx[slot].wire = msg.wireId; s_sailRx[slot].lastSeq = msg.seq; ++s_sailRxOk; }
-    L("[Sail] rx ship=%p wire=%016llu %u->%u seq=%u ok=%d\n", gcl, (unsigned long long)msg.wireId,
-      before, st, msg.seq, ok);
+    if (ok) { s_sailRx[slot].used = 1; s_sailRx[slot].wire = msg.wireId; s_sailRx[slot].lastSeq = msg.seq; ++s_sailRxOk; if (viaLocal) ++s_sailRxLocal; }
+    L("[Sail] rx ship=%p wire=%016llu %u->%u seq=%u via=%s ok=%d\n", gcl, (unsigned long long)msg.wireId,
+      before, st, msg.seq, via, ok);
 }
 
 // TEST HARNESS - [Coop] SailTestCycle (default 0): the host-side driver for the oracle's PASS arm
@@ -8170,8 +8183,8 @@ static void SailConsumeTick() {
     const DWORD now = GetTickCount();
     if (now - s_next < 5000) return;
     s_next = now;
-    L("[Sail] rx stats ok=%ld stale=%ld unresolved=%ld bad=%ld exc=%ld tx=%ld\n",
-      s_sailRxOk, s_sailRxStale, s_sailRxUnres, s_sailRxBad, s_sailRxExc, s_sailTxN);
+    L("[Sail] rx stats ok=%ld stale=%ld unresolved=%ld bad=%ld exc=%ld tx=%ld local=%ld\n",
+      s_sailRxOk, s_sailRxStale, s_sailRxUnres, s_sailRxBad, s_sailRxExc, s_sailTxN, s_sailRxLocal);
 }
 
 // Sender: the local player's own frame.
