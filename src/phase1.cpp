@@ -3837,20 +3837,26 @@ static Entity* GetLocalShip() {
 // bit 95 at 0 (condition false), and setting bit 95 must turn it true without the hull moving. Hull is READ ONLY.
 
 // The nearest non-local AI ship within maxDist of the player. Shared so both harnesses pick the same ship and the
-// selection exists once. *outD2 receives the squared distance.
-static Entity* PickNearestNonLocalShip(void* mgr, Entity* player, Entity* local, float maxDist, float* outD2) {
+// selection exists once. *outD2 receives the squared distance. *outExamined (optional) receives the number of
+// candidate ships the distance test saw - the list entries that passed the entity/class/local/ghost filters - so a
+// harness can distinguish "ships present but none in range" from "no ships at all".
+static Entity* PickNearestNonLocalShip(void* mgr, Entity* player, Entity* local, float maxDist, float* outD2,
+                                       int* outExamined = nullptr) {
+    if (outExamined) *outExamined = 0;
     if (!mgr || !player || !readable((char*)mgr + 0x3E8, 8)) return nullptr;
     if (outD2) *outD2 = 0.0f;
     const unsigned short n = *(unsigned short*)((char*)mgr + 0x3EE);
-    Entity* best = nullptr; float bestD2 = maxDist * maxDist;
+    Entity* best = nullptr; float bestD2 = maxDist * maxDist; int examined = 0;
     const float px = player->m_GlobalMatrix.M41, py = player->m_GlobalMatrix.M42;
     for (int i = 0; i < (int)n && i < 128; ++i) {
         Entity* se = GetShipEntity(mgr, i);
         if (!se || !readable(se, 0x50) || *(uint32_t*)se != 0x01E4A128u || se == local) continue;
         if (se == (Entity*)g_ghostShip) continue;
+        ++examined;
         const float dx = se->m_GlobalMatrix.M41 - px, dy = se->m_GlobalMatrix.M42 - py;
         if (dx * dx + dy * dy < bestD2) { bestD2 = dx * dx + dy * dy; best = se; }
     }
+    if (outExamined) *outExamined = examined;
     if (best && outD2) *outD2 = bestD2;
     return best;
 }
@@ -3920,14 +3926,26 @@ static void BoardableTestTick() {
 }
 
 // ---- [Coop] BoardProbe (default 0) - TEST HARNESS, not shipped behaviour --------------------------------
-// One shot, 5 s after the first frame that has a qualifying ship within 200 m:
+// One shot, 5 s after the first frame that has a qualifying ship within [Coop] BoardProbeRange metres:
 //   S0 read state, S1 sub_1207960 only, S2 then bit 95 - and the two condition predicates at each stage.
 // The predicates are called through the ship object's own vtable (slots 408 and 368), exactly as the engine's
 // BoardingCondition calls them and as BoardableTest already does - so this needs NO new address and no resolver
 // for the slot-14 condition object. Nothing here writes the hull.
+//
+// [Coop] BoardProbeRange (default 200 m, clamped 1..20000) only widens/narrows that selection: the 2026-11-20 run
+// logged zero [Board] lines because the save had no non-local ship within 200 m, which is indistinguishable from a
+// dead harness. So a tick where nothing qualifies now states the fact, at most once per 10 s:
+//   [Board] waiting: no non-local ship within %d m (ships examined=%d)
+// ("examined" = naval-list entries that are readable, class 0x01E4A128, not the local ship and not the ghost.)
 static void BoardProbeTick() {
     static int s_on = -1, s_done = 0; static DWORD s_next = 0;
+    static int s_range = -1; static DWORD s_waitNext = 0;
     if (s_on < 0) s_on = GetPrivateProfileIntA("Coop", "BoardProbe", 0, Paths::Ini()) != 0 ? 1 : 0;
+    if (s_range < 0) {
+        int r = GetPrivateProfileIntA("Coop", "BoardProbeRange", 200, Paths::Ini());
+        if (r < 1) r = 1; else if (r > 20000) r = 20000;
+        s_range = r;
+    }
     if (!s_on || s_done) return;
     const DWORD now = GetTickCount();
     if (now < s_next) return;
@@ -3936,10 +3954,17 @@ static void BoardProbeTick() {
         World* world = World::GetCurrentWorld();
         Entity* player = world ? world->GetPlayer() : nullptr;
         void* mgr = GetNavalManager();
-        if (!player || !mgr) return;
-        float d2 = 0.0f;
-        Entity* best = PickNearestNonLocalShip(mgr, player, GetLocalShip(), 200.0f, &d2);
-        if (!best) return;                                     // nothing in range yet - look again in 5 s
+        float d2 = 0.0f; int examined = 0;
+        Entity* best = (player && mgr)
+                     ? PickNearestNonLocalShip(mgr, player, GetLocalShip(), (float)s_range, &d2, &examined)
+                     : nullptr;
+        if (!best) {                                           // nothing in range yet - look again in 5 s
+            if (now >= s_waitNext) {                           // ... but say so, once per 10 s
+                s_waitNext = now + 10000;
+                L("[Board] waiting: no non-local ship within %d m (ships examined=%d)\n", s_range, examined);
+            }
+            return;
+        }
         s_done = 1;                                            // one shot
         void* obj = ((void* (__cdecl*)(void*))0x0122BA20)((void*)best);
         if (!obj || !readable(obj, 0x548)) { L("[Board] S0 ship=%p obj=%p unreadable - stopped\n", best, obj); return; }
@@ -13365,7 +13390,7 @@ static void DumpConfigOnce()
 
     struct K { const char* s; const char* k; int d; };
     static const K keys[] = {
-        { "Coop", "ActionDeathLog", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "CombatObserve", 0 },
+        { "Coop", "ActionDeathLog", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "CombatObserve", 0 },
         { "Coop", "CombatTest", 0 }, { "Coop", "CrashContext", 0 }, { "Coop", "CorpseKeepSec", 30 }, { "Coop", "CrowdProbeIntegrate", 1 },
         { "Coop", "CrowdProbeLiveKeys", 1 }, { "Coop", "DamageRelay", 0 }, { "Coop", "Diag", 0 },
         { "Coop", "DisableCrowd", 0 }, { "Coop", "DisablePuppetAI", 1 }, { "Coop", "DisableSpawns", 0 },
