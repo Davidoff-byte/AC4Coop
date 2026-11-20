@@ -22,8 +22,11 @@ MSBuild AC4Coop.sln /nologo /v:m /p:Configuration=Release /p:Platform=x86 /p:Pla
 Release is reproducible in size (`/Brepro`, no PDB). The hash still depends on the checkout path, so
 "same hash" only means "same build from the same directory".
 Set the paths first (`AC4_GAME_DIR`, `AC4_KNOWN_EXE`; see README), then check them with `py tools\paths.py`.
-On the owner's machine they are set as user environment variables pointing at
-`G:\Games\Assassins Creed IV Black Flag`, the test install where the mod is deployed.
+On the owner's machine they are set as user environment variables pointing at the test install where the
+mod is deployed. **Corrected 2026-11-20:** that install is
+`D:\SteamLibrary\steamapps\common\Assassin's Creed IV Black Flag` on the machine this worktree is used
+from (`G:\Games\...` does not exist here). Do not trust the path from memory — resolve it with
+`py tools\paths.py` and check it exists before running anything that needs the exe.
 Run after every change that touches `src/` or `decomp/`:
 ```text
 py tools\spine_gate.py
