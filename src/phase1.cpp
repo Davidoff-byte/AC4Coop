@@ -8207,21 +8207,27 @@ static bool HelmSeatOn() {
 }
 
 // The helm function is the only caller-side action; it is reachable only while the gcl is fully readable.
+// enter = 1 seat the player, enter = 0 leave the helm (0x11FE85C stores a2 into *(this+0x39A) first, then
+// the guarded branch runs only when a2 != the value read before that store).
 // Returns 1 when the call returned without throwing (not proof the engine kept the value - the re-read
-// in HelmSeatTick decides that).
-static int HelmEnterViaEngine(void* gcl, void* ship) {
+// in HelmSeatTick decides that). Own SEH frame per call so one throw never hides the other call's result.
+static int HelmCallEngine(void* gcl, void* ship, int enter) {
     int ok = 0;
     __try {
         if (readable(gcl, 0xB70)) {                  // covers +0x398..+0x39E
-            ((void (__thiscall*)(void*, int))0x011FE840)(gcl, 1);
+            ((void (__thiscall*)(void*, int))0x011FE840)(gcl, enter);
             ok = 1;
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        L("[Helm] EXCEPTION 0x%08X ship=%p gcl=%p\n", GetExceptionCode(), ship, gcl);
+        L("[Helm] EXCEPTION 0x%08X enter=%d ship=%p gcl=%p\n", GetExceptionCode(), enter, ship, gcl);
     }
     return ok;
 }
 
+// Bidirectional harness cycle: leave (only if seated) then enter, five seconds apart, so one run covers
+// both directions of the engine call. The three captain readings c0 -> c1 -> c2 are the evidence: the
+// engine's own store is at +0x39A and is written unconditionally, so c1 reports the leave call and c2
+// the enter call even when the guarded branch declines.
 static void HelmSeatTick() {
     if (!HelmSeatOn()) return;                     // flag off: nothing is read and nothing is called
     static DWORD s_next = 0;
@@ -8231,26 +8237,28 @@ static void HelmSeatTick() {
     Entity* ship = GetLocalShip();
     void*   gcl  = ship ? ShipGcLObj(ship) : nullptr;
     if (!gcl) { L("[Helm] state ship=%p (no local ship)\n", (void*)ship); return; }
-    unsigned cap = 0, drv = 0, solo = 0, sfl = 0;
     if (!readable(gcl, 0xB70)) { L("[Helm] state gcl=%p (unreadable)\n", gcl); return; }
-    cap  = *(unsigned char*)((char*)gcl + 0x39A);  // CaptainAtWheel
-    drv  = *(unsigned char*)((char*)gcl + 0x399);  // IsPlayerDrivable
-    solo = *(unsigned char*)((char*)gcl + 0x39E);  // solo-board flag
-    sfl  = *(unsigned char*)((char*)gcl + 0x398);  // IsPlayerShip
-    L("[Helm] state ship=%p captain=%d drivable=%d solo=%d ship=%d\n", (void*)ship, cap, drv, solo, sfl);
-    if (cap != 0) return;                          // already seated: the re-read below would say nothing
-    const int ok = HelmEnterViaEngine(gcl, ship);
-    // Same-tick re-read. drivable/solo/ship are post-call on purpose: they tell whether the guarded
-    // branch ran at all; captain 0 -> 1 is the accept signal.
-    unsigned cap2 = 0xFF, drv2 = 0xFF, solo2 = 0xFF, sfl2 = 0xFF;
-    if (readable(gcl, 0xB70)) {
-        cap2  = *(unsigned char*)((char*)gcl + 0x39A);
-        drv2  = *(unsigned char*)((char*)gcl + 0x399);
-        solo2 = *(unsigned char*)((char*)gcl + 0x39E);
-        sfl2  = *(unsigned char*)((char*)gcl + 0x398);
+    const unsigned cap0 = *(unsigned char*)((char*)gcl + 0x39A);  // CaptainAtWheel, before the cycle
+    int ok = 1;
+    unsigned cap1 = cap0;                          // no leave call when not seated: c1 == c0
+    if (cap0 == 1) {
+        if (!HelmCallEngine(gcl, ship, 0)) ok = 0;
+        cap1 = readable(gcl, 0xB70) ? *(unsigned char*)((char*)gcl + 0x39A) : 0xFF;
     }
-    L("[Helm] ship=%p gcl=%p ship=%d drivable=%d solo=%d captain %d -> %d ok=%d\n",
-      (void*)ship, gcl, sfl2, drv2, solo2, cap, cap2, ok);
+    if (!HelmCallEngine(gcl, ship, 1)) ok = 0;     // enter, regardless of the leave call's outcome
+    // Same-tick re-read. drivable/solo/ship are post-cycle on purpose: they tell whether the guarded
+    // branch ran at all; c2 == 1 is the accept signal.
+    unsigned cap2 = 0xFF, drv = 0xFF, solo = 0xFF, sfl = 0xFF;
+    if (readable(gcl, 0xB70)) {
+        cap2 = *(unsigned char*)((char*)gcl + 0x39A);
+        drv  = *(unsigned char*)((char*)gcl + 0x399);
+        solo = *(unsigned char*)((char*)gcl + 0x39E);
+        sfl  = *(unsigned char*)((char*)gcl + 0x398);
+    }
+    L("[Helm] cycle ship=%p gcl=%p captain %d -> %d -> %d ok=%d\n",
+      (void*)ship, gcl, cap0, cap1, cap2, ok);
+    L("[Helm] state ship=%p captain=%d drivable=%d solo=%d ship=%d\n",
+      (void*)ship, cap2, drv, solo, sfl);
 }
 
 // Sender: the local player's own frame.
