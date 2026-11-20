@@ -8005,6 +8005,112 @@ static Entity* FiResolve(uint64_t id) {
     return (Entity*)e;
 }
 
+// ---- [Coop] SailSync (default 0): the ship's SailState as a memento --------------------------------
+// docs/design/sail-memento.md + docs/design/storm-replication.md 3.2. One replicated enum, host-mastered,
+// applied on the guest through the ENGINE'S OWN SETTER. Verified statically (sail-sync-static-2026-11-16):
+//
+//   sub_1220960(GcLShip* this, unsigned newState, char)     // the ONLY correct write path
+//     0x1220970  if (newState > 3) return;                  // SailState::Count == 4
+//     0x1220976  old = *(this+51)                           // GcLShip+0xCC, a DWORD
+//     0x122097C  *(this+344) = old                          // +0x560 previous state
+//     0x1220984  if (newState == old) return;               // <- NO-OP when equal
+//     ... six-way visual selection from (new, old) at v7+0x8C/0xA4/0xBC/0xD4/0xEC/0x104 (stride 0x18)
+//     0x1220A59  *(this+0xCC) = newState                    // the write lands AFTER the visual work
+//     ... publishes event types 3 and 45
+//
+// Consequence: writing +0xCC first makes the next call a no-op and the sails never move. So the field
+// is read here and NEVER written. Identity is the entity lane's canonical id (FiCanonicalId/FiResolve),
+// the same mechanism IC_FIGHT/IC_DAMAGE use; `slot` is 0 as in every existing publisher.
+// UNVERIFIED: whether sub_1220960 is safe on a DUPLICATE GcLShip (the guest's ghost ship). The known
+// faulting duplicate case was a different setter (0x12C -> sub_1225A10, which re-enters sub_1220B60);
+// this call is SEH-guarded and counted, and the live oracle decides it.
+static int s_sailIni = -1;                       // [Coop] SailSync, read once (the s_x = -1 idiom)
+static bool SailSyncOn() {
+    if (s_sailIni < 0) s_sailIni = GetPrivateProfileIntA("Coop", "SailSync", 0, Paths::Ini()) != 0 ? 1 : 0;
+    return s_sailIni == 1 && Net::IntentLaneOn();
+}
+static const unsigned kSailStateCount = 4;       // SailState::Count (sub_1220960 rejects newState > 3)
+
+// Host: publish the local ship's SailState on an EDGE. PublishIntent has no flags parameter - the lane
+// itself stamps IF_BASE on the first message of a (guard, channel) key and on every resync replay
+// (net.h contract), which is exactly the semantics this memento needs.
+static uint64_t s_sailTxWire  = 0;
+static int      s_sailTxState = -1;
+static LONG     s_sailTxN     = 0;
+static void SailPublishTick() {
+    if (!SailSyncOn() || !Phase1_IsEntityHost()) return;
+    Entity* ship = GetLocalShip();
+    void*  gcl   = ShipGcLObj(ship);                     // validates readable(hobj, 0xD4), covers +0xCC
+    if (!gcl) return;
+    const unsigned st = *(unsigned*)((char*)gcl + 0xCC);  // a dword at +0xCC (the setter's this+51)
+    if (st >= kSailStateCount) return;                    // not a SailState: refuse to publish garbage
+    const uint64_t wire = FiCanonicalId(ship);            // the entity lane's id (0 = none; lane uses slot)
+    if (st == (unsigned)s_sailTxState && wire == s_sailTxWire) return;   // edge only
+    const IntentShipMemento m = { (uint8_t)st, 0 };
+    const bool ok = Net::PublishIntent(0, wire, IC_SHIP, (uint32_t)GetTickCount(), &m, (uint8_t)sizeof(m));
+    s_sailTxState = (int)st; s_sailTxWire = wire; ++s_sailTxN;
+    Net::IntentStats is{};
+    Net::GetIntentStats(is);   // the lane owns `seq` and does not expose it per message; report its counter
+    L("[Sail] tx ship=%p state=%u wire=%016llu seq=%u ok=%d\n", gcl, st,
+      (unsigned long long)wire, is.myInc, ok ? 1 : 0);
+}
+
+// Guest: resolve, freshness, apply. Counters are reported on a 5 s line, never per message.
+static struct { uint64_t wire; uint32_t lastSeq; uint8_t used; } s_sailRx[4];
+static LONG s_sailRxOk = 0, s_sailRxStale = 0, s_sailRxUnres = 0, s_sailRxBad = 0, s_sailRxExc = 0;
+
+static Entity* SailResolveShip(uint64_t wire) {
+    Entity* e = FiResolve(wire);
+    // The guest's copy of the peer's ship is the spawned ghost. UNVERIFIED: that g_ghostObjId is the
+    // ghost's source objId; it is used only as a fallback, guarded by the pointer and the id match.
+    if (!e && wire && g_ghostShip && (uint64_t)g_ghostObjId == wire) e = (Entity*)g_ghostShip;
+    return e;
+}
+
+// One IC_SHIP message. Called from the lane's single consumer (FightIntentDrain): PollIntent's delivered
+// queue has exactly one reader, so the ship channel cannot have a drain loop of its own.
+static void SailApplyMsg(const Net::IntentMsg& msg) {
+    if (!SailSyncOn()) return;
+    if (msg.len != sizeof(IntentShipMemento)) { ++s_sailRxBad; return; }
+    const unsigned st = msg.payload[0];
+    if (st >= kSailStateCount) { ++s_sailRxBad; return; }
+    Entity* ship = SailResolveShip(msg.wireId);
+    void*   gcl  = ship ? ShipGcLObj(ship) : nullptr;
+    if (!gcl) { ++s_sailRxUnres; return; }
+    int slot = -1;                                        // per-key apply state (a memento is idempotent)
+    for (int i = 0; i < 4; ++i) if (s_sailRx[i].used && s_sailRx[i].wire == msg.wireId) { slot = i; break; }
+    const bool sameKey = slot >= 0;
+    if (slot < 0) { slot = 0; for (int i = 1; i < 4; ++i) if (s_sailRx[i].lastSeq < s_sailRx[slot].lastSeq) slot = i; }
+    if (sameKey && msg.seq <= s_sailRx[slot].lastSeq) { ++s_sailRxStale; return; }
+    const unsigned before = *(unsigned*)((char*)gcl + 0xCC);
+    int ok = 0;
+    __try {
+        void** vt = *(void***)gcl;                        // GcLShip shape: a readable vtable with the
+        if (readable(vt, 0x1B8) && vt[0x130 / 4]) {       // max-hull slot 0x130 (sub_121F2F0) present
+            ((void (__thiscall*)(void*, unsigned, char))0x01220960)(gcl, st, 0);
+            ok = 1;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        ++s_sailRxExc;
+        L("[Sail] EXCEPTION 0x%08X setter ship=%p wire=%016llu state=%u\n",
+          GetExceptionCode(), gcl, (unsigned long long)msg.wireId, st);
+    }
+    if (ok) { s_sailRx[slot].used = 1; s_sailRx[slot].wire = msg.wireId; s_sailRx[slot].lastSeq = msg.seq; ++s_sailRxOk; }
+    L("[Sail] rx ship=%p wire=%016llu %u->%u seq=%u ok=%d\n", gcl, (unsigned long long)msg.wireId,
+      before, st, msg.seq, ok);
+}
+
+// Per-frame: the 5 s counter line. The drain itself is the FightIntentDrain loop (see SailApplyMsg).
+static void SailConsumeTick() {
+    if (!SailSyncOn()) return;
+    static DWORD s_next = 0;
+    const DWORD now = GetTickCount();
+    if (now - s_next < 5000) return;
+    s_next = now;
+    L("[Sail] rx stats ok=%ld stale=%ld unresolved=%ld bad=%ld exc=%ld tx=%ld\n",
+      s_sailRxOk, s_sailRxStale, s_sailRxUnres, s_sailRxBad, s_sailRxExc, s_sailTxN);
+}
+
 // Sender: the local player's own frame.
 static void FightIntentSend(Human* player) {
     if (!FightIntentsOn()) return;
@@ -8339,9 +8445,11 @@ static void AttackForwardReport() {
 // Receiver part 1, the local player's frame: drain the lane (the only consumer) and queue IC_FIGHT for the puppet.
 static void FightIntentDrain() {
     const bool fi = FightIntentsOn();
-    if (!fi && !(OwnerDamageOn() && Net::IntentLaneOn()) && !(PdrOn() && Net::IntentLaneOn()) && !(AfOn() && Net::IntentLaneOn())) return;
+    if (!fi && !(OwnerDamageOn() && Net::IntentLaneOn()) && !(PdrOn() && Net::IntentLaneOn()) && !(AfOn() && Net::IntentLaneOn())
+        && !SailSyncOn()) return;   // [Coop] SailSync keeps the lane drained even with every fight flag off
     Net::IntentMsg m;
     while (Net::PollIntent(m)) {
+        if (m.channel == IC_SHIP) { SailApplyMsg(m); continue; }   // [Coop] SailSync, docs/design/sail-memento.md
         if (m.channel == IC_ATK_A || m.channel == IC_ATK_B || m.channel == IC_ATK_C) { AttackForwardOwnerRx(m); continue; }   // [Coop] AttackForward
         if (m.channel == IC_PDAMAGE && m.wireId == kPdrWire && m.len == sizeof(PdrPayload)) {   // [Coop] PlayerDamageRelay
             PdrPayload p; memcpy(&p, m.payload, sizeof(p));
@@ -13019,7 +13127,7 @@ static void OnFrameInner(Human* updatedHuman) {
         InterlockedExchange(&g_inSaveTick, (w && w->m_CharacterList.GetSize() >= 2) ? (LONG)GetTickCount() : 0);
     }
     Pilot::OnPlayerFrame(updatedHuman);   // [Pilot] Enabled only: publish the player + m_CharacterList
-    __try { FightIntentSend(updatedHuman); FightIntentDrain(); OwnerDamageGuestPump(); PlayerDamageHostPump(); AttackForwardHostPump(); AttackForwardOwnerTick(); SpawnerIdProbeTick(); }   // [Coop] FightIntents / OwnerDamage / SpawnerIdProbe only
+    __try { FightIntentSend(updatedHuman); FightIntentDrain(); OwnerDamageGuestPump(); PlayerDamageHostPump(); AttackForwardHostPump(); AttackForwardOwnerTick(); SailPublishTick(); SailConsumeTick(); SpawnerIdProbeTick(); }   // [Coop] FightIntents / OwnerDamage / SailSync / SpawnerIdProbe only
     __except (EXCEPTION_EXECUTE_HANDLER) { static int s_fe = 0; if (s_fe < 10) { ++s_fe; L("[FI] EXCEPTION 0x%08X in send/drain\n", GetExceptionCode()); } }
 
     ProbeIdentityOnce();

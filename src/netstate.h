@@ -348,6 +348,8 @@ enum IntentChannel : uint8_t {
     IC_ATK_A     = 8,   // host -> owner: [Coop] AttackForward part A (seq, bytes, f336, f60, f5C)
     IC_ATK_B     = 9,   //                part B (seq, f110 f124 f128 f120 f11C f114 f130)
     IC_ATK_C     = 10,  //                part C (seq, dir xy, pos xyz, f50)
+    IC_SHIP      = 11,  // host -> guest: a ship's SailState as a memento ([Coop] SailSync,
+                        //                docs/design/sail-memento.md). Payload IntentShipMemento.
     IC_LIMIT     = 16,  // ids 1..15 are legal on the wire, so a later build can add a channel without a
                         // layout change; the receiver delivers a channel id it does not name
 };
@@ -363,6 +365,17 @@ static const int INTENT_MSG_FIXED      = 27;   // wire bytes of a message before
 static const int INTENT_ACK_RANGES_MAX = 16;   // SACK runs per datagram
 static const int INTENT_MSGS_MAX       = 64;   // messages per datagram (1170 B holds at most 42 empty ones)
 static const int INTENT_DGRAM_MAX      = 1170; // UDP / EOS P2P payload budget (proto 16), same as the entity lane's chunks
+
+// IC_SHIP payload ([Coop] SailSync). One enum, nothing else: the guest applies it through the engine's
+// sail setter (sub_1220960), which owns every other field the visual needs. `reserved` keeps the payload
+// a round 2 bytes and is always 0.
+#pragma pack(push, 1)
+struct IntentShipMemento {
+    uint8_t sailState;   // GcLShip+0xCC read as a dword, clamped to < 4 (SailState::Count)
+    uint8_t reserved;
+};
+#pragma pack(pop)
+static_assert(sizeof(IntentShipMemento) == 2, "IC_SHIP payload is a 2-byte wire layout");
 
 #pragma pack(push, 1)
 struct IntentWireHeader {
