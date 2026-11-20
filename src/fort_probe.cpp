@@ -260,7 +260,8 @@ int ScanEntities(World* w, uintptr_t fortDesc, uintptr_t towerDesc, bool logDeta
 // One-shot vtable census (read-only). Forts measured zero on both machines while the manager walk
 // examined ~4k entities, so the probe needs to say which components this list actually holds:
 // either the fort vtables are here (and the class-info lookup is what fails) or they are not (and
-// forts live in another container). Runs once per run, after the first successful walk.
+// forts live in another container). Runs once per run: at the first walk that examined >= 1000
+// entities, or (loudly) after 120 s if the world never gets that large.
 //
 // Count source is the entity's component array: data @ entity+0x60, authoritative count (u16) @
 // entity+0x66, clamped to 0..96 - the same read phase1.cpp:3494-3535 uses and documents
@@ -270,6 +271,12 @@ int ScanEntities(World* w, uintptr_t fortDesc, uintptr_t towerDesc, bool logDeta
 const int      kMaxDistinctVt = 256;   // distinct vtables tracked; the rest go to overflow
 const int      kMaxTopVt      = 40;    // top lines logged
 const int      kMaxComponents = 96;    // same safety clamp phase1 uses
+// The census is only meaningful on a loaded world: the first shot of a run can fire while the world is
+// still streaming (18 entities were observed), which measures an empty world and proves nothing. Arm it
+// only once a walk has examined kCensusArmExamined entities; if the world never grows that large, run it
+// anyway after kCensusForceMs and say so, so an under-loaded world is a stated fact rather than silence.
+const int      kCensusArmExamined = 1000;
+const ULONGLONG kCensusForceMs    = 120000;   // 120 s of ticks with a usable walk and examined < 1000
 
 struct VtCount
 {
@@ -291,13 +298,26 @@ void CensusBump(VtCount* map, int* distinct, uint32_t* overflow, uint32_t vt)
     (*overflow)++;
 }
 
-void CensusOnce(World* w)
+void CensusOnce(World* w, int examined)
 {
     static bool s_done = false;
     if (s_done) return;                // one shot per process, whatever the tick rate
+    if (examined < kCensusArmExamined) {
+        static ULONGLONG s_first = 0;  // first tick at which a shot had a usable walk
+        const ULONGLONG now = GetTickCount64();
+        if (!s_first) s_first = now;
+        if (now - s_first < kCensusForceMs) return;   // world still streaming: wait, and re-check next shot
+        char forced[128];
+        _snprintf_s(forced, sizeof(forced), _TRUNCATE,
+                    "[FortC] forced at examined=%d (<1000 after 120s)\n", examined);
+        Phase1_LogLine(forced);
+    }
     s_done = true;
 
     char line[192];
+
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[FortC] census at examined=%d\n", examined);
+    Phase1_LogLine(line);
 
     BaseBigArray<Reference>& ents = w->m_EntityManager.m_Entities;   // World.h:228
     int nobj = 0;
@@ -429,7 +449,7 @@ void ShotOnce(bool logDetail)
     if (logDetail && sh.loggedForts >= kMaxFortsLog)
         Phase1_LogLine("[Fort] detail capped at 8 forts x 8 towers per 10 s; the counts above are complete\n");
 
-    CensusOnce(w);   // one shot, after the first walk that had a usable entity manager
+    CensusOnce(w, sh.examined);   // one shot, at the first walk that examined >= 1000 entities
 }
 
 }  // namespace
