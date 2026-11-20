@@ -29,6 +29,11 @@
 // Rates: one shot per second whatever the frame rate. Detail lines (fort/tower) and the towerMgrs count are printed
 // once every 10 s, capped at 8 forts x 8 towers, so a naval map cannot flood the log; the summary line carries the
 // true counts and repeats every shot.
+//
+// Census: once per run (after the first walk with a usable entity manager) every component's vtable is counted and
+// the top 40 are logged as [FortC] lines, plus an explicit n for the three fort vtables (0x026FD400 GcLNavalFort,
+// 0x026F7AC0 GcLNavalTowerACGA, 0x02722048 FortTowerManager). forts=0 in the summary is then decidable: vtables
+// present -> the class-info lookup in GetComponentByType is wrong; all zero -> forts live in another container.
 #include "fort_probe.h"
 #include "paths.h"
 #include "Scimitar/Entity.h"
@@ -251,6 +256,131 @@ int ScanEntities(World* w, uintptr_t fortDesc, uintptr_t towerDesc, bool logDeta
     return forts;
 }
 
+// ---------------------------------------------------------------------------------------------
+// One-shot vtable census (read-only). Forts measured zero on both machines while the manager walk
+// examined ~4k entities, so the probe needs to say which components this list actually holds:
+// either the fort vtables are here (and the class-info lookup is what fails) or they are not (and
+// forts live in another container). Runs once per run, after the first successful walk.
+//
+// Count source is the entity's component array: data @ entity+0x60, authoritative count (u16) @
+// entity+0x66, clamped to 0..96 - the same read phase1.cpp:3494-3535 uses and documents
+// (+0x64 is cap|flags, never the count). No engine address is introduced: the vtables are read
+// from live objects, and the three watch constants below are only compared, never dereferenced.
+// ---------------------------------------------------------------------------------------------
+const int      kMaxDistinctVt = 256;   // distinct vtables tracked; the rest go to overflow
+const int      kMaxTopVt      = 40;    // top lines logged
+const int      kMaxComponents = 96;    // same safety clamp phase1 uses
+
+struct VtCount
+{
+    uint32_t vt;
+    uint32_t n;
+};
+
+void CensusBump(VtCount* map, int* distinct, uint32_t* overflow, uint32_t vt)
+{
+    for (int i = 0; i < *distinct; ++i) {
+        if (map[i].vt == vt) { map[i].n++; return; }
+    }
+    if (*distinct < kMaxDistinctVt) {
+        map[*distinct].vt = vt;
+        map[*distinct].n = 1;
+        (*distinct)++;
+        return;
+    }
+    (*overflow)++;
+}
+
+void CensusOnce(World* w)
+{
+    static bool s_done = false;
+    if (s_done) return;                // one shot per process, whatever the tick rate
+    s_done = true;
+
+    char line[192];
+
+    BaseBigArray<Reference>& ents = w->m_EntityManager.m_Entities;   // World.h:228
+    int nobj = 0;
+    __try { nobj = ents.GetSize(); } __except (EXCEPTION_EXECUTE_HANDLER) { nobj = 0; }
+    if (nobj <= 0) {
+        Phase1_LogLine("[FortC] entities=0 components=0 distinct=0 overflow=0 (entity manager unusable)\n");
+        return;
+    }
+    const int n = ((unsigned)nobj > kMaxEntries) ? (int)kMaxEntries : nobj;
+
+    VtCount  map[kMaxDistinctVt];
+    int      distinct = 0;
+    uint32_t overflow = 0;
+    int      entities = 0;
+    unsigned long long components = 0;
+
+    for (int i = 0; i < n; ++i) {
+        Reference* ref = nullptr;
+        __try { ref = ents.GetElement(i); } __except (EXCEPTION_EXECUTE_HANDLER) { break; }
+        if (!ref || !Readable(ref, 4)) break;                    // same break/continue split as phase1
+
+        HandleContainer* hc = nullptr;
+        Entity* e = nullptr;
+        __try {
+            hc = ref->m_HandleContainer;
+            if (hc) e = (Entity*)hc->m_Object;
+        } __except (EXCEPTION_EXECUTE_HANDLER) { hc = nullptr; e = nullptr; }
+        if (!hc || !Readable(hc, 4)) continue;
+        if (!e || !Readable(e, 4)) continue;
+        entities++;
+
+        uint16_t    count = 0;
+        Component** data  = nullptr;
+        __try {
+            count = *(const uint16_t*)((const uint8_t*)e + 0x66);
+            data  = *(Component***)((const uint8_t*)e + 0x60);
+        } __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
+        if (count < 1 || count > kMaxComponents) continue;
+        if (!data || !Readable(data, (size_t)count * 4)) continue;
+
+        for (int k = 0; k < count; ++k) {
+            uintptr_t c = 0;
+            __try { c = (uintptr_t)data[k]; } __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
+            if (!c || !Readable((const void*)c, 4)) continue;
+            uint32_t vt = 0;
+            __try { vt = *(const uint32_t*)c; } __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
+            if (!vt) continue;
+            components++;
+            CensusBump(map, &distinct, &overflow, vt);
+        }
+    }
+
+    _snprintf_s(line, sizeof(line), _TRUNCATE,
+                "[FortC] entities=%d components=%llu distinct=%d overflow=%u\n",
+                entities, components, distinct, overflow);
+    Phase1_LogLine(line);
+
+    for (int i = 1; i < distinct; ++i) {                 // insertion sort, descending by count
+        const VtCount cur = map[i];
+        int j = i - 1;
+        while (j >= 0 && map[j].n < cur.n) { map[j + 1] = map[j]; --j; }
+        map[j + 1] = cur;
+    }
+    const int top = (distinct < kMaxTopVt) ? distinct : kMaxTopVt;
+    for (int i = 0; i < top; ++i) {
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[FortC] vt=%08X n=%u\n", map[i].vt, map[i].n);
+        Phase1_LogLine(line);
+    }
+
+    // The three vtables the fort question turns on: present (n>0) means the class-info lookup is
+    // what misses; all zero while thousands of components were counted means another container.
+    for (int pass = 0; pass < 3; ++pass) {
+        static const uint32_t watchVt[3]   = { 0x026FD400, 0x026F7AC0, 0x02722048 };
+        static const char*    watchName[3] = { "GcLNavalFort", "GcLNavalTowerACGA", "FortTowerManager" };
+        uint32_t wn = 0;
+        for (int i = 0; i < distinct; ++i)
+            if (map[i].vt == watchVt[pass]) { wn = map[i].n; break; }
+        _snprintf_s(line, sizeof(line), _TRUNCATE,
+                    "[FortC] watch vt=%08X (%-16s) n=%u\n", watchVt[pass], watchName[pass], wn);
+        Phase1_LogLine(line);
+    }
+}
+
 void ShotOnce(bool logDetail)
 {
     char line[256];
@@ -298,6 +428,8 @@ void ShotOnce(bool logDetail)
     Phase1_LogLine(line);
     if (logDetail && sh.loggedForts >= kMaxFortsLog)
         Phase1_LogLine("[Fort] detail capped at 8 forts x 8 towers per 10 s; the counts above are complete\n");
+
+    CensusOnce(w);   // one shot, after the first walk that had a usable entity manager
 }
 
 }  // namespace
