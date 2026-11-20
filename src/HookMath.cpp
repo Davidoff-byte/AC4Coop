@@ -133,24 +133,28 @@ namespace HookMath
 		if (trace > 0.0f) {
 			float s = Sqrt(trace + 1.0f) * 2.0f;
 			q.w = 0.25f * s;
-			q.x = (m->M32 - m->M23) / s;   // row-vector convention
-			q.y = (m->M13 - m->M31) / s;
-			q.z = (m->M21 - m->M12) / s;
+			// Row-vector convention: the antisymmetric differences are the TRANSPOSE of the familiar
+			// column-vector form, so each difference is (Mij - Mji), not (Mji - Mij). Measured
+			// 2026-11-20: the previous signs returned the conjugate of ToMatrix's input, which mirrored
+			// every rotation that went through the wire (ship ghost, guards, puppet).
+			q.x = (m->M23 - m->M32) / s;
+			q.y = (m->M31 - m->M13) / s;
+			q.z = (m->M12 - m->M21) / s;
 		} else if (m->M11 > m->M22 && m->M11 > m->M33) {
 			float s = Sqrt(1.0f + m->M11 - m->M22 - m->M33) * 2.0f;
-			q.w = (m->M32 - m->M23) / s;
+			q.w = (m->M23 - m->M32) / s;
 			q.x = 0.25f * s;
 			q.y = (m->M12 + m->M21) / s;
 			q.z = (m->M13 + m->M31) / s;
 		} else if (m->M22 > m->M33) {
 			float s = Sqrt(1.0f + m->M22 - m->M11 - m->M33) * 2.0f;
-			q.w = (m->M13 - m->M31) / s;
+			q.w = (m->M31 - m->M13) / s;
 			q.x = (m->M12 + m->M21) / s;
 			q.y = 0.25f * s;
 			q.z = (m->M23 + m->M32) / s;
 		} else {
 			float s = Sqrt(1.0f + m->M33 - m->M11 - m->M22) * 2.0f;
-			q.w = (m->M21 - m->M12) / s;
+			q.w = (m->M12 - m->M21) / s;
 			q.x = (m->M13 + m->M31) / s;
 			q.y = (m->M23 + m->M32) / s;
 			q.z = 0.25f * s;
