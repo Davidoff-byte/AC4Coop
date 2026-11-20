@@ -8404,6 +8404,7 @@ static LONG s_sailRxOk = 0, s_sailRxStale = 0, s_sailRxUnres = 0, s_sailRxBad = 
 static LONG s_sailRxRefused = 0;   // resolved to a mirror proxy (a duplicated entity that is NOT the peer's ship)
 static LONG s_sailRxLocal = 0;   // applies whose identity came from the local-ship fallback (via=local)
 static LONG s_sailRxGhost = 0;   // applies that landed on g_ghostShip, the clone of the PEER's ship (via=ghost)
+static LONG s_sailCloneRaw = 0;  // target had +0xA4 == 0 (a clone): raw +0xCC write, no events, no visual motion
 
 // The ONE guarded setter call (the only correct write path - see the header above). Shared by the consumer
 // and the [Coop] SailTestCycle harness below so both take the identical resolve/guard/SEH route; the only
@@ -8413,8 +8414,26 @@ static int SailSetViaEngine(void* gcl, unsigned st, uint64_t wire) {
     __try {
         void** vt = *(void***)gcl;                        // GcLShip shape: a readable vtable with the
         if (readable(vt, 0x1B8) && vt[0x130 / 4]) {       // max-hull slot 0x130 (sub_121F2F0) present
-            ((void (__thiscall*)(void*, unsigned, char))0x01220960)(gcl, st, 0);
-            ok = 1;
+            // A DuplicateShip clone has +0xA4 == 0. The setter writes +0xCC FIRST (0x1220A59) and only
+            // then dereferences [[+0xA4]+0xC8] to publish events 3/45 (0x1220A79, fault 0xC0000005 at
+            // +0xC8). Verified statically 2026-11-20 (ops/evidence/sail-setter-on-clone-2026-11-20.md).
+            // So on a clone: write the field and skip the call - the state is correct and nothing throws.
+            // The visible sails cannot follow on a clone either: the sail cue objects are owned by the
+            // SOURCE ship through that weak handle, so sharing them would animate the source instead.
+            void* cue = readable((char*)gcl + 0xA4, 4) ? *(void**)((char*)gcl + 0xA4) : nullptr;
+            if (!cue) {
+                if (readable((char*)gcl + 0xCC, 4)) {
+                    *(unsigned*)((char*)gcl + 0xCC) = st;
+                    ++s_sailCloneRaw;
+                    static int once = 0;
+                    if (!once) { once = 1;
+                        L("[Sail] clone path: +0xA4 null -> raw +0xCC (state yes, events no, visual no)\n"); }
+                    ok = 1;
+                }
+            } else {
+                ((void (__thiscall*)(void*, unsigned, char))0x01220960)(gcl, st, 0);
+                ok = 1;
+            }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         ++s_sailRxExc;
@@ -8531,8 +8550,9 @@ static void SailConsumeTick() {
     const DWORD now = GetTickCount();
     if (now - s_next < 5000) return;
     s_next = now;
-    L("[Sail] rx stats ok=%ld stale=%ld unresolved=%ld bad=%ld exc=%ld tx=%ld local=%ld ghost=%ld refused=%ld\n",
-      s_sailRxOk, s_sailRxStale, s_sailRxUnres, s_sailRxBad, s_sailRxExc, s_sailTxN, s_sailRxLocal, s_sailRxGhost, s_sailRxRefused);
+    L("[Sail] rx stats ok=%ld stale=%ld unresolved=%ld bad=%ld exc=%ld tx=%ld local=%ld ghost=%ld cloneRaw=%ld refused=%ld\n",
+      s_sailRxOk, s_sailRxStale, s_sailRxUnres, s_sailRxBad, s_sailRxExc, s_sailTxN, s_sailRxLocal, s_sailRxGhost,
+      s_sailCloneRaw, s_sailRxRefused);
 }
 
 // ---- TEST HARNESS [Coop] HelmSeat (default 0): does the helm function actually seat the player? -----
