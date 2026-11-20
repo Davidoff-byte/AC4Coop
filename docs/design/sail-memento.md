@@ -112,3 +112,24 @@ Those are later slices; this one carries one enum.
 3. Guest consumer: resolve, freshness, apply via setter, log.
 4. Flag `[Coop] SailSync` default **0**; a counter for dropped/stale/unresolved.
 5. Gate: `py tools/spine_gate.py` exit 0. PR against `feat/launcher`'s line with the oracle above.
+
+---
+
+## 9. Accepted limitation (owner decision, 2026-11-20)
+
+**Sail *state* syncs; the peer's sails do not visibly deploy.** This is not a bug that a better write
+fixes — it is a property of representing the peer's ship as a `DuplicateShip` clone.
+
+- The setter `sub_1220960` writes `+0xCC` at `0x1220A59` and only then dereferences `[[ship+0xA4]+0xC8]`
+  at `0x1220A79` to publish events 3/45. A clone has **`+0xA4 == 0`**, so the call faults *after* the
+  state is already correct (`0xC0000005`, caught by SEH; observed live as `ghost=1, exc=8`).
+- `+0xA4` is the sail-visual controller, reached through a **weak handle owned by the source ship**. Its
+  six 24-byte cue objects (stride 0x18 at `+0x8C/0xA4/0xBC/0xD4/0xEC/0x104`) belong to that source;
+  sharing them would animate the source, not the clone. The visual path is also double-gated on
+  `IsPlayerShip (+0x398)` and `PlaySoundWithSailStateChangedE3 (+0x3AC)`, and `v7` is null-guarded.
+
+Implemented consequence: a target whose `+0xA4` is null takes a **raw `+0xCC` write** instead of the
+call (counted as `cloneRaw=`), so the state is right and nothing throws.
+
+Owner accepted state-only sail sync on 2026-11-20. The only route to visible sails on a clone would be
+deep-cloning the cue objects, whose concrete class is still `[UNPROVEN]`. Revisit only deliberately.
