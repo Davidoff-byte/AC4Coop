@@ -755,6 +755,15 @@
    "size": 172,
    "status": "unknown"
   },
+  "011D9380": {
+    "addr": "011D9380",
+    "claimed_at": null,
+    "name": "GetFortFromEntity",
+    "owner": null,
+    "receipts": [],
+    "size": 0,
+    "status": "unknown"
+  },
   "01207960": {
    "addr": "01207960",
    "claimed_at": null,
