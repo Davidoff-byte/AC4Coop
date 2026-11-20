@@ -3829,6 +3829,61 @@ static Entity* GetLocalShip() {
 // and the mission condition BoardingCondition reads obj->vtbl[+408]() && obj->vtbl[+368]() (u8 predicates).
 // This test does exactly the action's call on the NEAREST non-local AI ship within 200 m, once, and logs the byte
 // and both predicates before and after. Question answered live: does the flag alone make the ship boardable?
+//
+// [Coop] BoardProbe (default 0, reuses the same selection and setter) tests the next static result,
+// ops/evidence/boarding-threshold-2026-11-20.md: BoardingCondition is
+//   bit 95 of ((u32*)*(u32*)(GcLShip+0x40))[2]  (mask 0x80000000)   AND   *(u8*)(GcLShip+0x540)
+// with no hull/crew/speed/distance term, while sub_1207960 writes +0x3A9 AND +0x540. So setter-only must leave
+// bit 95 at 0 (condition false), and setting bit 95 must turn it true without the hull moving. Hull is READ ONLY.
+
+// The nearest non-local AI ship within maxDist of the player. Shared so both harnesses pick the same ship and the
+// selection exists once. *outD2 receives the squared distance.
+static Entity* PickNearestNonLocalShip(void* mgr, Entity* player, Entity* local, float maxDist, float* outD2) {
+    if (!mgr || !player || !readable((char*)mgr + 0x3E8, 8)) return nullptr;
+    if (outD2) *outD2 = 0.0f;
+    const unsigned short n = *(unsigned short*)((char*)mgr + 0x3EE);
+    Entity* best = nullptr; float bestD2 = maxDist * maxDist;
+    const float px = player->m_GlobalMatrix.M41, py = player->m_GlobalMatrix.M42;
+    for (int i = 0; i < (int)n && i < 128; ++i) {
+        Entity* se = GetShipEntity(mgr, i);
+        if (!se || !readable(se, 0x50) || *(uint32_t*)se != 0x01E4A128u || se == local) continue;
+        if (se == (Entity*)g_ghostShip) continue;
+        const float dx = se->m_GlobalMatrix.M41 - px, dy = se->m_GlobalMatrix.M42 - py;
+        if (dx * dx + dy * dy < bestD2) { bestD2 = dx * dx + dy * dy; best = se; }
+    }
+    if (best && outD2) *outD2 = bestD2;
+    return best;
+}
+
+// sub_1207960(obj, value): the engine setter behind ActionShipBoardable - writes obj+0x3A9 and obj+0x540 and posts
+// the class-135 notify. Called through one site so both harnesses share it (and its unit).
+static void CallSetBoardable(void* obj, unsigned char value) {
+    ((void (__thiscall*)(void*, unsigned char))0x01207960)(obj, value);
+}
+
+// (((u32*)*(u32*)(gcl+0x40))[2] >> 31) & 1, with the array base validated for 3 dwords. -1 = unreadable ("?").
+static int ReadBoardBit95(uint32_t* maskp) {
+    if (!maskp) return -1;
+    int v = -1;
+    __try { v = (int)((*maskp >> 31) & 1u); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { v = -1; }
+    return v;
+}
+
+// ORs bit 95 into the mask under SEH - that write attempt IS the writability check. False = nothing written.
+static bool SetBoardBit95(uint32_t* maskp) {
+    if (!maskp) return false;
+    __try { *maskp |= 0x80000000u; return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// "1"/"0", or "?" when the mask could not be read - an unread must never be logged as a false.
+static const char* BoardBitStr(int v, char* buf, size_t n) {
+    if (v < 0) { buf[0] = '?'; buf[1] = 0; }
+    else sprintf_s(buf, n, "%d", v);
+    return buf;
+}
+
 static void BoardableTestTick() {
     static int s_on = -1, s_done = 0; static DWORD s_next = 0;
     if (s_on < 0) s_on = GetPrivateProfileIntA("Coop", "BoardableTest", 0, Paths::Ini()) != 0 ? 1 : 0;
@@ -3840,18 +3895,9 @@ static void BoardableTestTick() {
         World* world = World::GetCurrentWorld();
         Entity* player = world ? world->GetPlayer() : nullptr;
         void* mgr = GetNavalManager();
-        if (!player || !mgr || !readable((char*)mgr + 0x3E8, 8)) return;
-        const unsigned short n = *(unsigned short*)((char*)mgr + 0x3EE);
-        Entity* local = GetLocalShip();
-        Entity* best = nullptr; float bestD2 = 200.0f * 200.0f;
-        const float px = player->m_GlobalMatrix.M41, py = player->m_GlobalMatrix.M42;
-        for (int i = 0; i < (int)n && i < 128; ++i) {
-            Entity* se = GetShipEntity(mgr, i);
-            if (!se || !readable(se, 0x50) || *(uint32_t*)se != 0x01E4A128u || se == local) continue;
-            if (se == (Entity*)g_ghostShip) continue;
-            const float dx = se->m_GlobalMatrix.M41 - px, dy = se->m_GlobalMatrix.M42 - py;
-            if (dx * dx + dy * dy < bestD2) { bestD2 = dx * dx + dy * dy; best = se; }
-        }
+        if (!player || !mgr) return;
+        float bestD2 = 0.0f;
+        Entity* best = PickNearestNonLocalShip(mgr, player, GetLocalShip(), 200.0f, &bestD2);
         if (!best) return;
         void* obj = ((void* (__cdecl*)(void*))0x0122BA20)((void*)best);
         if (!readable(obj, 0x548) || !readable(*(void**)obj, 0x1A0)) { L("[Board] ship=%p obj=%p unreadable - skipped\n", best, obj); s_done = 1; return; }
@@ -3861,7 +3907,7 @@ static void BoardableTestTick() {
         const unsigned char p408a = ((Pred)vt[408 / 4])(obj), p368a = ((Pred)vt[368 / 4])(obj);
         L("[Board] BEFORE ship=%p obj=%p dist=%.1f +0x3A9=%u +0x540=%u pred408=%u pred368=%u\n",
           best, obj, sqrtf(bestD2), b0, m0, p408a, p368a);
-        ((void (__thiscall*)(void*, unsigned char))0x01207960)(obj, 1);                  // SetBoardable(obj, 1)
+        CallSetBoardable(obj, 1);                                                        // SetBoardable(obj, 1)
         const unsigned char b1 = *((unsigned char*)obj + 0x3A9), m1 = *((unsigned char*)obj + 0x540);
         const unsigned char p408b = ((Pred)vt[408 / 4])(obj), p368b = ((Pred)vt[368 / 4])(obj);
         L("[Board] AFTER  ship=%p +0x3A9=%u +0x540=%u pred408=%u pred368=%u\n", best, b1, m1, p408b, p368b);
@@ -3869,6 +3915,111 @@ static void BoardableTestTick() {
         s_done = 1;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         L("[Board] EXCEPTION code=0x%08X\n", GetExceptionCode());
+        s_done = 1;
+    }
+}
+
+// ---- [Coop] BoardProbe (default 0) - TEST HARNESS, not shipped behaviour --------------------------------
+// One shot, 5 s after the first frame that has a qualifying ship within 200 m:
+//   S0 read state, S1 sub_1207960 only, S2 then bit 95 - and the two condition predicates at each stage.
+// The predicates are called through the ship object's own vtable (slots 408 and 368), exactly as the engine's
+// BoardingCondition calls them and as BoardableTest already does - so this needs NO new address and no resolver
+// for the slot-14 condition object. Nothing here writes the hull.
+static void BoardProbeTick() {
+    static int s_on = -1, s_done = 0; static DWORD s_next = 0;
+    if (s_on < 0) s_on = GetPrivateProfileIntA("Coop", "BoardProbe", 0, Paths::Ini()) != 0 ? 1 : 0;
+    if (!s_on || s_done) return;
+    const DWORD now = GetTickCount();
+    if (now < s_next) return;
+    s_next = now + 5000;                                       // look every 5 s until one ship qualifies
+    __try {
+        World* world = World::GetCurrentWorld();
+        Entity* player = world ? world->GetPlayer() : nullptr;
+        void* mgr = GetNavalManager();
+        if (!player || !mgr) return;
+        float d2 = 0.0f;
+        Entity* best = PickNearestNonLocalShip(mgr, player, GetLocalShip(), 200.0f, &d2);
+        if (!best) return;                                     // nothing in range yet - look again in 5 s
+        s_done = 1;                                            // one shot
+        void* obj = ((void* (__cdecl*)(void*))0x0122BA20)((void*)best);
+        if (!obj || !readable(obj, 0x548)) { L("[Board] S0 ship=%p obj=%p unreadable - stopped\n", best, obj); return; }
+        typedef unsigned char (__thiscall* Pred)(void*);
+        void** vt = *(void***)obj;
+        void* gcl = ShipGcLObj(best);                          // validates the GcLShip for 0xD4 (covers +0xB4/+0xD0)
+        // The dword-mask array: *(u32*)(gcl+0x40) is the base, index 2 holds bit 95. Readable-checked for 3 dwords.
+        uint32_t* maskp = nullptr;
+        if (gcl) {
+            __try {
+                uint32_t* base = *(uint32_t**)((char*)gcl + 0x40);
+                if (base && readable(base, 12)) maskp = base + 2;
+            } __except (EXCEPTION_EXECUTE_HANDLER) { maskp = nullptr; }
+        }
+        // S0 - starting state, nothing written yet.
+        unsigned a3A9 = 0u, a540 = 0u;
+        int b95 = -1;
+        float hull = 0.0f, maxHull = 0.0f;
+        __try {
+            a3A9 = *((unsigned char*)obj + 0x3A9);
+            a540 = *((unsigned char*)obj + 0x540);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            L("[Board] EXCEPTION 0x%08X at S0(read flags)\n", GetExceptionCode());
+            a3A9 = a540 = 0xFFFFFFFFu;
+        }
+        if (gcl) {
+            __try { hull = *(float*)((char*)gcl + 0xD0); maxHull = *(float*)((char*)gcl + 0xB4); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { L("[Board] EXCEPTION 0x%08X at S0(read hull)\n", GetExceptionCode()); }
+        }
+        b95 = ReadBoardBit95(maskp);
+        char b95s[8];
+        L("[Board] S0 ship=%p gcl=%p hull=%.1f maxHull=%.1f a3A9=%u a540=%u bit95=%s\n",
+          best, gcl, hull, maxHull, a3A9, a540, BoardBitStr(b95, b95s, sizeof(b95s)));
+        {   // the two BoardingCondition predicates, on the ship object the engine tests
+            unsigned char p408 = 0, p368 = 0;
+            __try { p408 = ((Pred)vt[408 / 4])(obj); p368 = ((Pred)vt[368 / 4])(obj); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { L("[Board] EXCEPTION 0x%08X at S0(predicates)\n", GetExceptionCode()); }
+            L("[Board] S0 pred408=%u pred368=%u dist=%.1f\n", (unsigned)p408, (unsigned)p368, sqrtf(d2));
+        }
+        // S1 - the engine setter only. Expect +0x540=1, bit 95 still 0, so pred408 stays false.
+        __try { CallSetBoardable(obj, 1); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { L("[Board] EXCEPTION 0x%08X at S1(setter)\n", GetExceptionCode()); }
+        __try {
+            a3A9 = *((unsigned char*)obj + 0x3A9);
+            a540 = *((unsigned char*)obj + 0x540);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            L("[Board] EXCEPTION 0x%08X at S1(read flags)\n", GetExceptionCode());
+            a3A9 = a540 = 0xFFFFFFFFu;
+        }
+        b95 = ReadBoardBit95(maskp);
+        L("[Board] S1 setter-only a3A9=%u a540=%u bit95=%s  (expect a540=1, bit95=0)\n",
+          a3A9, a540, BoardBitStr(b95, b95s, sizeof(b95s)));
+        {
+            unsigned char p408 = 0, p368 = 0;
+            __try { p408 = ((Pred)vt[408 / 4])(obj); p368 = ((Pred)vt[368 / 4])(obj); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { L("[Board] EXCEPTION 0x%08X at S1(predicates)\n", GetExceptionCode()); }
+            L("[Board] S1 pred408=%u pred368=%u\n", (unsigned)p408, (unsigned)p368);
+        }
+        // S2 - add bit 95 to the mask. Expect bit95=1 and the hull unchanged: the condition must now be true.
+        const bool wrote = SetBoardBit95(maskp);
+        if (!wrote) L("[Board] S2 skipped: mask %p not writable/shared null (bit95 stays %s)\n", (void*)maskp,
+                      BoardBitStr(b95, b95s, sizeof(b95s)));
+        float hull2 = hull, maxHull2 = maxHull;
+        if (gcl) {
+            __try { hull2 = *(float*)((char*)gcl + 0xD0); maxHull2 = *(float*)((char*)gcl + 0xB4); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { L("[Board] EXCEPTION 0x%08X at S2(read hull)\n", GetExceptionCode()); }
+        }
+        b95 = ReadBoardBit95(maskp);
+        L("[Board] S2 setter+bit95 a3A9=%u a540=%u bit95=%s hull=%.1f  (expect bit95=1, hull unchanged)\n",
+          a3A9, a540, BoardBitStr(b95, b95s, sizeof(b95s)), hull2);
+        {
+            unsigned char p408 = 0, p368 = 0;
+            __try { p408 = ((Pred)vt[408 / 4])(obj); p368 = ((Pred)vt[368 / 4])(obj); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { L("[Board] EXCEPTION 0x%08X at S2(predicates)\n", GetExceptionCode()); }
+            L("[Board] S2 pred408=%u pred368=%u\n", (unsigned)p408, (unsigned)p368);
+        }
+        L("[E] ev=boardprobe wrote=%d hullMoved=%d maxHull=%.1f\n", wrote ? 1 : 0,
+          (hull2 == hull && maxHull2 == maxHull) ? 0 : 1, maxHull2);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        L("[Board] EXCEPTION 0x%08X (BoardProbe outer)\n", GetExceptionCode());
         s_done = 1;
     }
 }
@@ -13214,7 +13365,7 @@ static void DumpConfigOnce()
 
     struct K { const char* s; const char* k; int d; };
     static const K keys[] = {
-        { "Coop", "ActionDeathLog", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "CombatObserve", 0 },
+        { "Coop", "ActionDeathLog", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "CombatObserve", 0 },
         { "Coop", "CombatTest", 0 }, { "Coop", "CrashContext", 0 }, { "Coop", "CorpseKeepSec", 30 }, { "Coop", "CrowdProbeIntegrate", 1 },
         { "Coop", "CrowdProbeLiveKeys", 1 }, { "Coop", "DamageRelay", 0 }, { "Coop", "Diag", 0 },
         { "Coop", "DisableCrowd", 0 }, { "Coop", "DisablePuppetAI", 1 }, { "Coop", "DisableSpawns", 0 },
@@ -13640,6 +13791,7 @@ static void OnFrameInner(Human* updatedHuman) {
     // F8 live test (no-op unless [Coop] BoardableTest=1). Must sit ABOVE the Net::Enabled() block: that block always
     // returns, so anything after it never runs in a networked session (first placement, 19788a1, never fired).
     BoardableTestTick();
+    BoardProbeTick();                                          // [Coop] BoardProbe (default 0): no-op unless set
     if (Net::Enabled()) {
         EntitySyncTick();   // host broadcasts entity transforms; peer mirrors them (synced worlds)
         // Capture only succeeds in a real playable world (not title/whiteroom). Require it to be
