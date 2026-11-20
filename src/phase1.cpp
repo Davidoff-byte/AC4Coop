@@ -14009,6 +14009,7 @@ static void OnFrameInner(Human* updatedHuman) {
     // returns, so anything after it never runs in a networked session (first placement, 19788a1, never fired).
     BoardableTestTick();
     BoardProbeTick();                                          // [Coop] BoardProbe (default 0): no-op unless set
+    { extern void FortProbeTick(); FortProbeTick(); }           // [Coop] FortProbe (default 0): read-only fort/tower enumeration
     if (Net::Enabled()) {
         EntitySyncTick();   // host broadcasts entity transforms; peer mirrors them (synced worlds)
         // Capture only succeeds in a real playable world (not title/whiteroom). Require it to be
