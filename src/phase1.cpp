@@ -8398,6 +8398,7 @@ static void SailPublishTick() {
 // Guest: resolve, freshness, apply. Counters are reported on a 5 s line, never per message.
 static struct { uint64_t wire; uint32_t lastSeq; uint8_t used; } s_sailRx[4];
 static LONG s_sailRxOk = 0, s_sailRxStale = 0, s_sailRxUnres = 0, s_sailRxBad = 0, s_sailRxExc = 0;
+static LONG s_sailRxRefused = 0;   // resolved to a duplicate (mirror proxy / ghost) - never an apply target
 static LONG s_sailRxLocal = 0;   // applies whose identity came from the local-ship fallback (via=local)
 
 // The ONE guarded setter call (the only correct write path - see the header above). Shared by the consumer
@@ -8431,6 +8432,11 @@ static Entity* SailResolveShip(uint64_t wire, bool* viaLocal) {
     // The guest's copy of the peer's ship is the spawned ghost. UNVERIFIED: that g_ghostObjId is the
     // ghost's source objId; it is used only as a fallback, guarded by the pointer and the id match.
     if (!e && wire && g_ghostShip && (uint64_t)g_ghostObjId == wire) e = (Entity*)g_ghostShip;
+    // A mirror proxy and the spawned ghost are DUPLICATED entities. `sub_1220960` is the setter known to
+    // fault on a duplicated GcLShip (raw field writes work, the setter does not), so neither is an apply
+    // target. Measured 2026-11-20: ShipMirror=1 + SailSync=1 killed one copy in two consecutive runs,
+    // while each feature alone was stable. Fall through to the local ship instead.
+    if (e && (IsMirrorProxy(e) || e == (Entity*)g_ghostShip)) { ++s_sailRxRefused; e = nullptr; }
     if (e) return e;
     e = GetLocalShip();
     if (e) { if (viaLocal) *viaLocal = true; return e; }
@@ -8508,8 +8514,8 @@ static void SailConsumeTick() {
     const DWORD now = GetTickCount();
     if (now - s_next < 5000) return;
     s_next = now;
-    L("[Sail] rx stats ok=%ld stale=%ld unresolved=%ld bad=%ld exc=%ld tx=%ld local=%ld\n",
-      s_sailRxOk, s_sailRxStale, s_sailRxUnres, s_sailRxBad, s_sailRxExc, s_sailTxN, s_sailRxLocal);
+    L("[Sail] rx stats ok=%ld stale=%ld unresolved=%ld bad=%ld exc=%ld tx=%ld local=%ld refused=%ld\n",
+      s_sailRxOk, s_sailRxStale, s_sailRxUnres, s_sailRxBad, s_sailRxExc, s_sailTxN, s_sailRxLocal, s_sailRxRefused);
 }
 
 // ---- TEST HARNESS [Coop] HelmSeat (default 0): does the helm function actually seat the player? -----
