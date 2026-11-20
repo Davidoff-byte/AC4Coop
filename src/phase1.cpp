@@ -8031,6 +8031,21 @@ static bool SailSyncOn() {
 }
 static const unsigned kSailStateCount = 4;       // SailState::Count (sub_1220960 rejects newState > 3)
 
+// ---- TEST HARNESS flags (default 0; with both off nothing below runs) -------------------------------
+// Both exist only to drive the oracle in docs/design/sail-memento.md §4 unattended. Neither is product
+// behaviour: they are read once, cached with the s_x = -1 idiom, and gated outside every normal path.
+static int s_sailCycleIni = -1;                  // TEST HARNESS [Coop] SailTestCycle (oracle PASS arm)
+static bool SailTestCycleOn() {
+    if (s_sailCycleIni < 0) s_sailCycleIni = GetPrivateProfileIntA("Coop", "SailTestCycle", 0, Paths::Ini()) != 0 ? 1 : 0;
+    return s_sailCycleIni == 1;
+}
+static int s_sailRawIni = -1;                    // TEST HARNESS [Coop] SailApplyRaw (oracle control B)
+static bool SailApplyRawOn() {
+    if (s_sailRawIni < 0) s_sailRawIni = GetPrivateProfileIntA("Coop", "SailApplyRaw", 0, Paths::Ini()) != 0 ? 1 : 0;
+    return s_sailRawIni == 1;
+}
+
+
 // Host: publish the local ship's SailState on an EDGE. PublishIntent has no flags parameter - the lane
 // itself stamps IF_BASE on the first message of a (guard, channel) key and on every resync replay
 // (net.h contract), which is exactly the semantics this memento needs.
@@ -8059,6 +8074,25 @@ static void SailPublishTick() {
 static struct { uint64_t wire; uint32_t lastSeq; uint8_t used; } s_sailRx[4];
 static LONG s_sailRxOk = 0, s_sailRxStale = 0, s_sailRxUnres = 0, s_sailRxBad = 0, s_sailRxExc = 0;
 
+// The ONE guarded setter call (the only correct write path - see the header above). Shared by the consumer
+// and the [Coop] SailTestCycle harness below so both take the identical resolve/guard/SEH route; the only
+// difference is `wire`, which is 0 for the harness (nothing was received). Returns 1 if the call returned.
+static int SailSetViaEngine(void* gcl, unsigned st, uint64_t wire) {
+    int ok = 0;
+    __try {
+        void** vt = *(void***)gcl;                        // GcLShip shape: a readable vtable with the
+        if (readable(vt, 0x1B8) && vt[0x130 / 4]) {       // max-hull slot 0x130 (sub_121F2F0) present
+            ((void (__thiscall*)(void*, unsigned, char))0x01220960)(gcl, st, 0);
+            ok = 1;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        ++s_sailRxExc;
+        L("[Sail] EXCEPTION 0x%08X setter ship=%p wire=%016llu state=%u\n",
+          GetExceptionCode(), gcl, (unsigned long long)wire, st);
+    }
+    return ok;
+}
+
 static Entity* SailResolveShip(uint64_t wire) {
     Entity* e = FiResolve(wire);
     // The guest's copy of the peer's ship is the spawned ghost. UNVERIFIED: that g_ghostObjId is the
@@ -8084,20 +8118,49 @@ static void SailApplyMsg(const Net::IntentMsg& msg) {
     if (sameKey && msg.seq <= s_sailRx[slot].lastSeq) { ++s_sailRxStale; return; }
     const unsigned before = *(unsigned*)((char*)gcl + 0xCC);
     int ok = 0;
-    __try {
-        void** vt = *(void***)gcl;                        // GcLShip shape: a readable vtable with the
-        if (readable(vt, 0x1B8) && vt[0x130 / 4]) {       // max-hull slot 0x130 (sub_121F2F0) present
-            ((void (__thiscall*)(void*, unsigned, char))0x01220960)(gcl, st, 0);
-            ok = 1;
+    // TEST HARNESS - [Coop] SailApplyRaw (default 0), control B for the oracle's negative arm
+    // (docs/design/sail-memento.md §4: "with the flag on but the setter deliberately not called ... the
+    // sails must not move - otherwise the visual is following something other than our apply"). The value
+    // arrives, the setter never runs: the sails must stay furled. Unreachable unless the flag is set.
+    if (SailApplyRawOn()) {
+        __try {
+            if (readable((char*)gcl + 0xCC, sizeof(unsigned))) {
+                *(unsigned*)((char*)gcl + 0xCC) = st;
+                ok = 1;
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            ++s_sailRxExc;
+            L("[Sail] EXCEPTION 0x%08X raw ship=%p wire=%016llu state=%u\n",
+              GetExceptionCode(), gcl, (unsigned long long)msg.wireId, st);
         }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        ++s_sailRxExc;
-        L("[Sail] EXCEPTION 0x%08X setter ship=%p wire=%016llu state=%u\n",
-          GetExceptionCode(), gcl, (unsigned long long)msg.wireId, st);
+        if (ok) { s_sailRx[slot].used = 1; s_sailRx[slot].wire = msg.wireId; s_sailRx[slot].lastSeq = msg.seq; ++s_sailRxOk; }
+        L("[Sail] rx RAW ship=%p %u->%u (setter skipped - control B)\n", gcl, before, st);
+        return;
     }
+    ok = SailSetViaEngine(gcl, st, msg.wireId);
     if (ok) { s_sailRx[slot].used = 1; s_sailRx[slot].wire = msg.wireId; s_sailRx[slot].lastSeq = msg.seq; ++s_sailRxOk; }
     L("[Sail] rx ship=%p wire=%016llu %u->%u seq=%u ok=%d\n", gcl, (unsigned long long)msg.wireId,
       before, st, msg.seq, ok);
+}
+
+// TEST HARNESS - [Coop] SailTestCycle (default 0): the host-side driver for the oracle's PASS arm
+// (docs/design/sail-memento.md §4: "the host toggles Up->Half->Full->Up ... three consecutive toggles").
+// With no keypress the arm can run unattended: every 3 s, step the LOCAL ship 0 -> 1 -> 2 -> 0 through the
+// engine setter. A raw +0xCC write is explicitly NOT used here: the setter no-ops when the field already
+// holds the value (see the header above), so it would freeze the field on the first step.
+static void SailTestCycleTick() {
+    if (!SailTestCycleOn() || !Phase1_IsEntityHost()) return;
+    static DWORD s_next = 0;
+    const DWORD now = GetTickCount();
+    if (s_next && now - s_next < 3000) return;
+    s_next = now;
+    Entity* ship = GetLocalShip();
+    void*  gcl   = ShipGcLObj(ship);
+    if (!gcl) return;
+    const unsigned before = *(unsigned*)((char*)gcl + 0xCC);
+    const unsigned st = before >= 2 ? 0u : before + 1u;   // 0 -> 1 -> 2 -> 0 (3 wraps to 0 as well)
+    const int ok = SailSetViaEngine(gcl, st, 0);          // wire 0: nothing was received
+    L("[Sail] testcycle %u -> %u ok=%d\n", before, st, ok);
 }
 
 // Per-frame: the 5 s counter line. The drain itself is the FightIntentDrain loop (see SailApplyMsg).
@@ -13127,7 +13190,7 @@ static void OnFrameInner(Human* updatedHuman) {
         InterlockedExchange(&g_inSaveTick, (w && w->m_CharacterList.GetSize() >= 2) ? (LONG)GetTickCount() : 0);
     }
     Pilot::OnPlayerFrame(updatedHuman);   // [Pilot] Enabled only: publish the player + m_CharacterList
-    __try { FightIntentSend(updatedHuman); FightIntentDrain(); OwnerDamageGuestPump(); PlayerDamageHostPump(); AttackForwardHostPump(); AttackForwardOwnerTick(); SailPublishTick(); SailConsumeTick(); SpawnerIdProbeTick(); }   // [Coop] FightIntents / OwnerDamage / SailSync / SpawnerIdProbe only
+    __try { FightIntentSend(updatedHuman); FightIntentDrain(); OwnerDamageGuestPump(); PlayerDamageHostPump(); AttackForwardHostPump(); AttackForwardOwnerTick(); SailPublishTick(); SailConsumeTick(); SailTestCycleTick(); SpawnerIdProbeTick(); }   // [Coop] FightIntents / OwnerDamage / SailSync / SailTestCycle(harness) / SpawnerIdProbe only
     __except (EXCEPTION_EXECUTE_HANDLER) { static int s_fe = 0; if (s_fe < 10) { ++s_fe; L("[FI] EXCEPTION 0x%08X in send/drain\n", GetExceptionCode()); } }
 
     ProbeIdentityOnce();
