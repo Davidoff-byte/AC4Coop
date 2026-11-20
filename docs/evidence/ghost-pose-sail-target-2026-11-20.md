@@ -81,3 +81,29 @@ a mirror-symmetric value would have shown the old conjugate bug.
 
 `feat/shipmirror-port` @ `dc7d1f1`, ASI 763,392 B sha256 `b50f6b91…d53c7d`, gate exit 0. Deployed, flags
 `SailSync=1`, `ShipMirror=0`, probes 0. **Not launched** — the owner is on another game.
+
+---
+
+## 6. The audit caught a regression I was about to ship
+
+A consumer audit of every `FromMatrix`/`ToMatrix` site found **two hand-built quaternion→matrix blocks**
+inside the `SetGlobalMatrixInternal` detour (`phase1.cpp`, the ghost override and the `g_syncTargets`
+override). They used the **transposed** off-diagonals, i.e. `ToMatrix(conjugate(q))`.
+
+Pre-fix, `FromMatrix` handed them `qᶜ`, so those two blocks produced the *true* matrix — two errors
+cancelling. Fixing only `FromMatrix` would have turned them into a **new mirror on the ghost and on every
+synced local ship**.
+
+Audit result: 9 sites FIXED, 2 NOW-WRONG (those two blocks), 1 UNKNOWN (whether the ghost branch fires at
+all — the file's own comment at 14384 says the hook cannot fire for the ghost, yet the branch exists; the
+`[GhostPose]` line will show it).
+
+Fixed in `3460888`: both blocks now call `HookMath::ToMatrix`. There is **one** convention in the codebase;
+a grep for hand-built `1 - 2*(y*y` rotation forms returns nothing.
+
+Final build: `3460888`, ASI 763,392 B sha256 `056a9291…a86726`, gate exit 0, deployed, **still not
+launched**.
+
+Residual risk, stated: the render path is now consistent by construction, but "consistent" has not been
+seen on a screen. `[GhostPose] d=` and the visible heading are the deciders.
+
