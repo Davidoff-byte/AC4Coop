@@ -59,7 +59,7 @@ try {
     Get-Process AC4BFSP -ErrorAction SilentlyContinue | Stop-Process -Force; Start-Sleep 2
     "closed old copies: $($old.Id -join ',')"
   }
-  Write-Ini ((Set-Key $run 'Mode' 'host'))
+  Write-Ini ((Set-Key (Set-Key $run 'Mode' 'host') 'EntityHost' '1'))
   $off0 = (Get-Item $netlog).Length
   $a = Start-Process -FilePath $exe -WorkingDirectory $GameDir -PassThru; "A (host) pid=$($a.Id)"
   $code = $null
@@ -71,11 +71,11 @@ try {
   }
   if (-not $code) { throw "no host code from A in 90 s" }
   "host code $code"
-  Write-Ini (Set-Key (Set-Key $run 'Mode' 'join') 'JoinCode' $code)
+  Write-Ini (Set-Key (Set-Key (Set-Key $run 'Mode' 'join') 'JoinCode' $code) 'EntityHost' '0')
   $b = Start-Process -FilePath $exe -WorkingDirectory $GameDir -PassThru; "B (guest) pid=$($b.Id)"
   $bLog = Join-Path $GameDir "phase1_log_$($b.Id).txt"
   for ($i = 0; $i -lt 90; $i++) { Start-Sleep 1; if ((Test-Path $bLog) -and (Select-String -Path $bLog -Pattern '\[Net\] cfg ' -Quiet)) { break } }
-  Write-Ini ((Set-Key $run 'Mode' 'host'))
+  Write-Ini ((Set-Key (Set-Key $run 'Mode' 'host') 'EntityHost' '1'))
   "B cfg: " + ((Select-String -Path $bLog -Pattern '\[Net\] cfg ').Line)
 
   foreach ($id in $a.Id, $b.Id) {
