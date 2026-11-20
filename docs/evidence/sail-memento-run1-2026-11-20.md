@@ -71,3 +71,34 @@ players have separate ships, but it is a much larger port and is not needed for 
   before the test).
 - Whether `sub_1220960` is safe on a duplicate `GcLShip` — untested; the guest's own ship is a real
   `GcLShip`, not a duplicate, so this run would not exercise it.
+
+---
+
+## 5. CORRECTION (added 2026-11-20, after run 2)
+
+This run's write-up above **missed a defect that was visible in its own numbers**: the host log carried
+`[Sail] rx` lines (`host rx=27, tx=39`) even though the host is supposed to be the only publisher. The
+cause was the rig, not the code:
+
+```
+Phase1_IsEntityHost() { return g_entHost == 1; }
+```
+and `two_copy.ps1` set `Mode=host` / `Mode=join` **per copy but left `EntityHost=1` for both**, so both
+processes satisfied the host predicate and **both published and applied**. That is why run 1 showed
+reception on the publisher.
+
+Fixed in `tools/two_copy.ps1` (`b006387`): A gets `EntityHost=1`, B gets `EntityHost=0`.
+
+**Run 2 (corrected rig, same build)** — host pid 27920, guest 21908, both at ~(-4465, 2552):
+```
+host : tx=28  testcycle=26  rx ship=0   final stats ok=0 stale=0 unresolved=0  bad=0 exc=0
+guest: tx=0   testcycle=0   rx ship=0   final stats ok=0 stale=0 unresolved=22 bad=0 exc=0
+```
+Exactly one publisher; the guest receives and resolves nothing. The unresolved count is therefore a
+clean identity result: `FiResolve(wireId)` has no object, and this base has no ship mirror
+(`c82a696` absent).
+
+Consequence: the "different scene cells" observation in §2 was true but was **not** the whole story, and
+the boot position quoted from `two_copy.ps1` described spawn, not the run. The next change is the
+identity fallback to the guest's own local ship (`via=local`), not a cell fix.
+
