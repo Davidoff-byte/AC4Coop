@@ -18,14 +18,17 @@
 // (src/Scimitar/Entity.cpp:19 -> Hook::CallClassMethod<Component*, Entity*, ClassDescriptor*>(0x005200C0, ...);
 // decomp/units.json "005200C0"), so this unit introduces NO new engine address and no new calling convention.
 //
-// Enumeration. The world handle array (world+0x80 = array, +0x84 = count; handle = {obj, soft rc, hard rc, u64 id})
-// is a LEAD from the AC4Tweaker digest and is NOT verified in this binary. Everything about it is guarded, and the
-// entry stride is probed empirically (0x18 / 0x14 / 0x10): the stride that actually yields fort components is the
-// one named in the `source=` field, so the log states what was used instead of assuming a layout. If the array is
-// unusable the probe says so (examined=0, source=-) rather than staying silent.
+// Enumeration: the engine's own entity manager, world->m_EntityManager.m_Entities (World.h:228), walked exactly as
+// src/phase1.cpp:3489-3503 does. The earlier world+0x80 / +0x84 handle array came from an external digest, was not
+// verified in this binary, and measured zero entities on both machines (2026-11-20 live run, three probed strides),
+// so it is gone along with the stride probe - this array has no stride to guess. Per-entity order is
+// Reference -> HandleContainer -> m_Object (Entity), with phase1's break (reference slot unreadable: stop) vs
+// continue (handle or object slot bad: skip) semantics. An entity is examined once its Entity pointer is readable;
+// the fort and FortTowerManager counts are the results of GetComponentByType on it.
 //
-// Rates: one shot per second whatever the frame rate. Detail lines are capped (8 forts x 8 towers per shot) so a
-// naval map cannot flood the log; the summary line carries the true counts and repeats every shot.
+// Rates: one shot per second whatever the frame rate. Detail lines (fort/tower) and the towerMgrs count are printed
+// once every 10 s, capped at 8 forts x 8 towers, so a naval map cannot flood the log; the summary line carries the
+// true counts and repeats every shot.
 #include "fort_probe.h"
 #include "paths.h"
 #include "Scimitar/Entity.h"
@@ -39,12 +42,12 @@ void Phase1_LogLine(const char* s);
 
 namespace {
 
-const uintptr_t VA_FORT_CLASSINFO = 0x02A18520;   // GcLNavalFort class descriptor (rebased at use)
+const uintptr_t VA_FORT_CLASSINFO     = 0x02A18520;   // GcLNavalFort class descriptor (rebased at use)
+const uintptr_t VA_TOWERMGR_CLASSINFO = 0x02A911C0;   // FortTowerManager class descriptor (rebased at use)
 
-const uint32_t kMaxEntries   = 4096;   // clamp on the world handle count
+const uint32_t kMaxEntries   = 4096;   // clamp on the entity-manager count per shot
 const int      kMaxFortsLog  = 8;      // forts detailed per shot
 const int      kMaxTowersLog = 8;      // tower lines per fort
-const uint32_t kStrides[3]   = { 0x18, 0x14, 0x10 };
 const size_t   kFortBytes    = 0x3D8;  // GcLNavalFort size: the readable floor before any field is trusted
 const size_t   kTowerBytes   = 0x2E8;  // covers +0x16C (float) and +0x2E3 (bool)
 
@@ -62,7 +65,7 @@ bool Readable(const void* p, size_t n)
 }
 
 // A candidate object: plausible heap range, aligned, and its vtable dword readable too. A soft/hard ref count read
-// as a pointer fails this, which is what makes the stride probe meaningful.
+// as a pointer fails this, which is what keeps the towersAlive slots honest.
 bool LooksLikeObject(uintptr_t p)
 {
     if (p < 0x10000 || p >= 0x7F000000 || (p & 3)) return false;
@@ -116,6 +119,8 @@ struct Shot
 {
     int         examined;
     int         forts;
+    int         towerMgrs;      // entities carrying a FortTowerManager component (this shot, when counted)
+    bool        towerMgrsOk;    // false: the FortTowerManager descriptor itself was unreadable
     const char* source;
     int         loggedForts;
 };
@@ -162,32 +167,53 @@ void LogTowers(uintptr_t fort, Shot* sh, char* line, size_t cap)
     }
 }
 
-// One pass over the world handle array with one stride. Returns the fort count, or -1 when the array itself is
-// unusable (pointer/count unreadable, zero, or out of range).
-int ScanStride(World* w, uintptr_t desc, uint32_t stride, bool logDetail, Shot* sh, char* line, size_t cap)
+// One pass over the engine's entity manager (src/phase1.cpp:3489-3503). Returns the fort count, or -1 when the
+// manager itself is unusable (count unreadable, non-positive, or absurd). The order and the break/continue split are
+// phase1's: a dead reference slot ends the walk, a bad handle or object slot is skipped.
+int ScanEntities(World* w, uintptr_t fortDesc, uintptr_t towerDesc, bool logDetail, bool countTowerMgrs,
+                 Shot* sh, char* line, size_t cap)
 {
-    const char* wb = (const char*)w;
-    if (!Readable(wb + 0x80, 8)) return -1;
-    const uintptr_t arr = *(const uintptr_t*)(wb + 0x80);
-    const uint32_t  cnt = *(const uint32_t*)(wb + 0x84);
-    if (!arr || !cnt || cnt > kMaxEntries) return -1;
-    if (!Readable((const void*)arr, (size_t)cnt * stride)) return -1;
+    BaseBigArray<Reference>& ents = w->m_EntityManager.m_Entities;   // World.h:228
+    int nobj = 0;
+    __try { nobj = ents.GetSize(); } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+    if (nobj <= 0) return -1;
+
+    if ((unsigned)nobj > kMaxEntries) {
+        _snprintf_s(line, cap, _TRUNCATE,
+                    "[Fort] entity manager count=%d exceeds the %u cap - walking the first %u\n",
+                    nobj, (unsigned)kMaxEntries, (unsigned)kMaxEntries);
+        Phase1_LogLine(line);
+    }
+    const int n = ((unsigned)nobj > kMaxEntries) ? (int)kMaxEntries : nobj;
 
     int forts = 0;
-    for (uint32_t i = 0; i < cnt; i++) {
-        const uintptr_t entry = arr + (uintptr_t)i * stride;
-        if (!Readable((const void*)entry, 4)) continue;          // unreadable entry: skipped, frame unaffected
-        uintptr_t obj = 0;
-        if (!ReadPtr(entry, &obj)) continue;
-        if (!LooksLikeObject(obj)) continue;
+    for (int i = 0; i < n; ++i) {
+        Reference* ref = nullptr;
+        __try { ref = ents.GetElement(i); } __except (EXCEPTION_EXECUTE_HANDLER) { break; }
+        if (!ref || !Readable(ref, 4)) break;                    // reference slot gone: end the walk, as phase1 does
+
+        HandleContainer* hc = nullptr;
+        Entity* e = nullptr;
+        __try {
+            hc = ref->m_HandleContainer;
+            if (hc) e = (Entity*)hc->m_Object;
+        } __except (EXCEPTION_EXECUTE_HANDLER) { hc = nullptr; e = nullptr; }
+        if (!hc || !Readable(hc, 4)) continue;
+        if (!e || !Readable(e, 4)) continue;
         sh->examined++;
 
-        Component* comp = nullptr;
-        __try { comp = ((Entity*)obj)->GetComponentByType((ClassDescriptor*)desc); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { comp = nullptr; }
-        if (!comp) continue;
+        uintptr_t fort = 0;
+        __try { fort = (uintptr_t)e->GetComponentByType((ClassDescriptor*)fortDesc); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { fort = 0; }
 
-        const uintptr_t fort = (uintptr_t)comp;
+        if (countTowerMgrs) {
+            uintptr_t tm = 0;
+            __try { tm = (uintptr_t)e->GetComponentByType((ClassDescriptor*)towerDesc); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { tm = 0; }
+            if (tm) sh->towerMgrs++;
+        }
+
+        if (!fort) continue;
         if (!Readable((const void*)fort, kFortBytes)) {
             _snprintf_s(line, cap, _TRUNCATE, "[Fort] comp=%p unreadable to +0x3D8 - skipped\n", (void*)fort);
             Phase1_LogLine(line);
@@ -206,7 +232,7 @@ int ScanStride(World* w, uintptr_t desc, uint32_t stride, bool logDetail, Shot* 
             fieldsOk = 1;
         } __except (EXCEPTION_EXECUTE_HANDLER) { fieldsOk = 0; }
 
-        const bool posOk = FortPosition(obj, pos);
+        const bool posOk = FortPosition((uintptr_t)e, pos);
         const unsigned alive = SmallArraySpan(fort + 0x118, &aliveBegin, &aliveSpan) ? aliveSpan / 4 : 0;
         const unsigned dead  = SmallArraySpan(fort + 0xC0, &deadBegin, &deadSpan) ? deadSpan / 4 : 0;
         if (!fieldsOk) {
@@ -217,7 +243,7 @@ int ScanStride(World* w, uintptr_t desc, uint32_t stride, bool logDetail, Shot* 
         _snprintf_s(line, cap, _TRUNCATE,
                     "[Fort] fort=%p pos=(%.1f,%.1f,%.1f) comp=%p towersAlive=%u destroyed=%u phase=%u combat=%d%s\n",
                     (void*)fort, posOk ? pos[0] : 0.0f, posOk ? pos[1] : 0.0f, posOk ? pos[2] : 0.0f,
-                    (void*)comp, alive, dead, phase, combat, posOk ? "" : " pos=unreadable");
+                    (void*)fort, alive, dead, phase, combat, posOk ? "" : " pos=unreadable");
         Phase1_LogLine(line);
         LogTowers(fort, sh, line, cap);
         sh->loggedForts++;
@@ -225,7 +251,7 @@ int ScanStride(World* w, uintptr_t desc, uint32_t stride, bool logDetail, Shot* 
     return forts;
 }
 
-void ShotOnce()
+void ShotOnce(bool logDetail)
 {
     char line[256];
     World* w = nullptr;
@@ -243,44 +269,35 @@ void ShotOnce()
         Phase1_LogLine(line);
         return;
     }
+    const uintptr_t towerDesc = GameModuleBase + (VA_TOWERMGR_CLASSINFO - 0x00400000);
 
-    // Stride probe: the first stride that yields a fort is the one the details and the source string name. If none
-    // does, the largest examined count is still reported - an empty result must be a stated fact.
-    int best = -1, bestExamined = 0;
-    bool arrayUnusable = false;
-    for (int s = 0; s < 3; s++) {
-        Shot probe = { 0, 0, "-", 0 };
-        const int n = ScanStride(w, desc, kStrides[s], false, &probe, line, sizeof(line));
-        if (n < 0) { arrayUnusable = true; break; }              // array unusable: other strides cannot help
-        if (probe.examined > bestExamined) bestExamined = probe.examined;
-        if (n > 0) { best = s; break; }
-    }
+    Shot sh = { 0, 0, 0, false, "mgr.m_Entities", 0 };
+    sh.towerMgrsOk = Readable((const void*)towerDesc, 4);
+    const int forts = ScanEntities(w, desc, towerDesc, logDetail, logDetail, &sh, line, sizeof(line));
 
-    if (best < 0) {
-        if (arrayUnusable) {
-            Phase1_LogLine("[Fort] examined=0 forts=0 source=- (world+0x80 handle array unusable: pointer or count "
-                           "unreadable, zero, or count > 4096) (no fort component matched)\n");
-        } else {
-            _snprintf_s(line, sizeof(line), _TRUNCATE,
-                        "[Fort] examined=%d forts=0 source=world+0x80 (no fort component matched)\n", bestExamined);
-            Phase1_LogLine(line);
-        }
+    if (forts < 0) {
+        _snprintf_s(line, sizeof(line), _TRUNCATE,
+                    "[Fort] examined=0 forts=0 source=- (entity manager unusable: count unreadable or empty) "
+                    "(no fort component matched)\n");
+        Phase1_LogLine(line);
         return;
     }
 
-    static char src[40];
-    _snprintf_s(src, sizeof(src), _TRUNCATE, "world+0x80/stride=0x%X", (unsigned)kStrides[best]);
-    Shot detail = { 0, 0, src, 0 };
-    const int forts = ScanStride(w, desc, kStrides[best], true, &detail, line, sizeof(line));
-    if (forts <= 0) {
+    if (!logDetail) {
         _snprintf_s(line, sizeof(line), _TRUNCATE,
-                    "[Fort] examined=%d forts=0 source=%s (no fort component matched)\n", detail.examined, src);
+                    "[Fort] examined=%d forts=%d source=%s\n", sh.examined, forts, sh.source);
+    } else if (!sh.towerMgrsOk) {
+        _snprintf_s(line, sizeof(line), _TRUNCATE,
+                    "[Fort] examined=%d forts=%d towerMgrs=? source=%s (FortTowerManager classinfo %08X unreadable)\n",
+                    sh.examined, forts, sh.source, (unsigned)VA_TOWERMGR_CLASSINFO);
     } else {
-        _snprintf_s(line, sizeof(line), _TRUNCATE, "[Fort] examined=%d forts=%d source=%s\n", detail.examined, forts, src);
+        _snprintf_s(line, sizeof(line), _TRUNCATE,
+                    "[Fort] examined=%d forts=%d towerMgrs=%d source=%s\n",
+                    sh.examined, forts, sh.towerMgrs, sh.source);
     }
     Phase1_LogLine(line);
-    if (detail.loggedForts >= kMaxFortsLog)
-        Phase1_LogLine("[Fort] detail capped at 8 forts x 8 towers per shot; the counts above are complete\n");
+    if (logDetail && sh.loggedForts >= kMaxFortsLog)
+        Phase1_LogLine("[Fort] detail capped at 8 forts x 8 towers per 10 s; the counts above are complete\n");
 }
 
 }  // namespace
@@ -292,11 +309,15 @@ void FortProbeTick()
     if (!s_on) return;
 
     static ULONGLONG s_next = 0;
+    static ULONGLONG s_nextDetail = 0;
     const ULONGLONG now = GetTickCount64();
     if (now < s_next) return;             // at most one shot each second, whatever the frame rate
     s_next = now + 1000;
 
-    __try { ShotOnce(); } __except (EXCEPTION_EXECUTE_HANDLER) {
+    const bool detail = now >= s_nextDetail;   // fort/tower lines and the towerMgrs count: every 10 s
+    if (detail) s_nextDetail = now + 10000;
+
+    __try { ShotOnce(detail); } __except (EXCEPTION_EXECUTE_HANDLER) {
         char line[128];
         _snprintf_s(line, sizeof(line), _TRUNCATE, "[Fort] EXCEPTION 0x%08X (shot aborted)\n", GetExceptionCode());
         Phase1_LogLine(line);
