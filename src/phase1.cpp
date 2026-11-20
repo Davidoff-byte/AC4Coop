@@ -8187,6 +8187,72 @@ static void SailConsumeTick() {
       s_sailRxOk, s_sailRxStale, s_sailRxUnres, s_sailRxBad, s_sailRxExc, s_sailTxN, s_sailRxLocal);
 }
 
+// ---- TEST HARNESS [Coop] HelmSeat (default 0): does the helm function actually seat the player? -----
+// ops/evidence/helm-fields-static-2026-11-20.md: all four helm bools are transition-written, there is no
+// per-frame writer, and the whole helm path is ONE direct call - not a vtable slot:
+//
+//   sub_11FE840(GcLShip* this, int a2)              a2 = 1 enter, 0 leave
+//     0x11FE85C  *(this+0x39A) = a2                 // CaptainAtWheel, written unconditionally first
+//     guarded:    if (a2 == old CaptainAtWheel) return;   // the value read BEFORE the store
+//                 gated on +0x398 IsPlayerShip and +0x399 IsPlayerDrivable
+//     then:       posts an enter event (sub_A014A0), or exits with sub_11F7260(this) + a "changed" event
+//
+// Calling it is the only action here: none of the four bools is written directly. All four are read
+// before the call and the second log line re-reads them in the SAME tick, so a run states whether the
+// engine accepted the enter (captain 0 -> 1) or reverted it.
+static int s_helmIni = -1;                       // [Coop] HelmSeat, read once (the s_x = -1 idiom)
+static bool HelmSeatOn() {
+    if (s_helmIni < 0) s_helmIni = GetPrivateProfileIntA("Coop", "HelmSeat", 0, Paths::Ini()) != 0 ? 1 : 0;
+    return s_helmIni == 1;
+}
+
+// The helm function is the only caller-side action; it is reachable only while the gcl is fully readable.
+// Returns 1 when the call returned without throwing (not proof the engine kept the value - the re-read
+// in HelmSeatTick decides that).
+static int HelmEnterViaEngine(void* gcl, void* ship) {
+    int ok = 0;
+    __try {
+        if (readable(gcl, 0xB70)) {                  // covers +0x398..+0x39E
+            ((void (__thiscall*)(void*, int))0x011FE840)(gcl, 1);
+            ok = 1;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        L("[Helm] EXCEPTION 0x%08X ship=%p gcl=%p\n", GetExceptionCode(), ship, gcl);
+    }
+    return ok;
+}
+
+static void HelmSeatTick() {
+    if (!HelmSeatOn()) return;                     // flag off: nothing is read and nothing is called
+    static DWORD s_next = 0;
+    const DWORD now = GetTickCount();
+    if (s_next && now - s_next < 5000) return;
+    s_next = now;
+    Entity* ship = GetLocalShip();
+    void*   gcl  = ship ? ShipGcLObj(ship) : nullptr;
+    if (!gcl) { L("[Helm] state ship=%p (no local ship)\n", (void*)ship); return; }
+    unsigned cap = 0, drv = 0, solo = 0, sfl = 0;
+    if (!readable(gcl, 0xB70)) { L("[Helm] state gcl=%p (unreadable)\n", gcl); return; }
+    cap  = *(unsigned char*)((char*)gcl + 0x39A);  // CaptainAtWheel
+    drv  = *(unsigned char*)((char*)gcl + 0x399);  // IsPlayerDrivable
+    solo = *(unsigned char*)((char*)gcl + 0x39E);  // solo-board flag
+    sfl  = *(unsigned char*)((char*)gcl + 0x398);  // IsPlayerShip
+    L("[Helm] state ship=%p captain=%d drivable=%d solo=%d ship=%d\n", (void*)ship, cap, drv, solo, sfl);
+    if (cap != 0) return;                          // already seated: the re-read below would say nothing
+    const int ok = HelmEnterViaEngine(gcl, ship);
+    // Same-tick re-read. drivable/solo/ship are post-call on purpose: they tell whether the guarded
+    // branch ran at all; captain 0 -> 1 is the accept signal.
+    unsigned cap2 = 0xFF, drv2 = 0xFF, solo2 = 0xFF, sfl2 = 0xFF;
+    if (readable(gcl, 0xB70)) {
+        cap2  = *(unsigned char*)((char*)gcl + 0x39A);
+        drv2  = *(unsigned char*)((char*)gcl + 0x399);
+        solo2 = *(unsigned char*)((char*)gcl + 0x39E);
+        sfl2  = *(unsigned char*)((char*)gcl + 0x398);
+    }
+    L("[Helm] ship=%p gcl=%p ship=%d drivable=%d solo=%d captain %d -> %d ok=%d\n",
+      (void*)ship, gcl, sfl2, drv2, solo2, cap, cap2, ok);
+}
+
 // Sender: the local player's own frame.
 static void FightIntentSend(Human* player) {
     if (!FightIntentsOn()) return;
@@ -13203,7 +13269,7 @@ static void OnFrameInner(Human* updatedHuman) {
         InterlockedExchange(&g_inSaveTick, (w && w->m_CharacterList.GetSize() >= 2) ? (LONG)GetTickCount() : 0);
     }
     Pilot::OnPlayerFrame(updatedHuman);   // [Pilot] Enabled only: publish the player + m_CharacterList
-    __try { FightIntentSend(updatedHuman); FightIntentDrain(); OwnerDamageGuestPump(); PlayerDamageHostPump(); AttackForwardHostPump(); AttackForwardOwnerTick(); SailPublishTick(); SailConsumeTick(); SailTestCycleTick(); SpawnerIdProbeTick(); }   // [Coop] FightIntents / OwnerDamage / SailSync / SailTestCycle(harness) / SpawnerIdProbe only
+    __try { FightIntentSend(updatedHuman); FightIntentDrain(); OwnerDamageGuestPump(); PlayerDamageHostPump(); AttackForwardHostPump(); AttackForwardOwnerTick(); SailPublishTick(); SailConsumeTick(); SailTestCycleTick(); HelmSeatTick(); SpawnerIdProbeTick(); }   // [Coop] FightIntents / OwnerDamage / SailSync / SailTestCycle(harness) / HelmSeat(harness) / SpawnerIdProbe only
     __except (EXCEPTION_EXECUTE_HANDLER) { static int s_fe = 0; if (s_fe < 10) { ++s_fe; L("[FI] EXCEPTION 0x%08X in send/drain\n", GetExceptionCode()); } }
 
     ProbeIdentityOnce();

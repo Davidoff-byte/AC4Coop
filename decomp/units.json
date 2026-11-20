@@ -764,6 +764,15 @@
    "size": 85,
    "status": "unknown"
   },
+  "011FE840": {
+    "addr": "011FE840",
+    "claimed_at": null,
+    "name": "GcLShipSetCaptainAtWheel",
+    "owner": null,
+    "receipts": [],
+    "size": 0,
+    "status": "unknown"
+  },
   "01220960": {
    "addr": "01220960",
    "claimed_at": null,
