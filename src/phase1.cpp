@@ -8346,9 +8346,12 @@ static Entity* FiResolve(uint64_t id) {
 // Consequence: writing +0xCC first makes the next call a no-op and the sails never move. So the field
 // is read here and NEVER written. Identity is the entity lane's canonical id (FiCanonicalId/FiResolve),
 // the same mechanism IC_FIGHT/IC_DAMAGE use; `slot` is 0 as in every existing publisher.
-// UNVERIFIED: whether sub_1220960 is safe on a DUPLICATE GcLShip (the guest's ghost ship). The known
-// faulting duplicate case was a different setter (0x12C -> sub_1225A10, which re-enters sub_1220B60);
-// this call is SEH-guarded and counted, and the live oracle decides it.
+// The guest's target for the peer's ship is g_ghostShip (the spawned clone), so that IS the apply target:
+// applying to the local ship with SailSync=1 put the host's state on the guest's own Jackdaw while the
+// peer's hull stood there as the ghost (owner report 2026-11-20). UNVERIFIED: whether sub_1220960 is safe
+// on a DUPLICATE GcLShip (the ghost). The known faulting duplicate case was a different setter (0x12C ->
+// sub_1225A10, which re-enters sub_1220B60); this call is SEH-guarded and its exceptions counted, and the
+// live oracle decides it.
 static int s_sailIni = -1;                       // [Coop] SailSync, read once (the s_x = -1 idiom)
 static bool SailSyncOn() {
     if (s_sailIni < 0) s_sailIni = GetPrivateProfileIntA("Coop", "SailSync", 0, Paths::Ini()) != 0 ? 1 : 0;
@@ -8398,8 +8401,9 @@ static void SailPublishTick() {
 // Guest: resolve, freshness, apply. Counters are reported on a 5 s line, never per message.
 static struct { uint64_t wire; uint32_t lastSeq; uint8_t used; } s_sailRx[4];
 static LONG s_sailRxOk = 0, s_sailRxStale = 0, s_sailRxUnres = 0, s_sailRxBad = 0, s_sailRxExc = 0;
-static LONG s_sailRxRefused = 0;   // resolved to a duplicate (mirror proxy / ghost) - never an apply target
+static LONG s_sailRxRefused = 0;   // resolved to a mirror proxy (a duplicated entity that is NOT the peer's ship)
 static LONG s_sailRxLocal = 0;   // applies whose identity came from the local-ship fallback (via=local)
+static LONG s_sailRxGhost = 0;   // applies that landed on g_ghostShip, the clone of the PEER's ship (via=ghost)
 
 // The ONE guarded setter call (the only correct write path - see the header above). Shared by the consumer
 // and the [Coop] SailTestCycle harness below so both take the identical resolve/guard/SEH route; the only
@@ -8420,26 +8424,37 @@ static int SailSetViaEngine(void* gcl, unsigned st, uint64_t wire) {
     return ok;
 }
 
-// Identity route: `wireId` first, then the LOCAL ship. Two Jackdaws are the same gameplay ship here
-// (docs/design/sail-memento.md 7), so a failed wireId lookup is not a "no entity" answer - the ship
-// mirror c82a696 is not in this base, and on `feat/launcher` the guest's own ship IS the follower's
-// target. `via` records which route was taken so the log can tell them apart. The fallback is correct
-// ONLY while both players share one hull; with two independent hulls it would apply the host's state to
-// the wrong ship. Both routes failing is an unresolved memento, as before.
-static Entity* SailResolveShip(uint64_t wire, bool* viaLocal) {
-    if (viaLocal) *viaLocal = false;
+// Identity route, in order: `wireId` (the entity lane resolved the sender's id), then g_ghostShip (the
+// spawned clone of the PEER's ship), then the LOCAL ship. Two Jackdaws are the same gameplay ship only
+// while both players share one hull (docs/design/sail-memento.md 7), so `local` is the last resort. `via`
+// records which route was taken so the log can tell them apart; only `local` is a same-hull assumption.
+static const int kSailViaNone = 0, kSailViaWire = 1, kSailViaGhost = 2, kSailViaLocal = 3;
+static const char* SailViaName(int via) {
+    return via == kSailViaWire  ? "wire"
+         : via == kSailViaGhost ? "ghost"
+         : via == kSailViaLocal ? "local" : "none";
+}
+
+static Entity* SailResolveShip(uint64_t wire, int* via) {
+    if (via) *via = kSailViaNone;
     Entity* e = FiResolve(wire);
-    // The guest's copy of the peer's ship is the spawned ghost. UNVERIFIED: that g_ghostObjId is the
-    // ghost's source objId; it is used only as a fallback, guarded by the pointer and the id match.
-    if (!e && wire && g_ghostShip && (uint64_t)g_ghostObjId == wire) e = (Entity*)g_ghostShip;
-    // A mirror proxy and the spawned ghost are DUPLICATED entities. `sub_1220960` is the setter known to
-    // fault on a duplicated GcLShip (raw field writes work, the setter does not), so neither is an apply
-    // target. Measured 2026-11-20: ShipMirror=1 + SailSync=1 killed one copy in two consecutive runs,
-    // while each feature alone was stable. Fall through to the local ship instead.
-    if (e && (IsMirrorProxy(e) || e == (Entity*)g_ghostShip)) { ++s_sailRxRefused; e = nullptr; }
-    if (e) return e;
+    // A mirror proxy is a DUPLICATED entity, but not the peer's ship - never an apply target (refused=).
+    if (e && IsMirrorProxy(e)) { ++s_sailRxRefused; e = nullptr; }
+    if (e) { if (via) *via = kSailViaWire; return e; }
+    // The peer's ship on this machine is the spawned ghost. The pointer is validated before use: the
+    // streamer can reclaim the clone, and a stale pointer read would fault. SEH-guarded, so a bad clone
+    // costs one unresolved memento instead of the process.
+    if (g_ghostShip) {
+        __try {
+            if (readable((void*)g_ghostShip, 0x50)) {
+                if (via) *via = kSailViaGhost;
+                return (Entity*)g_ghostShip;
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+    }
     e = GetLocalShip();
-    if (e) { if (viaLocal) *viaLocal = true; return e; }
+    if (e) { if (via) *via = kSailViaLocal; return e; }
     return nullptr;
 }
 
@@ -8450,9 +8465,9 @@ static void SailApplyMsg(const Net::IntentMsg& msg) {
     if (msg.len != sizeof(IntentShipMemento)) { ++s_sailRxBad; return; }
     const unsigned st = msg.payload[0];
     if (st >= kSailStateCount) { ++s_sailRxBad; return; }
-    bool viaLocal = false;
-    Entity* ship = SailResolveShip(msg.wireId, &viaLocal);
-    const char* via = viaLocal ? "local" : "wire";
+    int via = kSailViaNone;
+    Entity* ship = SailResolveShip(msg.wireId, &via);
+    const char* viaName = SailViaName(via);
     void*   gcl  = ship ? ShipGcLObj(ship) : nullptr;
     if (!gcl) { ++s_sailRxUnres; return; }
     int slot = -1;                                        // per-key apply state (a memento is idempotent)
@@ -8477,14 +8492,16 @@ static void SailApplyMsg(const Net::IntentMsg& msg) {
             L("[Sail] EXCEPTION 0x%08X raw ship=%p wire=%016llu state=%u\n",
               GetExceptionCode(), gcl, (unsigned long long)msg.wireId, st);
         }
-        if (ok) { s_sailRx[slot].used = 1; s_sailRx[slot].wire = msg.wireId; s_sailRx[slot].lastSeq = msg.seq; ++s_sailRxOk; if (viaLocal) ++s_sailRxLocal; }
-        L("[Sail] rx RAW ship=%p %u->%u via=%s (setter skipped - control B)\n", gcl, before, st, via);
+        if (ok) { s_sailRx[slot].used = 1; s_sailRx[slot].wire = msg.wireId; s_sailRx[slot].lastSeq = msg.seq; ++s_sailRxOk;
+                   if (via == kSailViaLocal) ++s_sailRxLocal; else if (via == kSailViaGhost) ++s_sailRxGhost; }
+        L("[Sail] rx RAW ship=%p %u->%u via=%s (setter skipped - control B)\n", gcl, before, st, viaName);
         return;
     }
     ok = SailSetViaEngine(gcl, st, msg.wireId);
-    if (ok) { s_sailRx[slot].used = 1; s_sailRx[slot].wire = msg.wireId; s_sailRx[slot].lastSeq = msg.seq; ++s_sailRxOk; if (viaLocal) ++s_sailRxLocal; }
+    if (ok) { s_sailRx[slot].used = 1; s_sailRx[slot].wire = msg.wireId; s_sailRx[slot].lastSeq = msg.seq; ++s_sailRxOk;
+              if (via == kSailViaLocal) ++s_sailRxLocal; else if (via == kSailViaGhost) ++s_sailRxGhost; }
     L("[Sail] rx ship=%p wire=%016llu %u->%u seq=%u via=%s ok=%d\n", gcl, (unsigned long long)msg.wireId,
-      before, st, msg.seq, via, ok);
+      before, st, msg.seq, viaName, ok);
 }
 
 // TEST HARNESS - [Coop] SailTestCycle (default 0): the host-side driver for the oracle's PASS arm
@@ -8514,8 +8531,8 @@ static void SailConsumeTick() {
     const DWORD now = GetTickCount();
     if (now - s_next < 5000) return;
     s_next = now;
-    L("[Sail] rx stats ok=%ld stale=%ld unresolved=%ld bad=%ld exc=%ld tx=%ld local=%ld refused=%ld\n",
-      s_sailRxOk, s_sailRxStale, s_sailRxUnres, s_sailRxBad, s_sailRxExc, s_sailTxN, s_sailRxLocal, s_sailRxRefused);
+    L("[Sail] rx stats ok=%ld stale=%ld unresolved=%ld bad=%ld exc=%ld tx=%ld local=%ld ghost=%ld refused=%ld\n",
+      s_sailRxOk, s_sailRxStale, s_sailRxUnres, s_sailRxBad, s_sailRxExc, s_sailTxN, s_sailRxLocal, s_sailRxGhost, s_sailRxRefused);
 }
 
 // ---- TEST HARNESS [Coop] HelmSeat (default 0): does the helm function actually seat the player? -----
@@ -14392,6 +14409,46 @@ static void OnFrameInner(Human* updatedHuman) {
                 ((Entity*)g_ghostShip)->SetGlobalMatrixInternal(&m, true);
                 { static int n = 0; if ((n++ & 0x3F) == 0)
                     L("[ShipSync] driving ghost to (%.1f, %.1f, %.1f)\n", m.M41, m.M42, m.M43); }
+                // --- [GhostPose] MEASUREMENT ONLY (1 Hz, no behaviour change): commanded yaw from the
+                // peer's quaternion vs the yaw actually in the ghost's own m_GlobalMatrix after the call.
+                // yaw = atan2(axis.y, axis.x) of the LOCAL X axis image, read as float indices [0],[1] of
+                // the row-major Transform - the same convention the render hook above uses ([0..2],[4..6],
+                // [8..10] = rotation, [12..14] = translation). The SAME pair is used on both sides, so
+                // only `d` is convention-free: d=0 means the drive landed, d!=0 means the rotation did not
+                // take. UNVERIFIED which row is the engine's forward axis and which sign `atan2` gives -
+                // the absolute values carry that convention, `d` does not. Rotation is NOT changed here.
+                // pos = the ghost matrix's translation (observed), tgt = the commanded translation.
+                { static DWORD s_poseNext = 0; const DWORD poseNow = GetTickCount();
+                  if (!s_poseNext || poseNow - s_poseNext >= 1000) {
+                      s_poseNext = poseNow;
+                      const float qx = g_ghostSyncQuat[0], qy = g_ghostSyncQuat[1];
+                      const float qz = g_ghostSyncQuat[2], qw = g_ghostSyncQuat[3];
+                      const float qlen2 = qx*qx + qy*qy + qz*qz + qw*qw;
+                      __try {
+                          if (qlen2 < 0.5f || qlen2 > 1.5f) {
+                              // no unit quaternion latched: the peer's heading never arrived (or is stale)
+                              L("[GhostPose] target=? actual=? (g_ghostSyncQuat not unit: len2=%.3f)\n", qlen2);
+                          } else if (!readable((void*)g_ghostShip, 0x50)) {
+                              L("[GhostPose] target=? actual=? (ghost %p m_GlobalMatrix unreadable)\n", (void*)g_ghostShip);
+                          } else {
+                              HookMath::Quaternion tq; tq.x = qx; tq.y = qy; tq.z = qz; tq.w = qw;
+                              HookMath::Transform tm; HookMath::ToMatrix(&tq, &tm);
+                              const float* tp = (const float*)&tm;
+                              const float* ap = (const float*)&((BaseEntity*)g_ghostShip)->m_GlobalMatrix;
+                              const double kRad2Deg = 57.29577951308232;
+                              const double ty = atan2((double)tp[1], (double)tp[0]) * kRad2Deg;
+                              const double ay = atan2((double)ap[1], (double)ap[0]) * kRad2Deg;
+                              double d = ay - ty;            // signed shortest difference
+                              while (d >  180.0) d -= 360.0;
+                              while (d < -180.0) d += 360.0;
+                              L("[GhostPose] target=%.1f actual=%.1f d=%.1f pos=(%.1f,%.1f,%.1f) tgt=(%.1f,%.1f,%.1f)\n",
+                                ty, ay, d, ap[12], ap[13], ap[14], m.M41, m.M42, m.M43);
+                          }
+                      } __except (EXCEPTION_EXECUTE_HANDLER) {
+                          L("[GhostPose] target=? actual=? (EXCEPTION 0x%08X)\n", GetExceptionCode());
+                      }
+                  }
+                }
             } __except (EXCEPTION_EXECUTE_HANDLER) {
                 L("[ShipSync] drive EXCEPTION code=0x%08X\n", GetExceptionCode());
                 // m1: the ref is dropped here too, so the next ghost must re-apply the peer's hull HP.
