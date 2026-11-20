@@ -30,5 +30,33 @@ ok = d.MiniDumpWriteDump(h, pid, f, 0x0 | 0x4, None, None, None)
 err = C.get_last_error() & 0xFFFFFFFF
 k.CloseHandle(f)
 k.CloseHandle(h)
+
+# A 64-bit dbghelp cannot dump a 32-bit (WOW64) target: MiniDumpWriteDump returns
+# ERROR_PARTIAL_COPY (0x12B) and writes an empty file. Fall back to the WOW64 copy of comsvcs.dll,
+# which runs inside the target's own bitness. Measured 2026-11-20: a hung 32-bit AC4BFSP.exe produced
+# a 0-byte dump and err=0x8007012B through the path above.
+if not ok and err == 0x12B:
+    import os
+    import subprocess
+    syswow = os.path.join(os.environ.get('SystemRoot', r'C:\Windows'), 'SysWOW64')
+    rundll = os.path.join(syswow, 'rundll32.exe')
+    comsvcs = os.path.join(syswow, 'comsvcs.dll')
+    if os.path.isfile(rundll) and os.path.isfile(comsvcs):
+        for p in (out, out):          # comsvcs creates the file itself; make sure it is not stale
+            try:
+                os.remove(p)
+                break
+            except OSError:
+                pass
+        subprocess.run([rundll, comsvcs + ',', 'MiniDump', str(pid), out, 'full'],
+                       capture_output=True, timeout=120)
+        if os.path.isfile(out) and os.path.getsize(out) > 0:
+            print('dump ok (wow64 comsvcs): %s (%d B)' % (out, os.path.getsize(out)))
+            sys.exit(0)
+        print('dump failed err=0x%08X and the WOW64 comsvcs fallback produced nothing' % err)
+        sys.exit(1)
+    print('dump failed err=0x%08X (no WOW64 comsvcs available)' % err)
+    sys.exit(1)
+
 print('dump ok: %s' % out if ok else 'dump failed err=0x%08X' % err)
 sys.exit(0 if ok else 1)
