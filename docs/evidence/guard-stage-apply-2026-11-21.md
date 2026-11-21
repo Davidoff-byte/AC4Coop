@@ -37,3 +37,25 @@ guest applied it. Each game ran its own guard state.
 
 ## Runs
 - 2026-11-21: run not started (usage limit); flag built, gated (spine OK, signatures PASS), never run. Next: the scripted A/B per the bar above, then owner G4.
+
+## Run 2026-11-21 (owner-driven, `GuardActionLane=1` `GuardStageApply=1` `CombatTimingProbe=1`)
+
+Build `48CFB068` (2,756,608 B — debug-sized; note for G3 frame numbers), host pid 21692, guest 17372, ini as above, one fight at Havana.
+
+| id | result |
+|---|---|
+| G1 | **66 %** — `hostFight=1940 bothFight=1280` → **FAIL** against the 80 % bar |
+| G2 | **PASS** — 10 `[CTP] G native` lines, 4 with `linked=1`, **all `ph=0`**; none with `ph=1` |
+| G3 | 0 exceptions on both logs; guest frame p50 16.6 ms, **p95 18.2 ms**, p99 21.8 ms, max 30.0 ms (>25 ms: 1 of 299); host p95 18.0 ms |
+| G4 | awaiting owner |
+
+```
+[GSA] apply=1 copies=34 frames=171833 agree=170414 hostFight=1940 bothFight=1280 |
+      enter try=23 ok=3   exit try=14 ok=7   noTarget=0
+```
+
+**The informative number is `enter try=23 ok=3`.** `noTarget=0`, so target mapping is not the failure: the engine's `CanEnterFight` refused the copy in 20 of 23 attempts. That is the exact risk this file listed as unverified before the run — *"whether a copy whose behaviour component is disabled accepts Can/DoEnterFight"*. Answer: mostly **no**.
+
+Caveats recorded rather than smoothed over: the bar's ON-vs-OFF comparison was not run in the same session, so 66 % is an ON-only measurement; and both processes had exited by the time the logs were read, so G3's "both alive" could not be confirmed after the fact (0 exceptions were logged).
+
+**Next:** `ops/evidence/enter-fight-refusal-2026-11-21.md` — decompile `CanEnterFight` and identify which condition refuses a behaviour-disabled copy.
