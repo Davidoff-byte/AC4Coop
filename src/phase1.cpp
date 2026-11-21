@@ -4591,11 +4591,25 @@ static Entity* MirrorPickSource(void* mgr, int n, uint32_t cls, bool* classMiss)
     *classMiss = true;
     return local;                                   // fallback: clone the local ship (wrong look, logged)
 }
+// [Coop] MirrorParkFar (default 0). The 2026-11-21 guest crash (ops/evidence/guest-crash-2026-11-21.md,
+// guest-crash-dump-2026-11-21.md) faults inside RtlEnterCriticalSection on a bad lock at X+0x104, where
+// X = *(update+0x24) is the proxy's per-entity world/render object and every other read of that same object
+// on the path ([X+0x4C], [X+0x88], [[X+0x134]+0x90]) was live - only that one dword is bad. Parking the
+// proxy at y=-100000 is what makes it fire immediately, so the default retires it in place instead.
+// =1 keeps the old park so the A/B can reproduce the crash.
+static int s_mirrorParkFar = -1;                  // [Coop] MirrorParkFar, read once (the s_x = -1 idiom)
 static void MirrorPark(MirrorSlot& m) {
-    __try {
-        HookMath::Transform hide; hide.M41 = 0.0f; hide.M42 = -100000.0f; hide.M43 = 0.0f;
-        ((Entity*)m.proxy)->SetGlobalMatrixInternal(&hide, false);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    if (s_mirrorParkFar < 0) s_mirrorParkFar = GetPrivateProfileIntA("Coop", "MirrorParkFar", 0, Paths::Ini()) != 0 ? 1 : 0;
+    if (s_mirrorParkFar) {
+        __try {
+            HookMath::Transform hide; hide.M41 = 0.0f; hide.M42 = -100000.0f; hide.M43 = 0.0f;
+            ((Entity*)m.proxy)->SetGlobalMatrixInternal(&hide, false);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    } else {
+        // In place: no SetGlobalMatrixInternal call at all. The slot stops being live and stops being driven,
+        // and the entity keeps its last transform until the slot is reused.
+        L("[ShipMirror] retire proxy=%p host=%llu (in place, no park)\n", m.proxy, (unsigned long long)m.hostId);
+    }
     m.live = false; m.hostId = 0;
 }
 // Drive (or create) the proxy for one host ship record. Returns the position error after the drive (metres), -1 on no proxy.
@@ -6783,7 +6797,8 @@ static bool IdResLogNow(int* counter) {
     return *counter <= 20 || (*counter % 500) == 0;
 }
 
-static int  s_idResRetry = 0;   // RES-1 retry throttle (bounded source-3 retry in ResolveEntityById)
+static int  s_idResRetry = 0;   // RES-1 retry attempts (throttled log)
+static int  s_idResRefused = 0; // RES-1 retries refused: 0xA1DC00 requires the 0x04DD601C lock held
 
 // The entity that currently owns `id`, or nullptr. The return value is only ever a pointer whose own id
 // reads back as `id`, so a stale-past-destroy hit degrades to a miss (and the caller falls back).
@@ -6796,18 +6811,18 @@ static Entity* ResolveEntityById(uint64_t id) {
         // restores those ids. Never re-call 0xA1F160 - it recurses into the same broken match.
         // Id halves are the same split ResolveEntityByIdRaw passes to 0xA1F160:
         //   lo = (uint32_t)id,  hi = (uint32_t)(id >> 32).
-        __try {
-            if (*(void**)0x04DD601C != nullptr) {   // registry lock/service up, as in ResolveEntityByIdRaw
-                int ent = Hook::CallClassMethod<int, void*, uint32_t, uint32_t>(
-                    0x00A1DC00, (void*)0x04DD9824, (uint32_t)id, (uint32_t)(id >> 32));
-                if (IdResLogNow(&s_idResRetry))
-                    L("[Mirror] resolver retry id=%llu hit=%d\n",
-                      (unsigned long long)id, ent ? 1 : 0);
-                obj = (void*)ent;   // 0 on miss: the null path stays exactly as it is today
-            }
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            obj = nullptr;
-        }
+        // REFUSED 2026-11-21: 0x00A1DC00 must never be called without the registry lock 0x04DD601C held.
+        // ops/evidence/guest-crash-dump-2026-11-21.md: the guest faults inside RtlEnterCriticalSection on a
+        // lock pointer that is in range but is not a live lock - a critical section entered by a path that
+        // did not own it, which is exactly what an unsynchronised 0xA1DC00 walk can do.
+        // A non-null *0x04DD601C only proves the registry came up; it is NOT the hold. The enter/leave
+        // wrapper for this lock has no receipt in decomp/units.json, so it cannot be taken here without
+        // guessing. A refused retry costs one unresolvable id (the caller falls back); an unlocked slot
+        // read costs the frame. Refuse and count.
+        ++s_idResRefused;
+        if (IdResLogNow(&s_idResRetry))
+            L("[Mirror] resolver retry id=%llu REFUSED (0x4DD601C not held; guest-crash-dump-2026-11-21.md)\n",
+              (unsigned long long)id);
     }
     if (!obj) return nullptr;
     __try {
@@ -8537,7 +8552,11 @@ static int SailSetViaEngine(void* gcl, unsigned st, uint64_t wire) {
                         L("[Sail] clone path: +0xA4 null -> raw +0xCC (state yes, events no, visual no)\n"); }
                     ok = 1;
                 }
-            } else {
+            } else if (*(uint32_t*)gcl == 0x026A34E8u) {
+                // Vtable gate (guest-crash-2026-11-21 analysis, item 2): 0x01220960 is GcLShip's sail setter
+                // and only valid on a GcLShip (coord_sync.h:7/37, coord_enum.cpp census n=9). Anything else
+                // here is not the object this path understands: skip the call rather than enter a foreign
+                // setter (ok stays 0, so the caller counts it as a failed apply).
                 ((void (__thiscall*)(void*, unsigned, char))0x01220960)(gcl, st, 0);
                 ok = 1;
             }

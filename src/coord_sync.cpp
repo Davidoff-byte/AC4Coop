@@ -111,6 +111,10 @@ LONG s_hullExc = 0;   // faults caught here; a bad GcL costs one message, never 
 bool ShipApplyHull(void* ent, float v) {
     void* gcl = CoordSyncEntityLogic(ent);                   // ShipGcLObj glue (phase1.cpp)
     if (!gcl || !Readable(gcl, 0xB70)) return false;
+    // Vtable gate (guest-crash-2026-11-21 analysis, item 2): 0x01225A10 is GcLShip vtable slot +0x12C and is
+    // only valid on a GcLShip. coord_sync.h:7/37 pins that vtable at 0x026A34E8 (coord_enum.cpp census, n=9).
+    // Calling it on anything else walks a foreign vtable slot into an arbitrary function.
+    if (*(uint32_t*)gcl != 0x026A34E8u) return false;
     float after = 0.0f, cap = 0.0f;
     int ok = 0;
     __try {
