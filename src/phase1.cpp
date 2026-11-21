@@ -2835,6 +2835,88 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
                 }
             }
         }
+        // [Coop] AiOffProbe (default 0, read once): the measurement that decides (A)/(B)/(C) of
+        // ops/evidence/ai-off-seam-2026-11-21.md. On the copy (already in the world) it performs the minimal
+        // documented disable - the decision sub-object's own enable, CharacterBehavior+0x24 -> vtbl+36(0), the
+        // call 0x54DFA0 makes (evidence 4a, ladder 5 step 3) - and logs cnt = *(u16*)(helper+0x106) before and
+        // after, plus the node/leaf identity the evidence names for it (7: path[2]/path[3] at helper+0x118).
+        // No VA is patched, no detour, no other flag touched; nothing is read or written unless the key is 1.
+        // Deliberately NOT done (risk list 6 #4): the engine's paired sub_52C260(+0x24, entity) rebind and the
+        // vtbl+40 follow-up. This probe turns off the enable bit alone, so a stale owner is possible afterwards.
+        {
+            static int s_apr = -1;                     // ini [Coop] AiOffProbe, read once (the s_x = -1 idiom)
+            static int s_aprStage = 0;                 // 0 before, 1 waiting for the after read, 2 done
+            static uint64_t s_aprAt = 0;
+            static unsigned s_aprCnt = 0, s_aprPath2 = 0, s_aprNode = 0;
+            if (s_apr < 0) {
+                s_apr = GetPrivateProfileIntA("Coop", "AiOffProbe", 0, Paths::Ini()) != 0 ? 1 : 0;
+                if (s_apr) L("[AiOff] AiOffProbe=1\n");
+            }
+            if (s_apr && s_aprStage < 2 && g_puppet) {
+                __try {
+                    // helper = *(u32*)(character+0x90) (evidence 7); bhv = the same component the toggle above uses.
+                    void* helper = readable((char*)g_puppet + 0x90, 4) ? *(void**)((char*)g_puppet + 0x90) : nullptr;
+                    void* bhv    = g_puppet->GetBehaviorComponent();
+                    const char* why = nullptr;
+                    if (!helper)                                          why = "no-helper";
+                    else if (!readable(helper, 0x120))                    why = "helper-unreadable";
+                    else if (!bhv)                                        why = "no-bhv";
+                    else if (!readable(bhv, 0x28))                        why = "bhv-unreadable";
+                    else if (!readable((char*)bhv + 0x24, 4) || !*(void**)((char*)bhv + 0x24)) why = "no-plus24";
+
+                    if (why) {
+                        s_aprStage = 2;
+                        L("[AiOff] skip reason=%s\n", why);
+                    } else if (s_aprStage == 0) {
+                        s_aprCnt   = *(unsigned short*)((char*)helper + 0x106);          // the decisive word
+                        void* bvec = readable((char*)helper + 0x118, 4) ? *(void**)((char*)helper + 0x118) : nullptr;
+                        s_aprPath2 = (bvec && readable(bvec, 8)) ? *(unsigned short*)((char*)bvec + 4) : 0;
+                        s_aprNode  = (bvec && readable(bvec, 8)) ? *(unsigned short*)((char*)bvec + 6) : 0;
+                        int n107 = 0;
+                        for (unsigned i = 0; i < s_aprCnt && i < 64; ++i) {
+                            if (!readable((char*)helper + 0xE0 + 4 * i, 4)) break;
+                            if (*(unsigned*)((char*)helper + 0xE0 + 4 * i) == 107) n107 = 1;
+                        }
+                        L("[AiOff] target=%p bhv=%p before cnt=%u node=%08X path2=%04X n107=%d\n",
+                          (void*)g_puppet, bhv, s_aprCnt, s_aprNode, s_aprPath2, n107);
+
+                        // exactly 0x54DFA0's form: (*(vtbl+36))(*(bhv+0x24), 0), null-checked first (ladder 5 step 3).
+                        void* sub24 = *(void**)((char*)bhv + 0x24);
+                        void* vt    = readable(sub24, 4) ? *(void**)sub24 : nullptr;
+                        void* slot  = (vt && readable((char*)vt + 36, 4)) ? *(void**)((char*)vt + 36) : nullptr;
+                        if (!slot) {
+                            s_aprStage = 2;
+                            L("[AiOff] skip reason=no-vtbl36\n");
+                        } else {
+                            typedef void (__thiscall *AiOffDisFn)(void*, int);
+                            ((AiOffDisFn)slot)(sub24, 0);
+                            s_aprStage = 1;
+                            s_aprAt = GetTickCount64() + 150;      // let the machine tick a few frames
+                        }
+                    } else if (GetTickCount64() >= s_aprAt) {
+                        s_aprStage = 2;
+                        unsigned cnt = *(unsigned short*)((char*)helper + 0x106);
+                        void* bvec = readable((char*)helper + 0x118, 4) ? *(void**)((char*)helper + 0x118) : nullptr;
+                        unsigned node = (bvec && readable(bvec, 8)) ? *(unsigned short*)((char*)bvec + 6) : 0;
+                        int n107 = 0;
+                        for (unsigned i = 0; i < cnt && i < 64; ++i) {
+                            if (!readable((char*)helper + 0xE0 + 4 * i, 4)) break;
+                            if (*(unsigned*)((char*)helper + 0xE0 + 4 * i) == 107) n107 = 1;
+                        }
+                        // verdict from the two readings only (evidence 7 discriminator, ladder 5 step 4):
+                        //   before cnt == 0 -> the list was already empty, nothing to attribute  -> C
+                        //   after  cnt == 0 -> producer is downstream of +0x24                   -> B
+                        //   after  cnt >  0 and 107 in ids                                      -> A
+                        //   after  cnt >  0 and 107 absent (machine ticks another node)          -> C
+                        const char v = (s_aprCnt == 0) ? 'C' : (cnt == 0 ? 'B' : (n107 ? 'A' : 'C'));
+                        L("[AiOff] after  cnt=%u node=%08X n107=%d verdict=%c\n", cnt, node, n107, v);
+                    }
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    s_aprStage = 2;
+                    L("[AiOff] skip reason=exception\n");
+                }
+            }
+        }
         // [Coop] FightIntents: while the puppet's own FSM is in a fight it was put into by the peer's decisions, the FSM owns
         // its actions; copying the peer's alias on top would make two writers (docs/design/s7-fight-intents.md).
         bool writeActions = actNow && g_switchCd == 0 && !FightIntentOwnsPuppet();   // gated on the settle cooldown
@@ -14417,7 +14499,7 @@ static void DumpConfigOnce()
 
     struct K { const char* s; const char* k; int d; };
     static const K keys[] = {
-        { "Coop", "ActionDeathLog", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "CombatObserve", 0 },
+        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "CombatObserve", 0 },
         { "Coop", "CombatTest", 0 }, { "Coop", "CrashContext", 0 }, { "Coop", "CorpseKeepSec", 30 }, { "Coop", "CrowdProbeIntegrate", 1 },
         { "Coop", "CrowdProbeLiveKeys", 1 }, { "Coop", "DamageRelay", 0 }, { "Coop", "Diag", 0 },
         { "Coop", "DisableCrowd", 0 }, { "Coop", "DisablePuppetAI", 1 }, { "Coop", "DisableSpawns", 0 },
