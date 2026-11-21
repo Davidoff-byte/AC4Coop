@@ -48,9 +48,10 @@ def stats(v, unit='ms'):
     return f'n={len(v)} p50={pct(v,50):.0f} p95={pct(v,95):.0f} max={max(v):.0f} {unit}'
 
 def main():
-    args = [a for a in sys.argv[1:] if not a.startswith('--')]
-    if len(args) != 2: print(__doc__); return 2
     opt = sys.argv[1:]
+    vals = {i + 1 for i, a in enumerate(opt) if a in ('--from-us', '--to-us')}
+    args = [a for i, a in enumerate(opt) if not a.startswith('--') and i not in vals]
+    if len(args) != 2: print(__doc__); return 2
     t0 = float(opt[opt.index('--from-us') + 1]) if '--from-us' in opt else 0
     t1 = float(opt[opt.index('--to-us') + 1]) if '--to-us' in opt else 1e30
     H = [d for d in parse(args[0]) if t0 <= num(d, 't', 0) <= t1]

@@ -398,7 +398,11 @@ bool AttackForward_Post(void* victim, void* attacker, const AtkFields& a)
     __try {
         char* f = ((char* (__cdecl*)())0x010EFC30)();
         if (!f) return false;
-        float dir[4], pos[4]; memcpy(dir, a.dir, 16); memcpy(pos, a.pos, 16);
+        // sub_18BD690 loads both vectors with `movaps` (0x018BD72D `movaps xmm0,[ecx]` = pos, 0x018BD74E = dir, ida_batch
+        // gcs/b3): they must be 16-byte aligned. Unaligned stack arrays faulted here on 968 of 1086 per-frame warning
+        // re-posts in the owner fight of 2026-11-21 (`[AF] post fault ... at=018BD72D addr=FFFFFFFF`).
+        __declspec(align(16)) float dir[4]; __declspec(align(16)) float pos[4];
+        memcpy(dir, a.dir, 16); memcpy(pos, a.pos, 16);
         ((void* (__thiscall*)(void*, int, int, int, void*, void*, char, char, void*))0x018BD690)(
             f, a.type, a.sub, (int)a.f336, dir, pos, (char)a.b331, (char)a.b328, attacker);
         auto SB = [&](int o, uint8_t v) { *(uint8_t*)(f + o) = v; };

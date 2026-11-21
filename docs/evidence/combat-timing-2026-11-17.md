@@ -109,3 +109,64 @@ candidate (i) of the task.
   fight never starts on the host, and no host guard attacks the puppet. That is candidate (v), guard placement /
   identity, seen once (n = 1 fight, 2 targets). It gave no hit-timing numbers.
 - The owner stopped the session here (2026-11-17 19:13). B1, B2, B3 (in a fight) and B5 are **not measured**.
+
+### Run 3 (2026-11-21): owner-driven fight, `AttackForward=1`, lane off then on in one session
+- ASI `9da8d40d3156e1a036dd3e21c43d7c05d32f1df4e31bf2220579950db2390ec0` (commit `baa5a98`, tree clean), host pid 25544,
+  guest pid 29092, `tools\two_copy.ps1 -Interactive -Set CombatTimingProbe=1`. Logs kept in
+  `D:\AC4-RE\deploy-backups\ctp-20261121\run-25544-29092\`.
+- The owner played the guest in Havana, 15-25 m from the idle host player: 8 fight entries, about 6 minutes. A watcher
+  wrote `GuardActionLane=1` into the live ini after the 17th hit; both copies logged the switch (host t = 94446.98 s,
+  guest t = 94447.51 s). The owner was not told when. Scored with `tools/combat_timing.py --to-us 94446900000` (off) and
+  `--from-us 94448500000` (on).
+- Life: host 125 throughout (no hit on the host player). Guest died twice (t = 94446.04 s, 0.9 s before the switch, and
+  about t = 94521 s) and respawned.
+
+| measure | lane off | lane on |
+|---|---|---|
+| joined guard hits | 18 of 18 | 18 of 18 |
+| hit: host post -> guest post | p50 10 ms, p95 17 ms | p50 12 ms; 4 hits 2.6-4.5 s late (see D2) |
+| action: host guard starts it -> guest copy plays it | p50 **329 ms**, p95 389 ms (n = 18) | p50 **34 ms**, p95 57 ms (n = 10) |
+| skew = hit latency - action latency | p50 **-314 ms**, range -378 .. -251 | p50 **-27 ms**, range -45 .. -8 (n = 10) |
+| copy in the host's attack action at the hit | 15 / 18 | 10 / 18 (9 of the 10 linked copies; 8 hits had no linked copy or fell in a reload) |
+| warning lead, host / guest | 529 / 533 ms, difference p95 7 ms | 476 / 470 ms on hits outside a reload |
+| guest player-update interval, fight windows | p50 16.7 ms, median p95 21.9 ms | p50 16.7 ms, median p95 21.2 ms |
+| host capture -> guest apply (entity lane) | p50 59 ms, median p95 82 ms | p50 62 ms, median p95 96 ms |
+
+**Bar**
+- **B1 baseline: FAIL**, as the owner reported. With the lane off every hit landed 251-378 ms before the same point of
+  the swing the guest was shown (|skew| p95 378 ms against 100 ms).
+- **B1 with the lane, linked copies: within the bar** (|skew| p95 45 ms, n = 10). **B1 as written: FAIL**, because only
+  10 of 18 hits had a linked copy that played the attack (bar 95 %). The remaining 8 are defects D2 and D3 below, not
+  the lane.
+- **B2: PASS** with the lane off (difference p95 7 ms, n = 18). With the lane on, 2 hits had no warning on the guest and
+  4 arrived after a reload (D2).
+- **B3: PASS** in both arms (median p95 21.9 / 21.2 ms against 25 ms). Candidates (iii) slow unfocused copy and (iv)
+  logging hitches are **killed for a real fight**: host p95 17.8-18.0 ms with its window never in front.
+- **B4: PASS** on the 100 ms bar, although the lane runs at 10 Hz (S1).
+- **B5: AWAITING OWNER.** The owner left before giving a verdict on whether counters can be timed.
+- `AttackForward=0` baseline: **not run** (needs a restart of the pair; the owner left).
+
+**Cause, with receipts.** Candidate (i): CONFIRMED in a fight. Animation and attack events were on lanes with different
+delays: 329 ms for the action (S1 + S7), 10 ms for the hit. Candidate (ii), the copy not playing the attack at all: 3 of
+18 hits with the lane off (the copy was in another action at the hit). Candidate (v): CONFIRMED as a separate
+contributor (D3).
+
+**Defects found in this run**
+
+| # | defect | receipt | status |
+|---|---|---|---|
+| D1 | The guest's per-frame re-post of a forwarded warning faults. `sub_18BD690` loads the position and direction vectors with `movaps` (`0x018BD72D movaps xmm0,[ecx]`, `0x018BD74E movaps xmm0,[eax]`, ida_batch gcs/b3), so both must be 16-byte aligned; `AttackForward_Post` passed unaligned stack arrays. | guest `[AF] post fault code=C0000005 at=018BD72D rw=0 addr=FFFFFFFF`; `[AF] stats ... posted=118/28 ... failed=968`. The same fault was seen and not explained on 2026-11-16 (590 failures). | fixed in source (`__declspec(align(16))`), **not yet run** |
+| D2 | Hits are applied after the guest died. While the guest reloaded, the host's guards kept attacking the puppet; the lane delivered those events on the first player update after the reload. | 4 hits with hit latency 2595-4529 ms, `copy=00000000`, applied as DamageEvents to the fresh player (life 125 -> 105 -> 85 at t = 94455.85 s) | `[Coop] RespawnHitGraceMs` (default 0) built, **not yet run** |
+| D3 | Guards lose their linked copy during a fight, and reinforcements exist only on the guest. | guest `[AF] ... unresolved=43 (hits applied as DamageEvent 9)`; `[GAL] rx=591 queued=323 noBody=333`; 5 consecutive hits at t = 94512.8-94519.9 s with no copy; host `[FI] apply ... unresolved` for 3 new guard ids (`F00233EC`, `F0023EC1`, one more) while the guest was 24 m from the host player | step 2 of the plan (GuardPlace, identity) |
+| D4 | The puppet spawn faulted 5 times on the guest after the reloads. | `[Phase1] EXCEPTION during resolve/build (code=0xC0000005)` x5 | known (handover 3.4), step 3 |
+
+**Static notes for design B** (the copy performs the attack itself; not built, not needed for B1 by these numbers)
+- The melee poster `sub_16551A0` has 4 call sites in 2 functions, both per-frame updates reached through a vtable slot
+  2: `sub_168D060` (data xref `0x026E098C`) and `sub_10EBD80` (data xref `0x026959FC`). `sub_168D060` asks the object at
+  `this+0x60` (`vt[1]`) for a result and posts a warning (result 2) or a warning and the hit (result 3) to the entity it
+  returns; the attacker is `this+0x10`. ida_batch gcs/b1, b2.
+- On the host the first warning is posted 15-16 ms after the attack action starts (`H fde ph=0 ... ratio=0.000
+  aliasAgeMs=15`, 6 of 6 lines read), and the hit follows 396-544 ms later at clip ratio 0.43-0.48.
+- UNVERIFIED: which class owns those two vtables, who creates the object, and whether a mirrored copy that plays the
+  attack action creates it too. With PlayerDamageRelay alone no double hits were seen on 2026-11-16 (13 of 13), so a
+  copy playing the clip does not hit the guest's player by itself.

@@ -8408,6 +8408,27 @@ static int PdrPlayerLife(Entity* pl) {
     return -1;
 }
 
+// ---- [Coop] RespawnHitGraceMs (default 0 = off; read once at load) ------------------------------------------------------
+// Owner fight 2026-11-21 (docs/evidence/combat-timing-2026-11-17.md, run 3): while the guest reloaded after a death the
+// host's guards kept attacking its puppet; the lane delivered those hits on the first player update after the reload
+// (2.6-4.5 s late) and they were applied to the fresh player (125 -> 85). With N > 0 the owner drops relayed / forwarded
+// guard attacks while its player is dead (life 0) and for N ms after its player entity changed (a reload). The running
+// total of PlayerDamageRelay still advances, so a dropped hit is never applied later.
+static int g_respawnGraceMs = 0;
+static bool s_ownerHitStale = false; static volatile LONG s_graceDropped = 0;
+static void OwnerHitStalePoll() {   // the local player's update, before the lane is drained
+    static Entity* s_pl = nullptr; static uint64_t s_since = 0;
+    if (g_respawnGraceMs <= 0) { s_ownerHitStale = false; return; }
+    World* w = World::GetCurrentWorld();
+    Entity* pl = w ? w->GetPlayer() : nullptr;
+    const uint64_t now = GetTickCount64();
+    if (pl != s_pl) { s_pl = pl; s_since = now; }
+    s_ownerHitStale = !pl || now - s_since < (uint64_t)g_respawnGraceMs || PdrPlayerLife(pl) == 0;
+}
+static void HitGraceReport() {
+    if (g_respawnGraceMs > 0) L("[Grace] RespawnHitGraceMs=%d dropped=%ld (now %s)\n", g_respawnGraceMs, s_graceDropped, s_ownerHitStale ? "dropping" : "applying");
+}
+
 // Owner (guest), player frame, from the lane drain: apply the new part of the total to the local player, natively.
 static void PlayerDamageOwnerApply(const PdrPayload& p, bool base) {
     if (s_pdrOn != 1 || g_entHost == 1) return;
@@ -8419,6 +8440,7 @@ static void PlayerDamageOwnerApply(const PdrPayload& p, bool base) {
     }
     if (p.total <= s_last) return;
     const int dmg = (int)(p.total - s_last); s_last = p.total;
+    if (s_ownerHitStale) { InterlockedIncrement(&s_graceDropped); return; }   // [Coop] RespawnHitGraceMs
     World* w = World::GetCurrentWorld();
     Entity* pl = w ? w->GetPlayer() : nullptr;
     if (!pl) { InterlockedIncrement(&s_pdrFail); return; }
@@ -8523,6 +8545,7 @@ static struct { uint64_t id; unsigned int ent; AtkFields a; ULONGLONG ms; bool l
 static uint32_t s_afCtpSeq = 0, s_afCtpMs = 0;   // [Coop] CombatTimingProbe: seq / publish time of the event being delivered
 static void AttackForwardOwnerDeliver(uint64_t id, const AtkFields& a) {
     const int ph = a.phase ? 1 : 0;
+    if (s_ownerHitStale) { InterlockedIncrement(&s_graceDropped); return; }   // [Coop] RespawnHitGraceMs
     InterlockedIncrement(&s_afRx[ph]);
     World* w = World::GetCurrentWorld();
     Entity* pl = w ? w->GetPlayer() : nullptr;
@@ -8596,6 +8619,7 @@ static void FightIntentDrain() {
     const bool fi = FightIntentsOn();
     if (!fi && !(OwnerDamageOn() && Net::IntentLaneOn()) && !(PdrOn() && Net::IntentLaneOn()) && !(AfOn() && Net::IntentLaneOn())
         && !(g_guardActLane && Net::IntentLaneOn())) return;
+    OwnerHitStalePoll();   // [Coop] RespawnHitGraceMs
     Net::IntentMsg m;
     while (Net::PollIntent(m)) {
         if (m.channel == IC_ATK_A || m.channel == IC_ATK_B || m.channel == IC_ATK_C) { AttackForwardOwnerRx(m); continue; }   // [Coop] AttackForward
@@ -13534,7 +13558,7 @@ static void DumpConfigOnce()
         { "Coop", "ShipPassenger", 0 }, { "Coop", "ShipRelevanceRadiusM", 1000 }, { "Coop", "ShipSync", 1 },
         { "Coop", "ShipTest", 0 }, { "Coop", "ShipTestFracPct", 45 }, { "Coop", "ShipTestRadiusM", 250 },
         { "Coop", "ActionWriterProbe", 0 }, { "Coop", "BlendTypeSafe", 0 }, { "Coop", "EntityFrameCadence", 0 },
-        { "Coop", "FloatProbe", 0 }, { "Coop", "FootOffsetFix", 0 }, { "Coop", "GuardActionGate", 0 }, { "Coop", "GuardActionLane", 0 }, { "Coop", "CombatTimingProbe", 0 }, { "Coop", "GuardExtrapMs", 100 },
+        { "Coop", "FloatProbe", 0 }, { "Coop", "FootOffsetFix", 0 }, { "Coop", "GuardActionGate", 0 }, { "Coop", "GuardActionLane", 0 }, { "Coop", "RespawnHitGraceMs", 0 }, { "Coop", "CombatTimingProbe", 0 }, { "Coop", "GuardExtrapMs", 100 },
         { "Coop", "GuardInterpBuffer", 0 }, { "Coop", "GuardInterpDelayMs", 120 }, { "Coop", "GuardPhaseLock", 0 },
         { "Coop", "GuardSeesPuppet", 0 }, { "Coop", "PuppetActionReassert", 0 }, { "Coop", "PuppetHostTime", 0 },
         { "Coop", "AlertQueryAsPlayer", 0 }, { "Coop", "ConflictNullGuard", 0 }, { "Coop", "ConflictKeepPuppet", 0 }, { "Coop", "GuardPoiFightTarget", 0 }, { "Coop", "FightOrderPuppet", 0 }, { "Coop", "DespawnLeaveFight", 0 }, { "Coop", "FightKeepOnConflictEnd", 0 }, { "Coop", "FightStateProbe", 0 }, { "Coop", "PuppetNavService", 0 }, { "Coop", "NativeReplica", 0 }, { "Coop", "NativeReplicaSnapCm", 300 }, { "Coop", "NativeReplicaBlendCmS", 150 }, { "Coop", "NativeReplicaStartBoostCmS", 400 }, { "Coop", "NativeReplicaParkour", 0 }, { "Coop", "NativeReplicaFreeRun", 0 }, { "Coop", "NativeReplicaClimbIntent", 0 }, { "Coop", "NativeReplicaClimbMoves", 0 }, { "Coop", "NativeReplicaClimbChoice", 0 }, { "Coop", "NativeReplicaBeam", 0 }, { "Coop", "NativeReplicaWallEntry", 0 }, { "Coop", "NativeReplicaClimbNoSnap", 0 }, { "Coop", "NativeReplicaParkourSnapCm", 800 }, { "Coop", "FightProbe", 0 }, { "Coop", "PeerLastPacket", 0 }, { "Coop", "PuppetActionsOwnUpdate", 1 }, { "Coop", "DetectKeepTarget", 0 }, { "Coop", "GuardPlayerOfInterest", 0 }, { "Coop", "EventProbe", 0 }, { "Coop", "PlayerDamageProbe", 0 }, { "Coop", "ReactProbe", 0 }, { "Coop", "FightSkipPuppet", 0 }, { "Coop", "NavNullGuard", 0 }, { "Coop", "PuppetStimMode", 1 }, { "Coop", "PuppetStimSeq", 0 }, { "Coop", "PuppetStimSource", 0 }, { "Coop", "PuppetFightStim", 1 }, { "Coop", "PuppetFightStimMs", 1000 }, { "Coop", "SightProbe", 0 }, { "Coop", "StateProbe", 0 }, { "Coop", "StuckProbe", 0 },
@@ -13785,6 +13809,7 @@ static void OnFrameInner(Human* updatedHuman) {
                 AttackForwardReport();
                 CombatTiming::Report(g_entHost == 1);   // [Coop] CombatTimingProbe
                 GalReport();                            // [Coop] GuardActionLane
+                HitGraceReport();                       // [Coop] RespawnHitGraceMs
                 OwnReport();
                 L("[Mirror] actions on=%d calls=%u deferred=%d queued=%u applied=%ld expired=%ld noSlot=%u\n",
                   MirrorActionsEnabled() ? 1 : 0, s_mirrorActionCalls, MirrorActionsDeferred() ? 1 : 0, s_maqQueued,
@@ -14675,6 +14700,7 @@ void Phase1::InstallFrameHook() {
     g_driveLoco = GetPrivateProfileIntA("Coop", "DriveLocomotion", 0, Paths::Ini());
     g_snapHz = GetPrivateProfileIntA("Net", "SnapshotHz", 20, Paths::Ini());
     g_guardActLane = GetPrivateProfileIntA("Coop", "GuardActionLane", 0, Paths::Ini()) != 0 ? 1 : 0;   // default 0 until verified live
+    g_respawnGraceMs = GetPrivateProfileIntA("Coop", "RespawnHitGraceMs", 0, Paths::Ini());            // default 0 = off
     if (g_snapHz < 1) g_snapHz = 1;
     if (g_snapHz > 60) g_snapHz = 60;
     g_driveContext = GetPrivateProfileIntA("Coop", "DriveContext", 0, Paths::Ini());
