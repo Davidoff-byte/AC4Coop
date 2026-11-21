@@ -59,3 +59,27 @@ Build `48CFB068` (2,756,608 B — debug-sized; note for G3 frame numbers), host 
 Caveats recorded rather than smoothed over: the bar's ON-vs-OFF comparison was not run in the same session, so 66 % is an ON-only measurement; and both processes had exited by the time the logs were read, so G3's "both alive" could not be confirmed after the fact (0 exceptions were logged).
 
 **Next:** `ops/evidence/enter-fight-refusal-2026-11-21.md` — decompile `CanEnterFight` and identify which condition refuses a behaviour-disabled copy.
+
+## Run 2026-11-21 #2 — `GuardStageForceEnter=1` (commit `b0eecc9`, ASI `C815ABC6`)
+
+The gate was identified and bypassed: `CanEnterFight`'s failing condition is `|self.z − target.z| < 3.0f`. Slot 76 is now called directly.
+
+```
+[GSA] apply=1/1 copies=43 frames=179367 agree=176289 hostFight=6584 bothFight=4880 |
+      enter try=55 ok=0 exit try=26 ok=13 noTarget=7 forceSkip=24
+[GSA] force enter gid=4 dz=0.00 target=333F56A0 ok=0      (x55, all zero)
+[GSA] skip gid=378 copy=3110FA90 …                        (x24)
+```
+
+| id | result |
+|---|---|
+| G1 | **74.1 %** (4880/6584) — up from 66 %, but **not from this path**: `enter ok=0` |
+| G2 | no `linked=1 ph=1` seen |
+| G3 | **2 exceptions** — one `resolve/build 0xC0000005` (known intermittent puppet-spawn fault), one `[FI] EXCEPTION 0xC0000005 in slot 160` (`PerformCombo`, separate bug) |
+| G4 | awaiting owner |
+
+**Two distinct populations, not one:**
+- **55 attempts with `gid=4` and `dz≈0`** — the dispatch id is right and the distance gate is satisfied, yet `DoEnterFight` returns 0. So `Do` has its own internal refusal, not the `Can` gate.
+- **24 copies with `gid=378`** — not in the Ground context at all. No enter is possible for them regardless of either call.
+
+**Next:** `ops/evidence/do-enter-fight-2026-11-21.md` — the return-0 branches inside `0x1D79A50`, and what `gid=378` means.
