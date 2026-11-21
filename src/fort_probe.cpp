@@ -51,6 +51,20 @@
 // 0x026F7AC0 GcLNavalTowerACGA, 0x02722048 FortTowerManager). It is now a CONTROL: with forts reached through
 // 0x011D9380 the fort vtable is expected to be absent from the component list, which explains the earlier zero and
 // is worth seeing in the same log. A nonzero fort vtable would mean a fort is also a live component.
+//
+// Coordinators: a live census measured 94 GameplayCoordinatorComponent instances while the fort predicate
+// returned null for every entity, so [Coord] says what those coordinators ARE, once per run. The chain is
+// reflection-derived and used only as offsets here (never called, never written):
+//
+//   GameplayCoordinatorComponent classinfo 0x027AFEF0  +0x60 Coordinator (AbstractGameplayCoordinator)
+//   AbstractGameplayCoordinator  classinfo 0x0276FE08  +0x64 GameplayLogic (GcL*)
+//   GcLAbstract classinfo 0x02786E28 (base Statechart)
+//
+// The logic object's vtable names the logic class the world is running, so "is there any fort logic at all"
+// becomes a counted fact instead of an inference. Same arming as the census (>= 1000 examined, 120 s forced
+// fallback) but its own s_done, so both passes run in one session. Read-only: every deref is Readable-guarded
+// and SEH-wrapped, no writes, and the only address introduced is the classinfo constant compared/passed as a
+// descriptor - the same shape as VA_TOWERMGR_CLASSINFO above.
 #include "fort_probe.h"
 #include "paths.h"
 #include "Scimitar/Entity.h"
@@ -477,6 +491,133 @@ void CensusOnce(World* w, int examined)
     }
 }
 
+const uintptr_t VA_COORD_CLASSINFO = 0x027AFEF0;   // GameplayCoordinatorComponent class descriptor (rebased at use)
+const int       kMaxCoordLines     = 120;          // per-entity [Coord] lines logged
+const int       kMaxDistinctCoordVt = 256;         // distinct logic vtables tracked; the rest go to overflow
+const int       kMaxTopCoordVt     = 20;           // histogram lines logged
+const int       kCoordArmExamined  = 1000;         // same loaded-world test as the census
+const ULONGLONG kCoordForceMs      = 120000;       // 120 s of ticks with a usable walk and examined < 1000
+
+void CoordOnce(World* w, int examined)
+{
+    static bool s_done = false;
+    if (s_done) return;                // one shot per process, whatever the tick rate
+    if (examined < kCoordArmExamined) {
+        static ULONGLONG s_first = 0;  // first tick at which a shot had a usable walk
+        const ULONGLONG now = GetTickCount64();
+        if (!s_first) s_first = now;
+        if (now - s_first < kCoordForceMs) return;   // world still streaming: wait, and re-check next shot
+        char forced[128];
+        _snprintf_s(forced, sizeof(forced), _TRUNCATE,
+                    "[Coord] forced at examined=%d (<1000 after 120s)\n", examined);
+        Phase1_LogLine(forced);
+    }
+    s_done = true;
+
+    char line[192];
+    const uintptr_t coordDesc = GameModuleBase + (VA_COORD_CLASSINFO - 0x00400000);
+    const bool descOk = Readable((const void*)coordDesc, 4);
+
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[Coord] census at examined=%d\n", examined);
+    Phase1_LogLine(line);
+
+    BaseBigArray<Reference>& ents = w->m_EntityManager.m_Entities;   // World.h:228
+    int nobj = 0;
+    __try { nobj = ents.GetSize(); } __except (EXCEPTION_EXECUTE_HANDLER) { nobj = 0; }
+    if (nobj <= 0) {
+        Phase1_LogLine("[Coord] entities=0 coordinators=0\n");
+        Phase1_LogLine("[Coord] entity manager unusable: count unreadable or empty\n");
+        return;
+    }
+    const int n = ((unsigned)nobj > kMaxEntries) ? (int)kMaxEntries : nobj;
+
+    VtCount  map[kMaxDistinctCoordVt];
+    int      distinct = 0;
+    uint32_t overflow = 0;
+    int      entities = 0, coordinators = 0, logicNull = 0, logged = 0;
+
+    for (int i = 0; i < n; ++i) {
+        Reference* ref = nullptr;
+        __try { ref = ents.GetElement(i); } __except (EXCEPTION_EXECUTE_HANDLER) { break; }
+        if (!ref || !Readable(ref, 4)) break;                    // same break/continue split as phase1
+
+        HandleContainer* hc = nullptr;
+        Entity* e = nullptr;
+        __try {
+            hc = ref->m_HandleContainer;
+            if (hc) e = (Entity*)hc->m_Object;
+        } __except (EXCEPTION_EXECUTE_HANDLER) { hc = nullptr; e = nullptr; }
+        if (!hc || !Readable(hc, 4)) continue;
+        if (!e || !Readable(e, 4)) continue;
+        entities++;
+
+        if (!descOk) continue;
+        uintptr_t comp = 0;
+        __try { comp = (uintptr_t)e->GetComponentByType((ClassDescriptor*)coordDesc); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { comp = 0; }
+        if (!comp) continue;
+        coordinators++;
+
+        // comp+0x60 -> Coordinator, coord+0x64 -> GameplayLogic (GcL*). Each hop is guarded separately so a
+        // garbage offset can only produce an empty field in one line, never a read fault.
+        uintptr_t coord = 0, logic = 0, vtRaw = 0;
+        if (Readable((const void*)(comp + 0x60), 4)) ReadPtr(comp + 0x60, &coord);
+        if (coord && Readable((const void*)coord, 0x70)) ReadPtr(coord + 0x64, &logic);
+        if (!logic) logicNull++;
+        if (logic && Readable((const void*)logic, 4)) ReadPtr(logic, &vtRaw);
+        const uint32_t vt = (uint32_t)vtRaw;
+        if (vt) CensusBump(map, &distinct, &overflow, vt);   // vt==0 is "no logic", counted as logicNull only
+
+        if (logged < kMaxCoordLines) {
+            _snprintf_s(line, sizeof(line), _TRUNCATE,
+                        "[Coord] ent=%p comp=%p coord=%p logic=%p vt=%08X\n",
+                        (void*)e, (void*)comp, (void*)coord, (void*)logic, vt);
+            Phase1_LogLine(line);
+            logged++;
+        }
+    }
+
+    if (coordinators == 0) {
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[Coord] entities=%d coordinators=0\n", entities);
+        Phase1_LogLine(line);
+        if (!descOk) {
+            _snprintf_s(line, sizeof(line), _TRUNCATE,
+                        "[Coord] classinfo %08X unreadable: the component test was skipped\n",
+                        (unsigned)VA_COORD_CLASSINFO);
+            Phase1_LogLine(line);
+        }
+        return;
+    }
+
+    _snprintf_s(line, sizeof(line), _TRUNCATE,
+                "[Coord] entities=%d coordinators=%d logicNull=%d distinct=%d\n",
+                entities, coordinators, logicNull, distinct);
+    Phase1_LogLine(line);
+    if (overflow) {
+        _snprintf_s(line, sizeof(line), _TRUNCATE,
+                    "[Coord] vt-overflow=%u (more than %d distinct logic vtables)\n",
+                    overflow, kMaxDistinctCoordVt);
+        Phase1_LogLine(line);
+    }
+    if (logged >= kMaxCoordLines) {
+        _snprintf_s(line, sizeof(line), _TRUNCATE,
+                    "[Coord] per-entity lines capped at %d; the summary counts are complete\n", kMaxCoordLines);
+        Phase1_LogLine(line);
+    }
+
+    for (int i = 1; i < distinct; ++i) {                 // insertion sort, descending by count
+        const VtCount cur = map[i];
+        int j = i - 1;
+        while (j >= 0 && map[j].n < cur.n) { map[j + 1] = map[j]; --j; }
+        map[j + 1] = cur;
+    }
+    const int top = (distinct < kMaxTopCoordVt) ? distinct : kMaxTopCoordVt;
+    for (int i = 0; i < top; ++i) {
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[Coord] vt=%08X n=%d\n", map[i].vt, (int)map[i].n);
+        Phase1_LogLine(line);
+    }
+}
+
 void ShotOnce(bool logDetail)
 {
     char line[256];
@@ -519,6 +660,7 @@ void ShotOnce(bool logDetail)
         Phase1_LogLine("[Fort] detail capped at 8 forts x 8 towers per 10 s; the counts above are complete\n");
 
     CensusOnce(w, sh.examined);   // one shot, at the first walk that examined >= 1000 entities
+    CoordOnce(w, sh.examined);    // one shot, same arming, independent s_done
 }
 
 }  // namespace
