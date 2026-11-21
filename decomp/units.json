@@ -1,5 +1,14 @@
 {
  "units": {
+  "017E5DF0": {
+   "addr": "017E5DF0",
+   "claimed_at": null,
+   "name": "GcLNavalTowerACGADamage",
+   "owner": null,
+   "receipts": [],
+   "size": 0,
+   "status": "unknown"
+  },
   "004212A0": {
    "addr": "004212A0",
    "claimed_at": null,

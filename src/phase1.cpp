@@ -14046,6 +14046,7 @@ static void OnFrameInner(Human* updatedHuman) {
     BoardProbeTick();                                          // [Coop] BoardProbe (default 0): no-op unless set
     { extern void FortProbeTick(); FortProbeTick(); }           // [Coop] FortProbe (default 0): read-only fort/tower enumeration
     { extern void CoordEnumTick(); CoordEnumTick(); }           // [Coop] CoordEnum (default 0): read-only coordinator census
+    { extern void FortDamageTestTick(); FortDamageTestTick(); } // [Coop] FortDamageTest (default 0): one-shot damage->disable->phase oracle
     CoordSyncTick();                                            // [Coop] CoordSync (default 0): host publishes GcLShip fields
     if (Net::Enabled()) {
         EntitySyncTick();   // host broadcasts entity transforms; peer mirrors them (synced worlds)
