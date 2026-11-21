@@ -48,6 +48,23 @@ enum CoordField : uint8_t {
     // a written value is not reverted the way the hull at +0xD0 is. Carries its own epoch rule - see
     // CoordSyncApplyMsg in coord_sync.cpp: last writer wins by sequence, ties to the lower peer id.
     CF_HELM = 9,           // +0x39A CaptainAtWheel (uint8 0|1)
+    // ShipAIDetectionSettings tuning values ([Coop] ShipTuning, default 0). LOCAL lane in this build: no
+    // network path uses these ids yet - they exist so a future sync lane has a stable wire id per value.
+    // The block is resolved exactly like the engine's own selector (0x012080A0): GcLShip+0x14C override when
+    // its weak-owner test passes, else GcLShip+0x148 cached; then +0x8 (Day) or +0x40 (HighSecurityZone) by
+    // GcLShip+0x3AF. Day and HSZ get their own ids so the receiver does not have to re-resolve the selector.
+    // ship-tuning-2026-11-21.md Q1 (offsets), Q3 (the floats are `stores`: both found readers are getters).
+    CF_TUNE_DAY_CONE_ANGLE = 10,   // Day+0x0C DetectionConeAngle   (120.0 live; units [UNPROVEN])
+    CF_TUNE_DAY_CONE_RANGE = 11,   // Day+0x10 DetectionConeRange   (350.0 live)
+    CF_TUNE_DAY_MAX_TIME = 12,     // Day+0x18 DetectionMaxTime     (30.0 live)
+    CF_TUNE_DAY_AGGRO_TIME = 13,   // Day+0x34 AggroTime            (30.0 live)
+    CF_TUNE_HSZ_CONE_ANGLE = 14,   // HSZ+0x44 DetectionConeAngle
+    CF_TUNE_HSZ_CONE_RANGE = 15,   // HSZ+0x48 DetectionConeRange
+    CF_TUNE_HSZ_MAX_TIME = 16,     // HSZ+0x50 DetectionMaxTime
+    CF_TUNE_HSZ_AGGRO_TIME = 17,   // HSZ+0x6C AggroTime
+    // GcLShip+0xD0 HullHealth, written through the engine setter 0x01225A10 (never a raw store: that skips
+    // the +0x520 mirror and sub_1220B60, ship-tuning-2026-11-21.md Q3).
+    CF_TUNE_HULL = 18,
 };
 
 struct CoordSchema {

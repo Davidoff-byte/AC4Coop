@@ -4,6 +4,7 @@
 #include "paths.h"
 #include "net.h"
 #include "coord_sync.h"
+#include "coord_enum.h"     // CoordCollect: the coord walk the [Coop] ShipTuning probe enumerates
 #include "Hook.h"
 #include "build_info.h"
 #include "action_writer.h"
@@ -8926,6 +8927,246 @@ static void HelmSeatTick() {
       (void*)ship, cap2, drv, solo, sfl);
 }
 
+// ---- [Coop] ShipTuning (default 0): local, per-ship ship-AI tuning lane --------------------------
+// The four tuning floats of one ship's detection model are plain DATA in ShipAIDetection, which is
+// embedded twice inside ShipAIDetectionSettings (Day at +0x8, HighSecurityZone at +0x40). The only two
+// functions found touching that object are pure getters - 0x012080A0 selects a block, 0x012122D0 reads
+// block+0x14 - so a write is expected to be `stores` with no per-tick re-initialiser. The risk is not
+// the field: it is the POINTER. GcLShip+0x14C (the override) can resolve into the exe image (observed
+// 0x04DD5F8C), and sub_12080A0 prefers it over +0x148, so a write through it retunes every ship on
+// that shared default. Whether two ships of one archetype share the cached (+0x148) object is
+// [UNPROVEN]. So this lane is a probe first and a writer second:
+//   ShipTuning=1 ShipTuningProbe=1  -> one line per ship per 10 s, nothing written
+//   ShipTuning=1 ShipTuningApply=1  -> writes only when the resolved block is NOT shared, re-reads each
+//                                      field, and goes through the engine setter for the hull
+// Evidence: ops/evidence/ship-tuning-2026-11-21.md (Q1 offsets / Q3 persistence / Q4 sharing risk).
+// The block selector 0x012080A0 is INLINED here, not called, so this lane adds no engine receipt. The
+// only engine address used is the hull setter 0x01225A10 - a raw +0xD0 store would skip the +0x520
+// mirror and the sub_1220B60 tier recompute (ship-tuning-2026-11-21.md Q3). No other flag is touched.
+static const uint32_t  kTuneGcLShipVt     = 0x026A34E8u;   // same vtable guard coord_sync.cpp:76 takes
+static const uintptr_t kTuneImageLo       = 0x00400000u;   // AC4BFSP.exe image range: shared data by definition
+static const uintptr_t kTuneImageHi       = 0x00E00000u;
+static const uintptr_t kTuneSharedDefault = 0x04DD5F8Cu;   // the override value the live sample showed
+
+enum TuneFlag { TF_SHIPTUNING = 0, TF_PROBE = 1, TF_APPLY = 2 };
+static int  s_tuneFlag[3] = { -1, -1, -1 };                 // ini, read once (the s_x = -1 idiom)
+static bool TuneFlagOn(TuneFlag f) {
+    if (s_tuneFlag[f] < 0) {
+        static const char* kName[3] = { "ShipTuning", "ShipTuningProbe", "ShipTuningApply" };
+        static const int   kDef[3]  = { 0, 1, 0 };
+        s_tuneFlag[f] = GetPrivateProfileIntA("Coop", kName[f], kDef[f], Paths::Ini()) != 0 ? 1 : 0;
+    }
+    return s_tuneFlag[f] == 1;
+}
+
+// One tunable value: the ini key, the field name for the log, and the two block offsets. Both blocks are
+// written because the selector only says which one the engine uses right now - a ship switched to HSZ
+// detection should not silently lose its tune.
+struct TuneField { const char* iniKey; const char* dayName; const char* hszName; uint32_t dayOff; uint32_t hszOff; uint8_t cfDay; uint8_t cfHsz; };
+static const TuneField kTuneFields[] = {
+    // ship-tuning-2026-11-21.md Q1b: SAID+0x4 -> SADS+0xC (Day) / +0x44 (HSZ), and so on.
+    { "TuneConeAngle", "Day.DetectionConeAngle", "HSZ.DetectionConeAngle", 0x0C, 0x44, CF_TUNE_DAY_CONE_ANGLE, CF_TUNE_HSZ_CONE_ANGLE },
+    { "TuneConeRange", "Day.DetectionConeRange", "HSZ.DetectionConeRange", 0x10, 0x48, CF_TUNE_DAY_CONE_RANGE, CF_TUNE_HSZ_CONE_RANGE },
+    { "TuneMaxTime",   "Day.DetectionMaxTime",   "HSZ.DetectionMaxTime",   0x18, 0x50, CF_TUNE_DAY_MAX_TIME,   CF_TUNE_HSZ_MAX_TIME },
+    { "TuneAggroTime", "Day.AggroTime",          "HSZ.AggroTime",          0x34, 0x6C, CF_TUNE_DAY_AGGRO_TIME, CF_TUNE_HSZ_AGGRO_TIME },
+};
+static const int kTuneFieldN = (int)(sizeof(kTuneFields) / sizeof(kTuneFields[0]));
+
+struct TuneVal { int set; float v; };
+static TuneVal    s_tuneVal[kTuneFieldN];
+static TuneVal    s_tuneHull = { 0, 0.0f };
+static int        s_tuneIniRead = -1;
+// Values are floats, so they are read as strings and parsed (GetPrivateProfileIntA would truncate
+// 140.5 to 140). ABSENT means "do not touch that field", not "zero".
+static TuneVal TuneReadFloat(const char* key) {
+    TuneVal r; r.set = 0; r.v = 0.0f;
+    const char sent[] = "\x1A\x1B absent";
+    char buf[64];
+    GetPrivateProfileStringA("Coop", key, sent, buf, sizeof(buf), Paths::Ini());
+    if (strcmp(buf, sent) == 0 || !buf[0]) return r;
+    char* end = nullptr;
+    const double d = strtod(buf, &end);
+    if (end == buf) return r;
+    r.set = 1; r.v = (float)d;
+    return r;
+}
+static void TuneReadIniOnce() {
+    if (s_tuneIniRead >= 0) return;
+    s_tuneIniRead = 1;
+    for (int i = 0; i < kTuneFieldN; ++i) s_tuneVal[i] = TuneReadFloat(kTuneFields[i].iniKey);
+    s_tuneHull = TuneReadFloat("TuneHull");
+}
+
+// Resolve the ship's ShipAIDetectionSettings* and the block the engine would use. This reproduces
+// 0x012080A0 instruction for instruction, reading only fields (+0x148 cached, +0x14C override handle,
+// +0x3AF IsUsingHighSecurityDetection) through Readable() so nothing is dereferenced blind:
+//   v1 = *(GcLShip+0x14C)                  the override is a WEAK-OWNER HANDLE, not the object:
+//   v2 = (int)v1[2] >> 31                  -1 when the validity word's sign bit is set
+//   obj = *v1 & v2                         the object pointer, zeroed when the handle is not valid
+//   base = obj ? obj : *(GcLShip+0x148)    the override WINS when valid (that is the shared-data risk)
+//   block = base + (IsUsingHighSecurityDetection ? 0x40 : 0x8)
+struct TuneBlockRef {
+    void*    gcl;
+    uint64_t key;
+    void*    cached;     // GcLShip+0x148, raw
+    void*    overH;      // GcLShip+0x14C, raw handle
+    void*    base;       // resolved settings object (override object, else cached)
+    void*    block;      // base + 0x8 or +0x40 - what the engine reads
+    int      hsz;
+};
+static bool TuneResolve(void* gcl, TuneBlockRef* out) {
+    if (!gcl || !readable(gcl, 0x3B0)) return false;          // covers +0x3AF
+    void* cached = *(void**)((char*)gcl + 0x148);
+    void* overH  = *(void**)((char*)gcl + 0x14C);
+    void* overObj = nullptr;
+    if (overH && readable(overH, 0x0C)) {
+        const int valid = (*(int*)((char*)overH + 8)) >> 31;   // -1 = valid, the engine's test
+        void* obj = *(void**)overH;
+        if (valid && obj) overObj = obj;
+    }
+    const int hsz = (*(unsigned char*)((char*)gcl + 0x3AF)) ? 1 : 0;
+    void* base = overObj ? overObj : cached;
+    if (!base) return false;
+    out->gcl    = gcl;
+    out->cached = cached;
+    out->overH  = overH;
+    out->base   = base;
+    out->block  = (char*)base + (hsz ? 0x40 : 0x8);
+    out->hsz    = hsz;
+    return true;
+}
+static bool TuneInImage(const void* p) {
+    const uintptr_t v = (uintptr_t)p;
+    return v >= kTuneImageLo && v < kTuneImageHi;
+}
+
+// "once per key" refusal log: a static set of ship keys already reported, so the 10 s tick cannot
+// repeat the same line forever.
+static uint64_t s_tuneRefused[64];
+static int      s_tuneRefusedN = 0;
+static bool TuneRefuseOnce(uint64_t key) {
+    for (int i = 0; i < s_tuneRefusedN; ++i) if (s_tuneRefused[i] == key) return false;
+    if (s_tuneRefusedN < 64) s_tuneRefused[s_tuneRefusedN++] = key;
+    return true;
+}
+
+// The hull setter is the only engine call in this lane. Its own SEH frame so one throw cannot hide the
+// before/after readings that decide whether the write stuck.
+static bool TuneCallHullSetter(void* gcl, float v) {
+    bool ok = false;
+    __try {
+        ((void (__thiscall*)(void*, float))0x01225A10)(gcl, v);   // unit: decomp/units.json 01225A10
+        ok = true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        L("[Tune] EXCEPTION 0x%08X hull setter gcl=%p v=%.3f\n", GetExceptionCode(), gcl, v);
+    }
+    return ok;
+}
+
+// Per ship key, at most one probe line per 10 s. Slot 0 is never used (tick stamp of 0 = "never"); the
+// table is small on purpose - the coord census is 9 GcLShips on the 2026-11-21 sample.
+struct TuneSeen { uint64_t key; DWORD at; };
+static TuneSeen s_tuneSeen[64];
+static int      s_tuneSeenN = 0;
+static bool TuneProbeDue(uint64_t key, DWORD now) {
+    for (int i = 0; i < s_tuneSeenN; ++i) {
+        if (s_tuneSeen[i].key != key) continue;
+        if (now - s_tuneSeen[i].at < 10000) return false;
+        s_tuneSeen[i].at = now;
+        return true;
+    }
+    if (s_tuneSeenN < 64) { s_tuneSeen[s_tuneSeenN].key = key; s_tuneSeen[s_tuneSeenN].at = now; ++s_tuneSeenN; }
+    return true;
+}
+
+static void ShipTuningTick() {
+    if (!TuneFlagOn(TF_SHIPTUNING)) return;                   // flag off: no walk, no read, no log
+    const bool probe = TuneFlagOn(TF_PROBE);
+    const bool apply = TuneFlagOn(TF_APPLY);
+    if (!probe && !apply) return;
+    static DWORD s_next = 0;
+    const DWORD now = GetTickCount();
+    if (s_next && now - s_next < 10000) return;
+    s_next = now;
+    if (apply) TuneReadIniOnce();
+
+    static CoordRef  refs[64];
+    static TuneBlockRef ships[32];
+    int n = 0;
+    __try {
+        const int nr = CoordCollect(refs, 64);
+        for (int i = 0; i < nr && n < 32; ++i) {
+            if (refs[i].vt != kTuneGcLShipVt || !refs[i].logic) continue;   // GcLShip coordinators only
+            TuneBlockRef b;
+            if (!TuneResolve(refs[i].logic, &b)) continue;
+            b.key = refs[i].objId ? refs[i].objId : (uint64_t)(uintptr_t)refs[i].logic;
+            ships[n++] = b;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        L("[Tune] EXCEPTION 0x%08X in the coord walk\n", GetExceptionCode());
+        return;
+    }
+
+    // sharedDefault, decided per pass - never statically. A block is shared when it is the image override
+    // the live sample showed, when ANY pointer on the way to it lands inside the exe image, or when another
+    // ship in THIS pass resolved to the same object - which is exactly the "per-archetype cached object"
+    // question ship-tuning-2026-11-21.md Q4 leaves [UNPROVEN].
+    for (int i = 0; i < n; ++i) {
+        const TuneBlockRef& b = ships[i];
+        int shared = 0;
+        if ((uintptr_t)b.block == kTuneSharedDefault) shared = 1;
+        if (TuneInImage(b.block) || TuneInImage(b.base) || TuneInImage(b.cached) || TuneInImage(b.overH)) shared = 1;
+        for (int j = 0; j < n && !shared; ++j) {
+            if (j == i) continue;
+            if (ships[j].block == b.block || ships[j].base == b.base) shared = 1;
+        }
+        if (probe && TuneProbeDue(b.key, now)) {
+            L("[Tune] ship=%016llX cached=%p override=%p block=%p hsz=%d sharedDefault=%d\n",
+              (unsigned long long)b.key, b.cached, b.overH, b.block, b.hsz, shared);
+        }
+        if (!apply) continue;
+        if (shared) {
+            if (TuneRefuseOnce(b.key))
+                L("[Tune] refuse key=%016llX reason=shared-default\n", (unsigned long long)b.key);
+            continue;
+        }
+        // Writes land only inside the 0x78-byte settings object that holds BOTH blocks (Day +0x8..+0x3F,
+        // HSZ +0x40..+0x77). Readable() is the gate; __try is the belt.
+        if (!readable(b.base, 0x78)) {
+            if (TuneRefuseOnce(b.key))
+                L("[Tune] refuse key=%016llX reason=unreadable\n", (unsigned long long)b.key);
+            continue;
+        }
+        char* day = (char*)b.base + 0x8;
+        char* hsz = (char*)b.base + 0x40;
+        __try {
+            for (int f = 0; f < kTuneFieldN; ++f) {
+                if (!s_tuneVal[f].set) continue;                // key absent: leave the field alone
+                const float v = s_tuneVal[f].v;
+                const float bd = *(float*)(day + kTuneFields[f].dayOff);
+                const float bh = *(float*)(hsz + kTuneFields[f].hszOff);
+                *(float*)(day + kTuneFields[f].dayOff) = v;
+                *(float*)(hsz + kTuneFields[f].hszOff) = v;
+                // Re-read in the same tick. after != wrote is the signal that something rewrote the field
+                // before we could look - the whole reason this lane exists.
+                L("[Tune] apply key=%016llX field=%s before=%.3f wrote=%.3f after=%.3f\n",
+                  (unsigned long long)b.key, kTuneFields[f].dayName, bd, v, *(float*)(day + kTuneFields[f].dayOff));
+                L("[Tune] apply key=%016llX field=%s before=%.3f wrote=%.3f after=%.3f\n",
+                  (unsigned long long)b.key, kTuneFields[f].hszName, bh, v, *(float*)(hsz + kTuneFields[f].hszOff));
+            }
+            if (s_tuneHull.set && s_tuneHull.v > 0.0f && readable(b.gcl, 0xD4)) {
+                const float before = *(float*)((char*)b.gcl + 0xD0);
+                if (TuneCallHullSetter(b.gcl, s_tuneHull.v))
+                    L("[Tune] apply key=%016llX field=HullHealth before=%.3f wrote=%.3f after=%.3f\n",
+                      (unsigned long long)b.key, before, s_tuneHull.v,
+                      *(float*)((char*)b.gcl + 0xD0));          // +0xD0 = what sub_1225A10 stores
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            L("[Tune] EXCEPTION 0x%08X in apply key=%016llX\n", GetExceptionCode(), (unsigned long long)b.key);
+        }
+    }
+}
+
 // Sender: the local player's own frame.
 static void FightIntentSend(Human* player) {
     if (!FightIntentsOn()) return;
@@ -14518,6 +14759,10 @@ static void DumpConfigOnce()
     struct K { const char* s; const char* k; int d; };
     static const K keys[] = {
         { "Coop", "BoardObjectiveSync", 0 },
+        { "Coop", "ShipTuning", 0 }, { "Coop", "ShipTuningProbe", 1 }, { "Coop", "ShipTuningApply", 0 },
+        // The Tune* values are floats (read with strtod, see ShipTuningTick); the dump shows the integer part.
+        { "Coop", "TuneConeAngle", 120 }, { "Coop", "TuneConeRange", 350 }, { "Coop", "TuneMaxTime", 30 },
+        { "Coop", "TuneAggroTime", 30 }, { "Coop", "TuneHull", 0 },
         { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "CombatObserve", 0 },
         { "Coop", "CombatTest", 0 }, { "Coop", "CrashContext", 0 }, { "Coop", "CorpseKeepSec", 30 }, { "Coop", "CrowdProbeIntegrate", 1 },
         { "Coop", "CrowdProbeLiveKeys", 1 }, { "Coop", "DamageRelay", 0 }, { "Coop", "Diag", 0 },
@@ -14582,7 +14827,7 @@ static void OnFrameInner(Human* updatedHuman) {
     }
     Pilot::OnPlayerFrame(updatedHuman);   // [Pilot] Enabled only: publish the player + m_CharacterList
     if (CombatTiming::On()) CtpPlayerFrame(updatedHuman);   // [Coop] CombatTimingProbe: frame interval, the player's action and life
-    __try { FightIntentSend(updatedHuman); FightIntentDrain(); OwnerDamageGuestPump(); PlayerDamageHostPump(); AttackForwardHostPump(); AttackForwardOwnerTick(); SailPublishTick(); SailConsumeTick(); SailTestCycleTick(); HelmSeatTick(); GalHostSweep(); GsaPoll(); SpawnerIdProbeTick(); }   // [Coop] FightIntents / OwnerDamage / SailSync / SailTestCycle(harness) / HelmSeat(harness) / GuardActionLane / GuardStageApply / SpawnerIdProbe only
+    __try { FightIntentSend(updatedHuman); FightIntentDrain(); OwnerDamageGuestPump(); PlayerDamageHostPump(); AttackForwardHostPump(); AttackForwardOwnerTick(); SailPublishTick(); SailConsumeTick(); SailTestCycleTick(); HelmSeatTick(); ShipTuningTick(); GalHostSweep(); GsaPoll(); SpawnerIdProbeTick(); }   // [Coop] FightIntents / OwnerDamage / SailSync / SailTestCycle(harness) / HelmSeat(harness) / ShipTuning / GuardActionLane / GuardStageApply / SpawnerIdProbe only
     __except (EXCEPTION_EXECUTE_HANDLER) { static int s_fe = 0; if (s_fe < 10) { ++s_fe; L("[FI] EXCEPTION 0x%08X in send/drain\n", GetExceptionCode()); } }
 
     ProbeIdentityOnce();
