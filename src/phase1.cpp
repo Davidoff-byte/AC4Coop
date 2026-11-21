@@ -8792,10 +8792,18 @@ static void FightIntentApply(Human* pup) {
 // Probe (runs with the flag off whenever GuardActionLane is on): per sampled copy frame, host stage vs copy stage.
 // UNVERIFIED: that a copy whose behaviour component is disabled accepts the Can/Do calls (the [GSA] rc / do lines tell).
 static int g_guardStageApply = 0;
+// [Coop] GuardStageForceEnter (default 0). Run 2026-11-21: enter try=23 ok=3, noTarget=0 - the engine's CanEnterFight
+// refused the behaviour-disabled copy in 20 of 23 attempts. The refusing gate is |self.z - target.z| < 3.0f
+// (0x1D269F0, constant 0x40400000; ops/evidence/enter-fight-refusal-2026-11-21.md); the behaviour-disabled state is not
+// consulted. When this flag is on the enter attempt skips CanEnterFight (slot 75) and calls DoEnterFight directly, only
+// when the ground dispatch id is 4 (Ground), the precondition 0x1D5D920 itself tests. The behaviour component stays
+// disabled (re-enabling it would let the copy run its own AI). Exit path untouched.
+static int g_guardStageForceEnter = 0;
 struct GsaEnt { unsigned int human, ent; uint64_t objId; uint8_t hostStage, tgt; uint64_t tryUs; };
 static GsaEnt s_gsa[64]; static volatile LONG s_gsaN = 0; static SRWLOCK s_gsaLock = SRWLOCK_INIT;
 static volatile LONG s_gsaFrames = 0, s_gsaAgree = 0, s_gsaHostFight = 0, s_gsaBothFight = 0, s_gsaEnterTry = 0, s_gsaEnterOk = 0,
-                     s_gsaExitTry = 0, s_gsaExitOk = 0, s_gsaNoTarget = 0, s_gsaLines = 0;
+                     s_gsaExitTry = 0, s_gsaExitOk = 0, s_gsaNoTarget = 0, s_gsaLines = 0,
+                     s_gsaForceSkip = 0, s_gsaForceLines = 0, s_gsaSkipLines = 0;
 static void GsaNote(Entity* e, uint64_t objId, uint8_t stage, uint8_t tgt) {   // guest player update (lane drain)
     Human* h = AIEntityHelper::GetHuman(e);
     if (!h || !stage) return;
@@ -8839,8 +8847,35 @@ static void GsaOwnUpdate(Human* h) {   // ANY Human's own update, guest
         if (!readable(t, 0xCC)) { InterlockedIncrement(&s_gsaNoTarget); return; }
         uint32_t hnd = *(uint32_t*)((char*)t + 0xC8);
         InterlockedIncrement(&s_gsaEnterTry);
-        rc = FiCall(ig, 75, 1, (uint32_t)&hnd);                                  // CanEnterFight(const Handle&)
-        if (rc & 0xFF) { rd = FiCall(ig, 76, 1, (uint32_t)&hnd); InterlockedIncrement(&s_gsaEnterOk); }   // DoEnterFight
+        if (g_guardStageForceEnter) {
+            // [Coop] GuardStageForceEnter: call DoEnterFight (IHumanGround slot 76 = vtable byte 0x130; VA 0x1D79A50)
+            // directly, bypassing CanEnterFight (slot 75) whose 3.0 m z gate (0x1D269F0) refuses this copy. The vtable
+            // slot is used, never the VA, so the dispatch follows the interface in use. The ground dispatch id must be 4
+            // (Ground): sub_1D5D920 tests *(u16*)(*(fsm+0x118)+6) == 4 before anything else (phase1.cpp:2339-2343), and
+            // fsm = [interface+0x90] = [hg+0xA0] is the pointer FiPath already reads.
+            char* fsm = readable((char*)ig + 0x90, 4) ? *(char**)((char*)ig + 0x90) : nullptr;
+            const char* ss = readable(fsm, 0x11C) ? *(const char**)(fsm + 0x118) : nullptr;
+            const unsigned gid = readable(ss, 8) ? (unsigned)*(const uint16_t*)(ss + 6) : 0u;
+            float dz = -1.0f;
+            Entity* self = (Entity*)g.ent;
+            if (readable(self, 0xCC)) {
+                const float az = self->m_GlobalMatrix.M43, bz = t->m_GlobalMatrix.M43;
+                dz = az > bz ? az - bz : bz - az;
+            }
+            if (gid != 4) {
+                InterlockedIncrement(&s_gsaForceSkip);
+                if (InterlockedIncrement(&s_gsaSkipLines) <= 60)
+                    L("[GSA] skip gid=%u copy=%08X id=%016llX t=%llu\n", gid, g.ent, (unsigned long long)g.objId, (unsigned long long)now);
+            } else {
+                rd = FiCall(ig, 76, 1, (uint32_t)&hnd);                          // DoEnterFight(const Handle&)
+                if (InterlockedIncrement(&s_gsaForceLines) <= 60)
+                    L("[GSA] force enter gid=%u dz=%.2f target=%p ok=%d\n", gid, dz, (void*)t, (int)(rd & 0xFF));
+                if (rd & 0xFF) InterlockedIncrement(&s_gsaEnterOk);
+            }
+        } else {
+            rc = FiCall(ig, 75, 1, (uint32_t)&hnd);                              // CanEnterFight(const Handle&)
+            if (rc & 0xFF) { rd = FiCall(ig, 76, 1, (uint32_t)&hnd); InterlockedIncrement(&s_gsaEnterOk); }   // DoEnterFight
+        }
     } else {
         InterlockedIncrement(&s_gsaExitTry);
         rc = FiCall(ig, 112, 1, 0);                                               // CanExitFight(ExitFightType_Normal)
@@ -8858,12 +8893,14 @@ static void GsaPoll() {   // player update: follow the ini every 2 s
     s_next = t + 2000;
     const int v = GetPrivateProfileIntA("Coop", "GuardStageApply", 0, Paths::Ini()) != 0 ? 1 : 0;
     if (v != g_guardStageApply) { L("[GSA] GuardStageApply=%d (was %d) t=%llu us\n", v, g_guardStageApply, (unsigned long long)OwnNowUs()); g_guardStageApply = v; }
+    const int f = GetPrivateProfileIntA("Coop", "GuardStageForceEnter", 0, Paths::Ini()) != 0 ? 1 : 0;
+    if (f != g_guardStageForceEnter) { L("[GSA] GuardStageForceEnter=%d (was %d) t=%llu us\n", f, g_guardStageForceEnter, (unsigned long long)OwnNowUs()); g_guardStageForceEnter = f; }
 }
 static void GsaReport() {
     if (!g_guardActLane || g_entHost == 1) return;
-    L("[GSA] apply=%d copies=%ld frames=%ld agree=%ld hostFight=%ld bothFight=%ld | enter try=%ld ok=%ld exit try=%ld ok=%ld noTarget=%ld\n",
-      g_guardStageApply, s_gsaN, s_gsaFrames, s_gsaAgree, s_gsaHostFight, s_gsaBothFight, s_gsaEnterTry, s_gsaEnterOk, s_gsaExitTry,
-      s_gsaExitOk, s_gsaNoTarget);
+    L("[GSA] apply=%d/%d copies=%ld frames=%ld agree=%ld hostFight=%ld bothFight=%ld | enter try=%ld ok=%ld exit try=%ld ok=%ld noTarget=%ld forceSkip=%ld\n",
+      g_guardStageApply, g_guardStageForceEnter, s_gsaN, s_gsaFrames, s_gsaAgree, s_gsaHostFight, s_gsaBothFight, s_gsaEnterTry,
+      s_gsaEnterOk, s_gsaExitTry, s_gsaExitOk, s_gsaNoTarget, s_gsaForceSkip);
 }
 
 // ---- [Coop] GuardPlace writer (docs/design/enemy-placement.md) -------------------------------------------------------
@@ -13679,7 +13716,7 @@ static void DumpConfigOnce()
         { "Coop", "ShipPassenger", 0 }, { "Coop", "ShipRelevanceRadiusM", 1000 }, { "Coop", "ShipSync", 1 },
         { "Coop", "ShipTest", 0 }, { "Coop", "ShipTestFracPct", 45 }, { "Coop", "ShipTestRadiusM", 250 },
         { "Coop", "ActionWriterProbe", 0 }, { "Coop", "BlendTypeSafe", 0 }, { "Coop", "EntityFrameCadence", 0 },
-        { "Coop", "FloatProbe", 0 }, { "Coop", "FootOffsetFix", 0 }, { "Coop", "GuardActionGate", 0 }, { "Coop", "GuardActionLane", 0 }, { "Coop", "RespawnHitGraceMs", 0 }, { "Coop", "GuardStageApply", 0 }, { "Coop", "CombatTimingProbe", 0 }, { "Coop", "GuardExtrapMs", 100 },
+        { "Coop", "FloatProbe", 0 }, { "Coop", "FootOffsetFix", 0 }, { "Coop", "GuardActionGate", 0 }, { "Coop", "GuardActionLane", 0 }, { "Coop", "RespawnHitGraceMs", 0 }, { "Coop", "GuardStageApply", 0 }, { "Coop", "GuardStageForceEnter", 0 }, { "Coop", "CombatTimingProbe", 0 }, { "Coop", "GuardExtrapMs", 100 },
         { "Coop", "GuardInterpBuffer", 0 }, { "Coop", "GuardInterpDelayMs", 120 }, { "Coop", "GuardPhaseLock", 0 },
         { "Coop", "GuardSeesPuppet", 0 }, { "Coop", "PuppetActionReassert", 0 }, { "Coop", "PuppetHostTime", 0 },
         { "Coop", "AlertQueryAsPlayer", 0 }, { "Coop", "ConflictNullGuard", 0 }, { "Coop", "ConflictKeepPuppet", 0 }, { "Coop", "GuardPoiFightTarget", 0 }, { "Coop", "FightOrderPuppet", 0 }, { "Coop", "DespawnLeaveFight", 0 }, { "Coop", "FightKeepOnConflictEnd", 0 }, { "Coop", "FightStateProbe", 0 }, { "Coop", "PuppetNavService", 0 }, { "Coop", "NativeReplica", 0 }, { "Coop", "NativeReplicaSnapCm", 300 }, { "Coop", "NativeReplicaBlendCmS", 150 }, { "Coop", "NativeReplicaStartBoostCmS", 400 }, { "Coop", "NativeReplicaParkour", 0 }, { "Coop", "NativeReplicaFreeRun", 0 }, { "Coop", "NativeReplicaClimbIntent", 0 }, { "Coop", "NativeReplicaClimbMoves", 0 }, { "Coop", "NativeReplicaClimbChoice", 0 }, { "Coop", "NativeReplicaBeam", 0 }, { "Coop", "NativeReplicaWallEntry", 0 }, { "Coop", "NativeReplicaClimbNoSnap", 0 }, { "Coop", "NativeReplicaParkourSnapCm", 800 }, { "Coop", "FightProbe", 0 }, { "Coop", "PeerLastPacket", 0 }, { "Coop", "PuppetActionsOwnUpdate", 1 }, { "Coop", "DetectKeepTarget", 0 }, { "Coop", "GuardPlayerOfInterest", 0 }, { "Coop", "EventProbe", 0 }, { "Coop", "PlayerDamageProbe", 0 }, { "Coop", "ReactProbe", 0 }, { "Coop", "FightSkipPuppet", 0 }, { "Coop", "NavNullGuard", 0 }, { "Coop", "PuppetStimMode", 1 }, { "Coop", "PuppetStimSeq", 0 }, { "Coop", "PuppetStimSource", 0 }, { "Coop", "PuppetFightStim", 1 }, { "Coop", "PuppetFightStimMs", 1000 }, { "Coop", "SightProbe", 0 }, { "Coop", "StateProbe", 0 }, { "Coop", "StuckProbe", 0 },
