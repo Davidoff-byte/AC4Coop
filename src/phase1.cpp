@@ -8839,6 +8839,18 @@ void* CoordSyncProxyEntity(uint64_t hostId) {
 // Unit: decomp/units.json 009F0B50 "GetObjectID" (receipt 2026-11-08).
 static uint64_t IdentityIdOf(void* obj);                  // defined with the [Coop] IdentityBand block below
 uint64_t CoordSyncObjectId(const void* obj) { return IdentityIdOf((void*)obj); }
+// Helm lever ([Coop] HelmSync, coord_sync.cpp CF_HELM) - the ONE proven route for GcLShip+0x39A and the same
+// call the [Coop] HelmSeat harness above already makes. sub_11FE840(GcLShip*, int on) is __thiscall, retn 4,
+// and `this` is the GcL object, proven at 0x012284B0 (`mov ecx, esi` with esi = *(a1+12), the same pointer
+// dereferenced at [esi+0A4h] and [esi+570h]). It writes +0x39A unconditionally, then (gated on +0x398/+0x399)
+// notifies +0x570, dispatches two interface calls on the +0xA4 controller and fires the enter/leave events.
+// It early-returns when the byte already equals `on`, so a redundant call is free.
+// Evidence: ops/evidence/helm-state-2026-11-21.md Q1/Q4/Q5. Unit: decomp/units.json 011FE840.
+bool CoordSyncHelmApply(void* gcl, unsigned on) {
+    if (!gcl) return false;
+    ((void (__thiscall*)(void*, int))0x011FE840)(gcl, on ? 1 : 0);
+    return true;
+}
 
 // ---- TEST HARNESS [Coop] HelmSeat (default 0): does the helm function actually seat the player? -----
 // ops/evidence/helm-fields-static-2026-11-20.md: all four helm bools are transition-written, there is no
@@ -14515,7 +14527,7 @@ static void DumpConfigOnce()
         { "Coop", "EntitySelfTestOffset", 0 }, { "Coop", "EntitySync", 0 }, { "Coop", "FixNullReturn", 1 },
         { "Coop", "ForceUnknownBuild", 0 }, { "Coop", "GhostMarkerSuppress", 1 }, { "Coop", "GhostProxy", 0 },
         { "Coop", "GuardNullActionTarget", 0 }, { "Coop", "GuardNullTarget", 1 }, { "Coop", "GuardAnimFull", 0 }, { "Coop", "GuardBlendFix", 0 }, { "Coop", "GuardStaleReturn", 0 }, { "Coop", "GuardStaleTarget", 1 },
-        { "Coop", "GuestKillMirror", 1 }, { "Coop", "HookSgm", 1 }, { "Coop", "HostileOnly", 0 },
+        { "Coop", "GuestKillMirror", 1 }, { "Coop", "HelmSync", 0 }, { "Coop", "HookSgm", 1 }, { "Coop", "HostileOnly", 0 },
         { "Coop", "HybridLoco", 1 }, { "Coop", "IdentityBand", 0 }, { "Coop", "IdResolver", 1 },
         { "Coop", "InstallHooks", 1 }, { "Coop", "IntegratePuppet", 0 }, { "Coop", "KillTrace", 1 },
         { "Coop", "KrLog", 0 }, { "Coop", "LegacyPadIdHook", 1 }, { "Coop", "MirrorActions", 1 }, { "Coop", "MirrorActionsDeferred", 1 }, { "Coop", "OwnPhysicsMs", 0 }, { "Coop", "OwnUpdateGuards", 0 }, { "Coop", "OwnUpdatePuppet", 0 }, { "Coop", "MinBlendInMs", 100 },

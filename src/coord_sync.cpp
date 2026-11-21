@@ -37,6 +37,7 @@ void*    CoordSyncEntityLogic(void* ent);            // ShipGcLObj(ent)
 bool     CoordSyncHullRead(void* gcl, float* out);   // hull HP on the GcL itself (slot 0x1B4 getter)
 bool     CoordSyncHullWriteRaw(void* ent, float hp); // WriteShipHullHPRaw
 int      CoordSyncSailApply(void* ent, unsigned st, uint64_t key);  // ShipGcLObj + SailSetViaEngine
+bool     CoordSyncHelmApply(void* gcl, unsigned on); // sub_11FE840(gcl, on) - the helm lever, [Coop] HelmSync
 uint64_t CoordSyncProxyHostId(const void* ent);      // live ShipMirror proxy -> its hostId, else 0
 void*    CoordSyncProxyEntity(uint64_t hostId);      // live ShipMirror slot for a hostId, else nullptr
 uint64_t CoordSyncObjectId(const void* obj);         // GetObjectID 0x9F0B50, read-only, all 64 bits back
@@ -67,6 +68,33 @@ bool Readable(const void* p, size_t n) {
     return end >= a && end <= (uintptr_t)m.BaseAddress + m.RegionSize;
 }
 
+// ---- [Coop] HelmSync: GcLShip+0x39A, the helm flag (ops/evidence/helm-state-2026-11-21.md) -----------
+// The state is the byte itself: 12 inline readers, no getter, and no "who holds it" field (Q2). Writers are
+// exactly three - the lever 0x011FE840, the reset 0x01204124, the object copy 0x0130A7D7 - and none of them
+// is per-tick, so unlike the hull at +0xD0 a value written here is not undone by regeneration.
+const int      kHelmOff    = 0x39A;
+const uint32_t kGcLShipVt  = 0x026A34E8u;     // the vtable guard every write in this lane already takes
+
+bool HelmSyncOn() {
+    static int s_ini = -1;   // the s_x = -1 idiom: read once
+    if (s_ini < 0) s_ini = GetPrivateProfileIntA("Coop", "HelmSync", 0, Paths::Ini()) != 0 ? 1 : 0;
+    return s_ini == 1;
+}
+
+// Read the helm byte off a GcL object: vtable-gated (a foreign object's +0x39A means nothing) and refused
+// when the byte is not 0/1, the same refusal the sail field makes before it can reach the wire.
+bool HelmRead(void* logic, uint8_t* out) {
+    if (!logic || !out) return false;
+    if (!Readable((const char*)logic + kHelmOff, 1)) return false;
+    __try {
+        if (*(uint32_t*)logic != kGcLShipVt) return false;
+        const uint8_t v = *(uint8_t*)((char*)logic + kHelmOff);
+        if (v > 1) return false;
+        *out = v;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
 // ---- schema callbacks for GcLShip ---------------------------------------------------------------
 // Identity, exactly as the table contract states: the local ship is key 0 on both machines; a ShipMirror
 // proxy is identified by the host's deep-copied entity id; everything else is not synced. Both lookups are
@@ -93,6 +121,12 @@ bool ShipExtract(void* logic, uint8_t field, float* out) {
             *out = (float)st;
             return true;
         } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    }
+    if (field == CF_HELM) {
+        uint8_t b = 0;
+        if (!HelmRead(logic, &b)) return false;
+        *out = (float)b;
+        return true;
     }
     return false;
 }
@@ -138,9 +172,22 @@ bool ShipApplyHull(void* ent, float v) {
     return ok == 1;
 }
 
+bool ShipApplyHelm(void* ent, float v) {
+    if (!(v == 0.0f || v == 1.0f)) return false;          // never hand the lever a non-helm value
+    void* gcl = CoordSyncEntityLogic(ent);
+    uint8_t cur = 0;
+    if (!HelmRead(gcl, &cur)) return false;               // vtable + readable gate, before the call
+    // The lever, not a raw store at +0x39A: sub_11FE840 ALSO resolves ship+0xA4 to the controller object and
+    // dispatches the two interface calls, notifies +0x570 and fires the enter/leave events (evidence Q1). A
+    // raw store would set the byte and leave the controller unaware - the state would look right and the seat
+    // would not be handed over. The lever itself early-returns when the byte already equals `on`.
+    return CoordSyncHelmApply(gcl, v >= 0.5f ? 1u : 0u);
+}
+
 bool ShipApply(void* ent, uint8_t field, float v) {
     if (!ent) return false;
     if (field == CF_HULL) return ShipApplyHull(ent, v);
+    if (field == CF_HELM) return ShipApplyHelm(ent, v);
     if (field == CF_SAIL) {
         if (!(v >= 0.0f) || !(v < 4.0f)) return false;   // never hand the setter a non-SailState
         return CoordSyncSailApply(ent, (unsigned)v, s_applyKey) == 1;
@@ -261,7 +308,7 @@ bool BoardApply(void* ent, uint8_t field, float v) {
     return ok == 1;
 }
 
-const uint8_t kShipFields[]  = { CF_HULL, CF_SAIL, 0 };
+const uint8_t kShipFields[]  = { CF_HULL, CF_SAIL, CF_HELM, 0 };
 const uint8_t kBoardFields[] = { CF_OBJ_CREW, CF_OBJ_CAPTAIN, CF_OBJ_SCOUTS, CF_OBJ_OFFICERS,
                                  CF_OBJ_FLAG, CF_OBJ_POWDER, 0 };
 
@@ -289,6 +336,11 @@ static LONG     s_rxOk = 0, s_rxStale = 0, s_rxUnres = 0, s_rxBad = 0, s_rxExc =
 // value; bad = unreadable / not a BattleObjectiveState; gone = the parent is no longer a live
 // GcLBoardingBattle (boarding ended, object released) - reported separately so `bad` keeps its meaning.
 static LONG     s_objOk = 0, s_objStale = 0, s_objRevert = 0, s_objBad = 0, s_objGone = 0;
+// [Coop] HelmSync: ok = the lever ran and the byte read back as sent; noop = the value was already there so
+// the lever was not called (this is what stops a two-sided publish from turning into a notification storm);
+// stale = an older sequence than the one already applied for that ship; refused = helm=1 declined by the
+// owner check; bad = unreadable object/byte, a non-0/1 value, or a fault.
+static LONG     s_helmOk = 0, s_helmNoop = 0, s_helmStale = 0, s_helmRefused = 0, s_helmBad = 0;
 
 // Host change cache: one row per (key, field), last value published. Publishing on change only is what
 // keeps the lane quiet - the hull moves in damage-sized steps and the sail state changes rarely.
@@ -297,6 +349,19 @@ struct TxSlot { uint64_t key; uint8_t field; float last; bool used; };
 TxSlot  s_tx[kMaxTxSlots];
 struct RxSlot { uint64_t key; uint8_t field; uint32_t lastSeq; uint32_t seenMs; bool used; };
 RxSlot  s_rx[kMaxRxSlots];
+
+// [Coop] HelmSync, one row per ship key: the epoch (last sequence applied), the last value this machine
+// published for that key (change detection), and whether anything has been published/applied yet.
+struct HelmShip {
+    uint64_t key;
+    uint32_t lastAppliedSeq;
+    uint8_t  lastPubValue;
+    bool     haveApplied;
+    bool     havePub;
+    bool     used;
+};
+const int kMaxHelmShips = 16;
+HelmShip  s_helm[kMaxHelmShips];
 
 // 2 s persistence probe, one row per in-flight apply. Eight is plenty: objectives change on boarding
 // events, not per frame.
@@ -322,6 +387,13 @@ bool CoordSyncOn() {
 }
 
 namespace {
+
+// [Coop] HelmSync, defined further down: declared here because the host walk (HostTick) also publishes the
+// helm byte of ships it sees as proxies.
+void HelmPublishChanged(uint64_t key, uint8_t v, bool holderIsLocal);
+void HelmSampleLocal();
+void HelmReportTick();
+void HelmApplyMessage(uint64_t key, uint32_t seq, uint8_t holderIsLocal, float v);
 
 // Publish one field if it differs from the last value published for (key, field).
 void PublishField(const CoordSchema* sc, uint64_t key, uint8_t field, float v) {
@@ -364,9 +436,17 @@ void HostTick() {
         const uint64_t key = sc->identity(c.ent, c.logic);
         if (key == kCoordKeyNone) continue;
         for (const uint8_t* f = sc->fields; f && *f; ++f) {
+            if (*f == CF_HELM) continue;   // [Coop] HelmSync has its own path (below): per-ship epoch + noop
             if (IsObjField(*f) && !BoardObjectiveSyncOn()) continue;   // flag 0: not a single extra read
             float v = 0.0f;
             if (sc->extract(c.logic, *f, &v)) PublishField(sc, key, *f, v);
+        }
+        // [Coop] HelmSync: sample the byte for every ship in the walk that is not this machine's own (key 0 is
+        // sampled every frame by HelmSampleLocal). State-driven, so a change the engine made on its own path is
+        // published too - not only one caused by our key press.
+        if (HelmSyncOn() && key != kCoordKeyLocal) {
+            uint8_t hv = 0;
+            if (HelmRead(c.logic, &hv)) HelmPublishChanged(key, hv, false);
         }
     }
 }
@@ -404,6 +484,189 @@ void LogUnresolvedOnce(uint64_t key, uint8_t field) {
     char line[192];
     _snprintf_s(line, sizeof(line), _TRUNCATE, "[CoordS] obj unresolved key=%016llX slot=%s\n",
                 (unsigned long long)key, ObjSlotName(field));
+    Phase1_LogLine(line);
+}
+
+// ---- [Coop] HelmSync: publish, epoch, apply ---------------------------------------------------------
+// Why this one field carries an epoch when hull and sail do not: the engine arbitrates helm changes by
+// IDENTITY - 0x01228352 loads ship+0xA4, compares it with the message sender, and 0x01228354 jnz parks a
+// foreign request at +0x963 instead of applying it (ops/evidence/helm-state-2026-11-21.md Q4). Calling the
+// lever directly BYPASSES that guard, so nothing on the engine side orders two calls and nothing on the
+// engine side has any notion of time. The rule is therefore ours, and it is stated here once:
+//
+//     LAST WRITER WINS BY SEQUENCE; ON AN EQUAL SEQUENCE THE LOWER PEER ID WINS.
+//
+// The sequence is the lane's own per-(guard, channel) seq (net.h: "strictly increasing in delivery order"),
+// not a counter of ours, so a re-delivered message is recognisable. "Lower peer id" is evaluated as
+// Phase1_IsEntityHost() (the host is the lower slot) and only on the equal-sequence tie, which a correct lane
+// never produces - it is there so the rule is total rather than undefined.
+//
+// holderIsLocal (IntentCoordValue::rsv[0], unused by every other field): 1 = the publishing machine natively
+// owns the object this value describes (the local ship, key 0); 0 = the ship is the peer's, seen through a
+// ShipMirror proxy. It is NOT a "which player is at the wheel" flag - the engine has no such field (Q2) - and
+// it is carried for the log and for the record, not trusted as proof of authority.
+HelmShip* HelmSlot(uint64_t key, bool create) {
+    for (int i = 0; i < kMaxHelmShips; ++i)
+        if (s_helm[i].used && s_helm[i].key == key) return &s_helm[i];
+    if (!create) return nullptr;
+    for (int i = 0; i < kMaxHelmShips; ++i)
+        if (!s_helm[i].used) {
+            s_helm[i].used = true;
+            s_helm[i].key = key;
+            s_helm[i].lastAppliedSeq = 0;
+            s_helm[i].lastPubValue = 0;
+            s_helm[i].haveApplied = false;
+            s_helm[i].havePub = false;
+            return &s_helm[i];
+        }
+    return nullptr;
+}
+
+void HelmLog(uint64_t key, bool holderIsLocal, uint8_t v, uint32_t seq,
+             uint8_t before, uint8_t after, const char* via) {
+    char line[192];
+    _snprintf_s(line, sizeof(line), _TRUNCATE,
+                "[CoordS] helm key=%016llX holder=%s v=%u seq=%u before=%u after=%u via=%s\n",
+                (unsigned long long)key, holderIsLocal ? "local" : "remote",
+                (unsigned)v, seq, (unsigned)before, (unsigned)after, via);
+    Phase1_LogLine(line);
+}
+
+// Publish only on a change of the byte as this machine sees it. This is deliberately state-driven and not
+// event-driven: a helm change made by the engine's own key path (or by the lever firing from a script) must
+// reach the peer too, so the byte is sampled rather than hooked.
+void HelmPublishChanged(uint64_t key, uint8_t v, bool holderIsLocal) {
+    HelmShip* s = HelmSlot(key, true);
+    if (!s) return;
+    if (s->havePub && s->lastPubValue == v) return;          // edge only
+    IntentCoordValue p;
+    memset(&p, 0, sizeof(p));
+    p.field    = CF_HELM;
+    p.rsv[0]   = holderIsLocal ? 1 : 0;
+    p.value    = (float)v;
+    // hostMs is carried through untouched by the lane (net.h), so GetTickCount is a stamp, not the ordering.
+    Net::PublishIntent(0, key, IC_COORD, (uint32_t)GetTickCount(), &p, (uint8_t)sizeof(p));
+    const uint8_t before = s->havePub ? s->lastPubValue : v;
+    s->havePub = true;
+    s->lastPubValue = v;
+    // seq 0 / via=tx: the lane assigns the real sequence at publish time and does not report it back.
+    HelmLog(key, holderIsLocal, v, 0, before, v, "tx");
+}
+
+// Every ship this machine natively drives, each frame: one vtable-gated byte read. Two pointer lookups and a
+// byte, so this is safe to run at frame rate on both host and guest (the coord walk is the only expensive
+// part of the lane and it stays at 10 Hz).
+void HelmSampleLocal() {
+    void* ent = CoordSyncLocalShipEntity();
+    if (!ent) return;
+    void* gcl = CoordSyncEntityLogic(ent);
+    uint8_t v = 0;
+    if (!HelmRead(gcl, &v)) return;
+    HelmPublishChanged(kCoordKeyLocal, v, true);
+}
+
+// The two evaluable halves of the engine's identity guard, since the guard itself is bypassed here:
+//   * a mirror proxy is ours to drive only if the key IS that proxy's host id (no guessing a stranger's ship);
+//   * the local ship is granted only while ship+0xA4 - the controller entity the engine hands helm changes to -
+//     still names something. With +0xA4 null the engine would have parked even its own command, so a grant
+//     here would be inventing an owner. The peer's own identity is not on the wire (IC_COORD is 8 bytes and
+//     carries no peer id), so no stronger check is claimed.
+bool HelmOwnerKnown(void* ent, void* logic, uint64_t key) {
+    if (key != kCoordKeyLocal) return CoordSyncProxyHostId(ent) == key;
+    if (!logic || !Readable((const char*)logic + 0xA4, 4)) return false;
+    __try { return *(void**)((char*)logic + 0xA4) != nullptr; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// `helm refused` once per key: a guest permanently without a controller would otherwise log it on every
+// republish. Same shape as UnresKey above.
+struct HelmRefusedKey { uint64_t key; bool used; };
+HelmRefusedKey s_helmRefusedKey[8];
+
+void HelmRefusedOnce(uint64_t key) {
+    for (int i = 0; i < 8; ++i) if (s_helmRefusedKey[i].used && s_helmRefusedKey[i].key == key) return;
+    for (int i = 0; i < 8; ++i)
+        if (!s_helmRefusedKey[i].used) {
+            s_helmRefusedKey[i].used = true;
+            s_helmRefusedKey[i].key = key;
+            char line[128];
+            _snprintf_s(line, sizeof(line), _TRUNCATE,
+                        "[CoordS] helm refused key=%016llX reason=no-owner\n", (unsigned long long)key);
+            Phase1_LogLine(line);
+            return;
+        }
+}
+
+// One IC_COORD message carrying CF_HELM, on either side. The generic apply path is not used: this field needs
+// the per-ship epoch, the noop rule and the owner check, none of which belong to a (field, float) store.
+void HelmApplyMessage(uint64_t key, uint32_t seq, uint8_t holderIsLocal, float v) {
+    if (!(v == 0.0f || v == 1.0f)) {                        // not a helm value
+        ++s_helmBad;
+        HelmLog(key, holderIsLocal != 0, 0, seq, 0, 0, "bad");
+        return;
+    }
+    const uint8_t want = (v >= 0.5f) ? 1 : 0;
+    void* ent = (key == kCoordKeyLocal) ? CoordSyncLocalShipEntity() : CoordSyncProxyEntity(key);
+    if (!ent) { ++s_helmBad; HelmLog(key, holderIsLocal != 0, want, seq, 0, 0, "bad"); return; }
+    void* logic = CoordSyncEntityLogic(ent);
+    uint8_t before = 0;
+    if (!HelmRead(logic, &before)) { ++s_helmBad; HelmLog(key, holderIsLocal != 0, want, seq, 0, 0, "bad"); return; }
+    HelmShip* s = HelmSlot(key, true);
+    if (!s) { ++s_helmBad; return; }
+
+    const bool newer  = !s->haveApplied || (int32_t)(seq - s->lastAppliedSeq) > 0;
+    const bool tieHost = s->haveApplied && seq == s->lastAppliedSeq && Phase1_IsEntityHost();
+    if (!newer && !tieHost) {                               // older (or equal, and we are not the host)
+        ++s_helmStale;
+        HelmLog(key, holderIsLocal != 0, want, seq, before, before, "stale");
+        return;
+    }
+    if (before == want) {                                   // already there: never fire the notifications twice
+        s->haveApplied = true;
+        s->lastAppliedSeq = seq;
+        s->havePub = true;
+        s->lastPubValue = want;                             // and do not echo it back out as a new change
+        ++s_helmNoop;
+        HelmLog(key, holderIsLocal != 0, want, seq, before, before, "noop");
+        return;
+    }
+    // Granting: only for a ship we can prove is ours to drive. Releasing is always allowed - a revoke can
+    // never hand control to anyone.
+    if (want == 1 && !HelmOwnerKnown(ent, logic, key)) {
+        ++s_helmRefused;
+        HelmRefusedOnce(key);
+        HelmLog(key, holderIsLocal != 0, want, seq, before, before, "refused");
+        return;
+    }
+
+    int ok = 0;
+    __try { ok = ShipApplyHelm(ent, (float)want) ? 1 : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { ok = 0; ++s_helmBad; }
+    uint8_t after = before;
+    if (!HelmRead(logic, &after)) after = before;
+    if (ok) {
+        s->haveApplied = true;
+        s->lastAppliedSeq = seq;
+        s->havePub = true;
+        s->lastPubValue = after;
+        ++s_helmOk;
+    } else if (after != want) {
+        ++s_helmBad;
+    }
+    HelmLog(key, holderIsLocal != 0, want, seq, before, after, "lever");
+}
+
+// The helm 5 s line, on BOTH sides: the guest's ReportTick already runs only on the guest, and the host
+// applies helm too, so this owns its own timer.
+void HelmReportTick() {
+    static DWORD s_next = 0;
+    const DWORD now = GetTickCount();
+    if (s_next && now - s_next < (DWORD)kReportMs) return;
+    s_next = now;
+    char line[192];
+    _snprintf_s(line, sizeof(line), _TRUNCATE,
+                "[CoordS] helm stats ok=%ld noop=%ld stale=%ld refused=%ld bad=%ld\n",
+                s_helmOk, s_helmNoop, s_helmStale, s_helmRefused, s_helmBad);
     Phase1_LogLine(line);
 }
 
@@ -487,19 +750,31 @@ void ReportTick() {
 } // namespace
 
 void CoordSyncTick() {
-    if (!CoordSyncOn()) return;
-    if (Phase1_IsEntityHost()) { HostTick(); return; }
-    ObjProbeTick();      // one loop over eight flags while no probe is armed
-    ReportTick();
+    const bool helm = HelmSyncOn();   // read once, before any branch: flag 0 = no sampling, no publish, no apply
+    if (CoordSyncOn()) {
+        if (Phase1_IsEntityHost()) HostTick();        // 10 Hz; also publishes proxy helm state it walks past
+        else { ObjProbeTick(); ReportTick(); }
+    }
+    if (helm) {
+        HelmSampleLocal();            // key 0, every frame, on both sides - the state IS the byte
+        HelmReportTick();
+    }
 }
 
 // One IC_COORD message: resolve the object by wire key, check per-(key, field) freshness, apply through
 // the schema, report the transition. A refused or faulting apply costs this message, never the frame.
 void CoordSyncApplyMsg(uint64_t wireId, uint32_t seq, const uint8_t* payload, uint8_t len) {
-    if (!CoordSyncOn()) return;
+    const bool helmOn = HelmSyncOn();
+    if (!CoordSyncOn() && !helmOn) return;
     if (len != sizeof(IntentCoordValue) || !payload) { ++s_rxBad; return; }
     IntentCoordValue p;
     memcpy(&p, payload, sizeof(p));
+    if (p.field == CF_HELM) {      // [Coop] HelmSync: the one field with its own per-ship epoch (see above)
+        if (!helmOn) { ++s_rxBad; return; }
+        HelmApplyMessage(wireId, seq, p.rsv[0], p.value);
+        return;
+    }
+    if (!CoordSyncOn()) return;    // every field below belongs to [Coop] CoordSync / BoardObjectiveSync
     const bool objField = IsObjField(p.field);
     if (!objField && p.field != CF_HULL && p.field != CF_SAIL) { ++s_rxBad; return; }
     if (objField && !BoardObjectiveSyncOn()) { ++s_rxBad; return; }

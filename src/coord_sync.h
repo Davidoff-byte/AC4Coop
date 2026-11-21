@@ -9,6 +9,9 @@
 //                                      write: raw +0xD0 (WriteShipHullHPRaw)
 //   field 2 sailState    GcLShip+0xCC  read: plain dword, refused when >= 4 (SailState::Count)
 //                                      write: the engine setter 0x01220960 (SailSetViaEngine)
+//   field 9 helm         GcLShip+0x39A read: the uint8 itself, refused when > 1 ([Coop] HelmSync)
+//                                      write: the lever sub_11FE840(GcLShip*, 1|0) - never a raw byte store,
+//                                      because the lever is also what tells the controller/notifier objects
 //
 // Identity: kCoordKeyLocal (0) is THIS machine's local ship on both sides - the host's Jackdaw and the
 // guest's Jackdaw are the same gameplay ship (docs/design/sail-memento.md 7, the same assumption IC_SHIP
@@ -40,6 +43,11 @@ enum CoordField : uint8_t {
     CF_OBJ_OFFICERS = 6,   // +0x6C ObjectiveKillOfficers
     CF_OBJ_FLAG = 7,       // +0x70 ObjectiveDestroyFlag
     CF_OBJ_POWDER = 8,     // +0x74 ObjectiveDestroyPowderReserve
+    // GcLShip again, not a battle objective ([Coop] HelmSync, default 0). The state IS the byte: there is no
+    // getter and no holder field (ops/evidence/helm-state-2026-11-21.md Q2), and no per-tick writer exists, so
+    // a written value is not reverted the way the hull at +0xD0 is. Carries its own epoch rule - see
+    // CoordSyncApplyMsg in coord_sync.cpp: last writer wins by sequence, ties to the lower peer id.
+    CF_HELM = 9,           // +0x39A CaptainAtWheel (uint8 0|1)
 };
 
 struct CoordSchema {
@@ -61,7 +69,9 @@ const CoordSchema* CoordSchemaFor(uint32_t vt);
 bool CoordSyncOn();
 
 // Per-frame, next to CoordEnumTick(): the HOST collects the coordinators and publishes changed fields; the
-// GUEST only reports its 5 s counter line (its applies happen in CoordSyncApplyMsg, below).
+// GUEST only reports its 5 s counter line (its applies happen in CoordSyncApplyMsg, below). With [Coop]
+// HelmSync on, BOTH sides also sample the local ship's helm byte every frame (CF_HELM is an own-epoch field
+// and has to follow engine-made changes, not only our key presses).
 void CoordSyncTick();
 
 // One IC_COORD message, from the lane's single consumer (FightIntentDrain).

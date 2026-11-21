@@ -387,8 +387,10 @@ static_assert(sizeof(IntentShipMemento) == 2, "IC_SHIP payload is a 2-byte wire 
 // `rsv` keeps the layout a round 8 bytes and is always 0.
 #pragma pack(push, 1)
 struct IntentCoordValue {
-    uint8_t field;      // CoordField: 1 = hullCurrent (GcLShip+0xD0), 2 = sailState (GcLShip+0xCC)
-    uint8_t rsv[3];     // 0
+    uint8_t field;      // CoordField: 1 = hullCurrent (GcLShip+0xD0), 2 = sailState (GcLShip+0xCC),
+                        // 9 = helm (GcLShip+0x39A, [Coop] HelmSync)
+    uint8_t rsv[3];     // 0, except field 9: rsv[0] = holderIsLocal (1 = the publishing machine natively
+                        // owns this object). Every other field keeps all three bytes 0.
     float   value;      // the value to publish / apply
 };
 #pragma pack(pop)
