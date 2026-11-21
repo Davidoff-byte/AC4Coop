@@ -3,6 +3,7 @@
 #include "phase1.h"
 #include "paths.h"
 #include "net.h"
+#include "coord_sync.h"
 #include "Hook.h"
 #include "build_info.h"
 #include "action_writer.h"
@@ -1175,18 +1176,23 @@ static void* ShipGcLObj(void* shipEnt) {
     void* hobj = ((void* (__cdecl*)(void*, char))0x01038330)(shipEnt, 0);
     return (hobj && readable(hobj, 0xD4)) ? hobj : nullptr;   // +0xD0 HP and the vtable pointer
 }
-// Current hull HP through slot 0x1B4. False (and *out untouched) when unreachable or not a sane value.
-static bool ReadShipHullHP(void* shipEnt, float* out) {
-    void* hobj = ShipGcLObj(shipEnt);
-    if (!hobj || !out) return false;
+// Current hull HP through slot 0x1B4, on the GcL object itself. False (and *out untouched) when unreachable
+// or not a sane value. CoordSync ([Coop] CoordSync, coord_sync.cpp) reads through the same function, so the
+// getter route has one implementation even though that lane already holds the GcL and has no entity.
+static bool ReadHullOnLogic(void* gcl, float* out) {
+    if (!gcl || !out) return false;
     __try {
-        void** vt = *(void***)hobj;
+        void** vt = *(void***)gcl;
         if (!readable((void*)vt, 0x1B8)) return false;
-        float v = ((float (__thiscall*)(void*))vt[0x1B4 / 4])(hobj);
+        float v = ((float (__thiscall*)(void*))vt[0x1B4 / 4])(gcl);
         if (!(v >= 0.0f) || !(v <= 1.0e7f)) return false;   // NaN / absurd -> treat as unknown
         *out = v;
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+// Current hull HP of a ship ENTITY (the entity -> GcL hop, then the getter above).
+static bool ReadShipHullHP(void* shipEnt, float* out) {
+    return ReadHullOnLogic(ShipGcLObj(shipEnt), out);
 }
 // Max hull HP for the same ship: a plain field at GcLShip+0xB4 (a class-level value with a single
 // writer, vtable slot 0x130 - not a per-damage value), NOT behind a getter. It is the fingerprint the
@@ -8555,6 +8561,34 @@ static void SailConsumeTick() {
       s_sailCloneRaw, s_sailRxRefused);
 }
 
+// ---- [Coop] CoordSync glue (default 0; the lane itself is src/coord_sync.cpp) ------------------------
+// The schema table's callbacks live in coord_sync.cpp and own NO engine route: every route they take comes
+// through one of these six wrappers, so the single copy of each (the hull getter route above, the raw hull
+// write, the sail setter 0x01220960 with its clone guard, GetLocalShip, the ShipMirror pool) stays here and
+// cannot drift apart from the coordinator lane. Read-only except CoordSyncHullWriteRaw / CoordSyncSailApply,
+// which are the two apply routes the guest is allowed to take.
+void* CoordSyncLocalShipEntity() { return GetLocalShip(); }                        // identity + key-0 resolve
+void* CoordSyncEntityLogic(void* ent) { return ShipGcLObj(ent); }                  // ent -> the GcL object
+bool  CoordSyncHullRead(void* gcl, float* out) { return ReadHullOnLogic(gcl, out); }
+bool  CoordSyncHullWriteRaw(void* ent, float hp) { return WriteShipHullHPRaw(ent, hp); }
+int   CoordSyncSailApply(void* ent, unsigned st, uint64_t key) {                   // ent -> GcL -> setter
+    void* gcl = ShipGcLObj(ent);
+    return gcl ? SailSetViaEngine(gcl, st, key) : 0;
+}
+// The ShipMirror pool: a proxy entity stands for the host's ship with this id. Pointer/id comparisons only -
+// the candidate entity is never dereferenced here.
+uint64_t CoordSyncProxyHostId(const void* ent) {
+    for (int i = 0; i < g_mirrorN; ++i)
+        if (g_mirror[i].live && g_mirror[i].proxy == ent) return g_mirror[i].hostId;
+    return 0;
+}
+void* CoordSyncProxyEntity(uint64_t hostId) {
+    if (!hostId) return nullptr;
+    for (int i = 0; i < g_mirrorN; ++i)
+        if (g_mirror[i].live && g_mirror[i].hostId == hostId) return g_mirror[i].proxy;
+    return nullptr;
+}
+
 // ---- TEST HARNESS [Coop] HelmSeat (default 0): does the helm function actually seat the player? -----
 // ops/evidence/helm-fields-static-2026-11-20.md: all four helm bools are transition-written, there is no
 // per-frame writer, and the whole helm path is ONE direct call - not a vtable slot:
@@ -8964,10 +8998,11 @@ static void AttackForwardReport() {
 static void FightIntentDrain() {
     const bool fi = FightIntentsOn();
     if (!fi && !(OwnerDamageOn() && Net::IntentLaneOn()) && !(PdrOn() && Net::IntentLaneOn()) && !(AfOn() && Net::IntentLaneOn())
-        && !SailSyncOn()) return;   // [Coop] SailSync keeps the lane drained even with every fight flag off
+        && !SailSyncOn() && !CoordSyncOn()) return;   // [Coop] SailSync/CoordSync keep the lane drained with every fight flag off
     Net::IntentMsg m;
     while (Net::PollIntent(m)) {
         if (m.channel == IC_SHIP) { SailApplyMsg(m); continue; }   // [Coop] SailSync, docs/design/sail-memento.md
+        if (m.channel == IC_COORD) { CoordSyncApplyMsg(m.wireId, m.seq, m.payload, m.len); continue; }   // [Coop] CoordSync
         if (m.channel == IC_ATK_A || m.channel == IC_ATK_B || m.channel == IC_ATK_C) { AttackForwardOwnerRx(m); continue; }   // [Coop] AttackForward
         if (m.channel == IC_PDAMAGE && m.wireId == kPdrWire && m.len == sizeof(PdrPayload)) {   // [Coop] PlayerDamageRelay
             PdrPayload p; memcpy(&p, m.payload, sizeof(p));
@@ -14011,6 +14046,7 @@ static void OnFrameInner(Human* updatedHuman) {
     BoardProbeTick();                                          // [Coop] BoardProbe (default 0): no-op unless set
     { extern void FortProbeTick(); FortProbeTick(); }           // [Coop] FortProbe (default 0): read-only fort/tower enumeration
     { extern void CoordEnumTick(); CoordEnumTick(); }           // [Coop] CoordEnum (default 0): read-only coordinator census
+    CoordSyncTick();                                            // [Coop] CoordSync (default 0): host publishes GcLShip fields
     if (Net::Enabled()) {
         EntitySyncTick();   // host broadcasts entity transforms; peer mirrors them (synced worlds)
         // Capture only succeeds in a real playable world (not title/whiteroom). Require it to be

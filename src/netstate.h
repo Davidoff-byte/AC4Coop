@@ -350,6 +350,10 @@ enum IntentChannel : uint8_t {
     IC_ATK_C     = 10,  //                part C (seq, dir xy, pos xyz, f50)
     IC_SHIP      = 11,  // host -> guest: a ship's SailState as a memento ([Coop] SailSync,
                         //                docs/design/sail-memento.md). Payload IntentShipMemento.
+    IC_COORD     = 12,  // host -> guest: ONE field of ONE coordinated object ([Coop] CoordSync,
+                        //                src/coord_sync.h). The object is the lane's wireId (0 = this
+                        //                machine's local ship); the field is in the payload.
+                        //                Payload IntentCoordValue.
     IC_LIMIT     = 16,  // ids 1..15 are legal on the wire, so a later build can add a channel without a
                         // layout change; the receiver delivers a channel id it does not name
 };
@@ -376,6 +380,19 @@ struct IntentShipMemento {
 };
 #pragma pack(pop)
 static_assert(sizeof(IntentShipMemento) == 2, "IC_SHIP payload is a 2-byte wire layout");
+
+// IC_COORD payload ([Coop] CoordSync). One (field, float) pair per message: `field` names which property
+// of the coordinated object it carries (1 = hullCurrent, 2 = sailState - the CoordField ids in
+// src/coord_sync.h) and the object itself is the lane's wireId, so nothing else needs to ride along.
+// `rsv` keeps the layout a round 8 bytes and is always 0.
+#pragma pack(push, 1)
+struct IntentCoordValue {
+    uint8_t field;      // CoordField: 1 = hullCurrent (GcLShip+0xD0), 2 = sailState (GcLShip+0xCC)
+    uint8_t rsv[3];     // 0
+    float   value;      // the value to publish / apply
+};
+#pragma pack(pop)
+static_assert(sizeof(IntentCoordValue) == 8, "IC_COORD payload is an 8-byte wire layout");
 
 #pragma pack(push, 1)
 struct IntentWireHeader {
