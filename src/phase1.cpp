@@ -581,6 +581,12 @@ static void FinishPadProbe() {    World* world = World::GetCurrentWorld();
 // ORDER MATTERS: M3 dereferences comp+8 (owner), which only M4 sets. Model source: the player's own skeleton (+0x20),
 // so the puppet wears Edward's rig. Every step is guarded; nothing runs unless SkelAttach=1.
 static const uint32_t VT_SKELETON_COMPONENT = 0x01E41E58;   // class-info-map.tsv
+// The per-entity update object U that both world-update steps take as `this` (esi in sub_65DDC0) is this entity's
+// ActionComponent: class-info-map.tsv:2939 names 0x01E5CD10 ActionComponent, and the function in its vtable at
+// 0x1E5CD8C (0x01E5CD10 + 31*4) = 0x64A7A0 reads this+8 -> [+0x5C] -> [+0x8A0], this+0x41 and writes this+0x158/
+// this+0x159 - the exact fields 0x65ddc0 reads (esi+8/+41h/+4Ch/+159h). Same gate byte the braindead lane already
+// writes at line ~2864.
+static const uint32_t VT_ACTION_COMPONENT   = 0x01E5CD10;   // class-info-map.tsv:2939
 static void* FindComponentByVtable(Entity* e, uint32_t vt) {
     if (!readable(e, 0x68)) return nullptr;
     uint16_t n = *(uint16_t*)((uint8_t*)e + 0x66);            // authoritative count (CLAIMS C1)
@@ -4612,6 +4618,30 @@ static void MirrorPark(MirrorSlot& m) {
     }
     m.live = false; m.hostId = 0;
 }
+// [Coop] ProxySkipWalk (default 1): crash guard for the 2026-11-21 guest crash (dump 33104,
+// ops/evidence/proxy-update-crash-2026-11-21.md). A DuplicateShip clone reaches the world-update walk with
+// X+0x134 == 0 (no render/level instance L), and 0x75a1f8 reads [L+0xA0] with L == 0. The engine's own early-out
+// for that situation is byte [U+0x159] != 0 (0x65ddc7, also honoured by 0x669420 at 0x669429), where U is the
+// per-entity update object = the entity's ActionComponent (see VT_ACTION_COMPONENT). Set it on the proxy only;
+// X+0x134 is deliberately NOT copied from the source (sub_5D55C0 writes the transform into L+0xA4 by an index
+// from L's own table, so a shared L makes proxy and source overwrite one matrix slot).
+static int s_proxySkipWalk = -1;                  // [Coop] ProxySkipWalk, read once (the s_x = -1 idiom)
+static void ProxySkipWalk(void* proxy) {
+    if (s_proxySkipWalk < 0) s_proxySkipWalk = GetPrivateProfileIntA("Coop", "ProxySkipWalk", 1, Paths::Ini()) != 0 ? 1 : 0;
+    if (!s_proxySkipWalk) return;
+    void* U = nullptr;
+    __try {
+        U = FindComponentByVtable((Entity*)proxy, VT_ACTION_COMPONENT);
+        if (U && readable(U, 0x15A)) {
+            *((uint8_t*)U + 0x159) = 1;
+            L("[ShipMirror] proxy=%p U=%p skipWalk=1 (no render/level instance on a clone)\n", proxy, U);
+        } else {
+            L("[ShipMirror] proxy=%p U=%p skipWalk=0 (no ActionComponent on the clone)\n", proxy, U);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        L("[ShipMirror] proxy=%p skipWalk=EXCEPTION 0x%08X\n", proxy, GetExceptionCode());
+    }
+}
 // Drive (or create) the proxy for one host ship record. Returns the position error after the drive (metres), -1 on no proxy.
 static float MirrorApply(void* mgr, int n, const EntityState& es, int* created, int* classMisses) {
     if (!es.objId) return -1.0f;
@@ -4635,6 +4665,7 @@ static float MirrorApply(void* mgr, int n, const EntityState& es, int* created, 
             slot = &m; ++*created; if (miss) ++*classMisses;
             L("[ShipMirror] created proxy=%p for host=%llu cls=%u src=%p classMiss=%d pool=%d\n",
               dup, (unsigned long long)es.objId, (unsigned)es.arch, src, miss ? 1 : 0, g_mirrorN);
+            ProxySkipWalk(dup);   // [Coop] ProxySkipWalk: keep the clone out of the world-update walk (U+0x159)
             L("[E] ev=shipmirror-create host=%llu cls=%u classMiss=%d\n", (unsigned long long)es.objId, (unsigned)es.arch, miss ? 1 : 0);
         }
         if (!slot) return -1.0f;
@@ -14374,7 +14405,7 @@ static void DumpConfigOnce()
 
     struct K { const char* s; const char* k; int d; };
     static const K keys[] = {
-        { "Coop", "ActionDeathLog", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "CombatObserve", 0 },
+        { "Coop", "ActionDeathLog", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "CombatObserve", 0 },
         { "Coop", "CombatTest", 0 }, { "Coop", "CrashContext", 0 }, { "Coop", "CorpseKeepSec", 30 }, { "Coop", "CrowdProbeIntegrate", 1 },
         { "Coop", "CrowdProbeLiveKeys", 1 }, { "Coop", "DamageRelay", 0 }, { "Coop", "Diag", 0 },
         { "Coop", "DisableCrowd", 0 }, { "Coop", "DisablePuppetAI", 1 }, { "Coop", "DisableSpawns", 0 },
