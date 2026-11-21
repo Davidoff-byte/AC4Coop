@@ -24,10 +24,14 @@ namespace {
 //   50               push eax
 //   51               push ecx             ; the L being walked
 //
-// then the unchecked dereference we are guarding (8B 88 A0 00 00 00 = mov ecx,[ecx+0A0h]).
+// then the unchecked dereference we are guarding. Both sites have the SAME instruction at +0x08:
+//
+//   75A1B8  8B 89 A0 00 00 00   mov ecx,[ecx+0A0h]   (ModRM 0x89 = mod 10 / reg 001 = ECX)
+//   75A1F8  8B 89 A0 00 00 00   mov ecx,[ecx+0A0h]
+//
 // 8 bytes is a whole-instruction prefix, so nothing has to be split for the 5-byte E9.
 const BYTE PROLOGUE[8] = { 0x55, 0x8B, 0xEC, 0x8B, 0x45, 0x08, 0x50, 0x51 };
-const BYTE RESUME[6]   = { 0x8B, 0x88, 0xA0, 0x00, 0x00, 0x00 };   // mov ecx,[ecx+0A0h]
+const BYTE RESUME[6]   = { 0x8B, 0x89, 0xA0, 0x00, 0x00, 0x00 };   // mov ecx,[ecx+0A0h]
 const BYTE EPILOGUE[4] = { 0x5D, 0xC2, 0x04, 0x00 };               // pop ebp; retn 4
 
 volatile LONG g_hitsF = 0;   // sub_75A1F0 null hits (written by the cave)
