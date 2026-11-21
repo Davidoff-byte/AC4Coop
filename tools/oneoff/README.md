@@ -6,3 +6,4 @@ Kept only because they produced committed evidence. They are not maintained tool
 |---|---|
 | `mk_evidence.py` … `mk_evidence5.py` | probe receipts/evidence under `decomp/` (2026-11-08, commits `f30d3c6`, `a38c9c1`, `1cd6093`, `74b670c`, `6bbd833`) |
 | `mk_baserel_units.py` | the base()+RVA units for spine gate rules 4–6 (`67d039a`) |
+| `action_latency.py` | guard action latency host -> guest from two CombatTimingProbe logs (`docs/evidence/combat-timing-2026-11-17.md`, runs 1-3) |

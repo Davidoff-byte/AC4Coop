@@ -34,6 +34,7 @@ void Phase1_PuppetHitPosted(uintptr_t attacker, int damage, uint32_t contact, ui
 
 #include "player_damage_probe.h"
 #include "attack_forward.h"
+#include "combat_timing.h"
 
 namespace {
 
@@ -152,6 +153,12 @@ int __fastcall H1(void* ev, void* /*edx*/, void* recv)
                                      d[row + 3], d[row + 4], d[row + 5], d[row + 6], d[row + 7]);
                         }
                     }
+                }
+                if (fde && w == 0 && CombatTiming::On()) {   // [Coop] CombatTimingProbe: every FDE a guard posts to the puppet
+                    const uintptr_t th = *(const uintptr_t*)((const char*)ev + 0x58);
+                    const uintptr_t tat = th && *(const int*)(th + 8) < 0 ? *(const uintptr_t*)th : 0;
+                    CombatTiming::HostFde(tat, (uintptr_t)recv, (int)*(const uint32_t*)((const char*)ev + 0x54),
+                                          *(const uint32_t*)((const char*)ev + 8), *(const uint32_t*)((const char*)ev + 0x10));
                 }
                 if (fde && w == 0 && g_atkFwd && *(const uint32_t*)((const char*)ev + 8) != 35) {
                     const uintptr_t ah = *(const uintptr_t*)((const char*)ev + 0x58);

@@ -10,6 +10,7 @@
 #include "event_probe.h"
 #include "player_damage_probe.h"
 #include "attack_forward.h"
+#include "combat_timing.h"
 #include "../third_party/minhook/include/MinHook.h"
 #include "puppet_stim.h"
 #include "pilot.h"
@@ -5421,6 +5422,8 @@ static void CorpseBudgetReport() {
 // GetCurrentActionRatio 0x667170, GetCurrentEvaluator / GetBlendFactorCount via 0x666BB0, GetBlendFactor 0x667590;
 // Action+0x0C body-part channel, Action+0x10 layer, evaluator +0xD4 type / +0x1C8 / +0x1CC / +0x1D0 / +0x1DC).
 static unsigned s_animBlendDropped = 0;   // non-zero factors beyond GUARD_ANIM_BLEND_MAX (should stay 0)
+static int g_guardActLane = 0;                            // [Coop] GuardActionLane (default 0; read at load, then every 2 s)
+static void GalHostScope(Human* h, uint64_t objId);       // defined with the lane, below FiResolve
 static void CaptureGuardAnim(ActionComponent* ac, void* act, GuardAnim& g) {
     std::memset(&g, 0, sizeof(g));
     g.channel = 0xFFFF; g.blendInMs = -1;
@@ -5533,6 +5536,8 @@ static void EmitGuardEntity(EntityPacket& pkt, uint32_t& count, int idx, Entity*
                 CaptureGuardAnim(ac, act, es.anim);   // proto 13
             }
         }
+        if (CombatTiming::On()) CombatTiming::ScopeBody(gh, e, es.objId);   // [Coop] CombatTimingProbe
+        if (g_guardActLane) GalHostScope(gh, es.objId);                     // [Coop] GuardActionLane
     }
     // G10 (ops/AI-T5-G10.md 7.2): es is fully populated and gh/gpB already range-checked; the statics
     // in here only read es, so nothing on the apply/mirror path or the wire is touched.
@@ -6868,6 +6873,7 @@ static void MirrorActDrain(Human* h) {
         ActionComponent* ac = h->GetActionComponent();
         if (!ac || !readable(ac, 0x40)) return;
         ac->SetTargetAction((int)alias, 0, 0, 0xFFFF, ACTLAYER_PRIMARY);
+        CombatTiming::GuestMirrorAct((const void*)ent, objId, alias);   // [Coop] CombatTimingProbe
         const LONG n = InterlockedIncrement(&s_maqApplied);
         if (n <= 3000)
             L("[MirrorAct] deferred ent=%08X objId=%016llX alias=%u tid=%lu\n", ent, (unsigned long long)objId,
@@ -8074,6 +8080,152 @@ static void FightIntentSend(Human* player) {
     s_inFight = inFight; s_attack = attack;
 }
 
+// ---- [Coop] GuardActionLane (default 0; read at load in InstallFrameHook, then every 2 s on the player update) ---------
+// Cause (docs/evidence/combat-timing-2026-11-17.md, run 1): a guard's action switch reaches the guest's copy a median
+// 331 ms after the host (the 6-frame entity tick plus the three-apply alias debounce) and 27 % of switches never play,
+// while a forwarded hit / warning arrives within frames on the intention lane. So the swing is drawn long after the hit.
+// Fix: the switch travels on the same lane as the attack events.
+//   host : every guard in sync scope (EmitGuardEntity) is sampled on its OWN update; a new current action is published
+//          as IC_ACTION (wireId = the guard's id). Same reads as CaptureGuards / CaptureGuardAnim.
+//   guest: the switch is issued on the copy's own update on the frame it arrives (MirrorActQueue: the very
+//          SetTargetAction the alias-only mirror issues), and the snapshot's alias path stands down for that guard.
+// Only the route and the timing change; no new engine call.
+#pragma pack(push, 1)
+struct GalPayload { uint32_t alias; uint16_t channel; int16_t layer; uint16_t ratioQ; uint16_t pad; uint32_t hostQpcMs; };
+#pragma pack(pop)
+static_assert(sizeof(GalPayload) == 16, "IC_ACTION payload is a wire layout");
+struct GalHostEnt { unsigned int human; uint64_t objId; uint32_t alias; uint64_t seenMs; };
+static GalHostEnt s_galH[64]; static volatile LONG s_galHN = 0; static SRWLOCK s_galLock = SRWLOCK_INIT;
+static volatile LONG s_galTx = 0, s_galTxFail = 0, s_galRx = 0, s_galQueued = 0, s_galNoBody = 0, s_galSnapSkipped = 0, s_galRebind = 0;
+
+// Host, player update (snapshot capture): this guard is in sync scope.
+static void GalHostScope(Human* h, uint64_t objId) {
+    if (g_entHost != 1 || !h || !objId) return;
+    const uint64_t now = GetTickCount64();
+    AcquireSRWLockExclusive(&s_galLock);
+    int k = -1;
+    for (int i = 0; i < s_galHN; ++i) if (s_galH[i].human == (unsigned int)h) { k = i; break; }
+    if (k < 0 && s_galHN < 64) { k = s_galHN; s_galH[k].human = (unsigned int)h; s_galH[k].alias = 0; InterlockedIncrement(&s_galHN); }
+    if (k >= 0) {
+        if (s_galH[k].objId != objId) s_galH[k].alias = 0;   // the Human now belongs to another guard: publish afresh
+        s_galH[k].objId = objId; s_galH[k].seenMs = now;
+    }
+    ReleaseSRWLockExclusive(&s_galLock);
+}
+static int s_galGN = 0;   // guest table size (defined below)
+// Player update, both copies: follow the ini (an A/B in one session), then on the host about once a second drop guards no
+// snapshot named for 10 s from the table and the lane. A flip clears both tables, so nothing stale survives an off period.
+static void GalHostSweep() {
+    {
+        static uint64_t s_flagNext = 0;
+        const uint64_t t = GetTickCount64();
+        if (t >= s_flagNext) {
+            s_flagNext = t + 2000;
+            const int v = GetPrivateProfileIntA("Coop", "GuardActionLane", 0, Paths::Ini()) != 0 ? 1 : 0;
+            if (v != g_guardActLane) {
+                AcquireSRWLockExclusive(&s_galLock);
+                InterlockedExchange(&s_galHN, 0);
+                ReleaseSRWLockExclusive(&s_galLock);
+                s_galGN = 0;
+                L("[GAL] GuardActionLane=%d (was %d) t=%llu us\n", v, g_guardActLane, (unsigned long long)OwnNowUs());
+                g_guardActLane = v;
+            }
+        }
+    }
+    if (!g_guardActLane || g_entHost != 1) return;
+    static uint64_t s_next = 0;
+    const uint64_t now = GetTickCount64();
+    if (now < s_next) return;
+    s_next = now + 1000;
+    uint64_t gone[64]; int n = 0;
+    AcquireSRWLockExclusive(&s_galLock);
+    for (int i = 0; i < s_galHN;) {
+        if (now - s_galH[i].seenMs > 10000) { gone[n++] = s_galH[i].objId; s_galH[i] = s_galH[s_galHN - 1]; InterlockedDecrement(&s_galHN); }
+        else ++i;
+    }
+    ReleaseSRWLockExclusive(&s_galLock);
+    for (int i = 0; i < n; ++i) Net::ForgetIntents(0, gone[i]);   // frees the persisted value (512 keys on the lane)
+}
+// Host, ANY Human's own update: publish a new current action of a scoped guard.
+static void GalHostOwnUpdate(Human* h) {
+    if (!s_galHN) return;
+    uint64_t objId = 0; uint32_t last = 0;
+    AcquireSRWLockShared(&s_galLock);
+    for (int i = 0; i < s_galHN; ++i) if (s_galH[i].human == (unsigned int)h) { objId = s_galH[i].objId; last = s_galH[i].alias; break; }
+    ReleaseSRWLockShared(&s_galLock);
+    if (!objId || !readable(h, 4)) return;
+    ActionComponent* ac = h->GetActionComponent();
+    if (!ac || !readable(ac, 0x40)) return;
+    unsigned char mir = 0;
+    void* act = ac->GetCurrentAction(&mir, 0, ACTLAYER_PRIMARY);
+    if (!act || !readable(act, 0x14)) return;
+    const uint32_t alias = *(uint32_t*)((char*)act + 8);
+    if (!alias || alias == last) return;
+    GalPayload p = {};
+    p.alias = alias; p.channel = 0xFFFF;
+    void* bpc = *(void**)((char*)act + 0x0C);
+    if (readable(bpc, 0x0A)) p.channel = *(uint16_t*)((char*)bpc + 8);
+    p.layer = (int16_t)*(int32_t*)((char*)act + 0x10);
+    float r = ac->GetCurrentActionRatio(0, ACTLAYER_PRIMARY);
+    if (!(r >= 0.0f)) r = 0.0f;
+    if (r > 1.0f) r = 1.0f;
+    p.ratioQ = (uint16_t)(r * 65535.0f + 0.5f);
+    p.hostQpcMs = (uint32_t)(OwnNowUs() / 1000);
+    const bool ok = Net::PublishIntent(0, objId, IC_ACTION, p.hostQpcMs, &p, (uint8_t)sizeof(p));
+    InterlockedIncrement(ok ? &s_galTx : &s_galTxFail);
+    AcquireSRWLockExclusive(&s_galLock);
+    for (int i = 0; i < s_galHN; ++i) if (s_galH[i].human == (unsigned int)h && s_galH[i].objId == objId) { s_galH[i].alias = alias; break; }
+    ReleaseSRWLockExclusive(&s_galLock);
+}
+static void GalHostOwnUpdateGuarded(Human* h) {
+    __try { GalHostOwnUpdate(h); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+// Guest (player update only): the lane's current action per guard.
+struct GalGuestEnt { uint64_t objId; uint32_t alias; unsigned int ent; uint64_t rxMs; };
+static GalGuestEnt s_galG[128];
+static GalGuestEnt* GalGuestFind(uint64_t id, bool create) {
+    for (int i = 0; i < s_galGN; ++i) if (s_galG[i].objId == id) return &s_galG[i];
+    if (!create) return nullptr;
+    int k = s_galGN;
+    if (k >= 128) { k = 0; for (int i = 1; i < 128; ++i) if (s_galG[i].rxMs < s_galG[k].rxMs) k = i; }   // oldest
+    else ++s_galGN;
+    s_galG[k].objId = id; s_galG[k].alias = 0; s_galG[k].ent = 0; s_galG[k].rxMs = 0;
+    return &s_galG[k];
+}
+static void GalGuestIssue(GalGuestEnt* g, Entity* e) {
+    Human* bh = AIEntityHelper::GetHuman(e);
+    if (!bh || !readable(bh, 4) || !MirrorActionsEnabled()) return;
+    g->ent = (unsigned int)e;
+    MirrorActQueue(bh, g->alias, (unsigned int)e, g->objId);   // issued on the copy's own update
+    InterlockedIncrement(&s_galQueued);
+}
+static void GalGuestRx(const Net::IntentMsg& m) {
+    if (!g_guardActLane || g_entHost == 1 || m.len != sizeof(GalPayload)) return;
+    GalPayload p; memcpy(&p, m.payload, sizeof(p));
+    InterlockedIncrement(&s_galRx);
+    GalGuestEnt* g = GalGuestFind(m.wireId, true);
+    g->alias = p.alias; g->rxMs = GetTickCount64();
+    Entity* e = (Entity*)GuestObjFind(m.wireId);                // the linked copy only
+    if (!e || !readable(e, 0xCC) || *(uint32_t*)e != 0x01E4CE90u || MirrorKilledLocally(e)) { g->ent = 0; InterlockedIncrement(&s_galNoBody); return; }
+    GalGuestIssue(g, e);
+}
+// ApplyGuards: true when the lane carries this guard's action, so the snapshot's alias is not applied. A record now
+// bound to another body gets the lane's current action once.
+static bool GalGuestOwns(uint64_t objId, Entity* body) {
+    if (!g_guardActLane || g_entHost == 1) return false;
+    GalGuestEnt* g = GalGuestFind(objId, false);
+    if (!g || !g->alias) return false;
+    if (g->ent != (unsigned int)body) { InterlockedIncrement(&s_galRebind); GalGuestIssue(g, body); }
+    InterlockedIncrement(&s_galSnapSkipped);
+    return true;
+}
+static void GalReport() {
+    if (!g_guardActLane) return;
+    L("[GAL] GuardActionLane=1 host: scoped=%ld tx=%ld txFail=%ld | guest: rx=%ld queued=%ld noBody=%ld rebind=%ld snapshotAliasSkipped=%ld tracked=%d\n",
+      s_galHN, s_galTx, s_galTxFail, s_galRx, s_galQueued, s_galNoBody, s_galRebind, s_galSnapSkipped, s_galGN);
+}
+
 // ---- [Coop] PlayerDamageRelay (default follows FightIntents, read once at load in player_damage_probe.cpp) ------------
 // Probe runs 25140 / 19900 (asi 687115e4 / 080e30fe, docs/evidence/player-damage-relay-2026-11-16.md): a guard's hit on
 // the puppet is posted (FightDamageEvent hit phase, FDE+0x54 == 1, attacker handle FDE+0x58) and then lost - the puppet
@@ -8138,6 +8290,7 @@ static void PlayerDamageHostPump() {
         p.damage = (uint16_t)h.dmg; p.contact = h.contact; p.subtype = h.sub; p.flags = h.flags; p.f18 = h.f18;
         const bool ok = Net::PublishIntent(0, kPdrWire, IC_PDAMAGE, (uint32_t)GetTickCount(), &p, (uint8_t)sizeof(p));
         InterlockedIncrement(&s_pdrTx);
+        CombatTiming::HostPdrTx(p.attacker, s_count, h.dmg);   // [Coop] CombatTimingProbe
         L("[PDR] tx hit #%u attacker=%08X id=%016llX damage=%d total=%u contact=%u sub=%u flags=%02X ok=%d\n", s_count,
           (unsigned)h.att, (unsigned long long)p.attacker, h.dmg, s_total, h.contact, h.sub, h.flags, ok ? 1 : 0);
     }
@@ -8178,6 +8331,7 @@ static void PlayerDamageOwnerApply(const PdrPayload& p, bool base) {
     if (att == pl) att = nullptr;
     const int before = PdrPlayerLife(pl);
     const bool ok = PlayerDamage_PostDamageEvent(pl, att, dmg, p.contact, p.subtype, p.f18, p.flags);
+    CombatTiming::GuestPdr(p.attacker, p.count, dmg, att, pl, ok, before);   // [Coop] CombatTimingProbe
     InterlockedIncrement(ok ? &s_pdrApplied : &s_pdrFail);
     L("[PDR] owner apply hit #%u damage=%d attacker id=%016llX -> local %08X | life before %d posted=%d\n", p.count, dmg,
       (unsigned long long)p.attacker, (unsigned)att, before, ok ? 1 : 0);
@@ -8255,6 +8409,7 @@ static void AttackForwardHostPump() {
         const bool ok = Net::PublishIntent(0, id, IC_ATK_A, t, &pa, 32) && Net::PublishIntent(0, id, IC_ATK_B, t, &pb, 32)
                      && Net::PublishIntent(0, id, IC_ATK_C, t, &pc, 32);
         InterlockedIncrement(&s_afTx[a.phase ? 1 : 0]);
+        CombatTiming::HostAtkTx(id, seq, a.phase ? 1 : 0, ok);   // [Coop] CombatTimingProbe
         static LONG s_lines = 0;
         if ((a.phase || s_lines < 40) && InterlockedIncrement(&s_lines) <= 300)
             L("[AF] tx %s guard=%016llX seq=%u type=%u sub=%u ok=%d\n", a.phase ? "HIT" : "warn", (unsigned long long)id, seq, a.type, a.sub, ok ? 1 : 0);
@@ -8270,6 +8425,7 @@ static void AttackForwardHostPump() {
 // Owner (guest): assemble the three parts, then keep / post the attack.
 static struct { uint64_t id; uint32_t seq; uint8_t mask; AtkFields a; } s_afAsm[16]; static int s_afAsmI = 0;
 static struct { uint64_t id; unsigned int ent; AtkFields a; ULONGLONG ms; bool live; } s_afAct[16];
+static uint32_t s_afCtpSeq = 0, s_afCtpMs = 0;   // [Coop] CombatTimingProbe: seq / publish time of the event being delivered
 static void AttackForwardOwnerDeliver(uint64_t id, const AtkFields& a) {
     const int ph = a.phase ? 1 : 0;
     InterlockedIncrement(&s_afRx[ph]);
@@ -8283,6 +8439,7 @@ static void AttackForwardOwnerDeliver(uint64_t id, const AtkFields& a) {
         bool fb = false;
         if (ph && pl && a.dmg > 0) fb = PlayerDamage_PostDamageEvent(pl, nullptr, a.dmg, 1, a.sub, 0, a.b1C);
         if (fb) InterlockedIncrement(&s_afFallback);
+        if (CombatTiming::On()) CombatTiming::GuestAtk(id, s_afCtpSeq, ph, s_afCtpMs, nullptr, pl, fb, pl ? PdrPlayerLife(pl) : -1);
         if (InterlockedIncrement(&s_ul) <= 30) L("[AF] owner: guard %016llX has no linked copy here (%s%s)\n", (unsigned long long)id, ph ? "HIT" : "warning lost",
                                                 ph ? (fb ? " -> applied as a DamageEvent" : " lost") : "");
         return;
@@ -8291,7 +8448,9 @@ static void AttackForwardOwnerDeliver(uint64_t id, const AtkFields& a) {
     for (int i = 0; i < 16; ++i) { if (s_afAct[i].live && s_afAct[i].id == id) { k = i; break; } if (!s_afAct[i].live && freeK < 0) freeK = i; }
     if (k < 0) k = freeK >= 0 ? freeK : 0;
     s_afAct[k].id = id; s_afAct[k].ent = (unsigned int)att; s_afAct[k].a = a; s_afAct[k].ms = GetTickCount64(); s_afAct[k].live = (ph == 0);
+    const int ctpLife = CombatTiming::On() ? PdrPlayerLife(pl) : -1;
     const bool ok = AttackForward_Post(pl, att, a);
+    if (CombatTiming::On()) CombatTiming::GuestAtk(id, s_afCtpSeq, ph, s_afCtpMs, att, pl, ok, ctpLife);
     InterlockedIncrement(ok ? &s_afPost[ph] : &s_afFail);
     if (ph) L("[AF] owner HIT posted guard=%016llX copy=%08X type=%u sub=%u ok=%d | life %d\n", (unsigned long long)id, (unsigned)att, a.type, a.sub, ok ? 1 : 0, PdrPlayerLife(pl));
 }
@@ -8315,7 +8474,7 @@ static void AttackForwardOwnerRx(const Net::IntentMsg& m) {
         a.dir[0] = p.dx; a.dir[1] = p.dy; a.dir[2] = 0; a.dir[3] = 0; a.dmg = p.dmg; a.pos[0] = p.px; a.pos[1] = p.py; a.pos[2] = p.pz; a.pos[3] = 0;
         a.f50 = p.f50; s_afAsm[k].mask |= 4;
     }
-    if (s_afAsm[k].mask == 7) { s_afAsm[k].mask = 0; AttackForwardOwnerDeliver(m.wireId, a); }
+    if (s_afAsm[k].mask == 7) { s_afAsm[k].mask = 0; s_afCtpSeq = seq; s_afCtpMs = m.hostMs; AttackForwardOwnerDeliver(m.wireId, a); }
 }
 // Owner, player frame: re-post each live warning every frame while it is < 250 ms old (the host's poster runs per frame).
 static void AttackForwardOwnerTick() {
@@ -8328,6 +8487,7 @@ static void AttackForwardOwnerTick() {
         if (!s_afAct[i].live) continue;
         if (now - s_afAct[i].ms > 250 || GuestObjEntGone(s_afAct[i].ent) || MirrorKilledLocally((void*)s_afAct[i].ent)) { s_afAct[i].live = false; continue; }
         if (AttackForward_Post(pl, (void*)s_afAct[i].ent, s_afAct[i].a)) InterlockedIncrement(&s_afPost[0]); else InterlockedIncrement(&s_afFail);
+        CombatTiming::GuestAtkRepost();   // [Coop] CombatTimingProbe
     }
 }
 static void AttackForwardReport() {
@@ -8339,10 +8499,12 @@ static void AttackForwardReport() {
 // Receiver part 1, the local player's frame: drain the lane (the only consumer) and queue IC_FIGHT for the puppet.
 static void FightIntentDrain() {
     const bool fi = FightIntentsOn();
-    if (!fi && !(OwnerDamageOn() && Net::IntentLaneOn()) && !(PdrOn() && Net::IntentLaneOn()) && !(AfOn() && Net::IntentLaneOn())) return;
+    if (!fi && !(OwnerDamageOn() && Net::IntentLaneOn()) && !(PdrOn() && Net::IntentLaneOn()) && !(AfOn() && Net::IntentLaneOn())
+        && !(g_guardActLane && Net::IntentLaneOn())) return;
     Net::IntentMsg m;
     while (Net::PollIntent(m)) {
         if (m.channel == IC_ATK_A || m.channel == IC_ATK_B || m.channel == IC_ATK_C) { AttackForwardOwnerRx(m); continue; }   // [Coop] AttackForward
+        if (m.channel == IC_ACTION) { GalGuestRx(m); continue; }                                                              // [Coop] GuardActionLane
         if (m.channel == IC_PDAMAGE && m.wireId == kPdrWire && m.len == sizeof(PdrPayload)) {   // [Coop] PlayerDamageRelay
             PdrPayload p; memcpy(&p, m.payload, sizeof(p));
             PlayerDamageOwnerApply(p, (m.flags & IF_BASE) != 0);
@@ -9158,6 +9320,10 @@ static void ApplyGuards(const EntityPacket& pkt) {
                     }
                 }
                 if (bh && !s_selfTestMode) OwnPublish(bh, (Entity*)best, es.pos, es.quat, es.actionAlias, es.anim, pkt.hostMs);
+                if (bh && CombatTiming::On()) {   // [Coop] CombatTimingProbe
+                    CombatTiming::ScopeBody(bh, best, es.objId);
+                    CombatTiming::GuestGuardRx(es.objId, best, es.actionAlias, es.anim.ratioQ, pkt.hostMs);
+                }
                 const bool ownWrites = bh && !s_selfTestMode && OwnGuardsOn() && !OwnStarved(bh);
                 // [Coop] BindLock: a body linked up to BindRadiusM away from its host guard used to SNAP there (scorecard
                 // 2026-11-16: guard maxErr 11.99 m = a visible teleport). Now it moves in (BindApproachStep); while an
@@ -9193,6 +9359,7 @@ static void ApplyGuards(const EntityPacket& pkt) {
                 }
                 // Only re-issue the clip when the alias changed.
                 if (es.actionAlias && MirrorActionsEnabled() && !(GuardAnimFullOn() && es.anim.valid)
+                    && !GalGuestOwns(es.objId, (Entity*)best)   // [Coop] GuardActionLane: the lane carries this guard's action
                     && MirrorAliasShouldApply(best, es.actionAlias)) {
                     if (bh && readable(bh, 4)) {
                         ActionComponent* ac = bh->GetActionComponent();
@@ -9558,7 +9725,7 @@ static void EntitySyncTick() {
         std::memset(&pkt, 0, sizeof(pkt));   // every field of every record starts at 0 (anim.valid = 0)
             CaptureShips(pkt);
             CaptureGuards(pkt);   // append the characters after the ships
-            if (pkt.count) Net::SendEntities(pkt);
+            if (pkt.count) { Net::SendEntities(pkt); CombatTiming::HostSnapshotSent(pkt.hostMs, pkt.count); }   // [Coop] CombatTimingProbe
         }
         // Peer-reported kills (guest -> host): resolve by position and kill the real guard. Kill
         // processing already ran above (before the self-test branch); do NOT poll a second time here.
@@ -9567,6 +9734,7 @@ static void EntitySyncTick() {
         // retained slot every call); the slow tick still re-applies it, as before, for binding upkeep.
         static uint32_t s_appliedSeq = 0;
         if (!s_frameCadence || slowTick || in.seq != s_appliedSeq) {
+            CombatTiming::GuestSnapshotApplied(in.seq, in.hostMs, in.seq != s_appliedSeq);   // [Coop] CombatTimingProbe
             s_appliedSeq = in.seq;
             ApplyShips(in);
             ApplyGuards(in);   // apply the characters
@@ -12911,8 +13079,41 @@ static void OnFrameInner(Human* updatedHuman);
 // Any access violation inside our per-frame work is logged and that frame is skipped, instead of taking
 // the process down. Crashes that follow from engine state we already corrupted will still happen, but a
 // bad pointer in our own code no longer kills the game - and the log names the frame instead of ending.
+// [Coop] CombatTimingProbe: the body's own current action (alias at Action+8, as CaptureGuards / OwnDrain read it) and its
+// playback ratio, sampled on the body's own update. Read-only.
+static bool CtpSampleAction(Human* h, uint32_t* alias, float* ratio) {
+    *alias = 0; *ratio = 0.0f;
+    if (!readable(h, 4)) return false;
+    ActionComponent* ac = h->GetActionComponent();
+    if (!ac || !readable(ac, 0x40)) return false;
+    unsigned char mir = 0;
+    void* act = ac->GetCurrentAction(&mir, 0, ACTLAYER_PRIMARY);
+    if (!act || !readable(act, 0x14)) return false;
+    *alias = *(uint32_t*)((char*)act + 8);
+    const float r = ac->GetCurrentActionRatio(0, ACTLAYER_PRIMARY);
+    *ratio = (r >= 0.0f && r <= 1.0f) ? r : 0.0f;
+    return true;
+}
+static void CtpOwnUpdate(Human* h) {
+    if (!CombatTiming::Tracked(h)) return;
+    uint32_t alias; float ratio;
+    if (CtpSampleAction(h, &alias, &ratio)) CombatTiming::BodySample(h, alias, ratio);
+}
+static void CtpOwnUpdateGuarded(Human* h) {
+    __try { CtpOwnUpdate(h); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+static void CtpPlayerFrame(Human* h) {
+    __try {
+        uint32_t pa = 0; float pr = 0.0f; CtpSampleAction(h, &pa, &pr);
+        World* cw = World::GetCurrentWorld(); Entity* cpl = cw ? cw->GetPlayer() : nullptr;
+        CombatTiming::PlayerFrame(g_entHost == 1, pa, pr, cpl ? PdrPlayerLife(cpl) : -1);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
 static void __cdecl OnFrame(Human* updatedHuman) {
     StateProbeHost(updatedHuman);                // [Coop] StateProbe host side (no-op unless on and host)
+    if (CombatTiming::On()) CtpOwnUpdateGuarded(updatedHuman);   // [Coop] CombatTimingProbe (default 0)
+    if (g_guardActLane && g_entHost == 1) GalHostOwnUpdateGuarded(updatedHuman);   // [Coop] GuardActionLane (default 0)
     __try { OwnDrain(updatedHuman); }            // puppet / mirrored guard: probe, and write in own-update mode
     __except (EXCEPTION_EXECUTE_HANDLER) {
         static int s_on = 0;
@@ -12977,7 +13178,7 @@ static void DumpConfigOnce()
         { "Coop", "ShipPassenger", 0 }, { "Coop", "ShipRelevanceRadiusM", 1000 }, { "Coop", "ShipSync", 1 },
         { "Coop", "ShipTest", 0 }, { "Coop", "ShipTestFracPct", 45 }, { "Coop", "ShipTestRadiusM", 250 },
         { "Coop", "ActionWriterProbe", 0 }, { "Coop", "BlendTypeSafe", 0 }, { "Coop", "EntityFrameCadence", 0 },
-        { "Coop", "FloatProbe", 0 }, { "Coop", "FootOffsetFix", 0 }, { "Coop", "GuardActionGate", 0 }, { "Coop", "GuardExtrapMs", 100 },
+        { "Coop", "FloatProbe", 0 }, { "Coop", "FootOffsetFix", 0 }, { "Coop", "GuardActionGate", 0 }, { "Coop", "GuardActionLane", 0 }, { "Coop", "CombatTimingProbe", 0 }, { "Coop", "GuardExtrapMs", 100 },
         { "Coop", "GuardInterpBuffer", 0 }, { "Coop", "GuardInterpDelayMs", 120 }, { "Coop", "GuardPhaseLock", 0 },
         { "Coop", "GuardSeesPuppet", 0 }, { "Coop", "PuppetActionReassert", 0 }, { "Coop", "PuppetHostTime", 0 },
         { "Coop", "AlertQueryAsPlayer", 0 }, { "Coop", "ConflictNullGuard", 0 }, { "Coop", "ConflictKeepPuppet", 0 }, { "Coop", "GuardPoiFightTarget", 0 }, { "Coop", "FightOrderPuppet", 0 }, { "Coop", "DespawnLeaveFight", 0 }, { "Coop", "FightKeepOnConflictEnd", 0 }, { "Coop", "FightStateProbe", 0 }, { "Coop", "PuppetNavService", 0 }, { "Coop", "NativeReplica", 0 }, { "Coop", "NativeReplicaSnapCm", 300 }, { "Coop", "NativeReplicaBlendCmS", 150 }, { "Coop", "NativeReplicaStartBoostCmS", 400 }, { "Coop", "NativeReplicaParkour", 0 }, { "Coop", "NativeReplicaFreeRun", 0 }, { "Coop", "NativeReplicaClimbIntent", 0 }, { "Coop", "NativeReplicaClimbMoves", 0 }, { "Coop", "NativeReplicaClimbChoice", 0 }, { "Coop", "NativeReplicaBeam", 0 }, { "Coop", "NativeReplicaWallEntry", 0 }, { "Coop", "NativeReplicaClimbNoSnap", 0 }, { "Coop", "NativeReplicaParkourSnapCm", 800 }, { "Coop", "FightProbe", 0 }, { "Coop", "PeerLastPacket", 0 }, { "Coop", "PuppetActionsOwnUpdate", 1 }, { "Coop", "DetectKeepTarget", 0 }, { "Coop", "GuardPlayerOfInterest", 0 }, { "Coop", "EventProbe", 0 }, { "Coop", "PlayerDamageProbe", 0 }, { "Coop", "ReactProbe", 0 }, { "Coop", "FightSkipPuppet", 0 }, { "Coop", "NavNullGuard", 0 }, { "Coop", "PuppetStimMode", 1 }, { "Coop", "PuppetStimSeq", 0 }, { "Coop", "PuppetStimSource", 0 }, { "Coop", "PuppetFightStim", 1 }, { "Coop", "PuppetFightStimMs", 1000 }, { "Coop", "SightProbe", 0 }, { "Coop", "StateProbe", 0 }, { "Coop", "StuckProbe", 0 },
@@ -13019,7 +13220,8 @@ static void OnFrameInner(Human* updatedHuman) {
         InterlockedExchange(&g_inSaveTick, (w && w->m_CharacterList.GetSize() >= 2) ? (LONG)GetTickCount() : 0);
     }
     Pilot::OnPlayerFrame(updatedHuman);   // [Pilot] Enabled only: publish the player + m_CharacterList
-    __try { FightIntentSend(updatedHuman); FightIntentDrain(); OwnerDamageGuestPump(); PlayerDamageHostPump(); AttackForwardHostPump(); AttackForwardOwnerTick(); SpawnerIdProbeTick(); }   // [Coop] FightIntents / OwnerDamage / SpawnerIdProbe only
+    if (CombatTiming::On()) CtpPlayerFrame(updatedHuman);   // [Coop] CombatTimingProbe: frame interval, the player's action and life
+    __try { FightIntentSend(updatedHuman); FightIntentDrain(); OwnerDamageGuestPump(); PlayerDamageHostPump(); AttackForwardHostPump(); AttackForwardOwnerTick(); GalHostSweep(); SpawnerIdProbeTick(); }   // [Coop] FightIntents / OwnerDamage / SpawnerIdProbe only
     __except (EXCEPTION_EXECUTE_HANDLER) { static int s_fe = 0; if (s_fe < 10) { ++s_fe; L("[FI] EXCEPTION 0x%08X in send/drain\n", GetExceptionCode()); } }
 
     ProbeIdentityOnce();
@@ -13225,6 +13427,8 @@ static void OnFrameInner(Human* updatedHuman) {
                 OwnerDamageReport();
                 PlayerDamageReport();
                 AttackForwardReport();
+                CombatTiming::Report(g_entHost == 1);   // [Coop] CombatTimingProbe
+                GalReport();                            // [Coop] GuardActionLane
                 OwnReport();
                 L("[Mirror] actions on=%d calls=%u deferred=%d queued=%u applied=%ld expired=%ld noSlot=%u\n",
                   MirrorActionsEnabled() ? 1 : 0, s_mirrorActionCalls, MirrorActionsDeferred() ? 1 : 0, s_maqQueued,
@@ -14114,6 +14318,7 @@ void Phase1::DumpPlayerInfo() {
 void Phase1::InstallFrameHook() {
     g_driveLoco = GetPrivateProfileIntA("Coop", "DriveLocomotion", 0, Paths::Ini());
     g_snapHz = GetPrivateProfileIntA("Net", "SnapshotHz", 20, Paths::Ini());
+    g_guardActLane = GetPrivateProfileIntA("Coop", "GuardActionLane", 0, Paths::Ini()) != 0 ? 1 : 0;   // default 0 until verified live
     if (g_snapHz < 1) g_snapHz = 1;
     if (g_snapHz > 60) g_snapHz = 60;
     g_driveContext = GetPrivateProfileIntA("Coop", "DriveContext", 0, Paths::Ini());
