@@ -30,6 +30,7 @@
 #include "action_writer.h"
 #include "guard_sight.h"
 #include "event_probe.h"
+#include "combat_timing.h"
 #include "player_damage_probe.h"
 #include "puppet_stim.h"
 #include "pilot.h"
@@ -636,6 +637,7 @@ BOOL APIENTRY DllMain(HMODULE hMod, DWORD reason, LPVOID)
         // Event probe on sub_64A020 (observation only): which events shooting / attacking posts. [Coop] EventProbe, default 0.
         EventProbe::Init();
         PlayerDamageProbe::Init();   // [Coop] PlayerDamageProbe (default 0) / PlayerDamageRelay (default follows FightIntents)
+        CombatTiming::Init();        // [Coop] CombatTimingProbe (default 0): read-only attack timing lines
         { void SenseGuardInit(); SenseGuardInit(); }
         { void TraversalProbeInit(); TraversalProbeInit(); }   // [Coop] TraversalProbe, default 0: context transitions   // [Coop] SenseOwnerGuard, default 1: sight check with a non-object owner
 

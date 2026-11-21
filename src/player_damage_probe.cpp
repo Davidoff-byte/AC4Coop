@@ -34,6 +34,7 @@ void Phase1_PuppetHitPosted(uintptr_t attacker, int damage, uint32_t contact, ui
 
 #include "player_damage_probe.h"
 #include "attack_forward.h"
+#include "combat_timing.h"
 
 namespace {
 
@@ -46,6 +47,7 @@ DWORD g_t1 = 0, g_t2 = 0, g_t3 = 0, g_t4 = 0;
 volatile uintptr_t g_pup = 0, g_pl = 0;
 volatile ULONGLONG g_nextMs = 0;
 __declspec(thread) int t_victim = 0;   // 1 puppet, 2 player: inside an H2 call for that victim
+__declspec(thread) int t_afPosting = 0; // inside AttackForward_Post: the FDE to the player is ours, not a local NPC's
 
 // [who][counter]: who 0 = puppet, 1 = player
 enum { C_FDE_POST, C_FDE_NOL, C_FDE_HIT, C_DE_POST, C_DE_NOL, C_H2, C_H2_HIT, C_H3, C_H3_SKIP, C_H4, C_N };
@@ -152,6 +154,17 @@ int __fastcall H1(void* ev, void* /*edx*/, void* recv)
                                      d[row + 3], d[row + 4], d[row + 5], d[row + 6], d[row + 7]);
                         }
                     }
+                }
+                if (fde && w == 1 && CombatTiming::On() && !t_afPosting) {   // a local NPC's own attack on this player
+                    const uintptr_t th = *(const uintptr_t*)((const char*)ev + 0x58);
+                    const uintptr_t tat = th && *(const int*)(th + 8) < 0 ? *(const uintptr_t*)th : 0;
+                    CombatTiming::GuestNativeFde(tat, (int)*(const uint32_t*)((const char*)ev + 0x54));
+                }
+                if (fde && w == 0 && CombatTiming::On()) {   // [Coop] CombatTimingProbe: every FDE a guard posts to the puppet
+                    const uintptr_t th = *(const uintptr_t*)((const char*)ev + 0x58);
+                    const uintptr_t tat = th && *(const int*)(th + 8) < 0 ? *(const uintptr_t*)th : 0;
+                    CombatTiming::HostFde(tat, (uintptr_t)recv, (int)*(const uint32_t*)((const char*)ev + 0x54),
+                                          *(const uint32_t*)((const char*)ev + 8), *(const uint32_t*)((const char*)ev + 0x10));
                 }
                 if (fde && w == 0 && g_atkFwd && *(const uint32_t*)((const char*)ev + 8) != 35) {
                     const uintptr_t ah = *(const uintptr_t*)((const char*)ev + 0x58);
@@ -391,7 +404,11 @@ bool AttackForward_Post(void* victim, void* attacker, const AtkFields& a)
     __try {
         char* f = ((char* (__cdecl*)())0x010EFC30)();
         if (!f) return false;
-        float dir[4], pos[4]; memcpy(dir, a.dir, 16); memcpy(pos, a.pos, 16);
+        // sub_18BD690 loads both vectors with `movaps` (0x018BD72D `movaps xmm0,[ecx]` = pos, 0x018BD74E = dir, ida_batch
+        // gcs/b3): they must be 16-byte aligned. Unaligned stack arrays faulted here on 968 of 1086 per-frame warning
+        // re-posts in the owner fight of 2026-11-21 (`[AF] post fault ... at=018BD72D addr=FFFFFFFF`).
+        __declspec(align(16)) float dir[4]; __declspec(align(16)) float pos[4];
+        memcpy(dir, a.dir, 16); memcpy(pos, a.pos, 16);
         ((void* (__thiscall*)(void*, int, int, int, void*, void*, char, char, void*))0x018BD690)(
             f, a.type, a.sub, (int)a.f336, dir, pos, (char)a.b331, (char)a.b328, attacker);
         auto SB = [&](int o, uint8_t v) { *(uint8_t*)(f + o) = v; };
@@ -400,9 +417,11 @@ bool AttackForward_Post(void* victim, void* attacker, const AtkFields& a)
         SB(0x145, a.b325); SB(0x149, a.b329); SD(0x124, a.f124); SD(0x128, a.f128); SD(0x120, a.f120); SD(0x50, a.f50);
         SB(0x169, a.b361); SB(0x143, a.b323); SB(0x144, a.b324); SD(0x11C, a.f11C); SD(0x114, a.f114);
         SD(0x130, a.f130); SB(0x134, a.b308); SD(0x5C, a.f5C); SD(0x54, a.phase ? 1u : 0u); SB(0x1C, a.b1C);   // +0x1C as seen at post time on the host
+        t_afPosting = 1;
         ((void(__thiscall*)(void*, void*))0x0064D8C0)(f, victim);
+        t_afPosting = 0;
         return true;
-    } __except (AfFaultNote(GetExceptionInformation())) { return false; }
+    } __except (AfFaultNote(GetExceptionInformation())) { t_afPosting = 0; return false; }
 }
 
 int PlayerDamageProbe::FormatReport(char* out, int cap)

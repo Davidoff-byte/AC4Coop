@@ -135,6 +135,7 @@
     <ClCompile Include="src\action_writer.cpp" />
     <ClCompile Include="src\event_probe.cpp" />
     <ClCompile Include="src\player_damage_probe.cpp" />
+    <ClCompile Include="src\combat_timing.cpp" />
     <ClCompile Include="src\sense_guard.cpp" />
     <ClCompile Include="src\traversal_probe.cpp" />
     <ClCompile Include="src\puppet_stim.cpp" />
