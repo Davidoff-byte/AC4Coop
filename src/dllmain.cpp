@@ -41,6 +41,7 @@
 void Phase1_OwnerDamageInstall();   // phase1.cpp: [Coop] OwnerDamage SetLife detour (S9)
 #include "action_guard.h"
 #include "deref_guard.h"
+#include "walk_guard.h"
 #include "combat_observe.h"
 #include "build_gate.h"
 #include "paths.h"
@@ -622,6 +623,12 @@ BOOL APIENTRY DllMain(HMODULE hMod, DWORD reason, LPVOID)
         // Correct fix for the same crash: per-site null guards on the two nullable node pointers
         // (+0x114 / +0x118), which the node constructor leaves NULL. [Coop] GuardNullTarget, default 1.
         DerefGuard::Init();
+
+        // Null guard on the world-update walk's two leaves (0x0075A1F0 / 0x0075A1B0): L = [edi+4] is one
+        // value per walk, so a proxy cannot supply its own; when it is 0 the leaf faults at 0x0035A1F8.
+        // Entry detours return immediately on ecx == 0, otherwise re-execute the stolen prologue.
+        // [Coop] WalkNullGuard, default 1 -> two byte-verified detours, nothing else patched.
+        WalkGuard::Init();
 
         // Read-only crash recorder for execute faults (a call through a freed or null object): registers, stack
         // and the objects they name, to AC4Coop_crashctx_<pid>.txt. [Coop] CrashContext, default 0.

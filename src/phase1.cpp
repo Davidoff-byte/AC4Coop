@@ -4626,9 +4626,21 @@ static void MirrorPark(MirrorSlot& m) {
 // X+0x134 is deliberately NOT copied from the source (sub_5D55C0 writes the transform into L+0xA4 by an index
 // from L's own table, so a shared L makes proxy and source overwrite one matrix slot).
 static int s_proxySkipWalk = -1;                  // [Coop] ProxySkipWalk, read once (the s_x = -1 idiom)
+static int s_walkNullGuard = -1;                  // [Coop] WalkNullGuard, read once (the s_x = -1 idiom)
 static void ProxySkipWalk(void* proxy) {
     if (s_proxySkipWalk < 0) s_proxySkipWalk = GetPrivateProfileIntA("Coop", "ProxySkipWalk", 1, Paths::Ini()) != 0 ? 1 : 0;
     if (!s_proxySkipWalk) return;
+    // Superseded, not removed: WalkGuard ([Coop] WalkNullGuard=1, default) makes the null-L crash impossible
+    // directly at 0x75A1F0/0x75A1B0 (entry detour: ecx == 0 -> return). That is strictly narrower than this
+    // write -- byte [U+0x159] is an engine early-out that kills the whole view's render, while the detour
+    // skips only the leaf whose L is null -- so with the guard installed this write is not made. The +0x159
+    // path is kept here only as a documented alternative (WalkNullGuard=0 ProxySkipWalk=1) for A/B.
+    if (s_walkNullGuard < 0) s_walkNullGuard = GetPrivateProfileIntA("Coop", "WalkNullGuard", 1, Paths::Ini()) != 0 ? 1 : 0;
+    if (s_walkNullGuard) {
+        static bool s_noted = false;
+        if (!s_noted) { s_noted = true; L("[ShipMirror] ProxySkipWalk skipped: [Coop] WalkNullGuard=1 supersedes it (U+0x159 not written)\n"); }
+        return;
+    }
     void* U = nullptr;
     __try {
         U = FindComponentByVtable((Entity*)proxy, VT_ACTION_COMPONENT);
@@ -14405,7 +14417,7 @@ static void DumpConfigOnce()
 
     struct K { const char* s; const char* k; int d; };
     static const K keys[] = {
-        { "Coop", "ActionDeathLog", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "CombatObserve", 0 },
+        { "Coop", "ActionDeathLog", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "CombatObserve", 0 },
         { "Coop", "CombatTest", 0 }, { "Coop", "CrashContext", 0 }, { "Coop", "CorpseKeepSec", 30 }, { "Coop", "CrowdProbeIntegrate", 1 },
         { "Coop", "CrowdProbeLiveKeys", 1 }, { "Coop", "DamageRelay", 0 }, { "Coop", "Diag", 0 },
         { "Coop", "DisableCrowd", 0 }, { "Coop", "DisablePuppetAI", 1 }, { "Coop", "DisableSpawns", 0 },
