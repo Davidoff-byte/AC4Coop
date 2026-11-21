@@ -83,3 +83,11 @@ The gate was identified and bypassed: `CanEnterFight`'s failing condition is `|s
 - **24 copies with `gid=378`** — not in the Ground context at all. No enter is possible for them regardless of either call.
 
 **Next:** `ops/evidence/do-enter-fight-2026-11-21.md` — the return-0 branches inside `0x1D79A50`, and what `gid=378` means.
+
+## VERDICT on this feature (2026-11-21, after the static pass)
+
+**`GuardStageApply` cannot work while the copy's behaviour component is disabled.** `DoEnterFight` returns 0 at `0x1D65D72` because state word **107** is absent from the state-path vector at `helper+0xE0`, which is a per-tick snapshot produced by the copy's own state machine. The mod disables the component, the machine never ticks, the vector is empty, and no `Can`/`Do` variant can get past it. Bypassing `Can` did not help because `Do` checks the same data one level down.
+
+`gid=378` copies are also permanently ineligible: that value is the state-path **leaf** (`path[2] == 377`), not a movement context, so such a copy can never accept an enter fight.
+
+**The real prerequisite** is Unity's arrangement: the replica keeps its **native state machine and animation**, and only the **AI decision layer** is off. `ops/evidence/ai-off-seam-2026-11-21.md` is the job that looks for that seam. Until it is found and used, the flag should stay **0**, and this feature is recorded as blocked-by-architecture rather than blocked-by-gate.
