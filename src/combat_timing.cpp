@@ -369,6 +369,22 @@ void GuestAtkRepost()
     AcquireSRWLockExclusive(&g_lock); ++g_reposts; ReleaseSRWLockExclusive(&g_lock);
 }
 
+void GuestNativeFde(uintptr_t attackerEnt, int phase)
+{
+    if (!g_on || !attackerEnt) return;
+    const uint64_t now = NowUs();
+    uint64_t id = 0; bool linked = false; bool log = true;
+    static uintptr_t s_last; static uint64_t s_lastUs;
+    AcquireSRWLockExclusive(&g_lock);
+    const int i = FindEnt((const void*)attackerEnt);
+    if (i >= 0) { linked = g_body[i].hostAlias != 0; id = g_body[i].id; }
+    if (!phase && attackerEnt == s_last && now - s_lastUs < 300000) log = false;   // the warning is posted every frame
+    if (!phase) { s_last = attackerEnt; s_lastUs = now; }
+    ReleaseSRWLockExclusive(&g_lock);
+    if (log) Line("[CTP] G native t=%llu ent=%08X id=%016llX linked=%d ph=%d", (unsigned long long)now, (unsigned)attackerEnt,
+                  (unsigned long long)id, linked ? 1 : 0, phase);
+}
+
 void GuestPdr(uint64_t guardId, uint32_t count, int dmg, const void* copyEnt, const void* playerEnt, bool posted, int lifeBefore)
 {
     if (!g_on) return;

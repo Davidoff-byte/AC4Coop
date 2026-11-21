@@ -46,5 +46,6 @@ void GuestMirrorAct(const void* ent, uint64_t objId, uint32_t alias);
 void GuestAtk(uint64_t guardId, uint32_t seq, int phase, uint32_t msgHostMs, const void* copyEnt, const void* playerEnt,
               bool posted, int lifeBefore);
 void GuestAtkRepost();
+void GuestNativeFde(uintptr_t attackerEnt, int phase);   // a local NPC posted an FDE to this player (not forwarded)
 void GuestPdr(uint64_t guardId, uint32_t count, int dmg, const void* copyEnt, const void* playerEnt, bool posted, int lifeBefore);
 }

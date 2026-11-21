@@ -5423,7 +5423,7 @@ static void CorpseBudgetReport() {
 // Action+0x0C body-part channel, Action+0x10 layer, evaluator +0xD4 type / +0x1C8 / +0x1CC / +0x1D0 / +0x1DC).
 static unsigned s_animBlendDropped = 0;   // non-zero factors beyond GUARD_ANIM_BLEND_MAX (should stay 0)
 static int g_guardActLane = 0;                            // [Coop] GuardActionLane (default 0; read at load, then every 2 s)
-static void GalHostScope(Human* h, uint64_t objId);       // defined with the lane, below FiResolve
+static void GalHostScope(Human* h, Entity* e, uint64_t objId);   // defined with the lane, below FiResolve
 static void CaptureGuardAnim(ActionComponent* ac, void* act, GuardAnim& g) {
     std::memset(&g, 0, sizeof(g));
     g.channel = 0xFFFF; g.blendInMs = -1;
@@ -5537,7 +5537,7 @@ static void EmitGuardEntity(EntityPacket& pkt, uint32_t& count, int idx, Entity*
             }
         }
         if (CombatTiming::On()) CombatTiming::ScopeBody(gh, e, es.objId);   // [Coop] CombatTimingProbe
-        if (g_guardActLane) GalHostScope(gh, es.objId);                     // [Coop] GuardActionLane
+        if (g_guardActLane) GalHostScope(gh, e, es.objId);                  // [Coop] GuardActionLane
     }
     // G10 (ops/AI-T5-G10.md 7.2): es is fully populated and gh/gpB already range-checked; the statics
     // in here only read es, so nothing on the apply/mirror path or the wire is touched.
@@ -8186,15 +8186,17 @@ static void FightIntentSend(Human* player) {
 //          SetTargetAction the alias-only mirror issues), and the snapshot's alias path stands down for that guard.
 // Only the route and the timing change; no new engine call.
 #pragma pack(push, 1)
-struct GalPayload { uint32_t alias; uint16_t channel; int16_t layer; uint16_t ratioQ; uint16_t pad; uint32_t hostQpcMs; };
+// stage = HumanGroundStage + 1 (0 = not sent); tgt = the guard's fight target: 0 none, 1 the puppet (= the receiver's own
+// player), 2 the sender's player, 3 another body ([Coop] GuardStageApply; read as GuardTargetClass below).
+struct GalPayload { uint32_t alias; uint16_t channel; int16_t layer; uint16_t ratioQ; uint8_t stage, tgt; uint32_t hostQpcMs; };
 #pragma pack(pop)
 static_assert(sizeof(GalPayload) == 16, "IC_ACTION payload is a wire layout");
-struct GalHostEnt { unsigned int human; uint64_t objId; uint32_t alias; uint64_t seenMs; };
+struct GalHostEnt { unsigned int human, ent; uint64_t objId; uint32_t alias; uint8_t stage, tgt; uint64_t seenMs; };
 static GalHostEnt s_galH[64]; static volatile LONG s_galHN = 0; static SRWLOCK s_galLock = SRWLOCK_INIT;
 static volatile LONG s_galTx = 0, s_galTxFail = 0, s_galRx = 0, s_galQueued = 0, s_galNoBody = 0, s_galSnapSkipped = 0, s_galRebind = 0;
 
 // Host, player update (snapshot capture): this guard is in sync scope.
-static void GalHostScope(Human* h, uint64_t objId) {
+static void GalHostScope(Human* h, Entity* e, uint64_t objId) {
     if (g_entHost != 1 || !h || !objId) return;
     const uint64_t now = GetTickCount64();
     AcquireSRWLockExclusive(&s_galLock);
@@ -8202,8 +8204,8 @@ static void GalHostScope(Human* h, uint64_t objId) {
     for (int i = 0; i < s_galHN; ++i) if (s_galH[i].human == (unsigned int)h) { k = i; break; }
     if (k < 0 && s_galHN < 64) { k = s_galHN; s_galH[k].human = (unsigned int)h; s_galH[k].alias = 0; InterlockedIncrement(&s_galHN); }
     if (k >= 0) {
-        if (s_galH[k].objId != objId) s_galH[k].alias = 0;   // the Human now belongs to another guard: publish afresh
-        s_galH[k].objId = objId; s_galH[k].seenMs = now;
+        if (s_galH[k].objId != objId) { s_galH[k].alias = 0; s_galH[k].stage = 0; s_galH[k].tgt = 0; }   // another guard now
+        s_galH[k].objId = objId; s_galH[k].ent = (unsigned int)e; s_galH[k].seenMs = now;
     }
     ReleaseSRWLockExclusive(&s_galLock);
 }
@@ -8242,22 +8244,47 @@ static void GalHostSweep() {
     for (int i = 0; i < n; ++i) Net::ForgetIntents(0, gone[i]);   // frees the persisted value (512 keys on the lane)
 }
 // Host, ANY Human's own update: publish a new current action of a scoped guard.
+// The guard's fight target, as sub_15DABC0 reads it (guard_poi.cpp FightTargetIs, IDA 2026-11-14 o84):
+// fd = *(*(e+0xE8)+0x98); rec = *(fd+0x40); target = entity of handle *(rec+0x14) = h[0] & (h[2] >> 31).
+static uint8_t GuardTargetClass(Entity* e) {
+    __try {
+        const char* ai = readable(e, 0xEC) ? *(const char* const*)((const char*)e + 0xE8) : nullptr;
+        const char* fd = readable(ai, 0x9C) ? *(const char* const*)(ai + 0x98) : nullptr;
+        const char* rec = readable(fd, 0x44) ? *(const char* const*)(fd + 0x40) : nullptr;
+        const int* hh = readable(rec, 0x18) ? *(const int* const*)(rec + 0x14) : nullptr;
+        if (!readable(hh, 12)) return 0;
+        const void* t = (const void*)(uintptr_t)((hh[2] >> 31) & hh[0]);
+        if (!t) return 0;
+        if (t == Phase1_PuppetEntity()) return 1;
+        World* w = World::GetCurrentWorld();
+        if (w && t == (const void*)w->GetPlayer()) return 2;
+        return 3;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+static uint8_t HumanStage1(Human* h) {   // HumanGroundStage + 1, 0 = unreadable (the read CaptureGuards does for EF_STAGE)
+    __try {
+        HumanDataBundle* b = readable(h, 4) ? h->m_Data.m_HumanDataBundle : nullptr;
+        return (b && readable(b, 4)) ? (uint8_t)((int32_t)b->m_GroundData.m_HumanGroundStage + 1) : 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
 static void GalHostOwnUpdate(Human* h) {
     if (!s_galHN) return;
-    uint64_t objId = 0; uint32_t last = 0;
+    uint64_t objId = 0; uint32_t last = 0; unsigned int ent = 0; uint8_t lastSt = 0, lastTg = 0;
     AcquireSRWLockShared(&s_galLock);
-    for (int i = 0; i < s_galHN; ++i) if (s_galH[i].human == (unsigned int)h) { objId = s_galH[i].objId; last = s_galH[i].alias; break; }
+    for (int i = 0; i < s_galHN; ++i)
+        if (s_galH[i].human == (unsigned int)h) { objId = s_galH[i].objId; last = s_galH[i].alias; ent = s_galH[i].ent; lastSt = s_galH[i].stage; lastTg = s_galH[i].tgt; break; }
     ReleaseSRWLockShared(&s_galLock);
     if (!objId || !readable(h, 4)) return;
+    const uint8_t st = HumanStage1(h), tg = ent ? GuardTargetClass((Entity*)ent) : 0;
     ActionComponent* ac = h->GetActionComponent();
     if (!ac || !readable(ac, 0x40)) return;
     unsigned char mir = 0;
     void* act = ac->GetCurrentAction(&mir, 0, ACTLAYER_PRIMARY);
     if (!act || !readable(act, 0x14)) return;
     const uint32_t alias = *(uint32_t*)((char*)act + 8);
-    if (!alias || alias == last) return;
+    if (!alias || (alias == last && st == lastSt && tg == lastTg)) return;
     GalPayload p = {};
-    p.alias = alias; p.channel = 0xFFFF;
+    p.alias = alias; p.channel = 0xFFFF; p.stage = st; p.tgt = tg;
     void* bpc = *(void**)((char*)act + 0x0C);
     if (readable(bpc, 0x0A)) p.channel = *(uint16_t*)((char*)bpc + 8);
     p.layer = (int16_t)*(int32_t*)((char*)act + 0x10);
@@ -8269,7 +8296,8 @@ static void GalHostOwnUpdate(Human* h) {
     const bool ok = Net::PublishIntent(0, objId, IC_ACTION, p.hostQpcMs, &p, (uint8_t)sizeof(p));
     InterlockedIncrement(ok ? &s_galTx : &s_galTxFail);
     AcquireSRWLockExclusive(&s_galLock);
-    for (int i = 0; i < s_galHN; ++i) if (s_galH[i].human == (unsigned int)h && s_galH[i].objId == objId) { s_galH[i].alias = alias; break; }
+    for (int i = 0; i < s_galHN; ++i)
+        if (s_galH[i].human == (unsigned int)h && s_galH[i].objId == objId) { s_galH[i].alias = alias; s_galH[i].stage = st; s_galH[i].tgt = tg; break; }
     ReleaseSRWLockExclusive(&s_galLock);
 }
 static void GalHostOwnUpdateGuarded(Human* h) {
@@ -8277,7 +8305,8 @@ static void GalHostOwnUpdateGuarded(Human* h) {
 }
 
 // Guest (player update only): the lane's current action per guard.
-struct GalGuestEnt { uint64_t objId; uint32_t alias; unsigned int ent; uint64_t rxMs; };
+struct GalGuestEnt { uint64_t objId; uint32_t alias; unsigned int ent; uint64_t rxMs; uint8_t stage, tgt; };
+static void GsaNote(Entity* e, uint64_t objId, uint8_t stage, uint8_t tgt);   // [Coop] GuardStageApply, below
 static GalGuestEnt s_galG[128];
 static GalGuestEnt* GalGuestFind(uint64_t id, bool create) {
     for (int i = 0; i < s_galGN; ++i) if (s_galG[i].objId == id) return &s_galG[i];
@@ -8285,7 +8314,7 @@ static GalGuestEnt* GalGuestFind(uint64_t id, bool create) {
     int k = s_galGN;
     if (k >= 128) { k = 0; for (int i = 1; i < 128; ++i) if (s_galG[i].rxMs < s_galG[k].rxMs) k = i; }   // oldest
     else ++s_galGN;
-    s_galG[k].objId = id; s_galG[k].alias = 0; s_galG[k].ent = 0; s_galG[k].rxMs = 0;
+    s_galG[k].objId = id; s_galG[k].alias = 0; s_galG[k].ent = 0; s_galG[k].rxMs = 0; s_galG[k].stage = 0; s_galG[k].tgt = 0;
     return &s_galG[k];
 }
 static void GalGuestIssue(GalGuestEnt* g, Entity* e) {
@@ -8300,10 +8329,14 @@ static void GalGuestRx(const Net::IntentMsg& m) {
     GalPayload p; memcpy(&p, m.payload, sizeof(p));
     InterlockedIncrement(&s_galRx);
     GalGuestEnt* g = GalGuestFind(m.wireId, true);
-    g->alias = p.alias; g->rxMs = GetTickCount64();
+    const bool newAlias = g->alias != p.alias;
+    g->alias = p.alias; g->rxMs = GetTickCount64(); g->stage = p.stage; g->tgt = p.tgt;
     Entity* e = (Entity*)GuestObjFind(m.wireId);                // the linked copy only
     if (!e || !readable(e, 0xCC) || *(uint32_t*)e != 0x01E4CE90u || MirrorKilledLocally(e)) { g->ent = 0; InterlockedIncrement(&s_galNoBody); return; }
-    GalGuestIssue(g, e);
+    GsaNote(e, m.wireId, p.stage, p.tgt);
+    // A stage / target-only update repeats the alias: re-issuing the current action re-runs its transition (GuardAnimFull
+    // note), so the alias is queued only when it changed or the guard is now on another body.
+    if (newAlias || g->ent != (unsigned int)e) GalGuestIssue(g, e);
 }
 // ApplyGuards: true when the lane carries this guard's action, so the snapshot's alias is not applied. A record now
 // bound to another body gets the lane's current action once.
@@ -8311,7 +8344,7 @@ static bool GalGuestOwns(uint64_t objId, Entity* body) {
     if (!g_guardActLane || g_entHost == 1) return false;
     GalGuestEnt* g = GalGuestFind(objId, false);
     if (!g || !g->alias) return false;
-    if (g->ent != (unsigned int)body) { InterlockedIncrement(&s_galRebind); GalGuestIssue(g, body); }
+    if (g->ent != (unsigned int)body) { InterlockedIncrement(&s_galRebind); GalGuestIssue(g, body); GsaNote(body, objId, g->stage, g->tgt); }
     InterlockedIncrement(&s_galSnapSkipped);
     return true;
 }
@@ -8744,6 +8777,93 @@ static void FightIntentApply(Human* pup) {
           s_fiTx[1], s_fiTx[2], s_fiTx[3], s_fiRx[1], s_fiRx[2], s_fiRx[3], s_fiApplied[1], s_fiApplied[2], s_fiApplied[3],
           s_fiUnresolved, s_fiDropped, s_fiPuppetFsm);
     }
+}
+
+// ---- [Coop] GuardStageApply (default 0; read at load, then every 2 s) ------------------------------------------------
+// handover 3.2 / plan step 2: the guard alert `stage` was sent (EF_STAGE) and never applied, so each game ran its own guard
+// state. The per-guard state here is HumanGroundStage (1 Navigation, 4 Fight; ops/evidence/guard-ai/dwarf-enums.md). The
+// world-level detection statechart (Unaware .. InConflict, holder+0x8E0) is NOT per guard and is not touched
+// (docs/evidence/guard-alert-apply-S4.md on re/guard-alert-apply).
+// Apply = the engine's own transition, never a field write: on the copy's own update, host Fight and copy not Fight ->
+// IHumanGround CanEnterFight / DoEnterFight (slots 75 / 76) with the copy's target (host target class 1 = the puppet =
+// this machine's player; 2 = the host player = the puppet here); host not Fight and copy Fight -> CanExitFight /
+// DoExitFight (112 / 113, ExitFightType_Normal). Same slots and arguments FightIntentApply uses on the puppet. At most one
+// try per copy per 500 ms. Needs GuardActionLane (it carries stage and target).
+// Probe (runs with the flag off whenever GuardActionLane is on): per sampled copy frame, host stage vs copy stage.
+// UNVERIFIED: that a copy whose behaviour component is disabled accepts the Can/Do calls (the [GSA] rc / do lines tell).
+static int g_guardStageApply = 0;
+struct GsaEnt { unsigned int human, ent; uint64_t objId; uint8_t hostStage, tgt; uint64_t tryUs; };
+static GsaEnt s_gsa[64]; static volatile LONG s_gsaN = 0; static SRWLOCK s_gsaLock = SRWLOCK_INIT;
+static volatile LONG s_gsaFrames = 0, s_gsaAgree = 0, s_gsaHostFight = 0, s_gsaBothFight = 0, s_gsaEnterTry = 0, s_gsaEnterOk = 0,
+                     s_gsaExitTry = 0, s_gsaExitOk = 0, s_gsaNoTarget = 0, s_gsaLines = 0;
+static void GsaNote(Entity* e, uint64_t objId, uint8_t stage, uint8_t tgt) {   // guest player update (lane drain)
+    Human* h = AIEntityHelper::GetHuman(e);
+    if (!h || !stage) return;
+    AcquireSRWLockExclusive(&s_gsaLock);
+    int k = -1;
+    for (int i = 0; i < s_gsaN; ++i) if (s_gsa[i].objId == objId || s_gsa[i].human == (unsigned int)h) { k = i; break; }
+    if (k < 0) {
+        if (s_gsaN < 64) { k = s_gsaN; InterlockedIncrement(&s_gsaN); }
+        else k = (int)(objId % 64);
+        s_gsa[k].tryUs = 0;
+    }
+    s_gsa[k].human = (unsigned int)h; s_gsa[k].ent = (unsigned int)e; s_gsa[k].objId = objId; s_gsa[k].hostStage = stage; s_gsa[k].tgt = tgt;
+    ReleaseSRWLockExclusive(&s_gsaLock);
+}
+static void GsaOwnUpdate(Human* h) {   // ANY Human's own update, guest
+    if (!s_gsaN) return;
+    GsaEnt g; bool found = false;
+    AcquireSRWLockShared(&s_gsaLock);
+    for (int i = 0; i < s_gsaN; ++i) if (s_gsa[i].human == (unsigned int)h) { g = s_gsa[i]; found = true; break; }
+    ReleaseSRWLockShared(&s_gsaLock);
+    if (!found || GuestObjEntGone(g.ent) || MirrorKilledLocally((void*)g.ent)) return;
+    const uint8_t cs = HumanStage1(h);
+    if (!cs) return;
+    const bool hostFight = g.hostStage == 5, copyFight = cs == 5;   // stage + 1: Fight (4) -> 5
+    InterlockedIncrement(&s_gsaFrames);
+    if (cs == g.hostStage) InterlockedIncrement(&s_gsaAgree);
+    if (hostFight) { InterlockedIncrement(&s_gsaHostFight); if (copyFight) InterlockedIncrement(&s_gsaBothFight); }
+    if (!g_guardStageApply || hostFight == copyFight) return;
+    const uint64_t now = OwnNowUs();
+    if (now - g.tryUs < 500000) return;
+    AcquireSRWLockExclusive(&s_gsaLock);
+    for (int i = 0; i < s_gsaN; ++i) if (s_gsa[i].human == (unsigned int)h) { s_gsa[i].tryUs = now; break; }
+    ReleaseSRWLockExclusive(&s_gsaLock);
+    char* hg = FiHumanGround(h);
+    if (!hg) return;
+    void* ig = hg + 0x10;
+    uint32_t rc = 0, rd = 0; Entity* t = nullptr;
+    if (hostFight) {
+        World* w = World::GetCurrentWorld();
+        t = g.tgt == 1 ? (w ? w->GetPlayer() : nullptr) : g.tgt == 2 ? (Entity*)Phase1_PuppetEntity() : nullptr;
+        if (!readable(t, 0xCC)) { InterlockedIncrement(&s_gsaNoTarget); return; }
+        uint32_t hnd = *(uint32_t*)((char*)t + 0xC8);
+        InterlockedIncrement(&s_gsaEnterTry);
+        rc = FiCall(ig, 75, 1, (uint32_t)&hnd);                                  // CanEnterFight(const Handle&)
+        if (rc & 0xFF) { rd = FiCall(ig, 76, 1, (uint32_t)&hnd); InterlockedIncrement(&s_gsaEnterOk); }   // DoEnterFight
+    } else {
+        InterlockedIncrement(&s_gsaExitTry);
+        rc = FiCall(ig, 112, 1, 0);                                               // CanExitFight(ExitFightType_Normal)
+        if (rc & 0xFF) { rd = FiCall(ig, 113, 1, 0); InterlockedIncrement(&s_gsaExitOk); }   // DoExitFight
+    }
+    if (InterlockedIncrement(&s_gsaLines) <= 60)
+        L("[GSA] %s copy=%08X id=%016llX hostStage=%d copyStage=%d tgt=%u target=%08X can=%08X do=%08X t=%llu\n", hostFight ? "enter" : "exit",
+          g.ent, (unsigned long long)g.objId, g.hostStage - 1, cs - 1, g.tgt, (unsigned)(uintptr_t)t, rc, rd, (unsigned long long)now);
+}
+static void GsaOwnUpdateGuarded(Human* h) { __try { GsaOwnUpdate(h); } __except (EXCEPTION_EXECUTE_HANDLER) {} }
+static void GsaPoll() {   // player update: follow the ini every 2 s
+    static uint64_t s_next = 0;
+    const uint64_t t = GetTickCount64();
+    if (t < s_next) return;
+    s_next = t + 2000;
+    const int v = GetPrivateProfileIntA("Coop", "GuardStageApply", 0, Paths::Ini()) != 0 ? 1 : 0;
+    if (v != g_guardStageApply) { L("[GSA] GuardStageApply=%d (was %d) t=%llu us\n", v, g_guardStageApply, (unsigned long long)OwnNowUs()); g_guardStageApply = v; }
+}
+static void GsaReport() {
+    if (!g_guardActLane || g_entHost == 1) return;
+    L("[GSA] apply=%d copies=%ld frames=%ld agree=%ld hostFight=%ld bothFight=%ld | enter try=%ld ok=%ld exit try=%ld ok=%ld noTarget=%ld\n",
+      g_guardStageApply, s_gsaN, s_gsaFrames, s_gsaAgree, s_gsaHostFight, s_gsaBothFight, s_gsaEnterTry, s_gsaEnterOk, s_gsaExitTry,
+      s_gsaExitOk, s_gsaNoTarget);
 }
 
 // ---- [Coop] GuardPlace writer (docs/design/enemy-placement.md) -------------------------------------------------------
@@ -13494,6 +13614,7 @@ static void __cdecl OnFrame(Human* updatedHuman) {
     StateProbeHost(updatedHuman);                // [Coop] StateProbe host side (no-op unless on and host)
     if (CombatTiming::On()) CtpOwnUpdateGuarded(updatedHuman);   // [Coop] CombatTimingProbe (default 0)
     if (g_guardActLane && g_entHost == 1) GalHostOwnUpdateGuarded(updatedHuman);   // [Coop] GuardActionLane (default 0)
+    if (g_guardActLane && g_entHost != 1) GsaOwnUpdateGuarded(updatedHuman);       // [Coop] GuardStageApply (default 0) + probe
     __try { OwnDrain(updatedHuman); }            // puppet / mirrored guard: probe, and write in own-update mode
     __except (EXCEPTION_EXECUTE_HANDLER) {
         static int s_on = 0;
@@ -13558,7 +13679,7 @@ static void DumpConfigOnce()
         { "Coop", "ShipPassenger", 0 }, { "Coop", "ShipRelevanceRadiusM", 1000 }, { "Coop", "ShipSync", 1 },
         { "Coop", "ShipTest", 0 }, { "Coop", "ShipTestFracPct", 45 }, { "Coop", "ShipTestRadiusM", 250 },
         { "Coop", "ActionWriterProbe", 0 }, { "Coop", "BlendTypeSafe", 0 }, { "Coop", "EntityFrameCadence", 0 },
-        { "Coop", "FloatProbe", 0 }, { "Coop", "FootOffsetFix", 0 }, { "Coop", "GuardActionGate", 0 }, { "Coop", "GuardActionLane", 0 }, { "Coop", "RespawnHitGraceMs", 0 }, { "Coop", "CombatTimingProbe", 0 }, { "Coop", "GuardExtrapMs", 100 },
+        { "Coop", "FloatProbe", 0 }, { "Coop", "FootOffsetFix", 0 }, { "Coop", "GuardActionGate", 0 }, { "Coop", "GuardActionLane", 0 }, { "Coop", "RespawnHitGraceMs", 0 }, { "Coop", "GuardStageApply", 0 }, { "Coop", "CombatTimingProbe", 0 }, { "Coop", "GuardExtrapMs", 100 },
         { "Coop", "GuardInterpBuffer", 0 }, { "Coop", "GuardInterpDelayMs", 120 }, { "Coop", "GuardPhaseLock", 0 },
         { "Coop", "GuardSeesPuppet", 0 }, { "Coop", "PuppetActionReassert", 0 }, { "Coop", "PuppetHostTime", 0 },
         { "Coop", "AlertQueryAsPlayer", 0 }, { "Coop", "ConflictNullGuard", 0 }, { "Coop", "ConflictKeepPuppet", 0 }, { "Coop", "GuardPoiFightTarget", 0 }, { "Coop", "FightOrderPuppet", 0 }, { "Coop", "DespawnLeaveFight", 0 }, { "Coop", "FightKeepOnConflictEnd", 0 }, { "Coop", "FightStateProbe", 0 }, { "Coop", "PuppetNavService", 0 }, { "Coop", "NativeReplica", 0 }, { "Coop", "NativeReplicaSnapCm", 300 }, { "Coop", "NativeReplicaBlendCmS", 150 }, { "Coop", "NativeReplicaStartBoostCmS", 400 }, { "Coop", "NativeReplicaParkour", 0 }, { "Coop", "NativeReplicaFreeRun", 0 }, { "Coop", "NativeReplicaClimbIntent", 0 }, { "Coop", "NativeReplicaClimbMoves", 0 }, { "Coop", "NativeReplicaClimbChoice", 0 }, { "Coop", "NativeReplicaBeam", 0 }, { "Coop", "NativeReplicaWallEntry", 0 }, { "Coop", "NativeReplicaClimbNoSnap", 0 }, { "Coop", "NativeReplicaParkourSnapCm", 800 }, { "Coop", "FightProbe", 0 }, { "Coop", "PeerLastPacket", 0 }, { "Coop", "PuppetActionsOwnUpdate", 1 }, { "Coop", "DetectKeepTarget", 0 }, { "Coop", "GuardPlayerOfInterest", 0 }, { "Coop", "EventProbe", 0 }, { "Coop", "PlayerDamageProbe", 0 }, { "Coop", "ReactProbe", 0 }, { "Coop", "FightSkipPuppet", 0 }, { "Coop", "NavNullGuard", 0 }, { "Coop", "PuppetStimMode", 1 }, { "Coop", "PuppetStimSeq", 0 }, { "Coop", "PuppetStimSource", 0 }, { "Coop", "PuppetFightStim", 1 }, { "Coop", "PuppetFightStimMs", 1000 }, { "Coop", "SightProbe", 0 }, { "Coop", "StateProbe", 0 }, { "Coop", "StuckProbe", 0 },
@@ -13601,7 +13722,7 @@ static void OnFrameInner(Human* updatedHuman) {
     }
     Pilot::OnPlayerFrame(updatedHuman);   // [Pilot] Enabled only: publish the player + m_CharacterList
     if (CombatTiming::On()) CtpPlayerFrame(updatedHuman);   // [Coop] CombatTimingProbe: frame interval, the player's action and life
-    __try { FightIntentSend(updatedHuman); FightIntentDrain(); OwnerDamageGuestPump(); PlayerDamageHostPump(); AttackForwardHostPump(); AttackForwardOwnerTick(); GalHostSweep(); SpawnerIdProbeTick(); }   // [Coop] FightIntents / OwnerDamage / SpawnerIdProbe only
+    __try { FightIntentSend(updatedHuman); FightIntentDrain(); OwnerDamageGuestPump(); PlayerDamageHostPump(); AttackForwardHostPump(); AttackForwardOwnerTick(); GalHostSweep(); GsaPoll(); SpawnerIdProbeTick(); }   // [Coop] FightIntents / OwnerDamage / SpawnerIdProbe only
     __except (EXCEPTION_EXECUTE_HANDLER) { static int s_fe = 0; if (s_fe < 10) { ++s_fe; L("[FI] EXCEPTION 0x%08X in send/drain\n", GetExceptionCode()); } }
 
     ProbeIdentityOnce();
@@ -13810,6 +13931,7 @@ static void OnFrameInner(Human* updatedHuman) {
                 CombatTiming::Report(g_entHost == 1);   // [Coop] CombatTimingProbe
                 GalReport();                            // [Coop] GuardActionLane
                 HitGraceReport();                       // [Coop] RespawnHitGraceMs
+                GsaReport();                            // [Coop] GuardStageApply
                 OwnReport();
                 L("[Mirror] actions on=%d calls=%u deferred=%d queued=%u applied=%ld expired=%ld noSlot=%u\n",
                   MirrorActionsEnabled() ? 1 : 0, s_mirrorActionCalls, MirrorActionsDeferred() ? 1 : 0, s_maqQueued,

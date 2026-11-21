@@ -1,6 +1,7 @@
 # Status
 
-Last updated 2026-11-11, at `main` after PR #1 (the live-tests stack). This file replaces every plan,
+Last updated 2026-11-21 on `feat/launcher` (guest combat timing, plan step 1 of `ops/HANDOVER-MP-BLUEPRINT-2026-11-21.md`); the
+rest of the file dates from 2026-11-11, at `main` after PR #1 (the live-tests stack). This file replaces every plan,
 journal and handoff in `docs/archive/`. Update it in the same PR as any change that alters what is true here.
 
 ## Build
@@ -22,6 +23,7 @@ journal and handoff in `docs/archive/`. Update it in the same PR as any change t
 | two copies on one PC | two `AC4BFSP.exe` running at once, both started directly from the exe (no Steam), with `proxy/version` `version.dll` | live 2026-11-15, pids 25788 + 26200 (`docs/evidence/single-instance-guard-2026-11-15.md`); render and co-op between them not yet checked |
 | fight decisions (S7 slice 1) | `[Coop] FightIntents` (default 0): fight enter / attack / exit with target on the intention lane drive the puppet's own FSM | same-PC two copies 2026-11-15: enter/exit 3/3, one real attack (`docs/evidence/s7-fight-intents-2026-11-15.md`); needs the target bound by the entity lane |
 | guards hitting the other player | `[Coop] PlayerDamageRelay` (default follows FightIntents): a guard's hit on the puppet (lost there: the puppet has no fight/health services) is scored with the engine's `sub_199A160` and posted as a native DamageEvent on the owner's player | same-PC two copies 2026-11-16: 13/13 hits applied, native death and respawn, no double hits (`docs/evidence/player-damage-relay-2026-11-16.md`); no hurt reaction, the owner's block/counter not consulted |
+| guest combat timing | `[Coop] CombatTimingProbe` (read-only) and `[Coop] GuardActionLane` (default 0): a guard's action switch rides the intention lane with the hits | owner fight 2026-11-21 (asi `9da8d40d`): lane off, hits landed 251-378 ms before the swing shown on the guest (action p50 329 ms, hit p50 10 ms, n = 18); lane on, linked copies \|skew\| p95 45 ms (n = 10). Frame time is not the cause (guest p95 21-22 ms, unfocused host 18 ms). **AWAITING OWNER:** whether counters can be timed (`docs/evidence/combat-timing-2026-11-17.md` run 3) |
 
 ## Measured negatives
 - Guards do not perceive the other player's body, with or without collision. `docs/ops/P6-RESULT.md`, `RUN-2026-11-10-X2b`.
@@ -30,6 +32,12 @@ journal and handoff in `docs/archive/`. Update it in the same PR as any change t
   continuation jump, fixed in `c718e92`. The investigation is in `docs/archive/ops/HAUL-2026-11-08.md`.
 
 ## Built but not verified live
+- Guest combat, built after the owner fight (default 0, NOT yet run in the game): the 16-byte alignment fix for the forwarded
+  attack event (968 of 1086 warning re-posts faulted at `0x018BD72D`); `[Coop] RespawnHitGraceMs` (hits forwarded while the
+  guest reloads were applied 2.6-4.5 s late to the respawned player); `[Coop] GuardStageApply` (the guard's Fight stage
+  through Can/DoEnterFight and Can/DoExitFight on the guest's copy, `docs/evidence/guard-stage-apply-2026-11-21.md`).
+- GuardPlace (`[Coop] GuardPlace`, default 0) is now on `feat/launcher` (cherry-picked `89da594`, `844586f` from
+  `feat/enemy-placement`; evidence `docs/evidence/enemy-placement-2026-11-16.md`).
 - Everything after `cddbc41`: skel-attach (`[Coop] SkelAttach`, default 0, tested solo only) and BoardableTest
   (`[Coop] BoardableTest`, default 0).
 - Guest→host kill relay.
