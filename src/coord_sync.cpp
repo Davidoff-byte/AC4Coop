@@ -99,9 +99,42 @@ bool ShipExtract(void* logic, uint8_t field, float* out) {
 // was handed; IC_SHIP passes msg.wireId the same way). Set by the consumer immediately before the call.
 uint64_t s_applyKey = 0;
 
+// Hull apply goes through the engine setter, never a raw +0xD0 write. A raw write is undone within a frame
+// or two: regeneration sub_1211EE0 does `+0xD0 = max*rate*dt + +0xD0` clamped to `+0xD4`, and at high hull
+// `+0xD4` is -1.0 ("no cap, regenerate to max"), so the write arms a full regen. 0x01225A10 is GcLShip
+// vtable slot +0x12C, `void __thiscall f(GcLShip*, float newHull)`: it sets the pool, HealthState, `+0xD4`
+// and the bar fraction at *(ship+0x570)+0x32C. It also rewrites `+0xD4` itself (via sub_1220B60), so the cap
+// that holds the value is written back AFTER the call. Evidence:
+// ops/evidence/ship-hull-live-write-2026-11-21.md (sections 1 and 2).
+LONG s_hullExc = 0;   // faults caught here; a bad GcL costs one message, never the frame
+
+bool ShipApplyHull(void* ent, float v) {
+    void* gcl = CoordSyncEntityLogic(ent);                   // ShipGcLObj glue (phase1.cpp)
+    if (!gcl || !Readable(gcl, 0xB70)) return false;
+    float after = 0.0f, cap = 0.0f;
+    int ok = 0;
+    __try {
+        float maxHull = *(float*)((char*)gcl + 0xB4);        // +0xB4 = max hull, +0xD0 = current HP
+        if (!(maxHull > 0.0f)) maxHull = 0.0f;
+        if (!(v > 0.0f)) v = 0.0f;                           // also turns NaN into 0
+        if (v > maxHull) v = maxHull;
+        ((void (__thiscall*)(void*, float))0x01225A10)(gcl, v);
+        *(float*)((char*)gcl + 0xD4) = v;                    // hold: cap regen at the applied value
+        after = *(float*)((char*)gcl + 0xD0);
+        cap = *(float*)((char*)gcl + 0xD4);
+        ok = 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { ++s_hullExc; }
+    char line[192];
+    _snprintf_s(line, sizeof(line), _TRUNCATE,
+                "[CoordS] hull apply ship=%p gcl=%p %.1f->%.1f cap=%.1f ok=%d\n",
+                ent, gcl, v, after, cap, ok);
+    Phase1_LogLine(line);
+    return ok == 1;
+}
+
 bool ShipApply(void* ent, uint8_t field, float v) {
     if (!ent) return false;
-    if (field == CF_HULL) return CoordSyncHullWriteRaw(ent, v);
+    if (field == CF_HULL) return ShipApplyHull(ent, v);
     if (field == CF_SAIL) {
         if (!(v >= 0.0f) || !(v < 4.0f)) return false;   // never hand the setter a non-SailState
         return CoordSyncSailApply(ent, (unsigned)v, s_applyKey) == 1;
@@ -196,8 +229,8 @@ void ReportTick() {
     s_next = now;
     char line[192];
     _snprintf_s(line, sizeof(line), _TRUNCATE,
-                "[CoordS] rx stats ok=%ld stale=%ld unres=%ld bad=%ld exc=%ld\n",
-                s_rxOk, s_rxStale, s_rxUnres, s_rxBad, s_rxExc);
+                "[CoordS] rx stats ok=%ld stale=%ld unres=%ld bad=%ld exc=%ld hexc=%ld\n",
+                s_rxOk, s_rxStale, s_rxUnres, s_rxBad, s_rxExc, s_hullExc);
     Phase1_LogLine(line);
 }
 
