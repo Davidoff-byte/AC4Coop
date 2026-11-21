@@ -39,6 +39,7 @@ bool     CoordSyncHullWriteRaw(void* ent, float hp); // WriteShipHullHPRaw
 int      CoordSyncSailApply(void* ent, unsigned st, uint64_t key);  // ShipGcLObj + SailSetViaEngine
 uint64_t CoordSyncProxyHostId(const void* ent);      // live ShipMirror proxy -> its hostId, else 0
 void*    CoordSyncProxyEntity(uint64_t hostId);      // live ShipMirror slot for a hostId, else nullptr
+uint64_t CoordSyncObjectId(const void* obj);         // GetObjectID 0x9F0B50, read-only, all 64 bits back
 
 // Already exported from phase1.cpp (coord_enum.cpp declares Phase1_LogLine the same way).
 bool Phase1_IsEntityHost();
@@ -70,7 +71,8 @@ bool Readable(const void* p, size_t n) {
 // Identity, exactly as the table contract states: the local ship is key 0 on both machines; a ShipMirror
 // proxy is identified by the host's deep-copied entity id; everything else is not synced. Both lookups are
 // pointer comparisons inside phase1.cpp (no dereference of the candidate), so no SEH is needed here.
-uint64_t ShipIdentity(void* ent) {
+uint64_t ShipIdentity(void* ent, void* logic) {
+    (void)logic;                                          // a GcLShip is identified by its entity
     if (!ent) return kCoordKeyNone;
     if (ent == CoordSyncLocalShipEntity()) return kCoordKeyLocal;
     const uint64_t hostId = CoordSyncProxyHostId(ent);
@@ -146,8 +148,129 @@ bool ShipApply(void* ent, uint8_t field, float v) {
     return false;
 }
 
+// ---- schema callbacks for GcLBoardingBattle (battle objectives; [Coop] BoardObjectiveSync) ----------
+// Six BattleObjective* at +0x60..+0x74 of one GcLBoardingBattle (class-info 0x02917FC0, vtable 0x026AEFD8,
+// size 0x3E8). The ctor sub_12ECE30 zeroes all six and the dtor frees all six independently, and the
+// class-info property names fix the slot order - evidence: ops/evidence/battle-objective-state-2026-11-21.md
+// sections 3 and 5. Each objective carries BattleObjectiveState as a uint32 at +0x04 (section 2).
+const int      kObjSlotBase  = 0x60;    // first Objective* (four-byte stride, six slots)
+const int      kObjSlotCount = 6;
+const int      kObjStateOff  = 0x04;    // BattleObjective+0x04 = State
+const uint32_t kBoardBattleVt = 0x026AEFD8u;   // NEVER 0x026AA294 - that address is the name string
+
+struct ObjSlotRow { uint8_t id; const char* name; };
+const ObjSlotRow kObjRows[kObjSlotCount] = {
+    { CF_OBJ_CREW,     "ObjectiveKillEnemyCrew" },
+    { CF_OBJ_CAPTAIN,  "ObjectiveKillCaptain" },
+    { CF_OBJ_SCOUTS,   "ObjectiveKillScouts" },
+    { CF_OBJ_OFFICERS, "ObjectiveKillOfficers" },
+    { CF_OBJ_FLAG,     "ObjectiveDestroyFlag" },
+    { CF_OBJ_POWDER,   "ObjectiveDestroyPowderReserve" },
+};
+
+bool IsObjField(uint8_t field) { return field >= CF_OBJ_CREW && field <= CF_OBJ_POWDER; }
+
+int ObjSlotIndex(uint8_t field) {
+    for (int i = 0; i < kObjSlotCount; ++i) if (kObjRows[i].id == field) return i;
+    return -1;
+}
+
+const char* ObjSlotName(uint8_t field) {
+    const int i = ObjSlotIndex(field);
+    return i >= 0 ? kObjRows[i].name : "?";
+}
+
+// A slot that has not been filled yet is normal (the ctor nulls all six); log it once per (parent, field)
+// rather than once per 100 ms host walk.
+struct NullSlotSeen { void* parent; uint8_t field; bool used; };
+NullSlotSeen s_nullSlot[16];
+
+void NullSlotOnce(void* parent, uint8_t field) {
+    for (int i = 0; i < 16; ++i)
+        if (s_nullSlot[i].used && s_nullSlot[i].parent == parent && s_nullSlot[i].field == field) return;
+    for (int i = 0; i < 16; ++i)
+        if (!s_nullSlot[i].used) {
+            s_nullSlot[i].used = true; s_nullSlot[i].parent = parent; s_nullSlot[i].field = field;
+            char line[192];
+            _snprintf_s(line, sizeof(line), _TRUNCATE, "[CoordS] obj slot=%s NULL parent=%p\n",
+                        ObjSlotName(field), parent);
+            Phase1_LogLine(line);
+            return;
+        }
+    // Table full: stay quiet rather than spam the log.
+}
+
+// The wire key is the parent object's own 64-bit registry id, read through GetObjectID (0x9F0B50), never a
+// pointer. Two clients only agree on it if both spawned the same authored boarding battle; if they did not,
+// the guest's walk finds nothing and it logs `obj unresolved` once instead of guessing a state.
+uint64_t BoardIdentity(void* ent, void* logic) {
+    (void)ent;                                            // identified by the parent, not the entity
+    if (!logic || !Readable(logic, kObjSlotBase + 4 * kObjSlotCount)) return kCoordKeyNone;
+    uint32_t vt = 0;
+    uint64_t id = 0;
+    __try {
+        vt = *(uint32_t*)logic;
+        if (vt == kBoardBattleVt) id = CoordSyncObjectId(logic);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return kCoordKeyNone; }
+    return vt == kBoardBattleVt ? id : kCoordKeyNone;
+}
+
+// `logic` is the GcLBoardingBattle. Slot i -> the BattleObjective*, whose +0x04 dword is the state; a value
+// above 2 is not a BattleObjectiveState and is refused (same refusal the ship sail field makes).
+bool BoardExtract(void* logic, uint8_t field, float* out) {
+    if (!logic || !out) return false;
+    const int i = ObjSlotIndex(field);
+    if (i < 0) return false;
+    if (!Readable((const char*)logic + kObjSlotBase, 4 * kObjSlotCount)) return false;
+    bool nullSlot = false;
+    __try {
+        void* obj = *(void**)((char*)logic + kObjSlotBase + 4 * i);
+        if (!obj) { nullSlot = true; }
+        else if (Readable((const char*)obj + kObjStateOff, 4)) {
+            const uint32_t st = *(uint32_t*)((char*)obj + kObjStateOff);
+            if (st <= 2u) { *out = (float)st; return true; }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    if (nullSlot) NullSlotOnce(logic, field);
+    return false;
+}
+
+// The parent for the message being applied, set by the consumer immediately before sc->apply - the same
+// one-shot channel s_applyKey already is for the sail setter.
+void* s_applyObj = nullptr;
+
+// Apply is a raw uint32 store at BattleObjective+0x04. There is no setter: the class writes +0x04 itself at
+// 0x14AA033 (`= 1`) and 0x14AA0F6 (`= 2`), both hard-coded and guarded (evidence section 4). Whether such a
+// store is later overwritten by the monitors is UNPROVEN - that is what the 2 s probe below measures.
+bool BoardApply(void* ent, uint8_t field, float v) {
+    (void)ent;
+    void* parent = s_applyObj;
+    if (!parent || !Readable(parent, kObjSlotBase + 4 * kObjSlotCount)) return false;
+    const int i = ObjSlotIndex(field);
+    if (i < 0 || !(v >= 0.0f) || !(v <= 2.0f)) return false;   // never store a non-BattleObjectiveState
+    const uint32_t st = (uint32_t)(v + 0.5f);
+    int ok = 0;
+    __try {
+        if (*(uint32_t*)parent != kBoardBattleVt) return false;     // vtable gate, as for the hull
+        void* obj = *(void**)((char*)parent + kObjSlotBase + 4 * i);  // re-read the slot now
+        if (obj && Readable((const char*)obj + kObjStateOff, 4)) {
+            *(uint32_t*)((char*)obj + kObjStateOff) = st;
+            ok = 1;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { ok = 0; }
+    return ok == 1;
+}
+
+const uint8_t kShipFields[]  = { CF_HULL, CF_SAIL, 0 };
+const uint8_t kBoardFields[] = { CF_OBJ_CREW, CF_OBJ_CAPTAIN, CF_OBJ_SCOUTS, CF_OBJ_OFFICERS,
+                                 CF_OBJ_FLAG, CF_OBJ_POWDER, 0 };
+
 const CoordSchema kSchemas[] = {
-    { 0x026A34E8u, "GcLShip", ShipIdentity, ShipExtract, ShipApply },   // coord_enum.cpp census: n = 9
+    { 0x026A34E8u, "GcLShip", ShipIdentity, ShipExtract, ShipApply, kShipFields },   // census: n = 9
+    // Not yet seen in a coordinator census: if GcLBoardingBattle is not a coordinator's GameplayLogic the
+    // existing walk will not yield it. The row is registered so it resolves if/when a ref appears; no new
+    // enumeration is invented here.
+    { kBoardBattleVt, "GcLBoardingBattle", BoardIdentity, BoardExtract, BoardApply, kBoardFields },
 };
 
 } // namespace
@@ -161,6 +284,11 @@ const CoordSchema* CoordSchemaFor(uint32_t vt) {
 // Telemetry. Counters are reported on the guest's 5 s line, never per message.
 static LONG     s_txN = 0;                                   // IC_COORD publishes accepted by the lane
 static LONG     s_rxOk = 0, s_rxStale = 0, s_rxUnres = 0, s_rxBad = 0, s_rxExc = 0;
+// Battle-objective persistence probe ([Coop] BoardObjectiveSync): classified 2 s after each apply.
+// ok = the applied value is still there; stale = changed to something else; revert = back to the old
+// value; bad = unreadable / not a BattleObjectiveState; gone = the parent is no longer a live
+// GcLBoardingBattle (boarding ended, object released) - reported separately so `bad` keeps its meaning.
+static LONG     s_objOk = 0, s_objStale = 0, s_objRevert = 0, s_objBad = 0, s_objGone = 0;
 
 // Host change cache: one row per (key, field), last value published. Publishing on change only is what
 // keeps the lane quiet - the hull moves in damage-sized steps and the sail state changes rarely.
@@ -169,6 +297,22 @@ struct TxSlot { uint64_t key; uint8_t field; float last; bool used; };
 TxSlot  s_tx[kMaxTxSlots];
 struct RxSlot { uint64_t key; uint8_t field; uint32_t lastSeq; uint32_t seenMs; bool used; };
 RxSlot  s_rx[kMaxRxSlots];
+
+// 2 s persistence probe, one row per in-flight apply. Eight is plenty: objectives change on boarding
+// events, not per frame.
+const int kMaxProbes = 8;
+struct ObjProbe {
+    uint64_t key; uint8_t field; uint32_t before; uint32_t applied; uint32_t after;
+    void* parent; DWORD dueMs; bool used;
+};
+ObjProbe s_probe[kMaxProbes];
+int      s_probeN = 0;
+}
+
+bool BoardObjectiveSyncOn() {
+    static int s_ini = -1;   // the s_x = -1 idiom: read once
+    if (s_ini < 0) s_ini = GetPrivateProfileIntA("Coop", "BoardObjectiveSync", 0, Paths::Ini()) != 0 ? 1 : 0;
+    return s_ini == 1;
 }
 
 bool CoordSyncOn() {
@@ -217,11 +361,109 @@ void HostTick() {
         const CoordRef& c = refs[i];
         const CoordSchema* sc = CoordSchemaFor(c.vt);
         if (!sc) continue;
-        const uint64_t key = sc->identity(c.ent);
+        const uint64_t key = sc->identity(c.ent, c.logic);
         if (key == kCoordKeyNone) continue;
-        float v = 0.0f;
-        if (sc->extract(c.logic, CF_HULL, &v)) PublishField(sc, key, CF_HULL, v);
-        if (sc->extract(c.logic, CF_SAIL, &v)) PublishField(sc, key, CF_SAIL, v);
+        for (const uint8_t* f = sc->fields; f && *f; ++f) {
+            if (IsObjField(*f) && !BoardObjectiveSyncOn()) continue;   // flag 0: not a single extra read
+            float v = 0.0f;
+            if (sc->extract(c.logic, *f, &v)) PublishField(sc, key, *f, v);
+        }
+    }
+}
+
+// Guest: find the object a wire key names, using the same read-only walk the host uses (CoordCollect is
+// the existing receipted enumerator - no new mechanism). The schema's identity decides the match, so a
+// class keyed by its parent's registry id resolves through the parent, not the entity.
+void* ResolveByKey(uint64_t key, void** logicOut) {
+    if (logicOut) *logicOut = nullptr;
+    if (!key || key == kCoordKeyLocal) return nullptr;
+    static CoordRef refs[kMaxCollect];
+    int n = 0;
+    __try { n = CoordCollect(refs, kMaxCollect); } __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+    for (int i = 0; i < n; ++i) {
+        const CoordSchema* sc = CoordSchemaFor(refs[i].vt);
+        if (!sc) continue;
+        if (sc->identity(refs[i].ent, refs[i].logic) == key) {
+            if (logicOut) *logicOut = refs[i].logic;
+            return refs[i].ent;
+        }
+    }
+    return nullptr;
+}
+
+// `obj unresolved` once per key, not once per message: the host republishes on change only, but a guest
+// that never spawned the same boarding battle must not fill the log with the same line.
+struct UnresKey { uint64_t key; bool used; };
+UnresKey s_unres[8];
+
+void LogUnresolvedOnce(uint64_t key, uint8_t field) {
+    for (int i = 0; i < 8; ++i) if (s_unres[i].used && s_unres[i].key == key) return;
+    bool have = false;
+    for (int i = 0; i < 8; ++i) if (!s_unres[i].used) { s_unres[i].used = true; s_unres[i].key = key; have = true; break; }
+    if (!have) return;
+    char line[192];
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[CoordS] obj unresolved key=%016llX slot=%s\n",
+                (unsigned long long)key, ObjSlotName(field));
+    Phase1_LogLine(line);
+}
+
+// Arm the 2 s re-read for one applied objective. `before`/`applied`/`after` are the values the log needs.
+void ProbeRecord(uint64_t key, uint8_t field, void* parent,
+                 uint32_t before, uint32_t applied, uint32_t after) {
+    ObjProbe* slot = nullptr;
+    for (int i = 0; i < kMaxProbes; ++i)
+        if (s_probe[i].used && s_probe[i].key == key && s_probe[i].field == field) { slot = &s_probe[i]; break; }
+    if (!slot) for (int i = 0; i < kMaxProbes; ++i) if (!s_probe[i].used) { slot = &s_probe[i]; break; }
+    if (!slot) {                                     // full: drop the row that is due soonest
+        slot = &s_probe[0];
+        for (int i = 1; i < kMaxProbes; ++i)
+            if ((int32_t)(s_probe[i].dueMs - slot->dueMs) < 0) slot = &s_probe[i];
+    }
+    if (!slot->used) ++s_probeN;
+    slot->used = true;
+    slot->key = key; slot->field = field;
+    slot->before = before; slot->applied = applied; slot->after = after;
+    slot->parent = parent;
+    slot->dueMs = GetTickCount() + 2000;             // the hull lane taught us one frame proves nothing
+}
+
+// Guest, per frame: the due 2 s re-reads. With no rows this is one loop over eight flags.
+void ObjProbeTick() {
+    if (!s_probeN) return;
+    const DWORD now = GetTickCount();
+    for (int i = 0; i < kMaxProbes; ++i) {
+        ObjProbe& p = s_probe[i];
+        if (!p.used || (int32_t)(now - p.dueMs) < 0) continue;
+        p.used = false;
+        --s_probeN;
+        uint32_t after2s = 0;
+        bool have = false, gone = false, bad = false;
+        if (!p.parent || !Readable(p.parent, kObjSlotBase + 4 * kObjSlotCount)) gone = true;
+        else __try {
+            if (*(uint32_t*)p.parent != kBoardBattleVt) { gone = true; }
+            else {
+                void* obj = *(void**)((char*)p.parent + kObjSlotBase + 4 * ObjSlotIndex(p.field));
+                if (!obj || !Readable((const char*)obj + kObjStateOff, 4)) gone = true;
+                else {
+                    const uint32_t st = *(uint32_t*)((char*)obj + kObjStateOff);
+                    if (st <= 2u) { after2s = st; have = true; } else { bad = true; }
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) { gone = true; have = false; }
+
+        if (have) {
+            if (after2s == p.applied)                                 ++s_objOk;
+            else if (after2s == p.before && p.before != p.applied)    ++s_objRevert;
+            else                                                      ++s_objStale;
+        } else if (bad)  ++s_objBad;
+        else             ++s_objGone;
+
+        char line[224];
+        _snprintf_s(line, sizeof(line), _TRUNCATE,
+                    "[CoordS] obj slot=%s key=%016llX before=%u applied=%u after=%u after2s=%u\n",
+                    ObjSlotName(p.field), (unsigned long long)p.key,
+                    p.before, p.applied, p.after, have ? after2s : 0xFFFFFFFFu);
+        Phase1_LogLine(line);
     }
 }
 
@@ -236,6 +478,10 @@ void ReportTick() {
                 "[CoordS] rx stats ok=%ld stale=%ld unres=%ld bad=%ld exc=%ld hexc=%ld\n",
                 s_rxOk, s_rxStale, s_rxUnres, s_rxBad, s_rxExc, s_hullExc);
     Phase1_LogLine(line);
+    _snprintf_s(line, sizeof(line), _TRUNCATE,
+                "[CoordS] obj stats ok=%ld stale=%ld revert=%ld bad=%ld gone=%ld\n",
+                s_objOk, s_objStale, s_objRevert, s_objBad, s_objGone);
+    Phase1_LogLine(line);
 }
 
 } // namespace
@@ -243,6 +489,7 @@ void ReportTick() {
 void CoordSyncTick() {
     if (!CoordSyncOn()) return;
     if (Phase1_IsEntityHost()) { HostTick(); return; }
+    ObjProbeTick();      // one loop over eight flags while no probe is armed
     ReportTick();
 }
 
@@ -253,13 +500,28 @@ void CoordSyncApplyMsg(uint64_t wireId, uint32_t seq, const uint8_t* payload, ui
     if (len != sizeof(IntentCoordValue) || !payload) { ++s_rxBad; return; }
     IntentCoordValue p;
     memcpy(&p, payload, sizeof(p));
-    if (p.field != CF_HULL && p.field != CF_SAIL) { ++s_rxBad; return; }
+    const bool objField = IsObjField(p.field);
+    if (!objField && p.field != CF_HULL && p.field != CF_SAIL) { ++s_rxBad; return; }
+    if (objField && !BoardObjectiveSyncOn()) { ++s_rxBad; return; }
 
     // Key 0 is the local ship on both sides; anything else is a ship this machine renders as a proxy.
-    void* ent = (wireId == kCoordKeyLocal) ? CoordSyncLocalShipEntity() : CoordSyncProxyEntity(wireId);
-    if (!ent) { ++s_rxUnres; return; }
-    void* logic = CoordSyncEntityLogic(ent);
-    if (!logic || !Readable(logic, 4)) { ++s_rxUnres; return; }
+    // An objective message names the parent GcLBoardingBattle by its registry id, so when no ship proxy
+    // owns the key the read-only coordinator walk is asked instead (ResolveByKey); if that finds nothing
+    // the guest reports `unresolved` once rather than inventing a state.
+    s_applyObj = nullptr;
+    void* ent = nullptr;
+    void* logic = nullptr;
+    if (wireId == kCoordKeyLocal) {
+        ent = CoordSyncLocalShipEntity();
+        if (ent) logic = CoordSyncEntityLogic(ent);
+    } else {
+        ent = CoordSyncProxyEntity(wireId);
+        if (ent) logic = CoordSyncEntityLogic(ent);
+        else if (objField) ent = ResolveByKey(wireId, &logic);
+    }
+    if (!ent) { ++s_rxUnres; if (objField) LogUnresolvedOnce(wireId, p.field); return; }
+    if (!logic || !Readable(logic, 4)) { ++s_rxUnres; if (objField) LogUnresolvedOnce(wireId, p.field); return; }
+    if (objField) s_applyObj = logic;
 
     uint32_t vt = 0;
     __try { vt = *(uint32_t*)logic; } __except (EXCEPTION_EXECUTE_HANDLER) { ++s_rxExc; return; }
@@ -301,7 +563,12 @@ void CoordSyncApplyMsg(uint64_t wireId, uint32_t seq, const uint8_t* payload, ui
         s_rx[slot].lastSeq = seq; s_rx[slot].seenMs = now;
         ++s_rxOk;
     }
-    sc->extract(logic, p.field, &after);                 // read back for the log; a failed read leaves 0
+    const bool haveAfter = sc->extract(logic, p.field, &after);   // read back; a failed read leaves 0
+    // Arm the 2 s persistence re-read. `applied` is the value this message actually stored, `before` and
+    // `after` the values around it - the log line the oracle reads.
+    if (ok && objField && s_applyObj)
+        ProbeRecord(wireId, p.field, s_applyObj, haveBefore ? (uint32_t)before : 0xFFFFFFFFu,
+                    (uint32_t)(p.value + 0.5f), haveAfter ? (uint32_t)after : 0xFFFFFFFFu);
     char line[192];
     _snprintf_s(line, sizeof(line), _TRUNCATE,
                 "[CoordS] rx vt=%08X key=%016llX f=%u %.2f->%.2f ok=%d\n",

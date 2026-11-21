@@ -27,18 +27,31 @@ static const uint64_t kCoordKeyLocal = 0;
 // "Not a coordinated object this build syncs": identity() returns this; the host then skips the entry.
 static const uint64_t kCoordKeyNone = ~(uint64_t)0;
 
-// Field ids carried in IntentCoordValue::field (netstate.h).
+// Field ids carried in IntentCoordValue::field (netstate.h). 1-2 are GcLShip, 3-8 are the six battle
+// objectives of one GcLBoardingBattle (+0x60..+0x74, in class-info property order).
 enum CoordField : uint8_t {
     CF_HULL = 1,   // hullCurrent: GcLShip+0xD0
     CF_SAIL = 2,   // sailState:   GcLShip+0xCC (read as a dword)
+    // GcLBoardingBattle: slot i is a BattleObjective* at +0x60+4*i; the synced value is its State dword at
+    // +0x04 (0 Invalid, 1 InProgress, 2 Completed). ops/evidence/battle-objective-state-2026-11-21.md 3, 5.
+    CF_OBJ_CREW = 3,       // +0x60 ObjectiveKillEnemyCrew
+    CF_OBJ_CAPTAIN = 4,    // +0x64 ObjectiveKillCaptain
+    CF_OBJ_SCOUTS = 5,     // +0x68 ObjectiveKillScouts
+    CF_OBJ_OFFICERS = 6,   // +0x6C ObjectiveKillOfficers
+    CF_OBJ_FLAG = 7,       // +0x70 ObjectiveDestroyFlag
+    CF_OBJ_POWDER = 8,     // +0x74 ObjectiveDestroyPowderReserve
 };
 
 struct CoordSchema {
-    uint32_t vt;                       // GcLShip = 0x026A34E8 (*(uint32_t*)logic)
+    uint32_t vt;                       // GcLShip = 0x026A34E8, GcLBoardingBattle = 0x026AEFD8 (*(uint32_t*)logic)
     const char* name;
-    uint64_t (*identity)(void* ent);   // local ship -> 0; mirror proxy -> hostId; else kCoordKeyNone (not synced)
+    // Shipped wire key. `ent` is the owning entity (what the coord walk yields); `logic` is the GcL object
+    // itself, so a class identified by the parent object's registry id (GcLBoardingBattle) can carry all 64
+    // bits of it without a pointer value. kCoordKeyNone = "not a coordinated object this build syncs".
+    uint64_t (*identity)(void* ent, void* logic);
     bool (*extract)(void* logic, uint8_t field, float* out);
     bool (*apply)(void* ent, uint8_t field, float v);
+    const uint8_t* fields;             // field ids this class publishes, 0-terminated (0 is never a field)
 };
 
 // The row for a logic vtable, or nullptr when the class is not synced.

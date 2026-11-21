@@ -8833,6 +8833,12 @@ void* CoordSyncProxyEntity(uint64_t hostId) {
         if (g_mirror[i].live && g_mirror[i].hostId == hostId) return g_mirror[i].proxy;
     return nullptr;
 }
+// Parent registry id for the boarding-battle schema (coord_sync.cpp). 0x9F0B50 -> sub_A200D0 is a pure
+// thiscall thunk: object in ECX, u64 back in EDX:EAX, arg_4 = 0 so a read can never mint or renumber an id
+// (ops/evidence/objective-identity.md 376-381 - all 64 bits are carried). Read-only.
+// Unit: decomp/units.json 009F0B50 "GetObjectID" (receipt 2026-11-08).
+static uint64_t IdentityIdOf(void* obj);                  // defined with the [Coop] IdentityBand block below
+uint64_t CoordSyncObjectId(const void* obj) { return IdentityIdOf((void*)obj); }
 
 // ---- TEST HARNESS [Coop] HelmSeat (default 0): does the helm function actually seat the player? -----
 // ops/evidence/helm-fields-static-2026-11-20.md: all four helm bools are transition-written, there is no
@@ -14499,6 +14505,7 @@ static void DumpConfigOnce()
 
     struct K { const char* s; const char* k; int d; };
     static const K keys[] = {
+        { "Coop", "BoardObjectiveSync", 0 },
         { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "CombatObserve", 0 },
         { "Coop", "CombatTest", 0 }, { "Coop", "CrashContext", 0 }, { "Coop", "CorpseKeepSec", 30 }, { "Coop", "CrowdProbeIntegrate", 1 },
         { "Coop", "CrowdProbeLiveKeys", 1 }, { "Coop", "DamageRelay", 0 }, { "Coop", "Diag", 0 },
