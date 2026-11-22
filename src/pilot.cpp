@@ -35,6 +35,7 @@ static_assert(offsetof(Pilot::PilotState, seq) == 8 && offsetof(Pilot::PilotStat
               "PilotState layout changed: update tools/pilot.py");
 static_assert(offsetof(Pilot::PilotCtl, f) == 20 && offsetof(Pilot::PilotCtl, rcount) == 100 && sizeof(Pilot::PilotCtl) == 1140, "PilotCtl layout changed: update tools/pilot.py");
 
+void* Phase1_PlayerShipEntity();   // phase1.cpp: the local player's ship entity or null
 namespace Pilot {
 namespace {
 
@@ -546,7 +547,20 @@ void RunCommand(Entity* pl)
     if (!c || c->req == c->done) return;
     if (c->cmd == kCmdHgCall) { uint32_t f0; memcpy(&f0, &c->f[0], 4); if (f0 & kHgPuppet) return; }   // served by OnPuppetFrame
     int32_t status = 0;
-    if (c->cmd == kCmdTeleport) {
+    if (c->cmd == kCmdTeleport && c->f[4] == 1.0f) {
+        // --ship: move the player's ship (x, y; its own z and rotation kept). UNVERIFIED that the world streams around
+        // the ship at sea; this is the test of that.
+        Entity* ship = (Entity*)Phase1_PlayerShipEntity();
+        if (!ship) status = -1;
+        else {
+            __try {
+                HookMath::Transform m = ((BaseEntity*)ship)->m_GlobalMatrix;
+                m.M41 = c->f[0]; m.M42 = c->f[1];
+                ship->SetGlobalMatrixInternal(&m, true);
+                Log("[Pilot] teleport ship %p -> (%.2f, %.2f, %.2f)\n", (void*)ship, m.M41, m.M42, m.M43);
+            } __except (EXCEPTION_EXECUTE_HANDLER) { status = -2; }
+        }
+    } else if (c->cmd == kCmdTeleport) {
         if (!pl) status = -1;
         else {
             __try {

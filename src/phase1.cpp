@@ -359,6 +359,22 @@ void* handleResolve(const Handle& h) {
     void*   o    = (void*)(obj & vbit);
     return ((uintptr_t)o == 0x04DD5F8C) ? nullptr : o;
 }
+} // namespace (reopened below: Phase1_PlayerShipEntity needs external linkage for pilot.cpp)
+// [Pilot] teleport --ship: the local player's ship entity (the vehicle Edward stands on), or null. Same resolution as
+// SpawnGhostShip: Human::m_IsOnShipEntity, else m_Data.m_Vehicle.
+void* Phase1_PlayerShipEntity() {
+    __try {
+        World* world = World::GetCurrentWorld();
+        Entity* player = world ? world->GetPlayer() : nullptr;
+        Human* h = player ? AIEntityHelper::GetHuman(player) : nullptr;
+        if (!h) return nullptr;
+        void* ship = handleResolve(h->m_IsOnShipEntity);
+        if (!ship) ship = handleResolve(h->m_Data.m_Vehicle);
+        return ship;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+}
+namespace {
+
 
 // True when the given world is the white-room (loadout/test world), which we must not spawn into.
 // Callers run inside an SEH __try, so the raw derefs here are covered; the readable() probes keep the
