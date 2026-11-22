@@ -14796,7 +14796,7 @@ static void CtpPlayerFrame(Human* h) {
 // change for 3 s after each call. Pre-registered: PASS = a state id 173 (attack, entered from fight idle 168) appears in the
 // path within 2 s of the slot-160 call; FAIL = it does not. Up to 3 copies, one at a time, 6 s apart. Nothing else changes.
 static int g_cctOn = -1;
-struct CctCand { unsigned int human, ent; };
+struct CctCand { unsigned int human, ent; int tested; };
 static CctCand s_cct[16]; static volatile LONG s_cctN = 0;
 static SRWLOCK s_cctLock = SRWLOCK_INIT;
 static unsigned int s_cctCur = 0;          // Human under test
@@ -14813,15 +14813,32 @@ static void CctNote(Human* h, Entity* e) {   // guest bind site (game thread)
     AcquireSRWLockExclusive(&s_cctLock);
     bool have = false;
     for (int i = 0; i < s_cctN; ++i) if (s_cct[i].human == (unsigned int)h) { have = true; break; }
-    if (!have && s_cctN < 16) { s_cct[s_cctN].human = (unsigned int)h; s_cct[s_cctN].ent = (unsigned int)e; InterlockedIncrement(&s_cctN); }
+    if (!have && s_cctN < 16) { s_cct[s_cctN].human = (unsigned int)h; s_cct[s_cctN].ent = (unsigned int)e; s_cct[s_cctN].tested = 0; InterlockedIncrement(&s_cctN); }
     ReleaseSRWLockExclusive(&s_cctLock);
+}
+// Active path (u16 *(fsm+0x118), depth u16 fsm+0x11E) and whether node 107 is in the node list (u32 fsm+0xE0, count u16
+// fsm+0x106; the list DoEnterFight consults, ops/evidence/do-enter-fight-2026-11-21.md).
+static void CctDescribe(char* fsm, char* out, size_t cap) {
+    out[0] = 0;
+    if (!readable(fsm, 0x120)) { _snprintf_s(out, cap, _TRUNCATE, "fsm?"); return; }
+    const unsigned d = *(const uint16_t*)(fsm + 0x11E), nn = *(const uint16_t*)(fsm + 0x106);
+    const uint16_t* p = *(const uint16_t**)(fsm + 0x118);
+    int n107 = 0;
+    for (unsigned i = 0; i < nn && i < 9; ++i) if (*(const uint32_t*)(fsm + 0xE0 + 4 * i) == 107) n107 = 1;
+    int o = _snprintf_s(out, cap, _TRUNCATE, "d=%u nodes=%u n107=%d path=", d, nn, n107);
+    for (unsigned i = 0; o > 0 && i < d && i < 12 && readable(p, 2 * (i + 1)) && (size_t)o < cap - 8; ++i) {
+        const int k = _snprintf_s(out + o, cap - o, _TRUNCATE, i ? "/%u" : "%u", p[i]);
+        if (k <= 0) break;
+        o += k;
+    }
 }
 static void CctOwnUpdate(Human* h) {
     if (s_cctDone >= 3 || !s_cctN) return;
     const uint64_t now = OwnNowUs();
     AcquireSRWLockExclusive(&s_cctLock);
-    unsigned int ent = 0; bool cand = false;
-    for (int i = 0; i < s_cctN; ++i) if (s_cct[i].human == (unsigned int)h) { cand = true; ent = s_cct[i].ent; break; }
+    unsigned int ent = 0; bool cand = false; int ci = -1;
+    for (int i = 0; i < s_cctN; ++i) if (s_cct[i].human == (unsigned int)h) { cand = true; ent = s_cct[i].ent; ci = i; break; }
+    if (cand && !s_cctCur && s_cct[ci].tested) cand = false;      // each copy once
     if (!cand || (s_cctCur && s_cctCur != (unsigned int)h) || GuestObjEntGone(ent) || MirrorKilledLocally((void*)ent)) { ReleaseSRWLockExclusive(&s_cctLock); return; }
     char* hg = FiHumanGround(h);
     uint16_t path[6] = {}; char* fsm = nullptr;
@@ -14831,27 +14848,31 @@ static void CctOwnUpdate(Human* h) {
         if (now < s_cctNext || !havePath || path[3] != 4) { ReleaseSRWLockExclusive(&s_cctLock); return; }
         World* w = World::GetCurrentWorld(); Entity* pl = w ? w->GetPlayer() : nullptr;
         if (!readable(pl, 0xCC)) { ReleaseSRWLockExclusive(&s_cctLock); return; }
-        s_cctCur = (unsigned int)h; s_cctStage = 1; s_cctT0 = now; s_cctHnd = *(uint32_t*)((char*)pl + 0xC8);
+        s_cctCur = (unsigned int)h; s_cctStage = 1; s_cctT0 = now; s_cctHnd = *(uint32_t*)((char*)pl + 0xC8); s_cct[ci].tested = 1;
+        char desc[200]; CctDescribe(fsm, desc, sizeof(desc));
+        float dist = -1.0f;
+        if (readable((void*)ent, 0x80)) { const float ex = ((Entity*)ent)->m_GlobalMatrix.M41 - pl->m_GlobalMatrix.M41,
+                                                      ey = ((Entity*)ent)->m_GlobalMatrix.M42 - pl->m_GlobalMatrix.M42; dist = sqrtf(ex * ex + ey * ey); }
         memcpy(s_cctLast, path, sizeof(path));
         const uint32_t rd = FiCall(ig, 76, 1, (uint32_t)&s_cctHnd);                    // DoEnterFight(const Handle&)
-        L("[CCT] copy#%d human=%p ent=%08X target=%p enter(76) do=%08X | before path=%u/%u/%u/%u/%u/%u\n", s_cctDone + 1, (void*)h, ent,
-          (void*)pl, rd, path[0], path[1], path[2], path[3], path[4], path[5]);
+        L("[CCT] copy#%d human=%p ent=%08X target=%p dist=%.1f enter(76) do=%08X | before %s\n", s_cctDone + 1, (void*)h, ent,
+          (void*)pl, dist, rd, desc);
         ReleaseSRWLockExclusive(&s_cctLock); return;
     }
     const double dt = (now - s_cctT0) / 1e6;
-    if (havePath && memcmp(path, s_cctLast, sizeof(path)) != 0 && s_cctLines < 400) {
-        ++s_cctLines; memcpy(s_cctLast, path, sizeof(path));
-        L("[CCT] copy#%d +%.3fs %s path=%u/%u/%u/%u/%u/%u\n", s_cctDone + 1, dt, s_cctStage == 1 ? "after-enter" : "after-combo",
-          path[0], path[1], path[2], path[3], path[4], path[5]);
+    static char s_cctLastDesc[200];
+    char desc[200]; CctDescribe(fsm, desc, sizeof(desc));
+    if (strcmp(desc, s_cctLastDesc) != 0 && s_cctLines < 400) {
+        ++s_cctLines; strcpy_s(s_cctLastDesc, desc);
+        L("[CCT] copy#%d +%.3fs %s %s\n", s_cctDone + 1, dt, s_cctStage == 1 ? "after-enter" : "after-combo", desc);
     }
     if (s_cctStage == 1 && dt >= 1.5) {
         World* w = World::GetCurrentWorld(); Entity* pl = w ? w->GetPlayer() : nullptr;
         const uint32_t rc = readable(pl, 0xCC) ? FiCall(ig, 160, 4, (uint32_t)pl, 3, 1, 0) : 0xFFFFFFFFu;   // PerformCombo
-        L("[CCT] copy#%d +%.3fs combo(160) target=%p n=3 -> %08X | path=%u/%u/%u/%u/%u/%u\n", s_cctDone + 1, dt, (void*)pl, rc,
-          path[0], path[1], path[2], path[3], path[4], path[5]);
+        L("[CCT] copy#%d +%.3fs combo(160) target=%p n=3 -> %08X | %s\n", s_cctDone + 1, dt, (void*)pl, rc, desc);
         s_cctStage = 2;
     } else if (s_cctStage == 2 && dt >= 4.5) {
-        L("[CCT] copy#%d end +%.3fs path=%u/%u/%u/%u/%u/%u\n", s_cctDone + 1, dt, path[0], path[1], path[2], path[3], path[4], path[5]);
+        L("[CCT] copy#%d end +%.3fs %s\n", s_cctDone + 1, dt, desc);
         ++s_cctDone; s_cctCur = 0; s_cctStage = 0; s_cctNext = now + 6000000;
     }
     ReleaseSRWLockExclusive(&s_cctLock);
