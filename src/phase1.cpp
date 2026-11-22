@@ -3451,7 +3451,9 @@ static void* DuplicateShip(void* shipEnt) {
         // walk without its own render instance (X+0x134 null; X+0x104 garbage): evidence walk-guard-ext-2026-11-22.md.
         // UNVERIFIED: that the engine route gives the clone its own instance; this flag is the test.
         static int s_inst = -1;
-        if (s_inst < 0) s_inst = GetPrivateProfileIntA("Coop", "ShipMirrorInstantiate", 0, Paths::Ini()) != 0 ? 1 : 0;
+        // Default 1 since 2026-11-22: soaks 3 and 4 (6 proxies, 22 min) no crash and zero null-L hits, against the old
+        // route's guest deaths at minutes 4 and 5 (walk-guard-ext-2026-11-22.md). Set 0 to get the old clone back.
+        if (s_inst < 0) s_inst = GetPrivateProfileIntA("Coop", "ShipMirrorInstantiate", 1, Paths::Ini()) != 0 ? 1 : 0;
         if (s_inst) {
             ((int (__thiscall*)(void*, void**))0x00527BA0)(shipEnt, &dup);
             L("[ShipMirror] instantiate route: dup=%p\n", dup);
@@ -14827,7 +14829,7 @@ static void DumpConfigOnce()
         // The Tune* values are floats (read with strtod, see ShipTuningTick); the dump shows the integer part.
         { "Coop", "TuneConeAngle", 120 }, { "Coop", "TuneConeRange", 350 }, { "Coop", "TuneMaxTime", 30 },
         { "Coop", "TuneAggroTime", 30 }, { "Coop", "TuneHull", 0 },
-        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "CombatObserve", 0 },
+        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 },
         { "Coop", "CombatTest", 0 }, { "Coop", "CrashContext", 0 }, { "Coop", "CorpseKeepSec", 30 }, { "Coop", "CrowdProbeIntegrate", 1 },
         { "Coop", "CrowdProbeLiveKeys", 1 }, { "Coop", "DamageRelay", 0 }, { "Coop", "Diag", 0 },
         { "Coop", "DisableCrowd", 0 }, { "Coop", "DisablePuppetAI", 1 }, { "Coop", "DisableSpawns", 0 },

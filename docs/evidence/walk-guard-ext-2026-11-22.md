@@ -99,3 +99,39 @@ Same rig, local build (asi `ceff8a5b…`, `feat/integration-1121` + this change 
 - **Report:** `ShipMirror` live and meanErr. A proxy that no longer renders or follows its source is a regression even
   if nothing crashes.
 - **FAIL:** a dump. n = 1: a pass is a lead to repeat, not a fix.
+
+**Result (soak 3, asi `a3a0a12d…`, host 21996, guest 33480, 07:44-07:55): PASS (n = 1).**
+- Both copies were alive at 11 minutes; no new dump; 0 `EXCEPTION` lines on either side.
+- `[WalkGuard] ext installed 3/3` on both, and **zero** `null L hit` lines.
+- Guest: `[ShipMirror] instantiate route: dup=3D9A0CE0` and `dup=3A319A50`, two proxies, both built through
+  `sub_527BA0`.
+  - `stat … live=2 … samples=102 meanErr=0.00` at peak, then each retired in place after 5 s without a record.
+  - The host took the instantiate route 0 times: it mirrors nothing.
+- Against soaks 1-2 (default clone route), whose guests died at minutes 4 and 5. Visual correctness of the proxies was
+  not checked (nobody looked).
+- **Pre-registered (soak 4), written before the run:** same build, `ShipMirrorInstantiate=1`, `WalkNullGuardExt=0`.
+  If the instantiate route gives the proxy its own render instance, the guest survives 11 minutes without the
+  extended guard, with zero null hits on the two original guards. A dump here means soak 3's survival needed the guard
+  (or was luck).
+
+**Result (soak 4, asi `a3a0a12d…`, host 13748, guest 27692, 07:58-08:09): PASS.**
+- Both copies were alive at 11 minutes; no new dump; 0 `EXCEPTION` lines.
+- Only the two original guards were installed, and they took zero null hits.
+- The guest built **4** proxies through `sub_527BA0` (`instantiate route` x4); `live=1 … meanErr=0.00` while
+  tracking.
+
+## 7. Verdict
+- **The guest crashes of 11-21/22 are the default clone route.**
+  - Two soaks with `ShipMirrorInstantiate=1` (6 proxies, 22 minutes): no crash, and **no** null render instance reached
+    any guarded leaf.
+  - Two soaks on the old route (1-2 proxies): both guests died within 5 minutes, one per symptom (`X+0x134` null,
+    `X+0x104` garbage).
+- **Static reading, matching DeepSeek's §7 verdict (A):** the engine's instantiate (`Begin(0,1)`, `vt[0xC](0,0)`)
+  produces a clone whose world object gets its own render instance; the `(0,1)` / `Begin(1,0)` clone does not.
+  UNVERIFIED which step publishes `X+0x134`; the outcome is measured, the mechanism is not named.
+- **`ShipMirrorInstantiate` now defaults to 1.** `WalkNullGuardExt` stays 0 (not needed on the new route; kept as a
+  fallback). n = 2 soaks, same spot, idle.
+- Not checked:
+  - visual correctness of the proxies;
+  - a soak while sailing past many ships;
+  - cross-machine behaviour.
