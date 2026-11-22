@@ -415,6 +415,14 @@ def cmd_frame(p, a):
     return 0
 
 
+def cmd_stim(p, a):
+    """Test harness (kCmdStim 16): post one fight-trigger stimulus (default 257) from Edward to guard ENT, as the engine's
+    sub_17B7A80 lays it out (src/puppet_stim.cpp PostFightStim). Starts a native fight with no pad input."""
+    st = p.ctl_send_u32(16, [int(a.ent, 16) & 0xFFFFFFFF, a.id])
+    print(f'status {st}')
+    return 0 if st == 0 else 3
+
+
 def cmd_lifehit(p, a):
     """S9 test (kCmdLifeHit 14): CSrvNPCHealth::SetLife(life - dmg) on ENT from the player's frame, unmarked like a combat
     hit. On a linked copy with [Coop] OwnerDamage the write is blocked (life unchanged) and sent to the host as a request."""
@@ -674,6 +682,7 @@ def main():
     x.add_argument('--do', type=int); x.add_argument('--arg', action='append'); x.add_argument('--puppet', action='store_true')
     x = sub.add_parser('frame'); x.add_argument('--out')
     x = sub.add_parser('lifehit'); x.add_argument('ent'); x.add_argument('dmg', type=int)
+    x = sub.add_parser('stim'); x.add_argument('ent'); x.add_argument('--id', type=int, default=257)
     x = sub.add_parser('route'); x.add_argument('x', type=float); x.add_argument('y', type=float)
     x = sub.add_parser('boot'); x.add_argument('--pulses', type=int, default=6); x.add_argument('--wait', type=float, default=5)
     x.add_argument('--settle', type=float, default=60); x.add_argument('--fps', type=float, default=0)   # 0: no Present patch (cap preceded 4 lost copies in 7 two-copy runs, docs/evidence/s0-two-copy-rig-2026-11-15.md)

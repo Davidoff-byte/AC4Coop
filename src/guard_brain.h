@@ -40,3 +40,4 @@ namespace Brain {
 void* Phase1_PuppetEntity();
 void* Phase1_LocalPlayerEntity();
 void  Phase1_LogLine(const char* s);
+int   Phase1_HumanStage1(void* human);   // HumanGroundStage + 1 (5 = Fight, 0 = unreadable)

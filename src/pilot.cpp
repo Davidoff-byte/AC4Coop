@@ -9,6 +9,7 @@
 // Imports patched (IAT only; AC4BFSP.exe imports xinput1_3 by ordinal: #2 GetState, #3 SetState, #4 GetCapabilities,
 // and user32 GetForegroundWindow / GetActiveWindow - read from the PE import table of md5 2058342866688f780c8b34526a65bc35).
 #include "pilot.h"
+#include "puppet_stim.h"   // kCmdStim (test harness)
 #include "paths.h"
 #include "Hook.h"
 #include "Scimitar/Entity.h"
@@ -658,6 +659,13 @@ void RunCommand(Entity* pl)
         int before = 0, after = 0;
         status = Phase1_TestLifeHit((void*)(uintptr_t)u[0], (int)u[1], &before, &after);
         const int32_t r[2] = { before, after }; memcpy(c->res, r, sizeof(r)); c->rcount = 2;
+    } else if (c->cmd == kCmdStim) {
+        // Test harness: one fight-trigger stimulus (default id 257) with Edward as the source, posted to a guard in the
+        // layout of the engine's sub_17B7A80 (PuppetStim::PostFightStim). Starts a native fight without driving the pad.
+        uint32_t u[2]; memcpy(u, c->f, sizeof(u));
+        if (!pl) status = -1;
+        else { __try { status = PuppetStim::PostFightStim(pl, (void*)(uintptr_t)u[0], u[1] ? (int)u[1] : 257) == 1 ? 0 : -5; }
+               __except (EXCEPTION_EXECUTE_HANDLER) { status = -2; } }
     } else if (c->cmd == kCmdStop) {
         g_goto.on = false; g_intentUntil = 0; g_climbUntil = 0; if (c->reserved[0] == 1) c->reserved[0] = 4;
     } else if (c->cmd >= kCmdRay && c->cmd <= kCmdSense) {

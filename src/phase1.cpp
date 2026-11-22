@@ -16286,3 +16286,6 @@ void Phase1::InstallFrameHook() {
         OutputDebugStringA("[Phase1] SGM hook installed (ship transform-write tracer)\n");
     }
 }
+
+// guard_brain.cpp ([Coop] Brain): HumanGroundStage + 1 of a Human (0 = unreadable; 5 = Fight), the read CaptureGuards does.
+int Phase1_HumanStage1(void* human) { return (int)HumanStage1((Human*)human); }

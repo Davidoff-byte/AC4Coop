@@ -76,9 +76,25 @@ int FindObj(uint64_t o) { for (int i = 0; i < g_nb; ++i) if (g_b[i].objId == o) 
 
 // ---- counters ------------------------------------------------------------------------------------
 volatile LONG c_cap[kNSlots] = {}, c_capUnbound = 0, c_tx = 0, c_txFail = 0, c_rx = 0, c_rxStaleBase = 0, c_exec = 0, c_execFail = 0,
-              c_stale = 0, c_noTarget = 0, c_noBody = 0, c_noClock = 0, c_s173 = 0, c_queueFull = 0, c_capLines = 0, c_execLines = 0;
+              c_stale = 0, c_noTarget = 0, c_noBody = 0, c_noClock = 0, c_s173 = 0, c_queueFull = 0, c_notReady = 0, c_enterRefused = 0, c_capLines = 0, c_execLines = 0;
 LONG    g_late[64]; volatile LONG g_lateN = 0;   // last 64 lateness samples (ms) for the report
 
+// Host: the guest is in a world and answering. Its PeerClock role is set only from a player frame (OnFrameInner), so the
+// host's estimate of the guest clock becomes valid only once the guest is in the world. Run 1 (brain-s0) sent its first
+// 24 markers while the guest was still loading; none ran there.
+// Run 2: gating on the clock alone still lost the first 24 markers: the intention lane's handshake (peerInc known) came
+// later, and the guest dropped the delayed first messages as more than 1 s late. Both must be up.
+bool PeerReady() {
+    bool v = false; PeerClock::OffsetUs(&v);
+    Net::IntentStats st; Net::GetIntentStats(st);
+    const bool lane = st.peerInc != 0;
+    static int s_logged = 0;
+    if ((v || lane) && s_logged < 2) {
+        const int want = (v && lane) ? 2 : 1;
+        if (want > s_logged) { s_logged = want; Log("[Brain] peer clock=%d lane=%d (peerInc=%08X) t=%llu ms\n", v ? 1 : 0, lane ? 1 : 0, st.peerInc, GetTickCount64()); }
+    }
+    return v && lane;
+}
 uint32_t HostMs(bool* ok) {
     uint64_t us = 0;
     *ok = PeerClock::HostUs(&us);
@@ -111,6 +127,7 @@ void Watch(uint32_t human, uint32_t execMs) {
 void Publish(uint64_t objId, const Cmd& c) {
     const bool ok = Net::PublishIntent(0, objId, IC_BRAIN, c.execHostMs, &c, (uint8_t)sizeof(c));
     InterlockedIncrement(ok ? &c_tx : &c_txFail);
+    if (ok) Net::PumpIntents();   // Havana run 1: commands waited up to a frame for the next player-lane send (late p50 22 ms)
 }
 
 void __cdecl Capture(uint32_t id, uint32_t ecx, const uint32_t* frame) {
@@ -139,6 +156,7 @@ void __cdecl Capture(uint32_t id, uint32_t ecx, const uint32_t* frame) {
             Log("[Brain] cap slot=%u id=%016llX tgt=%u tobj=%016llX a=%08X,%08X,%08X,%08X ret=%08X hostMs=%u clk=%d\n", s.slot,
                 (unsigned long long)objId, c.tgt, (unsigned long long)c.tgtObj, c.a[0], c.a[1], c.a[2], c.a[3], frame[0], now, clk ? 1 : 0);
         if (!s.replay || !clk) return;
+        if (!PeerReady()) { InterlockedIncrement(&c_notReady); return; }
         Publish(objId, c);
         if (s.slot == 155 || s.slot == 160 || s.slot == 546) Watch(human, c.execHostMs);
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
@@ -219,11 +237,11 @@ uint32_t ResolveTarget(const Cmd& c, bool* ok) {   // guest side
     }
 }
 
-void Execute(uint32_t human, uint32_t ig, uint64_t objId, const Cmd& c, int32_t lateMs) {
+bool Execute(uint32_t human, uint32_t ig, uint64_t objId, const Cmd& c, int32_t lateMs) {
     if (c.slot == kMark) {
         InterlockedIncrement(&c_exec);
         Log("[Brain] exec role=%s slot=mark id=%016llX execMs=%u lateMs=%d\n", g_role == 1 ? "host" : "guest", (unsigned long long)objId, c.execHostMs, lateMs);
-        return;
+        return true;
     }
     bool tok = true;
     const uint32_t t = ResolveTarget(c, &tok);
@@ -231,27 +249,49 @@ void Execute(uint32_t human, uint32_t ig, uint64_t objId, const Cmd& c, int32_t 
         InterlockedIncrement(&c_noTarget);
         if (InterlockedIncrement(&c_execLines) <= 120)
             Log("[Brain] exec slot=%u id=%016llX NO TARGET tgt=%u tobj=%016llX\n", c.slot, (unsigned long long)objId, c.tgt, (unsigned long long)c.tgtObj);
-        return;
+        return true;
     }
     uint32_t a[4] = { c.a[0], c.a[1], c.a[2], c.a[3] };
     uint32_t r1 = 0, r2 = 0;
-    if (c.slot == 76) {
+    const bool attack = c.slot == 155 || c.slot == 160 || c.slot == 546;
+    // Havana run 1 (2026-11-23): an attack sent while the copy was still in Navigation (path 1/2/3/4/..) did not attack,
+    // or attacked 390 ms late; and the first enter commands were refused by CanEnterFight. So: an attack on a copy that is
+    // not in Fight enters first with the attack's target; a refused enter is held and retried (OwnUpdate requeues).
+    const int st1 = Phase1_HumanStage1((void*)human);   // HumanGroundStage + 1: 5 = Fight
+    float dz = -1.0f;
+    __try {
+        AcquireSRWLockShared(&g_bLock);
+        const int k = FindBy(&Body::human, human);
+        const uint32_t self = k >= 0 ? g_b[k].ent : 0;
+        ReleaseSRWLockShared(&g_bLock);
+        if (Rd((void*)self, 0x50) && Rd((void*)t, 0x50)) { dz = *(float*)(self + 0x48) - *(float*)(t + 0x48); if (dz < 0) dz = -dz; }   // M43 (entity+0x40 = M41)
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    if (c.slot == 76 || (attack && st1 != 5)) {
         uint32_t hnd = *(uint32_t*)(t + 0xC8);          // the entity's HandleContainer* (as CopyCmdTest / GuardStageApply)
-        a[0] = (uint32_t)(uintptr_t)&hnd;
-        r1 = CallSlot(ig, 75, 1, a);                    // CanEnterFight pushes node 107 ...
-        if (r1 & 0xFF) r2 = CallSlot(ig, 76, 1, a);     // ... DoEnterFight consumes it
-    } else if (c.slot == 113) {
+        uint32_t ha[4] = { (uint32_t)(uintptr_t)&hnd, 0, 0, 0 };
+        r1 = CallSlot(ig, 75, 1, ha);                   // CanEnterFight pushes node 107 ...
+        if (r1 & 0xFF) r2 = CallSlot(ig, 76, 1, ha);    // ... DoEnterFight consumes it
+        if (!(r1 & 0xFF)) {
+            InterlockedIncrement(&c_enterRefused);
+            if (InterlockedIncrement(&c_execLines) <= 200)
+                Log("[Brain] enter refused slot=%u id=%016llX stage1=%d dz=%.2f lateMs=%d (held)\n", c.slot, (unsigned long long)objId, st1, dz, lateMs);
+            return false;
+        }
+        if (c.slot == 76) a[0] = ha[0];
+    }
+    if (c.slot == 113) {
         r1 = CallSlot(ig, 112, 1, a);                   // CanExitFight(type)
         if (r1 & 0xFF) r2 = CallSlot(ig, 113, 1, a);    // DoExitFight(type)
-    } else {
+    } else if (attack) {
         a[0] = t;
         r2 = CallSlot(ig, c.slot, c.nargs, a);
     }
     InterlockedIncrement(&c_exec);
-    if (c.slot == 155 || c.slot == 160 || c.slot == 546) Watch(human, c.execHostMs);
+    if (attack) Watch(human, c.execHostMs);
     if (InterlockedIncrement(&c_execLines) <= 200)
-        Log("[Brain] exec role=guest slot=%u id=%016llX tgt=%u target=%08X a=%08X,%08X,%08X can=%08X do=%08X execMs=%u lateMs=%d\n", c.slot,
-            (unsigned long long)objId, c.tgt, t, a[1], a[2], a[3], r1, r2, c.execHostMs, lateMs);
+        Log("[Brain] exec role=guest slot=%u id=%016llX tgt=%u target=%08X a=%08X,%08X,%08X stage1=%d dz=%.2f can=%08X do=%08X execMs=%u lateMs=%d\n", c.slot,
+            (unsigned long long)objId, c.tgt, t, a[1], a[2], a[3], st1, dz, r1, r2, c.execHostMs, lateMs);
+    return true;
 }
 
 void WatchPath(int k, uint32_t ig) {   // body k locked by the caller (exclusive)
@@ -309,7 +349,18 @@ void SetRole(bool isHost) {
 void NoteBody(uint64_t objId, void* human, void* entity) {
     if (!On() || !objId || !human) return;
     const uint32_t h = (uint32_t)(uintptr_t)human, ig = IgOf(h);
-    if (!ig) return;
+    if (!ig) {   // run 3: one guest copy (bound, slot 23) never reached the table; say why
+        static uint64_t s_seen[32]; static int s_n = 0;
+        bool seen = false; for (int i = 0; i < s_n; ++i) if (s_seen[i] == objId) seen = true;
+        if (!seen && s_n < 32) {
+            s_seen[s_n++] = objId;
+            uint32_t hg = 0, v0 = 0, v1 = 0;
+            __try { if (Rd((void*)(h + 0x720), 4)) hg = *(uint32_t*)(h + 0x720); if (Rd((void*)hg, 0x20)) { v0 = *(uint32_t*)hg; v1 = *(uint32_t*)(hg + 0x10); } }
+            __except (EXCEPTION_EXECUTE_HANDLER) {}
+            Log("[Brain] body refused id=%016llX human=%08X hg=%08X vt=%08X igvt=%08X\n", (unsigned long long)objId, h, hg, v0, v1);
+        }
+        return;
+    }
     AcquireSRWLockExclusive(&g_bLock);
     int k = FindObj(objId);
     if (k < 0) k = FindBy(&Body::human, h);
@@ -358,6 +409,7 @@ void OwnUpdate(void* human) {
     if (!objId) return;
     if (g_role == 0) {
         bool clk = false; const uint32_t now = HostMs(&clk);
+        Cmd held[8]; int nh = 0;   // refused this frame (enter not accepted yet): retried next frame, up to 1 s late
         for (;;) {   // due commands for this body, oldest execution time first
             Cmd c; int best = -1;
             AcquireSRWLockExclusive(&g_qLock);
@@ -370,8 +422,13 @@ void OwnUpdate(void* human) {
             if (!clk) InterlockedIncrement(&c_noClock);
             const int32_t late = clk ? (int32_t)(now - c.execHostMs) : 0;
             if (late > 1000) { InterlockedIncrement(&c_stale); continue; }
+            if (!Execute(h, ig, objId, c, late)) { if (nh < 8) held[nh++] = c; else InterlockedIncrement(&c_stale); continue; }
             const LONG n = InterlockedIncrement(&g_lateN); g_late[(n - 1) & 63] = late;
-            Execute(h, ig, objId, c, late);
+        }
+        if (nh) {
+            AcquireSRWLockExclusive(&g_qLock);
+            for (int j = 0, i = 0; j < nh && i < kQ; ++i) if (!g_q[i].used) { g_q[i].objId = objId; g_q[i].c = held[j++]; g_q[i].used = 1; }
+            ReleaseSRWLockExclusive(&g_qLock);
         }
     }
     if (watching) {
@@ -388,7 +445,7 @@ void Tick() {
     bool clk = false; const uint32_t now = HostMs(&clk);
     static uint64_t s_nextTest = 0, s_nextSweep = 0, s_nextReport = 0;
     static uint32_t s_lcg = 0x1234567u;
-    if (g_role == 1 && g_test && clk && ms >= s_nextTest) {   // S0 lane oracle: a marker to one random bound guard per second
+    if (g_role == 1 && g_test && clk && PeerReady() && ms >= s_nextTest) {   // S0 lane oracle: a marker to one random bound guard per second
         s_nextTest = ms + 1000;
         uint64_t obj = 0; uint32_t human = 0;
         AcquireSRWLockShared(&g_bLock);
@@ -440,9 +497,9 @@ void Tick() {
         char caps[160]; int o = 0; caps[0] = 0;
         for (int i = 0; i < kNSlots && o < 150; ++i) if (c_cap[i]) o += _snprintf_s(caps + o, sizeof(caps) - o, _TRUNCATE, "%u:%ld ", kSlots[i].slot, c_cap[i]);
         Log("[Brain] stats role=%s bodies=%d clk=%d cap={%s} unbound=%ld tx=%ld txFail=%ld rx=%ld staleBase=%ld exec=%ld execFail=%ld stale=%ld "
-            "noTarget=%ld noBody=%ld noClock=%ld queueFull=%ld s173=%ld late(ms) n=%ld p50=%ld p95=%ld max=%ld\n",
+            "noTarget=%ld noBody=%ld noClock=%ld queueFull=%ld notReady=%ld enterRefused=%ld s173=%ld late(ms) n=%ld p50=%ld p95=%ld max=%ld\n",
             g_role == 1 ? "host" : "guest", g_nb, clk ? 1 : 0, caps, c_capUnbound, c_tx, c_txFail, c_rx, c_rxStaleBase, c_exec, c_execFail, c_stale,
-            c_noTarget, c_noBody, c_noClock, c_queueFull, c_s173, n, n ? s[n / 2] : 0, n ? s[(n * 95) / 100 < n ? (n * 95) / 100 : n - 1] : 0, n ? s[n - 1] : 0);
+            c_noTarget, c_noBody, c_noClock, c_queueFull, c_notReady, c_enterRefused, c_s173, n, n ? s[n / 2] : 0, n ? s[(n * 95) / 100 < n ? (n * 95) / 100 : n - 1] : 0, n ? s[n - 1] : 0);
     }
 }
 
