@@ -42,6 +42,7 @@ void Phase1_OwnerDamageInstall();   // phase1.cpp: [Coop] OwnerDamage SetLife de
 #include "action_guard.h"
 #include "deref_guard.h"
 #include "walk_guard.h"
+#include "guard_brain.h"
 #include "ground_tick_probe.h"
 #include "call_trace.h"
 #include "combat_observe.h"
@@ -633,6 +634,7 @@ BOOL APIENTRY DllMain(HMODULE hMod, DWORD reason, LPVOID)
         WalkGuard::Init();
 
         // R1 counter on the Ground context update slot (0x026E8B24). [Coop] GroundTickProbe, default 0.
+        Brain::Init();         // [Coop] Brain (default 0)
         GroundTick::Init();
 
         // Call tracer over chosen vtables (find the function behind an action). [Coop] CallTraceVt, default empty.

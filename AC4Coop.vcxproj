@@ -99,6 +99,8 @@
     <ClCompile Include="src\walk_guard.cpp" />
     <ClCompile Include="src\ground_tick_probe.cpp" />
     <ClCompile Include="src\call_trace.cpp" />
+    <ClCompile Include="src\peer_clock.cpp" />
+    <ClCompile Include="src\guard_brain.cpp" />
     <ClCompile Include="src\Scimitar\AI\AIActor.cpp" />
     <ClCompile Include="src\Scimitar\AI\AIEntityHelper.cpp" />
     <ClCompile Include="src\Scimitar\AI\Human.cpp" />

@@ -7,6 +7,7 @@
 #include <cstring>
 #include <share.h>
 #include <process.h>      // _beginthreadex: RecvThread calls CRT (dbg -> printf/fputs); see dllmain.cpp "_beginthreadex, not CreateThread"
+#include "peer_clock.h"
 #include "net.h"
 #include "paths.h"
 #include "lobby_code.h"
@@ -2142,6 +2143,16 @@ namespace {
                     InterlockedIncrement(&g_rxSizeMismatch);
                     LogSizeMismatch(n, haveProto, peerProto);
                 }
+                // [Coop] PeerClock (brain S0): 'AC4K' ping/pong, same source gate. Answered from this thread at once so
+                // the peer's hold time (t3 - t2) stays small; never refreshes g_lastRecvMs.
+                if (magic == PeerClock::kMagic) {
+                    const uint64_t rxUs = PeerClock::LocalUs();
+                    if (g_strictPeer && from.sin_addr.s_addr != peer.sin_addr.s_addr) continue;
+                    PeerClock::Wire reply;
+                    const int rn = PeerClock::OnDatagram(buf, n, rxUs, &reply);
+                    if (rn > 0) SendRaw(&reply, rn, peer, peerSlot);
+                    continue;
+                }
                 // proto 15 intention lane: its own datagram type, same source gate as the other game lanes.
                 // It never refreshes g_lastRecvMs (liveness stays defined by the player/entity lanes).
                 if (magic == NET_INTENT_MAGIC) {
@@ -2627,6 +2638,7 @@ bool Init() {
 
     InitializeCriticalSection(&g_lock);
     // proto 15 intention lane: [Coop] IntentLane=1 turns it on (default 0 = idle; received 'AC4I' datagrams are ignored).
+    PeerClock::Init();                         // [Coop] PeerClock (default 0): brain S0 shared clock
     InitializeCriticalSection(&g_intentLock);
     g_intentOn = GetPrivateProfileIntA("Coop", "IntentLane", 0, Paths::Ini()) != 0;
     g_intent.Init(MakeIntentIncarnation());
@@ -2779,6 +2791,8 @@ void Send(const PlayerState& s) {
     InterlockedIncrement(&g_txPackets);
     InterlockedAdd(&g_txBytes, (LONG)sizeof(s));
     PumpIntents();                             // proto 15: no-op unless [Coop] IntentLane=1
+    PeerClock::Wire ping;                      // [Coop] PeerClock: a ping when one is due (10 Hz)
+    if (PeerClock::BuildPing(&ping) > 0) SendRaw(&ping, (int)sizeof(ping), peer, slot);
 }
 
 bool GetRemote(PlayerState& out) {
@@ -3000,7 +3014,7 @@ void GetIntentStats(IntentStats& out) {
 // Offline gate (tools/net_selftest.py): build net.cpp + its link deps into a console exe and run the codec
 // selftests without the game. Never part of the ASI build.
 int main() {
-    const bool ok = SelfTestWire();
+    const bool ok = SelfTestWire() & PeerClock::SelfTest();
     printf("[selftest] SelfTestWire %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }

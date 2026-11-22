@@ -26,7 +26,7 @@ VCVARS = [
     Path(r"C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars32.bat"),
 ]
 # net.cpp and what it calls (paths, lobby code, UPnP, STUN). No engine code: the selftest never touches the game.
-SOURCES = ["src/net.cpp", "src/paths.cpp", "src/lobby_code.cpp", "src/upnp.cpp", "src/stun.cpp"]
+SOURCES = ["src/net.cpp", "src/peer_clock.cpp", "src/paths.cpp", "src/lobby_code.cpp", "src/upnp.cpp", "src/stun.cpp"]
 LIBS = ["ws2_32.lib", "winhttp.lib", "iphlpapi.lib", "user32.lib", "bcrypt.lib"]
 
 

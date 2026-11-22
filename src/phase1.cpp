@@ -19,6 +19,8 @@
 #include "pilot.h"
 #include "react_probe.h"
 #include "guard_poi.h"
+#include "guard_brain.h"        // [Coop] Brain: shared-brain command lane + player (S0/S2)
+#include "peer_clock.h"         // [Coop] PeerClock: shared host clock (S0)
 #include "ground_tick_probe.h"   // [Coop] GroundTickProbe: R1, does the Ground statechart tick on guard copies
 #include <windows.h>
 #include <cstdint>
@@ -6087,6 +6089,7 @@ static void EmitGuardEntity(EntityPacket& pkt, uint32_t& count, int idx, Entity*
     if (g_entHost == 1 && GroundTick::On() && gh && readable((char*)gh + 0x720, 4))   // [Coop] GroundTickProbe: native guard
         GroundTick::Note(e, *(void**)((char*)gh + 0x720), 2);
     if (g_entHost == 1 && gh && CctOn()) CctNote(gh, e);         // [Coop] CopyCmdTest control: the same calls on an AI-on body
+    if (g_entHost == 1 && gh && Brain::On()) Brain::NoteBody(es.objId, gh, e);   // [Coop] Brain: a native guard the host captures
     if (gh && readable(gh, 4)) {
         HumanDataBundle* gpB = gh->m_Data.m_HumanDataBundle;
         if (gpB && readable(gpB, 4)) es.stage = (uint8_t)(int32_t)gpB->m_GroundData.m_HumanGroundStage;
@@ -8240,6 +8243,10 @@ void* Phase1_PuppetEntity() {
     return e;
 }
 bool Phase1_IsEntityHost() { return g_entHost == 1; }
+void* Phase1_LocalPlayerEntity() {   // guard_brain.cpp: this machine's player entity (nullptr off-world)
+    World* w = World::GetCurrentWorld();
+    return w ? (void*)w->GetPlayer() : nullptr;
+}
 // [Overlay] RoleFromPanel=1: the in-game panel picks the role (Host -> 1, Join -> 0) instead of [Coop] EntityHost.
 // Until it does, g_entHost stays -1 and EntitySyncTick does nothing. Set once per process: returns false (and
 // changes nothing) when a different role is already in force. -1 is "undecided" everywhere: every role test
@@ -9805,13 +9812,14 @@ static void AttackForwardReport() {
 static void FightIntentDrain() {
     const bool fi = FightIntentsOn();
     if (!fi && !(OwnerDamageOn() && Net::IntentLaneOn()) && !(PdrOn() && Net::IntentLaneOn()) && !(AfOn() && Net::IntentLaneOn())
-        && !SailSyncOn() && !CoordSyncOn() && !(g_guardActLane && Net::IntentLaneOn())) return;   // [Coop] SailSync/CoordSync/GuardActionLane keep the lane drained with every fight flag off
+        && !SailSyncOn() && !CoordSyncOn() && !(g_guardActLane && Net::IntentLaneOn()) && !(Brain::On() && Net::IntentLaneOn())) return;   // [Coop] SailSync/CoordSync/GuardActionLane keep the lane drained with every fight flag off
     OwnerHitStalePoll();   // [Coop] RespawnHitGraceMs
     Net::IntentMsg m;
     while (Net::PollIntent(m)) {
         if (m.channel == IC_SHIP) { SailApplyMsg(m); continue; }   // [Coop] SailSync, docs/design/sail-memento.md
         if (m.channel == IC_COORD) { CoordSyncApplyMsg(m.wireId, m.seq, m.payload, m.len); continue; }   // [Coop] CoordSync
         if (m.channel == IC_ATK_A || m.channel == IC_ATK_B || m.channel == IC_ATK_C) { AttackForwardOwnerRx(m); continue; }   // [Coop] AttackForward
+        if (m.channel == IC_BRAIN) { Brain::OnIntent(m.wireId, m.seq, m.flags, m.payload, m.len); continue; }                 // [Coop] Brain
         if (m.channel == IC_ACTION) { GalGuestRx(m); continue; }                                                              // [Coop] GuardActionLane
         if (m.channel == IC_PDAMAGE && m.wireId == kPdrWire && m.len == sizeof(PdrPayload)) {   // [Coop] PlayerDamageRelay
             PdrPayload p; memcpy(&p, m.payload, sizeof(p));
@@ -10957,6 +10965,7 @@ static void ApplyGuards(const EntityPacket& pkt) {
             if (!locallyDead && GroundTick::On() && bh && readable((char*)bh + 0x720, 4))   // [Coop] GroundTickProbe: bound copy
                 GroundTick::Note(best, *(void**)((char*)bh + 0x720), 1);
             if (!locallyDead && bh && CctOn()) CctNote(bh, best);                    // [Coop] CopyCmdTest candidates
+            if (bh && Brain::On()) { if (locallyDead || es.dead) Brain::ForgetBody(bh); else Brain::NoteBody(es.objId, bh, best); }   // [Coop] Brain: the copy that plays host commands
             if (!locallyDead && bh && readable(bh, 4)) {
                 CharacterController* cc = (CharacterController*)bh->GetCharacterComponent();
                 if (readable(cc, 0x600)) cc->m_DriveEntity = false;
@@ -14907,6 +14916,7 @@ static void __cdecl OnFrame(Human* updatedHuman) {
     if (g_guardActLane && g_entHost == 1) GalHostOwnUpdateGuarded(updatedHuman);   // [Coop] GuardActionLane (default 0)
     if (g_guardActLane && g_entHost != 1) GsaOwnUpdateGuarded(updatedHuman);       // [Coop] GuardStageApply (default 0) + probe
     if (CctOn()) CctOwnUpdateGuarded(updatedHuman);              // [Coop] CopyCmdTest (default 0): guest copies; host natives = control
+    if (Brain::On()) { __try { Brain::OwnUpdate(updatedHuman); } __except (EXCEPTION_EXECUTE_HANDLER) {} }   // [Coop] Brain (default 0)
     __try { OwnDrain(updatedHuman); }            // puppet / mirrored guard: probe, and write in own-update mode
     __except (EXCEPTION_EXECUTE_HANDLER) {
         static int s_on = 0;
@@ -14955,7 +14965,7 @@ static void DumpConfigOnce()
         // The Tune* values are floats (read with strtod, see ShipTuningTick); the dump shows the integer part.
         { "Coop", "TuneConeAngle", 120 }, { "Coop", "TuneConeRange", 350 }, { "Coop", "TuneMaxTime", 30 },
         { "Coop", "TuneAggroTime", 30 }, { "Coop", "TuneHull", 0 },
-        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 },
+        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 },
         { "Coop", "CombatTest", 0 }, { "Coop", "CrashContext", 0 }, { "Coop", "CorpseKeepSec", 30 }, { "Coop", "CrowdProbeIntegrate", 1 },
         { "Coop", "CrowdProbeLiveKeys", 1 }, { "Coop", "DamageRelay", 0 }, { "Coop", "Diag", 0 },
         { "Coop", "DisableCrowd", 0 }, { "Coop", "DisablePuppetAI", 1 }, { "Coop", "DisableSpawns", 0 },
@@ -15019,6 +15029,9 @@ static void OnFrameInner(Human* updatedHuman) {
     }
     Pilot::OnPlayerFrame(updatedHuman);   // [Pilot] Enabled only: publish the player + m_CharacterList
     if (CombatTiming::On()) CtpPlayerFrame(updatedHuman);   // [Coop] CombatTimingProbe: frame interval, the player's action and life
+    if (g_entHost >= 0) { PeerClock::SetRole(g_entHost == 1); Brain::SetRole(g_entHost == 1); }   // [Coop] PeerClock / Brain: once the role is known
+    PeerClock::Report(Phase1_LogLine);                                                               // [Coop] PeerClock: [Clock] line every 2 s
+    __try { Brain::Tick(); } __except (EXCEPTION_EXECUTE_HANDLER) {}                                // [Coop] Brain: test driver, sweep, stats
     __try { FightIntentSend(updatedHuman); FightIntentDrain(); OwnerDamageGuestPump(); PlayerDamageHostPump(); AttackForwardHostPump(); AttackForwardOwnerTick(); SailPublishTick(); SailConsumeTick(); SailTestCycleTick(); HelmSeatTick(); ShipTuningTick(); GalHostSweep(); GsaPoll(); SpawnerIdProbeTick(); }   // [Coop] FightIntents / OwnerDamage / SailSync / SailTestCycle(harness) / HelmSeat(harness) / ShipTuning / GuardActionLane / GuardStageApply / SpawnerIdProbe only
     __except (EXCEPTION_EXECUTE_HANDLER) { static int s_fe = 0; if (s_fe < 10) { ++s_fe; L("[FI] EXCEPTION 0x%08X in send/drain\n", GetExceptionCode()); } }
 

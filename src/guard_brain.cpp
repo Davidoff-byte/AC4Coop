@@ -1,0 +1,449 @@
+// [Coop] Brain - see guard_brain.h.
+#include "guard_brain.h"
+#include "peer_clock.h"
+#include "net.h"
+#include "netstate.h"
+#include "paths.h"
+#include <windows.h>
+#include <cstdio>
+#include <cstdarg>
+#include <cstring>
+
+namespace {
+
+// ---- wire ----------------------------------------------------------------------------------------
+#pragma pack(push, 1)
+struct Cmd {                 // IC_BRAIN payload, 32 B
+    uint16_t slot;           // IHumanGround slot the host's AI called (kMark = test command, no engine call)
+    uint8_t  tgt;            // TargetClass of arg0 (slots that take a target)
+    uint8_t  nargs;          // stack args the slot takes
+    uint32_t execHostMs;     // host clock (PeerClock, ms, wraps) at which both games run it
+    uint32_t a[4];           // the call's args as captured; a[0] is replaced by the mapped target on replay
+    uint64_t tgtObj;         // tgt == TG_GUARD: the target guard's host objId
+};
+#pragma pack(pop)
+static_assert(sizeof(Cmd) == 32, "IC_BRAIN payload is 32 bytes (INTENT_PAYLOAD_MAX)");
+const uint16_t kMark = 0xFFFF;
+enum TargetClass : uint8_t { TG_NONE = 0, TG_HOST_PLAYER = 1, TG_GUEST_PLAYER = 2, TG_GUARD = 3, TG_OTHER = 4 };
+
+const uint32_t kVtIg = 0x026E7DC0u;   // IHumanGround interface vtable (hg+0x10)
+const uint32_t kVtHg = 0x026E8AE8u;   // HumanGround context vtable (*(Human+0x720))
+struct SlotSpec { uint16_t slot; uint32_t fn; uint8_t nargs; uint8_t replay; uint8_t argKind; };   // argKind 1 = Handle&, 2 = entity, 0 = none
+const SlotSpec kSlots[] = {
+    { 76,  0x01D79A50u, 1, 1, 1 },    // DoEnterFight(const Handle&)
+    { 113, 0x01D79C30u, 1, 1, 0 },    // DoExitFight(type)
+    { 155, 0x01D50310u, 3, 1, 2 },    // (target, 0, 34)  sub_14BE2A0 case 11
+    { 160, 0x01D505E0u, 4, 1, 2 },    // PerformCombo(target, n, end, 0)
+    { 546, 0x01D4F450u, 2, 1, 2 },    // (target, 7)      sub_14BE2A0 case 27
+    { 158, 0, 0, 0, 0 }, { 159, 0, 0, 0, 0 }, { 241, 0, 0, 0, 0 }, { 242, 0, 0, 0, 0 }, { 533, 0, 0, 0, 0 }, { 534, 0, 0, 0, 0 },
+};
+const int kNSlots = sizeof(kSlots) / sizeof(kSlots[0]);
+
+int  g_on = -1, g_delayMs = 0, g_test = 0, g_testDelayMs = 150;
+volatile LONG g_role = -1;   // 1 host, 0 guest
+
+void Log(const char* fmt, ...) {
+    char b[512];
+    va_list ap; va_start(ap, fmt); _vsnprintf_s(b, sizeof(b), _TRUNCATE, fmt, ap); va_end(ap);
+    Phase1_LogLine(b);
+}
+bool Rd(const void* p, size_t n) {
+    if (!p) return false;
+    MEMORY_BASIC_INFORMATION mi;
+    if (!VirtualQuery(p, &mi, sizeof(mi)) || mi.State != MEM_COMMIT || (mi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) return false;
+    return (const char*)p + n <= (const char*)mi.BaseAddress + mi.RegionSize;
+}
+
+// ---- bodies --------------------------------------------------------------------------------------
+struct Body {
+    uint32_t human, ent, ig; uint64_t objId; uint64_t seenMs;
+    uint64_t watchUntilUs; uint32_t watchExec; uint8_t in173; uint16_t lastPath[12]; uint8_t lastDepth; int pathLines;
+};
+const int kBodies = 256;
+Body    g_b[kBodies]; int g_nb = 0;
+SRWLOCK g_bLock = SRWLOCK_INIT;
+
+uint32_t IgOf(uint32_t human) {
+    __try {
+        if (!Rd((void*)(human + 0x720), 4)) return 0;
+        const uint32_t hg = *(uint32_t*)(human + 0x720);
+        if (!Rd((void*)hg, 0x20) || *(uint32_t*)hg != kVtHg || *(uint32_t*)(hg + 0x10) != kVtIg) return 0;
+        return hg + 0x10;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+int FindBy(uint32_t Body::* f, uint32_t v) { for (int i = 0; i < g_nb; ++i) if (g_b[i].*f == v) return i; return -1; }
+int FindObj(uint64_t o) { for (int i = 0; i < g_nb; ++i) if (g_b[i].objId == o) return i; return -1; }
+
+// ---- counters ------------------------------------------------------------------------------------
+volatile LONG c_cap[kNSlots] = {}, c_capUnbound = 0, c_tx = 0, c_txFail = 0, c_rx = 0, c_rxStaleBase = 0, c_exec = 0, c_execFail = 0,
+              c_stale = 0, c_noTarget = 0, c_noBody = 0, c_noClock = 0, c_s173 = 0, c_queueFull = 0, c_capLines = 0, c_execLines = 0;
+LONG    g_late[64]; volatile LONG g_lateN = 0;   // last 64 lateness samples (ms) for the report
+
+uint32_t HostMs(bool* ok) {
+    uint64_t us = 0;
+    *ok = PeerClock::HostUs(&us);
+    return (uint32_t)(us / 1000);
+}
+
+TargetClass ClassOf(uint32_t ent, uint64_t* obj) {
+    *obj = 0;
+    if (!ent) return TG_NONE;
+    if ((void*)ent == Phase1_LocalPlayerEntity()) return TG_HOST_PLAYER;   // host side: the local player is the host's
+    if ((void*)ent == Phase1_PuppetEntity()) return TG_GUEST_PLAYER;
+    AcquireSRWLockShared(&g_bLock);
+    const int k = FindBy(&Body::ent, ent);
+    if (k >= 0) *obj = g_b[k].objId;
+    ReleaseSRWLockShared(&g_bLock);
+    return k >= 0 ? TG_GUARD : TG_OTHER;
+}
+
+void Watch(uint32_t human, uint32_t execMs) {
+    AcquireSRWLockExclusive(&g_bLock);
+    const int k = FindBy(&Body::human, human);
+    if (k >= 0) {
+        LARGE_INTEGER c, f; QueryPerformanceCounter(&c); QueryPerformanceFrequency(&f);
+        g_b[k].watchUntilUs = (uint64_t)(c.QuadPart * 1000000.0 / f.QuadPart) + 3000000; g_b[k].watchExec = execMs; g_b[k].pathLines = 0;
+    }
+    ReleaseSRWLockExclusive(&g_bLock);
+}
+
+// ---- host capture --------------------------------------------------------------------------------
+void Publish(uint64_t objId, const Cmd& c) {
+    const bool ok = Net::PublishIntent(0, objId, IC_BRAIN, c.execHostMs, &c, (uint8_t)sizeof(c));
+    InterlockedIncrement(ok ? &c_tx : &c_txFail);
+}
+
+void __cdecl Capture(uint32_t id, uint32_t ecx, const uint32_t* frame) {
+    if (id >= (uint32_t)kNSlots) return;
+    __try {
+        uint64_t objId = 0; uint32_t human = 0;
+        AcquireSRWLockShared(&g_bLock);
+        const int k = FindBy(&Body::ig, ecx);
+        if (k >= 0) { objId = g_b[k].objId; human = g_b[k].human; }
+        ReleaseSRWLockShared(&g_bLock);
+        if (!objId) { InterlockedIncrement(&c_capUnbound); return; }   // player, puppet, or an unscoped body
+        InterlockedIncrement(&c_cap[id]);
+        const SlotSpec& s = kSlots[id];
+        bool clk = false;
+        const uint32_t now = HostMs(&clk);
+        Cmd c = {};
+        c.slot = s.slot; c.nargs = s.nargs; c.execHostMs = now + (uint32_t)g_delayMs;
+        for (int i = 0; i < 4; ++i) c.a[i] = frame[1 + i];
+        uint32_t tent = 0;
+        if (s.argKind == 1 && Rd((void*)frame[1], 4)) {                 // const Handle&: *arg = HandleContainer*
+            const int32_t* hc = *(const int32_t* const*)frame[1];
+            if (Rd(hc, 12)) tent = (uint32_t)(hc[0] & (hc[2] >> 31));  // object = hc[0] & (hc[2] >> 31) (GuardTargetClass)
+        } else if (s.argKind == 2) tent = frame[1];
+        if (s.argKind) c.tgt = (uint8_t)ClassOf(tent, &c.tgtObj);
+        if (InterlockedIncrement(&c_capLines) <= 80)
+            Log("[Brain] cap slot=%u id=%016llX tgt=%u tobj=%016llX a=%08X,%08X,%08X,%08X ret=%08X hostMs=%u clk=%d\n", s.slot,
+                (unsigned long long)objId, c.tgt, (unsigned long long)c.tgtObj, c.a[0], c.a[1], c.a[2], c.a[3], frame[0], now, clk ? 1 : 0);
+        if (!s.replay || !clk) return;
+        Publish(objId, c);
+        if (s.slot == 155 || s.slot == 160 || s.slot == 546) Watch(human, c.execHostMs);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+uint8_t* g_stubs = nullptr;
+void Emit(uint8_t* p, uint32_t id, uint32_t orig) {
+    int k = 0;
+    auto b = [&](uint8_t v) { p[k++] = v; };
+    auto d = [&](uint32_t v) { memcpy(p + k, &v, 4); k += 4; };
+    b(0x60); b(0x9C);                               // pushad; pushfd
+    b(0x8D); b(0x44); b(0x24); b(0x24);             // lea eax, [esp+24h]  -> the original frame: [0] ret, [1..] args
+    b(0x50);                                        // push eax
+    b(0x51);                                        // push ecx (this = the IHumanGround interface)
+    b(0x68); d(id);                                 // push id
+    b(0xB8); d((uint32_t)(uintptr_t)&Capture);      // mov eax, Capture
+    b(0xFF); b(0xD0);                               // call eax
+    b(0x83); b(0xC4); b(0x0C);                      // add esp, 12
+    b(0x9D); b(0x61);                               // popfd; popad
+    b(0x68); d(orig);                               // push orig
+    b(0xC3);                                        // ret  (stack and registers exactly as the caller left them)
+}
+void InstallCapture() {
+    uint32_t* tab = (uint32_t*)(uintptr_t)kVtIg;
+    g_stubs = (uint8_t*)VirtualAlloc(nullptr, kNSlots * 40, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!g_stubs) { Log("[Brain] VirtualAlloc failed: no capture\n"); return; }
+    int ok = 0;
+    for (int i = 0; i < kNSlots; ++i) {
+        const uint32_t cur = tab[kSlots[i].slot];
+        if (kSlots[i].fn && cur != kSlots[i].fn) { Log("[Brain] slot %u is %08X, expected %08X: not hooked\n", kSlots[i].slot, cur, kSlots[i].fn); continue; }
+        if (cur < 0x00401000u || cur >= 0x02400000u) { Log("[Brain] slot %u target %08X outside code: not hooked\n", kSlots[i].slot, cur); continue; }
+        uint8_t* stub = g_stubs + i * 40;
+        Emit(stub, (uint32_t)i, cur);
+        DWORD old = 0;
+        if (VirtualProtect(&tab[kSlots[i].slot], 4, PAGE_READWRITE, &old)) {
+            InterlockedExchange((volatile LONG*)&tab[kSlots[i].slot], (LONG)(uintptr_t)stub);
+            VirtualProtect(&tab[kSlots[i].slot], 4, old, &old);
+            ++ok;
+        }
+    }
+    FlushInstructionCache(GetCurrentProcess(), g_stubs, kNSlots * 40);
+    Log("[Brain] host capture: %d of %d IHumanGround slots hooked (vtable %08X)\n", ok, kNSlots, kVtIg);
+}
+
+// ---- guest queue ---------------------------------------------------------------------------------
+struct Pending { uint64_t objId; Cmd c; uint8_t used; };
+const int kQ = 512;
+Pending g_q[kQ];
+SRWLOCK g_qLock = SRWLOCK_INIT;
+
+uint32_t CallSlot(uint32_t ig, int slot, int n, const uint32_t* a) {
+    void* fn = (*(void***)ig)[slot];
+    __try {
+        switch (n) {
+        case 1: return ((uint32_t (__thiscall*)(uint32_t, uint32_t))fn)(ig, a[0]);
+        case 2: return ((uint32_t (__thiscall*)(uint32_t, uint32_t, uint32_t))fn)(ig, a[0], a[1]);
+        case 3: return ((uint32_t (__thiscall*)(uint32_t, uint32_t, uint32_t, uint32_t))fn)(ig, a[0], a[1], a[2]);
+        case 4: return ((uint32_t (__thiscall*)(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t))fn)(ig, a[0], a[1], a[2], a[3]);
+        default: return 0;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { InterlockedIncrement(&c_execFail); return 0xFFFFFFFFu; }
+}
+
+uint32_t ResolveTarget(const Cmd& c, bool* ok) {   // guest side
+    *ok = true;
+    switch (c.tgt) {
+    case TG_NONE: return 0;
+    case TG_HOST_PLAYER: return (uint32_t)(uintptr_t)Phase1_PuppetEntity();        // the host's body here is the puppet
+    case TG_GUEST_PLAYER: return (uint32_t)(uintptr_t)Phase1_LocalPlayerEntity();
+    case TG_GUARD: {
+        AcquireSRWLockShared(&g_bLock);
+        const int k = FindObj(c.tgtObj);
+        const uint32_t e = k >= 0 ? g_b[k].ent : 0;
+        ReleaseSRWLockShared(&g_bLock);
+        *ok = e != 0; return e;
+    }
+    default: *ok = false; return 0;
+    }
+}
+
+void Execute(uint32_t human, uint32_t ig, uint64_t objId, const Cmd& c, int32_t lateMs) {
+    if (c.slot == kMark) {
+        InterlockedIncrement(&c_exec);
+        Log("[Brain] exec role=%s slot=mark id=%016llX execMs=%u lateMs=%d\n", g_role == 1 ? "host" : "guest", (unsigned long long)objId, c.execHostMs, lateMs);
+        return;
+    }
+    bool tok = true;
+    const uint32_t t = ResolveTarget(c, &tok);
+    if (!tok || ((c.slot == 76 || c.slot == 155 || c.slot == 160 || c.slot == 546) && !Rd((void*)t, 0xCC))) {
+        InterlockedIncrement(&c_noTarget);
+        if (InterlockedIncrement(&c_execLines) <= 120)
+            Log("[Brain] exec slot=%u id=%016llX NO TARGET tgt=%u tobj=%016llX\n", c.slot, (unsigned long long)objId, c.tgt, (unsigned long long)c.tgtObj);
+        return;
+    }
+    uint32_t a[4] = { c.a[0], c.a[1], c.a[2], c.a[3] };
+    uint32_t r1 = 0, r2 = 0;
+    if (c.slot == 76) {
+        uint32_t hnd = *(uint32_t*)(t + 0xC8);          // the entity's HandleContainer* (as CopyCmdTest / GuardStageApply)
+        a[0] = (uint32_t)(uintptr_t)&hnd;
+        r1 = CallSlot(ig, 75, 1, a);                    // CanEnterFight pushes node 107 ...
+        if (r1 & 0xFF) r2 = CallSlot(ig, 76, 1, a);     // ... DoEnterFight consumes it
+    } else if (c.slot == 113) {
+        r1 = CallSlot(ig, 112, 1, a);                   // CanExitFight(type)
+        if (r1 & 0xFF) r2 = CallSlot(ig, 113, 1, a);    // DoExitFight(type)
+    } else {
+        a[0] = t;
+        r2 = CallSlot(ig, c.slot, c.nargs, a);
+    }
+    InterlockedIncrement(&c_exec);
+    if (c.slot == 155 || c.slot == 160 || c.slot == 546) Watch(human, c.execHostMs);
+    if (InterlockedIncrement(&c_execLines) <= 200)
+        Log("[Brain] exec role=guest slot=%u id=%016llX tgt=%u target=%08X a=%08X,%08X,%08X can=%08X do=%08X execMs=%u lateMs=%d\n", c.slot,
+            (unsigned long long)objId, c.tgt, t, a[1], a[2], a[3], r1, r2, c.execHostMs, lateMs);
+}
+
+void WatchPath(int k, uint32_t ig) {   // body k locked by the caller (exclusive)
+    Body& b = g_b[k];
+    LARGE_INTEGER cq, fq; QueryPerformanceCounter(&cq); QueryPerformanceFrequency(&fq);
+    const uint64_t nowUs = (uint64_t)(cq.QuadPart * 1000000.0 / fq.QuadPart);
+    if (!b.watchUntilUs || nowUs > b.watchUntilUs) { b.watchUntilUs = 0; return; }
+    __try {
+        const uint32_t fsm = Rd((void*)(ig + 0x90), 4) ? *(uint32_t*)(ig + 0x90) : 0;   // = [hg+0xA0] (FiPath)
+        if (!Rd((void*)fsm, 0x120)) return;
+        unsigned d = *(const uint16_t*)(fsm + 0x11E); if (d > 12) d = 12;
+        const uint16_t* p = *(const uint16_t* const*)(fsm + 0x118);
+        if (!Rd(p, 2 * d)) return;
+        bool has = false, changed = d != b.lastDepth;
+        for (unsigned i = 0; i < d; ++i) { if (p[i] == 173) has = true; if (p[i] != b.lastPath[i]) changed = true; }
+        bool clk = false; const uint32_t now = HostMs(&clk);
+        if (changed && b.pathLines < 24) {
+            ++b.pathLines;
+            char s[96]; int o = 0; s[0] = 0;
+            for (unsigned i = 0; i < d && o < 80; ++i) o += _snprintf_s(s + o, sizeof(s) - o, _TRUNCATE, i ? "/%u" : "%u", p[i]);
+            Log("[Brain] path role=%s id=%016llX +%dms %s\n", g_role == 1 ? "host" : "guest", (unsigned long long)b.objId, (int)(now - b.watchExec), s);
+        }
+        for (unsigned i = 0; i < d; ++i) b.lastPath[i] = p[i];
+        b.lastDepth = (uint8_t)d;
+        if (has && !b.in173) {
+            InterlockedIncrement(&c_s173);
+            Log("[Brain] s173 role=%s id=%016llX execMs=%u hostMs=%u dt=%dms\n", g_role == 1 ? "host" : "guest", (unsigned long long)b.objId, b.watchExec, now,
+                (int)(now - b.watchExec));
+        }
+        b.in173 = has ? 1 : 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+}  // namespace
+
+namespace Brain {
+
+void Init() {
+    if (g_on >= 0) return;
+    g_on = GetPrivateProfileIntA("Coop", "Brain", 0, Paths::Ini()) != 0 ? 1 : 0;
+    g_delayMs = GetPrivateProfileIntA("Coop", "BrainDelayMs", 0, Paths::Ini());
+    g_test = GetPrivateProfileIntA("Coop", "BrainTest", 0, Paths::Ini());
+    g_testDelayMs = GetPrivateProfileIntA("Coop", "BrainTestDelayMs", 150, Paths::Ini());
+    if (g_on) Log("[Brain] Brain=1 delayMs=%d test=%d testDelayMs=%d (needs IntentLane=1, PeerClock=1)\n", g_delayMs, g_test, g_testDelayMs);
+}
+
+bool On() { return g_on == 1; }
+
+void SetRole(bool isHost) {
+    if (!On() || InterlockedCompareExchange(&g_role, isHost ? 1 : 0, -1) != -1) return;
+    Log("[Brain] role=%s\n", isHost ? "host" : "guest");
+    if (isHost) InstallCapture();
+}
+
+void NoteBody(uint64_t objId, void* human, void* entity) {
+    if (!On() || !objId || !human) return;
+    const uint32_t h = (uint32_t)(uintptr_t)human, ig = IgOf(h);
+    if (!ig) return;
+    AcquireSRWLockExclusive(&g_bLock);
+    int k = FindObj(objId);
+    if (k < 0) k = FindBy(&Body::human, h);
+    if (k < 0) {
+        if (g_nb < kBodies) { k = g_nb++; memset(&g_b[k], 0, sizeof(g_b[k])); }
+        else {   // full: reuse the stalest
+            k = 0; for (int i = 1; i < g_nb; ++i) if (g_b[i].seenMs < g_b[k].seenMs) k = i;
+            memset(&g_b[k], 0, sizeof(g_b[k]));
+        }
+    }
+    g_b[k].human = h; g_b[k].ent = (uint32_t)(uintptr_t)entity; g_b[k].ig = ig; g_b[k].objId = objId; g_b[k].seenMs = GetTickCount64();
+    ReleaseSRWLockExclusive(&g_bLock);
+}
+
+void ForgetBody(void* human) {
+    if (!On()) return;
+    AcquireSRWLockExclusive(&g_bLock);
+    const int k = FindBy(&Body::human, (uint32_t)(uintptr_t)human);
+    if (k >= 0) g_b[k] = g_b[--g_nb];
+    ReleaseSRWLockExclusive(&g_bLock);
+}
+
+void OnIntent(uint64_t wireId, uint32_t seq, uint8_t flags, const void* payload, uint8_t len) {
+    if (!On() || g_role != 0 || len != sizeof(Cmd)) return;
+    Cmd c; memcpy(&c, payload, sizeof(c));
+    InterlockedIncrement(&c_rx);
+    bool clk = false; const uint32_t now = HostMs(&clk);
+    if ((flags & IF_BASE) && clk && (int32_t)(now - c.execHostMs) > 1000) { InterlockedIncrement(&c_rxStaleBase); return; }   // a replayed old command
+    (void)seq;
+    AcquireSRWLockExclusive(&g_qLock);
+    int k = -1;
+    for (int i = 0; i < kQ; ++i) if (!g_q[i].used) { k = i; break; }
+    if (k >= 0) { g_q[k].objId = wireId; g_q[k].c = c; g_q[k].used = 1; }
+    ReleaseSRWLockExclusive(&g_qLock);
+    if (k < 0) InterlockedIncrement(&c_queueFull);
+}
+
+void OwnUpdate(void* human) {
+    if (!On() || g_role < 0) return;
+    const uint32_t h = (uint32_t)(uintptr_t)human;
+    uint64_t objId = 0; uint32_t ig = 0; bool watching = false;
+    AcquireSRWLockShared(&g_bLock);
+    const int k = FindBy(&Body::human, h);
+    if (k >= 0) { objId = g_b[k].objId; ig = g_b[k].ig; watching = g_b[k].watchUntilUs != 0; }
+    ReleaseSRWLockShared(&g_bLock);
+    if (!objId) return;
+    if (g_role == 0) {
+        bool clk = false; const uint32_t now = HostMs(&clk);
+        for (;;) {   // due commands for this body, oldest execution time first
+            Cmd c; int best = -1;
+            AcquireSRWLockExclusive(&g_qLock);
+            for (int i = 0; i < kQ; ++i)
+                if (g_q[i].used && g_q[i].objId == objId && (!clk || (int32_t)(now - g_q[i].c.execHostMs) >= 0)
+                    && (best < 0 || (int32_t)(g_q[i].c.execHostMs - g_q[best].c.execHostMs) < 0)) best = i;
+            if (best >= 0) { c = g_q[best].c; g_q[best].used = 0; }
+            ReleaseSRWLockExclusive(&g_qLock);
+            if (best < 0) break;
+            if (!clk) InterlockedIncrement(&c_noClock);
+            const int32_t late = clk ? (int32_t)(now - c.execHostMs) : 0;
+            if (late > 1000) { InterlockedIncrement(&c_stale); continue; }
+            const LONG n = InterlockedIncrement(&g_lateN); g_late[(n - 1) & 63] = late;
+            Execute(h, ig, objId, c, late);
+        }
+    }
+    if (watching) {
+        AcquireSRWLockExclusive(&g_bLock);
+        const int kk = FindBy(&Body::human, h);
+        if (kk >= 0) WatchPath(kk, ig);
+        ReleaseSRWLockExclusive(&g_bLock);
+    }
+}
+
+void Tick() {
+    if (!On() || g_role < 0) return;
+    const uint64_t ms = GetTickCount64();
+    bool clk = false; const uint32_t now = HostMs(&clk);
+    static uint64_t s_nextTest = 0, s_nextSweep = 0, s_nextReport = 0;
+    static uint32_t s_lcg = 0x1234567u;
+    if (g_role == 1 && g_test && clk && ms >= s_nextTest) {   // S0 lane oracle: a marker to one random bound guard per second
+        s_nextTest = ms + 1000;
+        uint64_t obj = 0; uint32_t human = 0;
+        AcquireSRWLockShared(&g_bLock);
+        if (g_nb) { s_lcg = s_lcg * 1664525u + 1013904223u; const int k = (int)((s_lcg >> 8) % (uint32_t)g_nb); obj = g_b[k].objId; human = g_b[k].human; }
+        ReleaseSRWLockShared(&g_bLock);
+        if (obj) {
+            Cmd c = {}; c.slot = kMark; c.execHostMs = now + (uint32_t)g_testDelayMs;
+            Publish(obj, c);
+            AcquireSRWLockExclusive(&g_qLock);   // the host plays its own marker at the same host time
+            for (int i = 0; i < kQ; ++i) if (!g_q[i].used) { g_q[i].objId = obj; g_q[i].c = c; g_q[i].used = 1; break; }
+            ReleaseSRWLockExclusive(&g_qLock);
+            Log("[Brain] issue slot=mark id=%016llX execMs=%u nowMs=%u\n", (unsigned long long)obj, c.execHostMs, now);
+            (void)human;
+        }
+    }
+    if (g_role == 1 && g_test && clk) {   // host markers execute here (no slot call, so the player frame is fine)
+        for (int i = 0; i < kQ; ++i) {
+            AcquireSRWLockExclusive(&g_qLock);
+            const bool due = g_q[i].used && (int32_t)(now - g_q[i].c.execHostMs) >= 0;
+            Cmd c = g_q[i].c; const uint64_t obj = g_q[i].objId;
+            if (due) g_q[i].used = 0;
+            ReleaseSRWLockExclusive(&g_qLock);
+            if (due) Execute(0, 0, obj, c, (int32_t)(now - c.execHostMs));
+        }
+    }
+    if (ms >= s_nextSweep) {   // drop commands for bodies that never ticked, and bodies not seen for 10 s
+        s_nextSweep = ms + 1000;
+        if (clk && g_role == 0) {
+            AcquireSRWLockExclusive(&g_qLock);
+            for (int i = 0; i < kQ; ++i)
+                if (g_q[i].used && (int32_t)(now - g_q[i].c.execHostMs) > 1000) {
+                    g_q[i].used = 0;
+                    AcquireSRWLockShared(&g_bLock);
+                    const bool known = FindObj(g_q[i].objId) >= 0;
+                    ReleaseSRWLockShared(&g_bLock);
+                    InterlockedIncrement(known ? &c_stale : &c_noBody);
+                }
+            ReleaseSRWLockExclusive(&g_qLock);
+        }
+        AcquireSRWLockExclusive(&g_bLock);
+        for (int i = 0; i < g_nb;) { if (ms - g_b[i].seenMs > 10000) g_b[i] = g_b[--g_nb]; else ++i; }
+        ReleaseSRWLockExclusive(&g_bLock);
+    }
+    if (ms >= s_nextReport) {
+        s_nextReport = ms + 5000;
+        LONG s[64]; const LONG n = g_lateN < 64 ? g_lateN : 64;
+        for (int i = 0; i < n; ++i) s[i] = g_late[i];
+        for (int i = 1; i < n; ++i) for (int j = i; j > 0 && s[j - 1] > s[j]; --j) { const LONG x = s[j]; s[j] = s[j - 1]; s[j - 1] = x; }
+        char caps[160]; int o = 0; caps[0] = 0;
+        for (int i = 0; i < kNSlots && o < 150; ++i) if (c_cap[i]) o += _snprintf_s(caps + o, sizeof(caps) - o, _TRUNCATE, "%u:%ld ", kSlots[i].slot, c_cap[i]);
+        Log("[Brain] stats role=%s bodies=%d clk=%d cap={%s} unbound=%ld tx=%ld txFail=%ld rx=%ld staleBase=%ld exec=%ld execFail=%ld stale=%ld "
+            "noTarget=%ld noBody=%ld noClock=%ld queueFull=%ld s173=%ld late(ms) n=%ld p50=%ld p95=%ld max=%ld\n",
+            g_role == 1 ? "host" : "guest", g_nb, clk ? 1 : 0, caps, c_capUnbound, c_tx, c_txFail, c_rx, c_rxStaleBase, c_exec, c_execFail, c_stale,
+            c_noTarget, c_noBody, c_noClock, c_queueFull, c_s173, n, n ? s[n / 2] : 0, n ? s[(n * 95) / 100 < n ? (n * 95) / 100 : n - 1] : 0, n ? s[n - 1] : 0);
+    }
+}
+
+}  // namespace Brain
