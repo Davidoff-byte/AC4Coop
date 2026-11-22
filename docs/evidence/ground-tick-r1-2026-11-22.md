@@ -81,3 +81,42 @@ Pre-registered (in `src/phase1.cpp` above `CctOwnUpdate`, before any run): from 
   hash-verified. A hostile-target run still needs a Havana start or a boarding.
 - Static next (rule 9): find what writes node 107 into `fsm+0xE0` (`+0x106` count); the earlier byte sweeps for direct
   `disp32` stores found no writer (`ai-off-seam-2026-11-21.md` §8), so it goes through a register-held base.
+
+---
+
+## Part 3: node 107 is a Can→Do handshake, not a state (static + run, same day)
+
+**Static (IDA cc jobs n1-n4, AC4BFSP.exe only):**
+- IHumanGround vtable `0x026E7DC0`: slot 75 (`+0x12C`) = `0x1D269F0` **CanEnterFight**, slot 76 (`+0x130`) = `0x1D79A50`
+  **DoEnterFight** (bytes read).
+- `sub_1D269F0` (one data ref, the slot) creates the 0xA80 helper if needed and returns `sub_1D02DF0(target) == 2`.
+- `sub_1D02DF0` (one caller, `0x1D26A40`): for Ground (`gid == 4`) it calls `sub_1CEDC90(target)` and, **only when that
+  returns 2, pushes 107** into `helper+0xE0` (`push 6Bh; lea ecx,[edi+0E0h]; call sub_59C660` at `0x1D02E2C`). Same shape:
+  gid 88 → 262, gid 135 → 359 / 346. A scan of `0x1000000-0x2000000` for pushes into `[reg+0xE0]` finds this single
+  107 site.
+- `sub_1CEDC90` returns 3 (refuse) when a body of kind 1 (`(+0x9C & 7) == 1`; which body, self or target, UNVERIFIED) is
+  3.0 or more apart in height from the target, or when bit `0x20` is set at `*(sub_667230(0,0)+0x14)` (a global; meaning
+  UNVERIFIED); otherwise 2. No faction check on this path.
+- DoEnterFight's check (`sub_1D65D40`, `0x1D65D72`) searches `helper+0xE0` for 107 and then clears the list
+  (`sub_59AA90`). So **DoEnterFight is valid only right after a CanEnterFight that returned true.**
+
+**Consequence:** the GuardStageForceEnter run (11-21, 55 of 55 refused) and the CopyCmdTest runs of parts 2 (5 of 5
+refused) all called slot 76 without slot 75, so they could never pass. FightIntents calls 75 then 76 and works on the
+puppet. The earlier "behaviour must be on" lead is withdrawn: nothing on this path reads the behaviour component.
+
+**Run (`6d3c97e`, asi `d76855ff…`, host 19392 / guest 34000, at sea, 12:14):** CanEnterFight then DoEnterFight then
+PerformCombo.
+
+| body | can(75) | node list after Can | do(76) | state 173 after slot 160 |
+|---|---|---|---|---|
+| host native crew (AI on) | 1 | 1 entry | **1** | not seen; path went `…/26/27` → `1/2/3/115` → empty (d=0) |
+| guest copy #1 (behaviour off) | 1 | 1 entry | **1** | not seen; path unchanged |
+| guest copy #2 | 1 | 1 entry | **1** | not seen; path unchanged |
+
+- **Enter fight now succeeds on behaviour-disabled copies** (2 of 2) and on the AI-on control (1 of 1).
+- The 173 criterion is still not met on either side, the control included. Not settled: which ids the active path shows
+  during a fight at all (no earlier log records a fight-time path); the native control's path emptied (d=0) about
+  1.6 s after the combo call, which may mean a context change rather than no fight. Next: record the puppet's path
+  during a FightIntents fight (known to work) to learn what a fight looks like in this reader, then re-score.
+- CctDescribe scans the inline dwords at `+0xE0`; after Can it reports 1 entry but `n107=0`, so the pushed value is not
+  at the first inline slot (data pointer `+0x100` may point elsewhere). Reader detail, not a result.
