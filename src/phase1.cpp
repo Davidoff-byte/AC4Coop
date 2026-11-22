@@ -19,6 +19,7 @@
 #include "pilot.h"
 #include "react_probe.h"
 #include "guard_poi.h"
+#include "ground_tick_probe.h"   // [Coop] GroundTickProbe: R1, does the Ground statechart tick on guard copies
 #include <windows.h>
 #include <cstdint>
 #include <cstdio>
@@ -2840,6 +2841,12 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
           if (s_applyLogged != (void*)g_puppet) { s_applyLogged = (void*)g_puppet; LogPuppetMode(); } }
 
         Human* h = AIEntityHelper::GetHuman(g_puppet);
+        if (GroundTick::On()) {                     // [Coop] GroundTickProbe controls: the puppet and the local player
+            if (h && readable((char*)h + 0x720, 4)) GroundTick::Note(g_puppet, *(void**)((char*)h + 0x720), 3);
+            World* gw = World::GetCurrentWorld(); Entity* gp = gw ? gw->GetPlayer() : nullptr;
+            Human* ph = gp ? AIEntityHelper::GetHuman(gp) : nullptr;
+            if (ph && readable((char*)ph + 0x720, 4)) GroundTick::Note(gp, *(void**)((char*)ph + 0x720), 4);
+        }
         HumanDataBundle* qB = h->m_Data.m_HumanDataBundle;
         bool bok = readable((void*)qB, 0x150);
         if (g_actMatchProbe) ActMatchNote(h, s, replica);
@@ -6060,6 +6067,8 @@ static void EmitGuardEntity(EntityPacket& pkt, uint32_t& count, int idx, Entity*
     es.stage = 0;
     es.actionAlias = 0;
     Human* gh = AIEntityHelper::GetHuman(e);
+    if (g_entHost == 1 && GroundTick::On() && gh && readable((char*)gh + 0x720, 4))   // [Coop] GroundTickProbe: native guard
+        GroundTick::Note(e, *(void**)((char*)gh + 0x720), 2);
     if (gh && readable(gh, 4)) {
         HumanDataBundle* gpB = gh->m_Data.m_HumanDataBundle;
         if (gpB && readable(gpB, 4)) es.stage = (uint8_t)(int32_t)gpB->m_GroundData.m_HumanGroundStage;
@@ -10927,6 +10936,8 @@ static void ApplyGuards(const EntityPacket& pkt) {
             if (!locallyDead) { TakeoverNote(best);   // [Coop] BindLock: remembered so an unlink returns it to its AI
                                 OwnerDamageNoteCopy(best, es.objId); }   // [Coop] OwnerDamage: its health service -> host id
             Human* bh = AIEntityHelper::GetHuman(best);
+            if (!locallyDead && GroundTick::On() && bh && readable((char*)bh + 0x720, 4))   // [Coop] GroundTickProbe: bound copy
+                GroundTick::Note(best, *(void**)((char*)bh + 0x720), 1);
             if (!locallyDead && bh && readable(bh, 4)) {
                 CharacterController* cc = (CharacterController*)bh->GetCharacterComponent();
                 if (readable(cc, 0x600)) cc->m_DriveEntity = false;
@@ -14829,7 +14840,7 @@ static void DumpConfigOnce()
         // The Tune* values are floats (read with strtod, see ShipTuningTick); the dump shows the integer part.
         { "Coop", "TuneConeAngle", 120 }, { "Coop", "TuneConeRange", 350 }, { "Coop", "TuneMaxTime", 30 },
         { "Coop", "TuneAggroTime", 30 }, { "Coop", "TuneHull", 0 },
-        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 },
+        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 },
         { "Coop", "CombatTest", 0 }, { "Coop", "CrashContext", 0 }, { "Coop", "CorpseKeepSec", 30 }, { "Coop", "CrowdProbeIntegrate", 1 },
         { "Coop", "CrowdProbeLiveKeys", 1 }, { "Coop", "DamageRelay", 0 }, { "Coop", "Diag", 0 },
         { "Coop", "DisableCrowd", 0 }, { "Coop", "DisablePuppetAI", 1 }, { "Coop", "DisableSpawns", 0 },

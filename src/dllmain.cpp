@@ -42,6 +42,7 @@ void Phase1_OwnerDamageInstall();   // phase1.cpp: [Coop] OwnerDamage SetLife de
 #include "action_guard.h"
 #include "deref_guard.h"
 #include "walk_guard.h"
+#include "ground_tick_probe.h"
 #include "combat_observe.h"
 #include "build_gate.h"
 #include "paths.h"
@@ -629,6 +630,9 @@ BOOL APIENTRY DllMain(HMODULE hMod, DWORD reason, LPVOID)
         // Entry detours return immediately on ecx == 0, otherwise re-execute the stolen prologue.
         // [Coop] WalkNullGuard, default 1 -> two byte-verified detours, nothing else patched.
         WalkGuard::Init();
+
+        // R1 counter on the Ground context update slot (0x026E8B24). [Coop] GroundTickProbe, default 0.
+        GroundTick::Init();
 
         // Read-only crash recorder for execute faults (a call through a freed or null object): registers, stack
         // and the objects they name, to AC4Coop_crashctx_<pid>.txt. [Coop] CrashContext, default 0.
