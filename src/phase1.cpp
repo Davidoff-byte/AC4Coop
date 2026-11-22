@@ -1,6 +1,7 @@
 // Phase 1 — spawn a second Human from the player's cached EntityBuilder + RowSelector, bind to pad 1.
 #define _CRT_SECURE_NO_WARNINGS
 #include "phase1.h"
+#include <intrin.h>         // __readfsdword (puppet build fault diagnostics)
 #include "paths.h"
 #include "net.h"
 #include "coord_sync.h"
@@ -637,8 +638,45 @@ static void PuppetSkelAttach(Entity* puppet, Entity* player) {
     }
 }
 
+// ---- puppet build fault diagnostics + [Coop] PuppetBuildRecover (default 0) -------------------------------------
+// 2026-11-22: the first BuildEntityWithSelector (sub_5FAC00) faults in about half of the sessions while the same builder
+// (vtable 0x01E57790, same handle and resource id) and selector succeed 2 s later (logs 4220/26516: try 1 fault, try 2
+// rc=0), so it is not a stale builder. sub_5FAC00 (decompiled, job p2) opens its own duplication scope
+// (sub_A2D5A0(0,1) at 0x005FAC1C) and closes it with sub_A2F320 after the builder's vt+76 / vt+64; an SEH unwind out of
+// the middle skips that close, leaving the engine's per-thread duplication stack one frame deep.
+// Depth = *(*(TLS[TlsIndex] + 0x18) + 2016): TlsIndex at 0x04DDF92C (0x00A2D5A3 `A1 2C F9 DD 04`), frame array at
+// TLS+0x18, depth dword +2016 (sub_A2D5A0 increments, sub_A2F320 decrements).
+static volatile DWORD s_pbAddr = 0, s_pbRw = 0, s_pbTarget = 0, s_pbEsp = 0, s_pbRet[10] = {};
+static int PuppetDupDepth() {
+    __try {
+        const DWORD idx = *(const DWORD*)0x04DDF92C;
+        void** tls = (void**)__readfsdword(0x2C);
+        char* slot = tls ? (char*)tls[idx] : nullptr;
+        char* stack = slot ? *(char**)(slot + 0x18) : nullptr;
+        return stack ? *(int*)(stack + 2016) : -1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return -2; }
+}
+static int PuppetBuildFilter(EXCEPTION_POINTERS* ep) {
+    __try {
+        const EXCEPTION_RECORD* er = ep->ExceptionRecord;
+        s_pbAddr = (DWORD)(uintptr_t)er->ExceptionAddress;
+        s_pbRw = er->NumberParameters >= 2 ? (DWORD)er->ExceptionInformation[0] : 0xFFFFFFFF;
+        s_pbTarget = er->NumberParameters >= 2 ? (DWORD)er->ExceptionInformation[1] : 0;
+        s_pbEsp = ep->ContextRecord->Esp;
+        const DWORD* sp = (const DWORD*)(uintptr_t)ep->ContextRecord->Esp;
+        int n = 0;
+        for (int i = 0; i < 256 && n < 10; ++i) {                 // exe-image return-address candidates on the stack
+            const DWORD v = sp[i];
+            if (v >= 0x00401000 && v < 0x0527E000) s_pbRet[n++] = v;
+        }
+        for (; n < 10; ++n) s_pbRet[n] = 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
 void* Phase1::TrySpawnPuppet() {
     Entity* newEntity = nullptr;
+    const int dupDepth0 = PuppetDupDepth();
     __try {
         World* world = World::GetCurrentWorld();
         if (!world)
@@ -703,8 +741,21 @@ void* Phase1::TrySpawnPuppet() {
         L("[Phase1] GetPlayer AFTER build = %p (orig=%p new=%p)\n",
           world->GetPlayer(), player, newEntity);
     }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        L("[Phase1] EXCEPTION during resolve/build (code=0x%08X)\n", GetExceptionCode());
+    __except (PuppetBuildFilter(GetExceptionInformation())) {
+        const int dupDepth1 = PuppetDupDepth();
+        L("[Phase1] EXCEPTION during resolve/build (code=0x%08X) at=%08X rw=%u target=%08X esp=%08X dupDepth before=%d after=%d\n",
+          GetExceptionCode(), s_pbAddr, s_pbRw, s_pbTarget, s_pbEsp, dupDepth0, dupDepth1);
+        L("[Phase1] build fault stack: %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X\n",
+          s_pbRet[0], s_pbRet[1], s_pbRet[2], s_pbRet[3], s_pbRet[4], s_pbRet[5], s_pbRet[6], s_pbRet[7], s_pbRet[8], s_pbRet[9]);
+        // [Coop] PuppetBuildRecover (default 0): pop the duplication frames the unwind leaked (sub_A2F320, the scope's own
+        // close), so the next attempt and the engine's later users start from the depth they expect.
+        if (GetPrivateProfileIntA("Coop", "PuppetBuildRecover", 0, Paths::Ini()) != 0 && dupDepth0 >= 0) {
+            int popped = 0;
+            __try {
+                while (PuppetDupDepth() > dupDepth0 && popped < 4) { DuplicationManager::End(); ++popped; }
+            } __except (EXCEPTION_EXECUTE_HANDLER) { L("[Phase1] PuppetBuildRecover: EXCEPTION 0x%08X\n", GetExceptionCode()); }
+            L("[Phase1] PuppetBuildRecover: popped %d duplication frame(s), depth now %d\n", popped, PuppetDupDepth());
+        }
         return nullptr;
     }
 
@@ -3393,12 +3444,25 @@ static void* DuplicateShip(void* shipEnt) {
         // 1) Clone the EntityGroup via its own Duplicate (vtable[3] = FUN_00503600): full deep copy incl.
         //    the sub-entity array (hull/masts/sails). arg2=0 (CreateObject), arg3=1 (dup flag).
         void* dup = nullptr;
-        DuplicationManager::Begin(1, 0);
-        __try {
-            typedef int (__thiscall *EGroupDupFn)(void*, void*, void*);
-            dup = (void*)(*(EGroupDupFn*)(*(uintptr_t*)shipEnt + 0x0C))(shipEnt, nullptr, (void*)1);
-        } __finally {
-            DuplicationManager::End();
+        // [Coop] ShipMirrorInstantiate (default 0): build the clone the way the engine instantiates entities,
+        // sub_527BA0(src, &out) (decompiled 2026-11-22, job p9; 42 engine callers): sub_A2D5A0(0,1), src->vt[0xC](src,0,0),
+        // sub_A2F320, then out+0x50 |= 4|8|0x800000 and sub_522610. The default path below calls the same vt[0xC] with
+        // (0,1) under Begin(1,0). Both guest crashes of 2026-11-21/22 are a proxy's world object reaching the update
+        // walk without its own render instance (X+0x134 null; X+0x104 garbage): evidence walk-guard-ext-2026-11-22.md.
+        // UNVERIFIED: that the engine route gives the clone its own instance; this flag is the test.
+        static int s_inst = -1;
+        if (s_inst < 0) s_inst = GetPrivateProfileIntA("Coop", "ShipMirrorInstantiate", 0, Paths::Ini()) != 0 ? 1 : 0;
+        if (s_inst) {
+            ((int (__thiscall*)(void*, void**))0x00527BA0)(shipEnt, &dup);
+            L("[ShipMirror] instantiate route: dup=%p\n", dup);
+        } else {
+            DuplicationManager::Begin(1, 0);
+            __try {
+                typedef int (__thiscall *EGroupDupFn)(void*, void*, void*);
+                dup = (void*)(*(EGroupDupFn*)(*(uintptr_t*)shipEnt + 0x0C))(shipEnt, nullptr, (void*)1);
+            } __finally {
+                DuplicationManager::End();
+            }
         }
         if (!dup || !readable(dup, 4)) return nullptr;
 
