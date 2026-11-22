@@ -277,8 +277,7 @@ HRESULT STDMETHODCALLTYPE FakePresent(IDXGISwapChain* chain, UINT sync, UINT fla
         if (t - g_fpsWindowStart >= 1000) { c->fps = (uint32_t)(g_fpsWindowPresents * 1000 / (LONG)(t - g_fpsWindowStart + 1)); g_fpsWindowPresents = 0; g_fpsWindowStart = t; }
     }
     if (InterlockedExchange(&g_frameReq, 0) && !(flags & DXGI_PRESENT_TEST)) {
-        __try { GrabFrame(chain); } __except (EXCEPTION_EXECUTE_HANDLER) { Log("[Pilot] frame: EXCEPTION 0x%08X
-", GetExceptionCode()); }
+        __try { GrabFrame(chain); } __except (EXCEPTION_EXECUTE_HANDLER) { Log("[Pilot] frame: EXCEPTION 0x%08X\n", GetExceptionCode()); }
     }
     return g_realPresent(chain, sync, flags);
 }
