@@ -14856,9 +14856,13 @@ static void CctOwnUpdate(Human* h) {
         if (readable((void*)ent, 0x80)) { const float ex = ((Entity*)ent)->m_GlobalMatrix.M41 - pl->m_GlobalMatrix.M41,
                                                       ey = ((Entity*)ent)->m_GlobalMatrix.M42 - pl->m_GlobalMatrix.M42; dist = sqrtf(ex * ex + ey * ey); }
         memcpy(s_cctLast, path, sizeof(path));
+        // CanEnterFight (slot 75 = 0x1D269F0) pushes node 107 into helper+0xE0 when sub_1D02DF0 -> sub_1CEDC90 == 2; DoEnterFight
+        // (slot 76 = 0x1D79A50) requires 107 there and consumes it (sub_59AA90). So Do is only valid right after a true Can.
+        const uint32_t rcan = FiCall(ig, 75, 1, (uint32_t)&s_cctHnd);                  // CanEnterFight(const Handle&)
+        char desc2[200]; CctDescribe(fsm, desc2, sizeof(desc2));                         // node list after Can
         const uint32_t rd = FiCall(ig, 76, 1, (uint32_t)&s_cctHnd);                    // DoEnterFight(const Handle&)
-        L("[CCT] %s#%d human=%p ent=%08X target=%p dist=%.1f enter(76) do=%08X | before %s\n", g_entHost == 1 ? "native" : "copy", s_cctDone + 1, (void*)h, ent,
-          (void*)pl, dist, rd, desc);
+        L("[CCT] %s#%d human=%p ent=%08X target=%p dist=%.1f can(75)=%08X [%s] do(76)=%08X | before %s\n", g_entHost == 1 ? "native" : "copy", s_cctDone + 1, (void*)h, ent,
+          (void*)pl, dist, rcan, desc2, rd, desc);
         ReleaseSRWLockExclusive(&s_cctLock); return;
     }
     const double dt = (now - s_cctT0) / 1e6;
