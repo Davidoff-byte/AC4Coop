@@ -5968,6 +5968,7 @@ static void CorpseBudgetReport() {
 static unsigned s_animBlendDropped = 0;   // non-zero factors beyond GUARD_ANIM_BLEND_MAX (should stay 0)
 static int g_guardActLane = 0;                            // [Coop] GuardActionLane (default 0; read at load, then every 2 s)
 static void GalHostScope(Human* h, Entity* e, uint64_t objId);   // defined with the lane, below FiResolve
+static bool CctOn(); static void CctNote(Human* h, Entity* e);   // [Coop] CopyCmdTest (defined before OnFrame)
 static void CaptureGuardAnim(ActionComponent* ac, void* act, GuardAnim& g) {
     std::memset(&g, 0, sizeof(g));
     g.channel = 0xFFFF; g.blendInMs = -1;
@@ -9943,7 +9944,6 @@ static GsaEnt s_gsa[64]; static volatile LONG s_gsaN = 0; static SRWLOCK s_gsaLo
 static volatile LONG s_gsaFrames = 0, s_gsaAgree = 0, s_gsaHostFight = 0, s_gsaBothFight = 0, s_gsaEnterTry = 0, s_gsaEnterOk = 0,
                      s_gsaExitTry = 0, s_gsaExitOk = 0, s_gsaNoTarget = 0, s_gsaLines = 0,
                      s_gsaForceSkip = 0, s_gsaForceLines = 0, s_gsaSkipLines = 0;
-static bool CctOn(); static void CctNote(Human* h, Entity* e);   // [Coop] CopyCmdTest (defined before OnFrame)
 static void GsaNote(Entity* e, uint64_t objId, uint8_t stage, uint8_t tgt) {   // guest player update (lane drain)
     Human* h = AIEntityHelper::GetHuman(e);
     if (!h || !stage) return;
