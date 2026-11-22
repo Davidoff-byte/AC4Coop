@@ -45,3 +45,39 @@ commands only fill a request record that this statechart consumes on its tick (s
   exists; whether a command on a copy plays the move is the next test.
 - Teleporting from sea into Havana does not load the town's population. A street-guard run needs a save that starts in
   Havana (11-15 era saves did) or a sail-in.
+
+---
+
+## Part 2: does a command on a copy play the move? (`[Coop] CopyCmdTest`, same day)
+
+Pre-registered (in `src/phase1.cpp` above `CctOwnUpdate`, before any run): from the body's own update, DoEnterFight
+(IHumanGround slot 76) on the local player, then 1.5 s later PerformCombo (slot 160: target, n = 3, end = 1, 0);
+**PASS** = state 173 in the active path within 2 s of the slot-160 call.
+
+| run | build (all `tree=clean`) | bodies | DoEnterFight (low byte) | node list (`fsm+0xE0`, count `+0x106`) | 173 after slot 160 |
+|---|---|---|---|---|---|
+| guest 24272 | `31b4225`, asi `fbc9d94c…` | 2 distinct copies (pirate crew at sea) | 0, 0 | not logged | no |
+| guest 11328 | `bcfb761`, asi `c9de4213…` | 2 copies | 0, 0 | **empty** (`nodes=0`, `n107=0`) | no |
+| host 5980 (control, AI on) | `ae2a46a`, asi `66e709b0…` | 1 native crew | **0** | **empty** | no |
+| guest 24004 | same | 1 copy | 0 | empty | no |
+
+- **Verdict against the bar: FAIL** (0 of 5 copies), and **not attributable to the copy being disabled**: the AI-on native
+  control refused the same way, with the same empty node list. Every body here was the player's own pirate crew at sea,
+  asked to fight its own captain; no hostile human was available on this save.
+- The copies' state machines were visibly running: the active path changed every ~0.35 s (`1/2/3/4/5/6/7` ↔
+  `1/2/3/4/55/56`), matching part 1.
+- PerformCombo returns 5 in every case; it only fills the request record, which nothing consumes outside fight idle
+  (state 168).
+- **Correction to `guard-stage-apply-2026-11-21.md`:** its verdict "the machine never ticks, the vector is empty"
+  has the first half refuted (part 1: it ticks). The empty node list is real, but it is empty on an AI-on body as well,
+  so ticking alone does not put node 107 there. Also, that run's `enter ok=3` counted CanEnterFight successes
+  (`ok` is incremented whenever `rc & 0xFF`, before DoEnterFight's result is read), not successful enters.
+- **Lead (UNVERIFIED):** the one place slot 76/160 is known to work live is the puppet, and the puppet's behaviour
+  component is **enabled** whenever it is in Ground (`HybridLoco`, `phase1.cpp` "GROUND context -> puppet's own FSM owns
+  actions: behavior ENABLED"). Guard copies run with it disabled. If the producer of node 107 sits behind the behaviour
+  component, the design's second branch applies: copies keep behaviour enabled and the decision hooks suppress their
+  own choices. Not proven: the at-sea control could not separate "behaviour off" from "friendly target".
+- A save swap to the 11-15 01:03 backup did not change where the game loads (still at sea); saves were restored and
+  hash-verified. A hostile-target run still needs a Havana start or a boarding.
+- Static next (rule 9): find what writes node 107 into `fsm+0xE0` (`+0x106` count); the earlier byte sweeps for direct
+  `disp32` stores found no writer (`ai-off-seam-2026-11-21.md` §8), so it goes through a register-held base.
