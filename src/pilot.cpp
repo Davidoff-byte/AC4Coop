@@ -720,7 +720,7 @@ void Poll()
     if (g_keepFocus && !g_focusDone) TrySubclass();
     // Present is patched only once a cap is wanted ([Pilot] FpsCap or the fps command), never speculatively at start.
     if (!g_presentTried && g_ctl && (g_ctl->fpsCap || (g_ctl->req != g_ctl->done && g_ctl->cmd == kCmdFpsCap)) && GetModuleHandleA("d3d11.dll")) TryPatchPresent();
-    if (g_ctl && g_ctl->req != g_ctl->done && g_ctl->cmd == kCmdFpsCap) RunCommand(nullptr);   // works in menus too
+    if (g_ctl && g_ctl->req != g_ctl->done && (g_ctl->cmd == kCmdFpsCap || g_ctl->cmd == kCmdFrame)) RunCommand(nullptr);   // works in menus too
 }
 
 void OnPlayerFrame(void* human)
