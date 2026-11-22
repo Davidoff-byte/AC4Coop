@@ -393,6 +393,28 @@ def cmd_hg(p, a):
     return 0 if st == 0 else 3
 
 
+def cmd_frame(p, a):
+    """kCmdFrame 15: save the next presented frame to %TEMP%\ac4frame_<pid>.bmp, then convert to PNG (--out)."""
+    import os
+    if not p.read().get('presentPatched', 1):
+        p.ctl_send(2, [0.0])   # fps 0 = no cap; installs the Present hook the frame grab rides on
+    path = os.path.join(os.environ.get('TEMP', '.'), f'ac4frame_{p.pid}.bmp')
+    old = os.path.getmtime(path) if os.path.exists(path) else 0
+    st = p.ctl_send(15, [])
+    if st == -4:
+        p.ctl_send(2, [0.0]); time.sleep(0.5); st = p.ctl_send(15, [])
+    end = time.time() + 5
+    while time.time() < end and (not os.path.exists(path) or os.path.getmtime(path) == old):
+        time.sleep(0.1)
+    if not os.path.exists(path) or os.path.getmtime(path) == old:
+        print(f'frame: none written (status {st})'); return 3
+    from PIL import Image
+    out = a.out or path[:-4] + '.png'
+    Image.open(path).save(out)
+    print(out)
+    return 0
+
+
 def cmd_lifehit(p, a):
     """S9 test (kCmdLifeHit 14): CSrvNPCHealth::SetLife(life - dmg) on ENT from the player's frame, unmarked like a combat
     hit. On a linked copy with [Coop] OwnerDamage the write is blocked (life unchanged) and sent to the host as a request."""
@@ -650,6 +672,7 @@ def main():
     x.add_argument('--speed', type=float, default=1.0); x.add_argument('--sec', type=float, default=1.0)
     x = sub.add_parser('hg'); x.add_argument('--iface', type=int, default=0); x.add_argument('--can', type=int)
     x.add_argument('--do', type=int); x.add_argument('--arg', action='append'); x.add_argument('--puppet', action='store_true')
+    x = sub.add_parser('frame'); x.add_argument('--out')
     x = sub.add_parser('lifehit'); x.add_argument('ent'); x.add_argument('dmg', type=int)
     x = sub.add_parser('route'); x.add_argument('x', type=float); x.add_argument('y', type=float)
     x = sub.add_parser('boot'); x.add_argument('--pulses', type=int, default=6); x.add_argument('--wait', type=float, default=5)

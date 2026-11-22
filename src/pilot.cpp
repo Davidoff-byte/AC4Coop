@@ -209,6 +209,52 @@ int64_t       g_nextFrame = 0;
 LONG          g_fpsWindowPresents = 0;
 DWORD         g_fpsWindowStart = 0;
 volatile LONG g_presentTried = 0;
+volatile LONG g_frameReq = 0;      // kCmdFrame: grab the next presented back buffer to %TEMP%\ac4frame_<pid>.bmp
+
+// Back buffer -> staging copy -> 24-bit BMP (halved when wider than 1280). Called inside Present, before the real one.
+void GrabFrame(IDXGISwapChain* chain)
+{
+    ID3D11Texture2D* bb = nullptr; ID3D11Device* dev = nullptr; ID3D11DeviceContext* ctx = nullptr; ID3D11Texture2D* st = nullptr;
+    if (FAILED(chain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&bb)) || !bb) { Log("[Pilot] frame: no back buffer\n"); return; }
+    bb->GetDevice(&dev); dev->GetImmediateContext(&ctx);
+    D3D11_TEXTURE2D_DESC d; bb->GetDesc(&d);
+    D3D11_TEXTURE2D_DESC sd = d; sd.Usage = D3D11_USAGE_STAGING; sd.BindFlags = 0; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ; sd.MiscFlags = 0;
+    sd.SampleDesc.Count = 1; sd.SampleDesc.Quality = 0; sd.MipLevels = 1; sd.ArraySize = 1;
+    if (SUCCEEDED(dev->CreateTexture2D(&sd, nullptr, &st)) && st) {
+        if (d.SampleDesc.Count > 1) ctx->ResolveSubresource(st, 0, bb, 0, d.Format); else ctx->CopyResource(st, bb);
+        D3D11_MAPPED_SUBRESOURCE m;
+        if (SUCCEEDED(ctx->Map(st, 0, D3D11_MAP_READ, 0, &m))) {
+            const int step = d.Width > 1280 ? 2 : 1, w = (int)d.Width / step, h = (int)d.Height / step, row = (w * 3 + 3) & ~3;
+            const bool bgra = d.Format == DXGI_FORMAT_B8G8R8A8_UNORM || d.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+            char path[MAX_PATH]; char tmp[MAX_PATH]; GetTempPathA(MAX_PATH, tmp);
+            _snprintf_s(path, sizeof(path), _TRUNCATE, "%sac4frame_%lu.bmp", tmp, GetCurrentProcessId());
+            FILE* f = nullptr;
+            if (fopen_s(&f, path, "wb") == 0 && f) {
+                const uint32_t img = (uint32_t)(row * h), fsz = 54 + img;
+                uint8_t hd[54] = { 'B', 'M' };
+                memcpy(hd + 2, &fsz, 4); uint32_t off = 54; memcpy(hd + 10, &off, 4); uint32_t hs = 40; memcpy(hd + 14, &hs, 4);
+                int32_t ww = w, hh = -h; memcpy(hd + 18, &ww, 4); memcpy(hd + 22, &hh, 4); uint16_t pl = 1, bpp = 24; memcpy(hd + 26, &pl, 2); memcpy(hd + 28, &bpp, 2);
+                memcpy(hd + 34, &img, 4);
+                fwrite(hd, 1, 54, f);
+                uint8_t* line = (uint8_t*)malloc(row);
+                for (int y = 0; y < h && line; ++y) {
+                    const uint8_t* src = (const uint8_t*)m.pData + (size_t)(y * step) * m.RowPitch;
+                    memset(line, 0, row);
+                    for (int x = 0; x < w; ++x) {
+                        const uint8_t* px = src + (size_t)(x * step) * 4;
+                        line[x * 3 + 0] = bgra ? px[0] : px[2]; line[x * 3 + 1] = px[1]; line[x * 3 + 2] = bgra ? px[2] : px[0];
+                    }
+                    fwrite(line, 1, row, f);
+                }
+                free(line); fclose(f);
+                Log("[Pilot] frame: %ux%u fmt=%u -> %s\n", d.Width, d.Height, (unsigned)d.Format, path);
+            }
+            ctx->Unmap(st, 0);
+        }
+        st->Release();
+    }
+    ctx->Release(); dev->Release(); bb->Release();
+}
 
 HRESULT STDMETHODCALLTYPE FakePresent(IDXGISwapChain* chain, UINT sync, UINT flags)
 {
@@ -229,6 +275,10 @@ HRESULT STDMETHODCALLTYPE FakePresent(IDXGISwapChain* chain, UINT sync, UINT fla
         ++g_fpsWindowPresents;
         DWORD t = GetTickCount();
         if (t - g_fpsWindowStart >= 1000) { c->fps = (uint32_t)(g_fpsWindowPresents * 1000 / (LONG)(t - g_fpsWindowStart + 1)); g_fpsWindowPresents = 0; g_fpsWindowStart = t; }
+    }
+    if (InterlockedExchange(&g_frameReq, 0) && !(flags & DXGI_PRESENT_TEST)) {
+        __try { GrabFrame(chain); } __except (EXCEPTION_EXECUTE_HANDLER) { Log("[Pilot] frame: EXCEPTION 0x%08X
+", GetExceptionCode()); }
     }
     return g_realPresent(chain, sync, flags);
 }
@@ -578,6 +628,9 @@ void RunCommand(Entity* pl)
                 Log("[Pilot] teleport -> (%.2f, %.2f, %.2f) yaw %s\n", c->f[0], c->f[1], c->f[2], (c->f[3] != c->f[3]) ? "kept" : "set");
             } __except (EXCEPTION_EXECUTE_HANDLER) { status = -2; }
         }
+    } else if (c->cmd == kCmdFrame) {
+        InterlockedExchange(&g_frameReq, 1);
+        status = g_realPresent ? 0 : -4;
     } else if (c->cmd == kCmdFpsCap) {
         float v = c->f[0];
         c->fpsCap = (v <= 0.0f) ? 0u : (uint32_t)(v > 240.0f ? 240.0f : v);
