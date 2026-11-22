@@ -43,6 +43,7 @@ void Phase1_OwnerDamageInstall();   // phase1.cpp: [Coop] OwnerDamage SetLife de
 #include "deref_guard.h"
 #include "walk_guard.h"
 #include "ground_tick_probe.h"
+#include "call_trace.h"
 #include "combat_observe.h"
 #include "build_gate.h"
 #include "paths.h"
@@ -633,6 +634,9 @@ BOOL APIENTRY DllMain(HMODULE hMod, DWORD reason, LPVOID)
 
         // R1 counter on the Ground context update slot (0x026E8B24). [Coop] GroundTickProbe, default 0.
         GroundTick::Init();
+
+        // Call tracer over chosen vtables (find the function behind an action). [Coop] CallTraceVt, default empty.
+        CallTrace::Init();
 
         // Read-only crash recorder for execute faults (a call through a freed or null object): registers, stack
         // and the objects they name, to AC4Coop_crashctx_<pid>.txt. [Coop] CrashContext, default 0.
