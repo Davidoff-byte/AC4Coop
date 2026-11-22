@@ -9942,6 +9942,7 @@ static GsaEnt s_gsa[64]; static volatile LONG s_gsaN = 0; static SRWLOCK s_gsaLo
 static volatile LONG s_gsaFrames = 0, s_gsaAgree = 0, s_gsaHostFight = 0, s_gsaBothFight = 0, s_gsaEnterTry = 0, s_gsaEnterOk = 0,
                      s_gsaExitTry = 0, s_gsaExitOk = 0, s_gsaNoTarget = 0, s_gsaLines = 0,
                      s_gsaForceSkip = 0, s_gsaForceLines = 0, s_gsaSkipLines = 0;
+static bool CctOn(); static void CctNote(Human* h, Entity* e);   // [Coop] CopyCmdTest (defined before OnFrame)
 static void GsaNote(Entity* e, uint64_t objId, uint8_t stage, uint8_t tgt) {   // guest player update (lane drain)
     Human* h = AIEntityHelper::GetHuman(e);
     if (!h || !stage) return;
@@ -10938,6 +10939,7 @@ static void ApplyGuards(const EntityPacket& pkt) {
             Human* bh = AIEntityHelper::GetHuman(best);
             if (!locallyDead && GroundTick::On() && bh && readable((char*)bh + 0x720, 4))   // [Coop] GroundTickProbe: bound copy
                 GroundTick::Note(best, *(void**)((char*)bh + 0x720), 1);
+            if (!locallyDead && bh && CctOn()) CctNote(bh, best);                    // [Coop] CopyCmdTest candidates
             if (!locallyDead && bh && readable(bh, 4)) {
                 CharacterController* cc = (CharacterController*)bh->GetCharacterComponent();
                 if (readable(cc, 0x600)) cc->m_DriveEntity = false;
@@ -14787,11 +14789,81 @@ static void CtpPlayerFrame(Human* h) {
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
+// [Coop] CopyCmdTest (default 0, guest only): the second half of R1 (ops/evidence/guard-ai/brain-design-2026-11-22.md section 4).
+// On a bound, behaviour-disabled copy whose Ground dispatch id is 4, from that copy's OWN update: DoEnterFight (IHumanGround
+// slot 76) on the guest's local player, then 1.5 s later PerformCombo (slot 160: target entity, n = 3, end = 1, 0; the
+// native executor's form at sub_14BE080). The active-state path (fsm = [hg+0xA0], u16 *(fsm+0x118)) is logged on every
+// change for 3 s after each call. Pre-registered: PASS = a state id 173 (attack, entered from fight idle 168) appears in the
+// path within 2 s of the slot-160 call; FAIL = it does not. Up to 3 copies, one at a time, 6 s apart. Nothing else changes.
+static int g_cctOn = -1;
+struct CctCand { unsigned int human, ent; };
+static CctCand s_cct[16]; static volatile LONG s_cctN = 0;
+static SRWLOCK s_cctLock = SRWLOCK_INIT;
+static unsigned int s_cctCur = 0;          // Human under test
+static int s_cctStage = 0, s_cctDone = 0, s_cctLines = 0;
+static uint64_t s_cctT0 = 0, s_cctNext = 0;
+static uint16_t s_cctLast[6];
+static uint32_t s_cctHnd = 0;
+static bool CctOn() {
+    if (g_cctOn < 0) { g_cctOn = GetPrivateProfileIntA("Coop", "CopyCmdTest", 0, Paths::Ini()) != 0 ? 1 : 0; if (g_cctOn) L("[CCT] CopyCmdTest=1\n"); }
+    return g_cctOn == 1;
+}
+static void CctNote(Human* h, Entity* e) {   // guest bind site (game thread)
+    if (!h) return;
+    AcquireSRWLockExclusive(&s_cctLock);
+    bool have = false;
+    for (int i = 0; i < s_cctN; ++i) if (s_cct[i].human == (unsigned int)h) { have = true; break; }
+    if (!have && s_cctN < 16) { s_cct[s_cctN].human = (unsigned int)h; s_cct[s_cctN].ent = (unsigned int)e; InterlockedIncrement(&s_cctN); }
+    ReleaseSRWLockExclusive(&s_cctLock);
+}
+static void CctOwnUpdate(Human* h) {
+    if (s_cctDone >= 3 || !s_cctN) return;
+    const uint64_t now = OwnNowUs();
+    AcquireSRWLockExclusive(&s_cctLock);
+    unsigned int ent = 0; bool cand = false;
+    for (int i = 0; i < s_cctN; ++i) if (s_cct[i].human == (unsigned int)h) { cand = true; ent = s_cct[i].ent; break; }
+    if (!cand || (s_cctCur && s_cctCur != (unsigned int)h) || GuestObjEntGone(ent) || MirrorKilledLocally((void*)ent)) { ReleaseSRWLockExclusive(&s_cctLock); return; }
+    char* hg = FiHumanGround(h);
+    uint16_t path[6] = {}; char* fsm = nullptr;
+    const bool havePath = hg && FiPath(hg, path, &fsm);
+    void* ig = hg ? hg + 0x10 : nullptr;
+    if (!s_cctCur) {                          // pick: Ground dispatch id 4, after the next-slot time
+        if (now < s_cctNext || !havePath || path[3] != 4) { ReleaseSRWLockExclusive(&s_cctLock); return; }
+        World* w = World::GetCurrentWorld(); Entity* pl = w ? w->GetPlayer() : nullptr;
+        if (!readable(pl, 0xCC)) { ReleaseSRWLockExclusive(&s_cctLock); return; }
+        s_cctCur = (unsigned int)h; s_cctStage = 1; s_cctT0 = now; s_cctHnd = *(uint32_t*)((char*)pl + 0xC8);
+        memcpy(s_cctLast, path, sizeof(path));
+        const uint32_t rd = FiCall(ig, 76, 1, (uint32_t)&s_cctHnd);                    // DoEnterFight(const Handle&)
+        L("[CCT] copy#%d human=%p ent=%08X target=%p enter(76) do=%08X | before path=%u/%u/%u/%u/%u/%u\n", s_cctDone + 1, (void*)h, ent,
+          (void*)pl, rd, path[0], path[1], path[2], path[3], path[4], path[5]);
+        ReleaseSRWLockExclusive(&s_cctLock); return;
+    }
+    const double dt = (now - s_cctT0) / 1e6;
+    if (havePath && memcmp(path, s_cctLast, sizeof(path)) != 0 && s_cctLines < 400) {
+        ++s_cctLines; memcpy(s_cctLast, path, sizeof(path));
+        L("[CCT] copy#%d +%.3fs %s path=%u/%u/%u/%u/%u/%u\n", s_cctDone + 1, dt, s_cctStage == 1 ? "after-enter" : "after-combo",
+          path[0], path[1], path[2], path[3], path[4], path[5]);
+    }
+    if (s_cctStage == 1 && dt >= 1.5) {
+        World* w = World::GetCurrentWorld(); Entity* pl = w ? w->GetPlayer() : nullptr;
+        const uint32_t rc = readable(pl, 0xCC) ? FiCall(ig, 160, 4, (uint32_t)pl, 3, 1, 0) : 0xFFFFFFFFu;   // PerformCombo
+        L("[CCT] copy#%d +%.3fs combo(160) target=%p n=3 -> %08X | path=%u/%u/%u/%u/%u/%u\n", s_cctDone + 1, dt, (void*)pl, rc,
+          path[0], path[1], path[2], path[3], path[4], path[5]);
+        s_cctStage = 2;
+    } else if (s_cctStage == 2 && dt >= 4.5) {
+        L("[CCT] copy#%d end +%.3fs path=%u/%u/%u/%u/%u/%u\n", s_cctDone + 1, dt, path[0], path[1], path[2], path[3], path[4], path[5]);
+        ++s_cctDone; s_cctCur = 0; s_cctStage = 0; s_cctNext = now + 6000000;
+    }
+    ReleaseSRWLockExclusive(&s_cctLock);
+}
+static void CctOwnUpdateGuarded(Human* h) { __try { CctOwnUpdate(h); } __except (EXCEPTION_EXECUTE_HANDLER) { L("[CCT] EXCEPTION 0x%08X\n", GetExceptionCode()); } }
+
 static void __cdecl OnFrame(Human* updatedHuman) {
     StateProbeHost(updatedHuman);                // [Coop] StateProbe host side (no-op unless on and host)
     if (CombatTiming::On()) CtpOwnUpdateGuarded(updatedHuman);   // [Coop] CombatTimingProbe (default 0)
     if (g_guardActLane && g_entHost == 1) GalHostOwnUpdateGuarded(updatedHuman);   // [Coop] GuardActionLane (default 0)
     if (g_guardActLane && g_entHost != 1) GsaOwnUpdateGuarded(updatedHuman);       // [Coop] GuardStageApply (default 0) + probe
+    if (g_entHost != 1 && CctOn()) CctOwnUpdateGuarded(updatedHuman);              // [Coop] CopyCmdTest (default 0)
     __try { OwnDrain(updatedHuman); }            // puppet / mirrored guard: probe, and write in own-update mode
     __except (EXCEPTION_EXECUTE_HANDLER) {
         static int s_on = 0;
@@ -14840,7 +14912,7 @@ static void DumpConfigOnce()
         // The Tune* values are floats (read with strtod, see ShipTuningTick); the dump shows the integer part.
         { "Coop", "TuneConeAngle", 120 }, { "Coop", "TuneConeRange", 350 }, { "Coop", "TuneMaxTime", 30 },
         { "Coop", "TuneAggroTime", 30 }, { "Coop", "TuneHull", 0 },
-        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 },
+        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 },
         { "Coop", "CombatTest", 0 }, { "Coop", "CrashContext", 0 }, { "Coop", "CorpseKeepSec", 30 }, { "Coop", "CrowdProbeIntegrate", 1 },
         { "Coop", "CrowdProbeLiveKeys", 1 }, { "Coop", "DamageRelay", 0 }, { "Coop", "Diag", 0 },
         { "Coop", "DisableCrowd", 0 }, { "Coop", "DisablePuppetAI", 1 }, { "Coop", "DisableSpawns", 0 },
