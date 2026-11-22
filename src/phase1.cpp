@@ -6069,6 +6069,7 @@ static void EmitGuardEntity(EntityPacket& pkt, uint32_t& count, int idx, Entity*
     Human* gh = AIEntityHelper::GetHuman(e);
     if (g_entHost == 1 && GroundTick::On() && gh && readable((char*)gh + 0x720, 4))   // [Coop] GroundTickProbe: native guard
         GroundTick::Note(e, *(void**)((char*)gh + 0x720), 2);
+    if (g_entHost == 1 && gh && CctOn()) CctNote(gh, e);         // [Coop] CopyCmdTest control: the same calls on an AI-on body
     if (gh && readable(gh, 4)) {
         HumanDataBundle* gpB = gh->m_Data.m_HumanDataBundle;
         if (gpB && readable(gpB, 4)) es.stage = (uint8_t)(int32_t)gpB->m_GroundData.m_HumanGroundStage;
@@ -14790,6 +14791,7 @@ static void CtpPlayerFrame(Human* h) {
 }
 
 // [Coop] CopyCmdTest (default 0, guest only): the second half of R1 (ops/evidence/guard-ai/brain-design-2026-11-22.md section 4).
+// Control (host): the identical sequence on native AI-on bodies from CaptureGuards, so a refusal can be attributed.
 // On a bound, behaviour-disabled copy whose Ground dispatch id is 4, from that copy's OWN update: DoEnterFight (IHumanGround
 // slot 76) on the guest's local player, then 1.5 s later PerformCombo (slot 160: target entity, n = 3, end = 1, 0; the
 // native executor's form at sub_14BE080). The active-state path (fsm = [hg+0xA0], u16 *(fsm+0x118)) is logged on every
@@ -14855,7 +14857,7 @@ static void CctOwnUpdate(Human* h) {
                                                       ey = ((Entity*)ent)->m_GlobalMatrix.M42 - pl->m_GlobalMatrix.M42; dist = sqrtf(ex * ex + ey * ey); }
         memcpy(s_cctLast, path, sizeof(path));
         const uint32_t rd = FiCall(ig, 76, 1, (uint32_t)&s_cctHnd);                    // DoEnterFight(const Handle&)
-        L("[CCT] copy#%d human=%p ent=%08X target=%p dist=%.1f enter(76) do=%08X | before %s\n", s_cctDone + 1, (void*)h, ent,
+        L("[CCT] %s#%d human=%p ent=%08X target=%p dist=%.1f enter(76) do=%08X | before %s\n", g_entHost == 1 ? "native" : "copy", s_cctDone + 1, (void*)h, ent,
           (void*)pl, dist, rd, desc);
         ReleaseSRWLockExclusive(&s_cctLock); return;
     }
@@ -14884,7 +14886,7 @@ static void __cdecl OnFrame(Human* updatedHuman) {
     if (CombatTiming::On()) CtpOwnUpdateGuarded(updatedHuman);   // [Coop] CombatTimingProbe (default 0)
     if (g_guardActLane && g_entHost == 1) GalHostOwnUpdateGuarded(updatedHuman);   // [Coop] GuardActionLane (default 0)
     if (g_guardActLane && g_entHost != 1) GsaOwnUpdateGuarded(updatedHuman);       // [Coop] GuardStageApply (default 0) + probe
-    if (g_entHost != 1 && CctOn()) CctOwnUpdateGuarded(updatedHuman);              // [Coop] CopyCmdTest (default 0)
+    if (CctOn()) CctOwnUpdateGuarded(updatedHuman);              // [Coop] CopyCmdTest (default 0): guest copies; host natives = control
     __try { OwnDrain(updatedHuman); }            // puppet / mirrored guard: probe, and write in own-update mode
     __except (EXCEPTION_EXECUTE_HANDLER) {
         static int s_on = 0;
