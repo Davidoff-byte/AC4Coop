@@ -93,7 +93,7 @@ int FindObj(uint64_t o) { for (int i = 0; i < g_nb; ++i) if (g_b[i].objId == o) 
 
 // ---- counters ------------------------------------------------------------------------------------
 volatile LONG c_cap[kNSlots] = {}, c_capUnbound = 0, c_tx = 0, c_txFail = 0, c_rx = 0, c_rxStaleBase = 0, c_exec = 0, c_execFail = 0,
-              c_stale = 0, c_noTarget = 0, c_noBody = 0, c_noClock = 0, c_s173 = 0, c_queueFull = 0, c_notReady = 0, c_enterRefused = 0, c_dupDropped = 0, c_alreadyFight = 0, c_gatePermits = 0, c_hitLines = 0, c_hitHeld = 0, c_hitApplied = 0, c_hitRefused = 0, c_gate181Tx = 0, c_gate181Blocked = 0, c_gate181Allowed = 0, c_gateSubst = 0, c_capLines = 0, c_execLines = 0;
+              c_stale = 0, c_noTarget = 0, c_noBody = 0, c_noClock = 0, c_s173 = 0, c_queueFull = 0, c_notReady = 0, c_enterRefused = 0, c_dupDropped = 0, c_alreadyFight = 0, c_gatePermits = 0, c_hitLines = 0, c_hitHeld = 0, c_hitApplied = 0, c_hitRefused = 0, c_gate181Tx = 0, c_gate181Blocked = 0, c_gate181Allowed = 0, c_gateSubst = 0, c_attackHeld = 0, c_capLines = 0, c_execLines = 0;
 LONG    g_late[64]; volatile LONG g_lateN = 0;   // last 64 lateness samples (ms) for the report
 
 // Host: the guest is in a world and answering. Its PeerClock role is set only from a player frame (OnFrameInner), so the
@@ -390,6 +390,20 @@ bool Execute(uint32_t human, uint32_t ig, uint64_t objId, const Cmd& c, int32_t 
     // or attacked 390 ms late; and the first enter commands were refused by CanEnterFight. So: an attack on a copy that is
     // not in Fight enters first with the attack's target; a refused enter is held and retried (OwnUpdate requeues).
     const int st1 = Phase1_HumanStage1((void*)human);   // HumanGroundStage + 1: 5 = Fight
+    // Havana run 13: all 3 missed attacks arrived while the copy was still in the previous attack (path .../173/180 or
+    // .../173/182), because the copy runs each attack 25-45 ms behind the host guard and the host starts the next one as it
+    // reaches fight idle. The slot call then started nothing. With BrainHitSync on, an attack is held (retried each frame,
+    // up to 1 s late) while attack state 173 is on the copy's path, so attacks run in the host's order.
+    if (attack && g_hitSync) {
+        bool in173 = false;
+        __try {
+            const uint32_t fsm = *(uint32_t*)(ig + 0x90);
+            unsigned d = *(const uint16_t*)(fsm + 0x11E); if (d > 12) d = 12;
+            const uint16_t* p = *(const uint16_t* const*)(fsm + 0x118);
+            for (unsigned i = 0; i < d; ++i) if (p[i] == 173) in173 = true;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        if (in173) { InterlockedIncrement(&c_attackHeld); return false; }
+    }
     float dz = -1.0f;
     __try {
         AcquireSRWLockShared(&g_bLock);
@@ -913,8 +927,9 @@ void Tick() {
     if (ms >= s_nextReport) {
         s_nextReport = ms + 5000;
         if (g_hitSync)
-            Log("[Brain] hitsync role=%s gateTx=%ld permits=%ld allowed=%ld substituted=%ld blocked=%ld hitApplied=%ld hitRefused=%ld hitHeld=%ld\n",
-                g_role == 1 ? "host" : "guest", c_gate181Tx, c_gatePermits, c_gate181Allowed, c_gateSubst, c_gate181Blocked, c_hitApplied, c_hitRefused, c_hitHeld);
+            Log("[Brain] hitsync role=%s gateTx=%ld permits=%ld allowed=%ld substituted=%ld blocked=%ld hitApplied=%ld hitRefused=%ld hitHeld=%ld attackHeld=%ld\n",
+                g_role == 1 ? "host" : "guest", c_gate181Tx, c_gatePermits, c_gate181Allowed, c_gateSubst, c_gate181Blocked, c_hitApplied, c_hitRefused, c_hitHeld,
+                c_attackHeld);
         if (g_probe115 || g_supp115)
             Log("[Brain] 115 role=%s eval4=%ld eval58=%ld copy4=%ld copy58=%ld native4=%ld native58=%ld unmatched=%ld suppressed=%ld evalCalls=%ld\n",
                 g_role == 1 ? "host" : "guest", c115[0], c115[1], c115Copy[0], c115Copy[1], c115Native[0], c115Native[1], c115Unmatched, c115Supp, c115SelCalls);
