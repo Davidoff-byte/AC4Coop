@@ -75,6 +75,7 @@ bool Rd(const void* p, size_t n) {
 struct Body {
     uint32_t human, ent, ig; uint64_t objId; uint64_t seenMs;
     uint64_t watchUntilUs; uint32_t watchExec; uint8_t in173; uint16_t lastPath[12]; uint8_t lastDepth; int pathLines; uint16_t lastGid; struct { uint16_t st; int32_t code; uint64_t untilMs; } permit[4];
+    Cmd pendAtk; uint8_t pendValid; uint8_t hostIn173;   // BrainHitSync host: last attack call, sent when the guard enters 173
 };
 const int kBodies = 256;
 Body    g_b[kBodies]; int g_nb = 0;
@@ -93,7 +94,7 @@ int FindObj(uint64_t o) { for (int i = 0; i < g_nb; ++i) if (g_b[i].objId == o) 
 
 // ---- counters ------------------------------------------------------------------------------------
 volatile LONG c_cap[kNSlots] = {}, c_capUnbound = 0, c_tx = 0, c_txFail = 0, c_rx = 0, c_rxStaleBase = 0, c_exec = 0, c_execFail = 0,
-              c_stale = 0, c_noTarget = 0, c_noBody = 0, c_noClock = 0, c_s173 = 0, c_queueFull = 0, c_notReady = 0, c_enterRefused = 0, c_dupDropped = 0, c_alreadyFight = 0, c_gatePermits = 0, c_hitLines = 0, c_hitHeld = 0, c_hitApplied = 0, c_hitRefused = 0, c_gate181Tx = 0, c_gate181Blocked = 0, c_gate181Allowed = 0, c_gateSubst = 0, c_attackHeld = 0, c_capLines = 0, c_execLines = 0;
+              c_stale = 0, c_noTarget = 0, c_noBody = 0, c_noClock = 0, c_s173 = 0, c_queueFull = 0, c_notReady = 0, c_enterRefused = 0, c_dupDropped = 0, c_alreadyFight = 0, c_gatePermits = 0, c_hitLines = 0, c_hitHeld = 0, c_hitApplied = 0, c_hitRefused = 0, c_gate181Tx = 0, c_gate181Blocked = 0, c_gate181Allowed = 0, c_gateSubst = 0, c_attackHeld = 0, c_atkBuffered = 0, c_atkSent = 0, c_atkNoCall = 0, c_capLines = 0, c_execLines = 0;
 LONG    g_late[64]; volatile LONG g_lateN = 0;   // last 64 lateness samples (ms) for the report
 
 // Host: the guest is in a world and answering. Its PeerClock role is set only from a player frame (OnFrameInner), so the
@@ -219,8 +220,18 @@ void __cdecl Capture(uint32_t id, uint32_t ecx, const uint32_t* frame) {
         if (!s.replay || !clk) return;
         if (s.argKind == 3 && !g_hitSync) return;
         if (!PeerReady()) { InterlockedIncrement(&c_notReady); return; }
-        Publish(objId, c);
-        if (s.slot == 155 || s.slot == 160 || s.slot == 546) Watch(human, c.execHostMs);
+        const bool atk = s.slot == 155 || s.slot == 160 || s.slot == 546;
+        if (atk && g_hitSync) {
+            // Havana run 14: only 5 of 9 attack calls on the host started an attack (the AI also calls while the guard cannot
+            // attack yet). The call is kept per guard and sent by OwnUpdate when the guard's path first shows 173, i.e. when
+            // the engine really starts it.
+            AcquireSRWLockExclusive(&g_bLock);
+            const int kb = FindBy(&Body::human, human);
+            if (kb >= 0) { g_b[kb].pendAtk = c; g_b[kb].pendValid = 1; }
+            ReleaseSRWLockExclusive(&g_bLock);
+            InterlockedIncrement(&c_atkBuffered);
+        } else Publish(objId, c);
+        if (atk) Watch(human, c.execHostMs);
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
@@ -784,6 +795,30 @@ void OwnUpdate(void* human) {
     if (k >= 0) { objId = g_b[k].objId; ig = g_b[k].ig; watching = g_b[k].watchUntilUs != 0; lastGid = g_b[k].lastGid; }
     ReleaseSRWLockShared(&g_bLock);
     if (!objId) return;
+    if (g_role == 1 && g_hitSync) {   // BrainHitSync host: send the kept attack call when this native guard enters 173
+        bool in173 = false;
+        __try {
+            const uint32_t fsm = *(uint32_t*)(ig + 0x90);
+            unsigned d = *(const uint16_t*)(fsm + 0x11E); if (d > 12) d = 12;
+            const uint16_t* p = *(const uint16_t* const*)(fsm + 0x118);
+            for (unsigned i = 0; i < d; ++i) if (p[i] == 173) in173 = true;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        Cmd c; bool send = false;
+        AcquireSRWLockExclusive(&g_bLock);
+        const int kk = FindBy(&Body::human, h);
+        if (kk >= 0) {
+            if (in173 && !g_b[kk].hostIn173) {
+                if (g_b[kk].pendValid) { c = g_b[kk].pendAtk; g_b[kk].pendValid = 0; send = true; }
+                else InterlockedIncrement(&c_atkNoCall);   // entered 173 with no kept call (UNVERIFIED how)
+            }
+            g_b[kk].hostIn173 = in173 ? 1 : 0;
+        }
+        ReleaseSRWLockExclusive(&g_bLock);
+        if (send) {
+            bool clk = false; const uint32_t now = HostMs(&clk);
+            if (clk && PeerReady()) { c.execHostMs = now + (uint32_t)g_delayMs; Publish(objId, c); InterlockedIncrement(&c_atkSent); }
+        }
+    }
     {   // State-115 probe: every change of the dispatch id (path[3]) on a registered body, host and guest, with the whole path
         char ps[96]; const unsigned gid = PathStr(ig, ps, sizeof(ps));
         if (gid && gid != lastGid) {
@@ -927,9 +962,9 @@ void Tick() {
     if (ms >= s_nextReport) {
         s_nextReport = ms + 5000;
         if (g_hitSync)
-            Log("[Brain] hitsync role=%s gateTx=%ld permits=%ld allowed=%ld substituted=%ld blocked=%ld hitApplied=%ld hitRefused=%ld hitHeld=%ld attackHeld=%ld\n",
+            Log("[Brain] hitsync role=%s gateTx=%ld permits=%ld allowed=%ld substituted=%ld blocked=%ld hitApplied=%ld hitRefused=%ld hitHeld=%ld attackHeld=%ld atkCalls=%ld atkSent=%ld atkNoCall=%ld\n",
                 g_role == 1 ? "host" : "guest", c_gate181Tx, c_gatePermits, c_gate181Allowed, c_gateSubst, c_gate181Blocked, c_hitApplied, c_hitRefused, c_hitHeld,
-                c_attackHeld);
+                c_attackHeld, c_atkBuffered, c_atkSent, c_atkNoCall);
         if (g_probe115 || g_supp115)
             Log("[Brain] 115 role=%s eval4=%ld eval58=%ld copy4=%ld copy58=%ld native4=%ld native58=%ld unmatched=%ld suppressed=%ld evalCalls=%ld\n",
                 g_role == 1 ? "host" : "guest", c115[0], c115[1], c115Copy[0], c115Copy[1], c115Native[0], c115Native[1], c115Unmatched, c115Supp, c115SelCalls);
