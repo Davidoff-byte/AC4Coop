@@ -499,15 +499,19 @@ void OwnUpdate(void* human) {
 
 void Tick() {
     const uint64_t ms = GetTickCount64();
-    {   // [Coop] Brain is re-read every 2 s so it can be switched off live; the host then restores its vtable (audit I-103)
+    // Live kill switch (audit I-103): [Coop] BrainOff (default 0) is re-read every 2 s; 1 turns a running brain off and the
+    // host restores its vtable, 0 again turns it back on. Not [Coop] Brain itself: Havana run 3 showed tools/two_copy.ps1
+    // restoring the ini after boot, so a live re-read of Brain switched the brain off mid-run (restored=11 foreign=0).
+    {
         static uint64_t s_nextFlag = 0;
-        if (g_on >= 0 && ms >= s_nextFlag) {
+        static int s_killed = 0;
+        if (g_on >= 0 && (g_on == 1 || s_killed) && ms >= s_nextFlag) {
             s_nextFlag = ms + 2000;
-            const int v = GetPrivateProfileIntA("Coop", "Brain", 0, Paths::Ini()) != 0 ? 1 : 0;
-            if (v != g_on) {
-                Log("[Brain] Brain=%d (was %d) live\n", v, g_on);
-                g_on = v;
-                if (g_role == 1) { if (v) InstallCapture(); else RemoveCapture(); }
+            const int off = GetPrivateProfileIntA("Coop", "BrainOff", 0, Paths::Ini()) != 0 ? 1 : 0;
+            if (off != s_killed) {
+                Log("[Brain] BrainOff=%d live\n", off);
+                s_killed = off; g_on = off ? 0 : 1;
+                if (g_role == 1) { if (off) RemoveCapture(); else InstallCapture(); }
             }
         }
     }
