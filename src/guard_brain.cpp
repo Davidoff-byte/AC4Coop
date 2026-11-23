@@ -415,6 +415,105 @@ void WatchPath(int k, uint32_t ig) {   // body k locked by the caller (exclusive
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
+// ---- Ground dispatch 115 (docs/evidence/brain-s0-2026-11-22.md, runs 3-6) -------------------------------------------
+// Both games enter 115 on their own from dispatch 4 and leave it after ~1.1 s; a copy in 115 refuses enter fight. Two static
+// entry routes (IDA cc/g10-g16), each reached through one E8 call (bytes checked against the exe, tools/pe.py):
+//   A: sub_1D9BAE0 0x1D9BAF4 -> selector sub_1D994F0 -> stub sub_1D89480 0x1D894AA -> sub_1D87230 (sets 115)
+//   B: sub_1D98770 0x1D98B23 -> selector sub_1D91D60 -> stub sub_1D90D10 0x1D90D36 -> sub_1D8F3D0 (sets 115)
+// Both stubs pass `ecx = [ctx+0xC]`; the selectors read the same object as **(this+0xC). Called X here; X+264 is what the
+// chart passes to sub_5FC110. Whether X is the HumanGround (ig - 0x10) is what the probe checks (UNVERIFIED).
+// [Coop] Brain115Probe (default 0): logging stubs on the two transition calls. [Coop] Brain115Suppress (default 0): on the
+// guest only, selector B returns 0 ("no transition") for a registered copy, so the copy does not enter 115 by route B.
+int g_probe115 = 0, g_supp115 = 0;
+volatile LONG c115[2] = {}, c115Copy[2] = {}, c115Native[2] = {}, c115Unmatched = 0, c115Lines = 0, c115Supp = 0, c115SelCalls = 0;
+
+int BodyOfX(uint32_t x, uint64_t* objId) {   // index of the registered body whose HumanGround is x, else -1 (lock held by caller)
+    const int k = FindBy(&Body::ig, x + 0x10);
+    if (k >= 0 && objId) *objId = g_b[k].objId;
+    return k;
+}
+
+void __cdecl Entry115(uint32_t route, uint32_t ecx) {
+    __try {
+        const uint32_t x = Rd((void*)ecx, 4) ? *(uint32_t*)ecx : 0;
+        uint64_t objId = 0;
+        AcquireSRWLockShared(&g_bLock);
+        const int k = BodyOfX(x, &objId);
+        ReleaseSRWLockShared(&g_bLock);
+        InterlockedIncrement(&c115[route & 1]);
+        if (k >= 0) InterlockedIncrement(g_role == 0 ? &c115Copy[route & 1] : &c115Native[route & 1]); else InterlockedIncrement(&c115Unmatched);
+        bool clk = false; const uint32_t now = HostMs(&clk);
+        if (InterlockedIncrement(&c115Lines) <= 300)
+            Log("[Brain] enter115 route=%c role=%s x=%08X id=%016llX matched=%d hostMs=%u\n", route ? 'B' : 'A', g_role == 1 ? "host" : g_role == 0 ? "guest" : "?",
+                x, (unsigned long long)objId, k >= 0 ? 1 : 0, now);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+uint8_t* g_stubs115 = nullptr;
+void Emit115(uint8_t* p, uint32_t route, uint32_t orig) {
+    int k = 0;
+    auto b = [&](uint8_t v) { p[k++] = v; };
+    auto d = [&](uint32_t v) { memcpy(p + k, &v, 4); k += 4; };
+    b(0x60); b(0x9C);                               // pushad; pushfd
+    b(0x51);                                        // push ecx (the transition's this)
+    b(0x68); d(route);                              // push route
+    b(0xB8); d((uint32_t)(uintptr_t)&Entry115);     // mov eax, Entry115
+    b(0xFF); b(0xD0);                               // call eax
+    b(0x83); b(0xC4); b(0x08);                      // add esp, 8
+    b(0x9D); b(0x61);                               // popfd; popad
+    b(0x68); d(orig);                               // push orig
+    b(0xC3);                                        // ret: as if the original E8 had called orig (return address untouched)
+}
+
+typedef int(__thiscall* SelBFn)(uint32_t self, int a2);
+int __fastcall SelB(uint32_t self, uint32_t /*edx*/, int a2) {   // replaces the E8 at 0x1D98B23; thiscall-compatible (ret 4)
+    InterlockedIncrement(&c115SelCalls);
+    if (g_supp115 && g_role == 0 && g_on == 1) {
+        bool copy = false;
+        __try {
+            const uint32_t p = Rd((void*)(self + 0xC), 4) ? *(uint32_t*)(self + 0xC) : 0;
+            const uint32_t x = Rd((void*)p, 4) ? *(uint32_t*)p : 0;
+            AcquireSRWLockShared(&g_bLock);
+            copy = BodyOfX(x, nullptr) >= 0;
+            ReleaseSRWLockShared(&g_bLock);
+        } __except (EXCEPTION_EXECUTE_HANDLER) { copy = false; }
+        if (copy) { InterlockedIncrement(&c115Supp); return 0; }   // sub_1D91D60's own "no transition" value
+    }
+    return ((SelBFn)0x01D91D60)(self, a2);
+}
+
+// Rewrite the rel32 of one E8 call at `site` from `expect` to `to`. Runs at load (Brain::Init from dllmain), before any world.
+bool PatchCall(uint32_t site, uint32_t expect, uint32_t to) {
+    uint8_t* p = (uint8_t*)(uintptr_t)site;
+    if (p[0] != 0xE8 || site + 5 + *(int32_t*)(p + 1) != expect) {
+        Log("[Brain] call %08X is %02X %08X, expected E8 -> %08X: not patched\n", site, p[0], site + 5 + *(int32_t*)(p + 1), expect);
+        return false;
+    }
+    DWORD old = 0;
+    if (!VirtualProtect(p + 1, 4, PAGE_EXECUTE_READWRITE, &old)) return false;
+    *(int32_t*)(p + 1) = (int32_t)(to - (site + 5));
+    VirtualProtect(p + 1, 4, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), p, 5);
+    return true;
+}
+void Install115() {
+    g_probe115 = GetPrivateProfileIntA("Coop", "Brain115Probe", 0, Paths::Ini()) != 0 ? 1 : 0;
+    g_supp115 = GetPrivateProfileIntA("Coop", "Brain115Suppress", 0, Paths::Ini()) != 0 ? 1 : 0;
+    if (g_probe115) {
+        g_stubs115 = (uint8_t*)VirtualAlloc(nullptr, 2 * 32, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        if (g_stubs115) {
+            Emit115(g_stubs115, 0, 0x01D87230u); Emit115(g_stubs115 + 32, 1, 0x01D8F3D0u);
+            FlushInstructionCache(GetCurrentProcess(), g_stubs115, 64);
+            const bool a = PatchCall(0x01D894AAu, 0x01D87230u, (uint32_t)(uintptr_t)g_stubs115);
+            const bool b = PatchCall(0x01D90D36u, 0x01D8F3D0u, (uint32_t)(uintptr_t)(g_stubs115 + 32));
+            Log("[Brain] 115 probe: route A %s, route B %s\n", a ? "hooked" : "NOT hooked", b ? "hooked" : "NOT hooked");
+        }
+    }
+    if (g_supp115) {
+        const bool s = PatchCall(0x01D98B23u, 0x01D91D60u, (uint32_t)(uintptr_t)&SelB);
+        Log("[Brain] 115 suppress (guest copies, route B): %s\n", s ? "installed" : "NOT installed");
+    }
+}
+
 }  // namespace
 
 namespace Brain {
@@ -426,6 +525,7 @@ void Init() {
     g_test = GetPrivateProfileIntA("Coop", "BrainTest", 0, Paths::Ini());
     g_testDelayMs = GetPrivateProfileIntA("Coop", "BrainTestDelayMs", 150, Paths::Ini());
     if (g_on) Log("[Brain] Brain=1 delayMs=%d test=%d testDelayMs=%d (needs IntentLane=1, PeerClock=1)\n", g_delayMs, g_test, g_testDelayMs);
+    if (g_on) Install115();
 }
 
 bool On() { return g_on == 1; }
@@ -627,6 +727,9 @@ void Tick() {
     }
     if (ms >= s_nextReport) {
         s_nextReport = ms + 5000;
+        if (g_probe115 || g_supp115)
+            Log("[Brain] 115 role=%s A=%ld B=%ld copyA=%ld copyB=%ld nativeA=%ld nativeB=%ld unmatched=%ld suppressed=%ld selBCalls=%ld\n",
+                g_role == 1 ? "host" : "guest", c115[0], c115[1], c115Copy[0], c115Copy[1], c115Native[0], c115Native[1], c115Unmatched, c115Supp, c115SelCalls);
         LONG s[64]; const LONG n = g_lateN < 64 ? g_lateN : 64;
         for (int i = 0; i < n; ++i) s[i] = g_late[i];
         for (int i = 1; i < n; ++i) for (int j = i; j > 0 && s[j - 1] > s[j]; --j) { const LONG x = s[j]; s[j] = s[j - 1]; s[j - 1] = x; }
