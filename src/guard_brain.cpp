@@ -816,7 +816,11 @@ void OwnUpdate(void* human) {
         ReleaseSRWLockExclusive(&g_bLock);
         if (send) {
             bool clk = false; const uint32_t now = HostMs(&clk);
-            if (clk && PeerReady()) { c.execHostMs = now + (uint32_t)g_delayMs; Publish(objId, c); InterlockedIncrement(&c_atkSent); }
+            if (clk && PeerReady()) {
+                c.execHostMs = now + (uint32_t)g_delayMs; Publish(objId, c); InterlockedIncrement(&c_atkSent);
+                Watch(h, c.execHostMs);   // the host's s173 line carries the sent command's execMs (tools/brain_check.py pairs on it)
+                watching = true;
+            }
         }
     }
     {   // State-115 probe: every change of the dispatch id (path[3]) on a registered body, host and guest, with the whole path
