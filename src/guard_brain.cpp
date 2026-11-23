@@ -55,8 +55,9 @@ const SlotSpec kSlots[] = {
 uint32_t VtOf(int i) { return kSlots[i].vt ? kSlots[i].vt : 0x026E7DC0u; }
 const int kNSlots = sizeof(kSlots) / sizeof(kSlots[0]);
 
-int  g_on = -1, g_delayMs = 0, g_test = 0, g_testDelayMs = 150, g_hitSync = 0;   // g_hitSync: [Coop] BrainHitSync (default 0)
+int  g_on = -1, g_delayMs = 0, g_test = 0, g_testDelayMs = 150, g_hitSync = 0, g_chartSync = 0;   // [Coop] BrainHitSync, [Coop] BrainChartSync (default 0)
 const uint16_t kGate = 0xB5B5;   // command: a host native took attack-substate transition a[1] from state a[0] (permit for the copy)
+const uint16_t kChart = 0xC4A7;   // command: a host native took Ground transition a[1] from node a[0], handler a[2] (BrainChartSync)
 volatile LONG g_role = -1;   // 1 host, 0 guest
 
 void Log(const char* fmt, ...) {
@@ -76,6 +77,8 @@ struct Body {
     uint32_t human, ent, ig; uint64_t objId; uint64_t seenMs;
     uint64_t watchUntilUs; uint32_t watchExec; uint8_t in173; uint16_t lastPath[12]; uint8_t lastDepth; int pathLines; uint16_t lastGid; struct { uint16_t st; int32_t code; uint64_t untilMs; } permit[4];
     Cmd pendAtk; uint8_t pendValid; uint8_t hostIn173;   // BrainHitSync host: last attack call, sent when the guard enters 173
+    uint32_t fsm;   // cached Ground helper *(ig+0x90), refreshed by NoteBody
+    struct { uint16_t node; int32_t code; uint32_t handler; uint64_t atMs; } cq[8]; int cqn;   // BrainChartSync guest queue
 };
 const int kBodies = 256;
 Body    g_b[kBodies]; int g_nb = 0;
@@ -94,7 +97,7 @@ int FindObj(uint64_t o) { for (int i = 0; i < g_nb; ++i) if (g_b[i].objId == o) 
 
 // ---- counters ------------------------------------------------------------------------------------
 volatile LONG c_cap[kNSlots] = {}, c_capUnbound = 0, c_tx = 0, c_txFail = 0, c_rx = 0, c_rxStaleBase = 0, c_exec = 0, c_execFail = 0,
-              c_stale = 0, c_noTarget = 0, c_noBody = 0, c_noClock = 0, c_s173 = 0, c_queueFull = 0, c_notReady = 0, c_enterRefused = 0, c_dupDropped = 0, c_alreadyFight = 0, c_gatePermits = 0, c_hitLines = 0, c_hitHeld = 0, c_hitApplied = 0, c_hitRefused = 0, c_gate181Tx = 0, c_gate181Blocked = 0, c_gate181Allowed = 0, c_gateSubst = 0, c_attackHeld = 0, c_atkBuffered = 0, c_atkSent = 0, c_atkNoCall = 0, c_capLines = 0, c_execLines = 0;
+              c_stale = 0, c_noTarget = 0, c_noBody = 0, c_noClock = 0, c_s173 = 0, c_queueFull = 0, c_notReady = 0, c_enterRefused = 0, c_dupDropped = 0, c_alreadyFight = 0, c_gatePermits = 0, c_hitLines = 0, c_hitHeld = 0, c_hitApplied = 0, c_hitRefused = 0, c_gate181Tx = 0, c_gate181Blocked = 0, c_gate181Allowed = 0, c_gateSubst = 0, c_attackHeld = 0, c_atkBuffered = 0, c_atkSent = 0, c_atkNoCall = 0, c_chartDropped = 0, c_chartRx = 0, c_capLines = 0, c_execLines = 0;
 LONG    g_late[64]; volatile LONG g_lateN = 0;   // last 64 lateness samples (ms) for the report
 
 // Host: the guest is in a world and answering. Its PeerClock role is set only from a player frame (OnFrameInner), so the
@@ -341,6 +344,19 @@ bool Execute(uint32_t human, uint32_t ig, uint64_t objId, const Cmd& c, int32_t 
         Log("[Brain] exec role=%s slot=mark id=%016llX execMs=%u lateMs=%d\n", g_role == 1 ? "host" : "guest", (unsigned long long)objId, c.execHostMs, lateMs);
         return true;
     }
+    if (c.slot == kChart) {   // BrainChartSync: queue the host guard's transition for the copy's node wrapper (NodeW)
+        AcquireSRWLockExclusive(&g_bLock);
+        const int k = FindBy(&Body::human, human);
+        if (k >= 0) {
+            Body& b = g_b[k];
+            if (b.cqn == 8) { for (int i = 1; i < 8; ++i) b.cq[i - 1] = b.cq[i]; b.cqn = 7; InterlockedIncrement(&c_chartDropped); }
+            b.cq[b.cqn].node = (uint16_t)c.a[0]; b.cq[b.cqn].code = (int32_t)c.a[1]; b.cq[b.cqn].handler = c.a[2]; b.cq[b.cqn].atMs = GetTickCount64();
+            ++b.cqn;
+        }
+        ReleaseSRWLockExclusive(&g_bLock);
+        InterlockedIncrement(&c_exec); InterlockedIncrement(&c_chartRx);
+        return true;
+    }
     if (c.slot == kGate) {   // BrainHitSync: the host guard took transition a[1] from attack substate a[0]; store it for the copy
         AcquireSRWLockExclusive(&g_bLock);
         const int k = FindBy(&Body::human, human);
@@ -521,8 +537,8 @@ int g_probe115 = 0, g_supp115 = 0;
 volatile LONG c115[2] = {}, c115Copy[2] = {}, c115Native[2] = {}, c115Unmatched = 0, c115Lines = 0, c115Supp = 0, c115SelCalls = 0;
 
 int BodyOfFsm(uint32_t fsm, uint64_t* objId) {   // registered body whose Ground helper is fsm, else -1
-    int k = -1;
     AcquireSRWLockShared(&g_bLock);
+    int k = fsm ? FindBy(&Body::fsm, fsm) : -1;   // cached by NoteBody; the live read below covers a helper allocated since
     for (int i = 0; i < g_nb && k < 0; ++i) {
         __try { if (*(uint32_t*)(g_b[i].ig + 0x90) == fsm) k = i; } __except (EXCEPTION_EXECUTE_HANDLER) {}
     }
@@ -603,6 +619,83 @@ int EvalGate(uint16_t st, uint32_t self, int a2, EvalFn orig, const GateCode* ta
     InterlockedIncrement(&c_gate181Blocked);
     return 0;
 }
+
+// [Coop] BrainChartSync (default 0; needs BrainHitSync). Havana run 15: after the attack-substate gate, copies still lagged
+// because every other fight substate exit is the copy's own decision (sub-step 178 lasted ~700 ms longer on a copy than on its
+// host guard). One call carries all of them: the dispatch sub_1D65BB0 asks sub_1D634D0(node, a2) for each active node
+// (E8 at 0x1D65BE1: push a2; push node; ecx = fsm; IDA cc/g28), and the first nonzero code is taken; the evaluator writes
+// the transition's handler at fsm+8. Scope: nodes strictly below 163 (the fight root) on the path, and only calls with
+// a2 == 0 (event calls carry pointer arguments and stay native).
+//   Host: a registered native's nonzero answer is sent as kChart {node, code, handler}.
+//   Guest: a registered copy makes no such decision itself. For the node being asked, if the host's queue has an entry for
+//   it: take the host's code and handler when the copy's own evaluator is ready (nonzero) or the entry is >= 100 ms old;
+//   drop it and every older entry. Otherwise the answer is 0 and fsm+8 is restored (the copy waits). Entries expire at
+//   1.5 s. The handler address is the host's, valid here because both run the same exe (build gate).
+typedef int(__thiscall* NodeFn)(uint32_t fsm, int node, int a2);
+volatile LONG c_chartTx = 0, c_chartApplied = 0, c_chartOwn = 0, c_chartForced = 0, c_chartWait = 0, c_chartExpired = 0, c_chartLines = 0;
+int __fastcall NodeW(uint32_t fsm, uint32_t, int node, int a2) {
+    uint32_t saved = 0;
+    __try { saved = *(uint32_t*)(fsm + 8); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    const int r = ((NodeFn)0x01D634D0)(fsm, node, a2);
+    if (!g_chartSync || g_on != 1 || a2 != 0 || g_role < 0) return r;
+    if (g_role == 1 && !r) return r;   // host: only answers are interesting
+    bool below163 = false;
+    __try {
+        unsigned d = *(const uint16_t*)(fsm + 0x11E); if (d > 12) d = 12;
+        const uint16_t* p = *(const uint16_t* const*)(fsm + 0x118);
+        int i163 = -1, in = -1;
+        for (unsigned i = 0; i < d; ++i) { if (p[i] == 163 && i163 < 0) i163 = (int)i; if (p[i] == (uint16_t)node && in < 0) in = (int)i; }
+        below163 = i163 >= 0 && in > i163;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { below163 = false; }
+    if (!below163) return r;
+    uint64_t objId = 0;
+    const int k = BodyOfFsm(fsm, &objId);
+    if (k < 0) return r;
+    if (g_role == 1) {
+        bool clk = false; const uint32_t now = HostMs(&clk);
+        uint32_t handler = 0;
+        __try { handler = *(uint32_t*)(fsm + 8); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        if (clk && PeerReady()) {
+            Cmd c = {}; c.slot = kChart; c.a[0] = (uint32_t)node; c.a[1] = (uint32_t)r; c.a[2] = handler; c.execHostMs = now;
+            Publish(objId, c); InterlockedIncrement(&c_chartTx);
+            if (InterlockedIncrement(&c_chartLines) <= 150)
+                Log("[Brain] chart role=host id=%016llX node=%d code=%d (-> %d) handler=%08X hostMs=%u\n", (unsigned long long)objId, node, r, r & 0x3FF, handler, now);
+        }
+        return r;
+    }
+    // guest copy
+    const uint64_t ms = GetTickCount64();
+    int32_t code = 0; uint32_t handler = 0; bool apply = false; uint64_t age = 0;
+    AcquireSRWLockExclusive(&g_bLock);
+    if (k < g_nb && g_b[k].objId == objId) {
+        Body& b = g_b[k];
+        int j = 0;   // expire
+        for (int i = 0; i < b.cqn; ++i) { if (ms - b.cq[i].atMs <= 1500) b.cq[j++] = b.cq[i]; else InterlockedIncrement(&c_chartExpired); }
+        b.cqn = j;
+        for (int i = 0; i < b.cqn; ++i)
+            if (b.cq[i].node == (uint16_t)node) {
+                age = ms - b.cq[i].atMs;
+                if (r || age >= 100) {
+                    code = b.cq[i].code; handler = b.cq[i].handler; apply = true;
+                    int m = 0; for (int q = i + 1; q < b.cqn; ++q) b.cq[m++] = b.cq[q];   // drop it and every older entry
+                    b.cqn = m;
+                }
+                break;
+            }
+    }
+    ReleaseSRWLockExclusive(&g_bLock);
+    if (apply) {
+        __try { *(uint32_t*)(fsm + 8) = handler; } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        InterlockedIncrement(&c_chartApplied); InterlockedIncrement(r == code ? &c_chartOwn : &c_chartForced);
+        if (InterlockedIncrement(&c_chartLines) <= 150)
+            Log("[Brain] chart role=guest id=%016llX node=%d own=%d host=%d (-> %d) ageMs=%llu\n", (unsigned long long)objId, node, r, code, code & 0x3FF,
+                (unsigned long long)age);
+        return code;
+    }
+    __try { *(uint32_t*)(fsm + 8) = saved; } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    if (r) InterlockedIncrement(&c_chartWait);
+    return 0;
+}
 int __fastcall Eval180W(uint32_t self, uint32_t, int a2) { return EvalGate(180, self, a2, (EvalFn)0x01CD8D70, kGate180, 1); }
 int __fastcall Eval181W(uint32_t self, uint32_t, int a2) { return EvalGate(181, self, a2, (EvalFn)0x01CD8DB0, kGate181, 3); }
 int __fastcall Eval182W(uint32_t self, uint32_t, int a2) { return EvalGate(182, self, a2, (EvalFn)0x01CD8E20, kGate182, 6); }
@@ -681,7 +774,10 @@ bool PatchCall(uint32_t site, uint32_t expect, uint32_t to) {
 void Install115() {
     g_probe115 = GetPrivateProfileIntA("Coop", "Brain115Probe", 0, Paths::Ini()) != 0 ? 1 : 0;
     g_supp115 = GetPrivateProfileIntA("Coop", "Brain115Suppress", 0, Paths::Ini()) != 0 ? 1 : 0;
-    if (g_hitSync) {
+    if (g_hitSync && g_chartSync) {   // the node mirror covers 180/181/182 too, so the per-state gate is not installed
+        const bool n = PatchCall(0x01D65BE1u, 0x01D634D0u, (uint32_t)(uintptr_t)&NodeW);
+        Log("[Brain] chart sync: dispatch node call %s\n", n ? "wrapped" : "NOT wrapped");
+    } else if (g_hitSync) {
         const bool h0 = PatchCall(0x01D64756u, 0x01CD8D70u, (uint32_t)(uintptr_t)&Eval180W);
         const bool h1 = PatchCall(0x01D64749u, 0x01CD8DB0u, (uint32_t)(uintptr_t)&Eval181W);
         const bool h2 = PatchCall(0x01D6473Cu, 0x01CD8E20u, (uint32_t)(uintptr_t)&Eval182W);
@@ -705,6 +801,7 @@ void Init() {
     g_test = GetPrivateProfileIntA("Coop", "BrainTest", 0, Paths::Ini());
     g_testDelayMs = GetPrivateProfileIntA("Coop", "BrainTestDelayMs", 150, Paths::Ini());
     g_hitSync = GetPrivateProfileIntA("Coop", "BrainHitSync", 0, Paths::Ini()) != 0 ? 1 : 0;
+    g_chartSync = GetPrivateProfileIntA("Coop", "BrainChartSync", 0, Paths::Ini()) != 0 ? 1 : 0;
     if (g_on) Log("[Brain] Brain=1 delayMs=%d test=%d testDelayMs=%d (needs IntentLane=1, PeerClock=1)\n", g_delayMs, g_test, g_testDelayMs);
     if (g_on) Install115();
 }
@@ -743,6 +840,7 @@ void NoteBody(uint64_t objId, void* human, void* entity) {
         }
     }
     g_b[k].human = h; g_b[k].ent = (uint32_t)(uintptr_t)entity; g_b[k].ig = ig; g_b[k].objId = objId; g_b[k].seenMs = GetTickCount64();
+    __try { g_b[k].fsm = *(uint32_t*)(ig + 0x90); } __except (EXCEPTION_EXECUTE_HANDLER) { g_b[k].fsm = 0; }
     ReleaseSRWLockExclusive(&g_bLock);
 }
 
@@ -969,6 +1067,9 @@ void Tick() {
             Log("[Brain] hitsync role=%s gateTx=%ld permits=%ld allowed=%ld substituted=%ld blocked=%ld hitApplied=%ld hitRefused=%ld hitHeld=%ld attackHeld=%ld atkCalls=%ld atkSent=%ld atkNoCall=%ld\n",
                 g_role == 1 ? "host" : "guest", c_gate181Tx, c_gatePermits, c_gate181Allowed, c_gateSubst, c_gate181Blocked, c_hitApplied, c_hitRefused, c_hitHeld,
                 c_attackHeld, c_atkBuffered, c_atkSent, c_atkNoCall);
+        if (g_chartSync)
+            Log("[Brain] chartsync role=%s tx=%ld rx=%ld applied=%ld own=%ld forced=%ld waitFrames=%ld expired=%ld dropped=%ld\n",
+                g_role == 1 ? "host" : "guest", c_chartTx, c_chartRx, c_chartApplied, c_chartOwn, c_chartForced, c_chartWait, c_chartExpired, c_chartDropped);
         if (g_probe115 || g_supp115)
             Log("[Brain] 115 role=%s eval4=%ld eval58=%ld copy4=%ld copy58=%ld native4=%ld native58=%ld unmatched=%ld suppressed=%ld evalCalls=%ld\n",
                 g_role == 1 ? "host" : "guest", c115[0], c115[1], c115Copy[0], c115Copy[1], c115Native[0], c115Native[1], c115Unmatched, c115Supp, c115SelCalls);

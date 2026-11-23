@@ -1240,6 +1240,15 @@
    "receipts": [],
    "size": 0,
    "status": "unknown"
+  },
+  "01D634D0": {
+   "addr": "01D634D0",
+   "claimed_at": null,
+   "name": "GroundEvalNode",
+   "owner": null,
+   "receipts": [],
+   "size": 0,
+   "status": "unknown"
   }
  }
 }
