@@ -5,6 +5,7 @@
 #include "netstate.h"
 #include "paths.h"
 #include <windows.h>
+#include <tlhelp32.h>
 #include <cstdio>
 #include <cstdarg>
 #include <cstring>
@@ -481,6 +482,62 @@ int __fastcall SelB(uint32_t self, uint32_t /*edx*/, int a2) {   // replaces the
     return ((SelBFn)0x01D91D60)(self, a2);
 }
 
+// [Coop] Brain115Watch (default 0): run 7 showed routes A/B explain 7 of 71 entries into 115, so the writer is found with a
+// hardware write watchpoint: DR0 = the u16 path[3] of one registered body in dispatch 4 (LEN 2, R/W 01 = write), set on
+// every thread of the process (suspend, Set/GetThreadContext, resume; re-applied every 5 s for new threads). The vectored
+// handler logs, for writes of 115 (and the first few other values), the eip and every dword on the 64 stack slots above
+// esp that points into the exe's code (0x401000..0x2400000). Up to 12 hits of 115, then DR7 is cleared everywhere.
+volatile LONG g_wAddr = 0, g_wHits115 = 0, g_wHitsOther = 0, g_wDone = 0;
+uint64_t g_wObj = 0; PVOID g_wVeh = nullptr;
+LONG WINAPI WatchVeh(PEXCEPTION_POINTERS ep) {
+    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP) return EXCEPTION_CONTINUE_SEARCH;
+    CONTEXT* c = ep->ContextRecord;
+    if (!(c->Dr6 & 1)) return EXCEPTION_CONTINUE_SEARCH;   // not our DR0
+    c->Dr6 = 0;
+    const uint32_t a = (uint32_t)g_wAddr;
+    uint16_t v = 0;
+    __try { v = *(volatile uint16_t*)a; } __except (EXCEPTION_EXECUTE_HANDLER) { return EXCEPTION_CONTINUE_EXECUTION; }
+    const bool is115 = v == 115;
+    const LONG n = is115 ? InterlockedIncrement(&g_wHits115) : InterlockedIncrement(&g_wHitsOther);
+    if ((is115 && n <= 12) || (!is115 && n <= 6)) {
+        char s[400]; int o = _snprintf_s(s, sizeof(s), _TRUNCATE, "[Brain] watch id=%016llX path[3]=%u eip=%08X tid=%u stack:", (unsigned long long)g_wObj, v,
+                                         (unsigned)c->Eip, GetCurrentThreadId());
+        __try {
+            const uint32_t* sp = (const uint32_t*)c->Esp;
+            for (int i = 0; i < 64 && o < 380; ++i) { const uint32_t w = sp[i]; if (w >= 0x00401000u && w < 0x02400000u) o += _snprintf_s(s + o, sizeof(s) - o, _TRUNCATE, " %08X", w); }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        Log("%s\n", s);
+    }
+    if (is115 && n >= 12) InterlockedExchange(&g_wDone, 1);   // Tick clears DR7 on all threads
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+void WatchSetAll(uint32_t addr) {   // addr 0 clears
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+    THREADENTRY32 te; te.dwSize = sizeof(te);
+    const DWORD pid = GetCurrentProcessId(), self = GetCurrentThreadId();
+    int n = 0;
+    for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
+        if (te.th32OwnerProcessID != pid) continue;
+        const bool me = te.th32ThreadID == self;
+        HANDLE th = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
+        if (!th) continue;
+        if (!me && SuspendThread(th) == (DWORD)-1) { CloseHandle(th); continue; }
+        CONTEXT cx; memset(&cx, 0, sizeof(cx)); cx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+        if (me) {   // the current thread: its context cannot be set while it runs; DR0 for it is set on the next pass
+        } else if (GetThreadContext(th, &cx)) {
+            cx.Dr0 = addr;
+            cx.Dr7 = addr ? ((cx.Dr7 & ~0x000F0003u) | 0x1u | (0x1u << 16) | (0x1u << 18)) : (cx.Dr7 & ~0x000F0003u);   // L0, R/W0 = 01, LEN0 = 01 (2 B)
+            if (SetThreadContext(th, &cx)) ++n;
+        }
+        if (!me) ResumeThread(th);
+        CloseHandle(th);
+    }
+    CloseHandle(snap);
+    static int s_lines = 0;
+    if (s_lines++ < 6) Log("[Brain] watch %s %08X on %d threads\n", addr ? "set" : "cleared", addr, n);
+}
+
 // Rewrite the rel32 of one E8 call at `site` from `expect` to `to`. Runs at load (Brain::Init from dllmain), before any world.
 bool PatchCall(uint32_t site, uint32_t expect, uint32_t to) {
     uint8_t* p = (uint8_t*)(uintptr_t)site;
@@ -678,6 +735,35 @@ void Tick() {
         }
     }
     if (!On() || g_role < 0) return;
+    {   // [Coop] Brain115Watch: arm once a registered body is in dispatch 4, re-apply every 5 s, clear when done or after 90 s
+        static int s_w = -1; static uint64_t s_wNext = 0, s_wStart = 0;
+        if (s_w < 0) s_w = GetPrivateProfileIntA("Coop", "Brain115Watch", 0, Paths::Ini()) != 0 ? 1 : 0;
+        if (s_w == 1 && ms >= s_wNext) {
+            s_wNext = ms + 5000;
+            if (g_wDone || (s_wStart && ms - s_wStart > 90000)) {
+                WatchSetAll(0); s_w = 2;
+                Log("[Brain] watch done hits115=%ld other=%ld\n", g_wHits115, g_wHitsOther);
+            } else if (!g_wAddr) {
+                uint32_t addr = 0; uint64_t obj = 0;
+                AcquireSRWLockShared(&g_bLock);
+                for (int i = 0; i < g_nb && !addr; ++i) {
+                    char ps[96];
+                    if (PathStr(g_b[i].ig, ps, sizeof(ps)) != 4) continue;
+                    __try {
+                        const uint32_t fsm = *(uint32_t*)(g_b[i].ig + 0x90);
+                        addr = *(uint32_t*)(fsm + 0x118) + 6; obj = g_b[i].objId;
+                    } __except (EXCEPTION_EXECUTE_HANDLER) { addr = 0; }
+                }
+                ReleaseSRWLockShared(&g_bLock);
+                if (addr) {
+                    g_wObj = obj; InterlockedExchange(&g_wAddr, (LONG)addr); s_wStart = ms;
+                    if (!g_wVeh) g_wVeh = AddVectoredExceptionHandler(1, WatchVeh);
+                    WatchSetAll(addr);
+                    Log("[Brain] watch armed id=%016llX addr=%08X (path[3] of a body in dispatch 4)\n", (unsigned long long)obj, addr);
+                }
+            } else WatchSetAll((uint32_t)g_wAddr);   // threads created since the last pass
+        }
+    }
     bool clk = false; const uint32_t now = HostMs(&clk);
     static uint64_t s_nextTest = 0, s_nextSweep = 0, s_nextReport = 0;
     static uint32_t s_lcg = 0x1234567u;
