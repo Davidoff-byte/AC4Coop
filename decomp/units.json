@@ -1196,10 +1196,19 @@
    "size": 26,
    "status": "unknown"
   },
-  "01D91D60": {
-   "addr": "01D91D60",
+  "01D0EDE0": {
+   "addr": "01D0EDE0",
    "claimed_at": null,
-   "name": "GroundSelect115B",
+   "name": "GroundEval4",
+   "owner": null,
+   "receipts": [],
+   "size": 0,
+   "status": "unknown"
+  },
+  "01D23570": {
+   "addr": "01D23570",
+   "claimed_at": null,
+   "name": "GroundEval58",
    "owner": null,
    "receipts": [],
    "size": 0,

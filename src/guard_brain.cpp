@@ -416,71 +416,56 @@ void WatchPath(int k, uint32_t ig) {   // body k locked by the caller (exclusive
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
-// ---- Ground dispatch 115 (docs/evidence/brain-s0-2026-11-22.md, runs 3-6) -------------------------------------------
-// Both games enter 115 on their own from dispatch 4 and leave it after ~1.1 s; a copy in 115 refuses enter fight. Two static
-// entry routes (IDA cc/g10-g16), each reached through one E8 call (bytes checked against the exe, tools/pe.py):
-//   A: sub_1D9BAE0 0x1D9BAF4 -> selector sub_1D994F0 -> stub sub_1D89480 0x1D894AA -> sub_1D87230 (sets 115)
-//   B: sub_1D98770 0x1D98B23 -> selector sub_1D91D60 -> stub sub_1D90D10 0x1D90D36 -> sub_1D8F3D0 (sets 115)
-// Both stubs pass `ecx = [ctx+0xC]`; the selectors read the same object as **(this+0xC). Called X here; X+264 is what the
-// chart passes to sub_5FC110. Whether X is the HumanGround (ig - 0x10) is what the probe checks (UNVERIFIED).
-// [Coop] Brain115Probe (default 0): logging stubs on the two transition calls. [Coop] Brain115Suppress (default 0): on the
-// guest only, selector B returns 0 ("no transition") for a registered copy, so the copy does not enter 115 by route B.
+// ---- Ground dispatch 115 (docs/evidence/brain-s0-2026-11-22.md, runs 3-9) -------------------------------------------
+// Both games enter 115 on their own and leave it after ~1.1 s; a copy in 115 refuses enter fight. Run 9's write watchpoint
+// put the write of 115 in the chart's own dispatch: sub_1D80950 -> sub_1D65BB0 (0x1D65CA9) -> sub_1D63440 (enter state)
+// -> sub_1CFFFE0 (0x1D0003F, path push). sub_1D65BB0 asks sub_1D634D0(stateId) for each active node; the first nonzero
+// code wins (target = low 10 bits, level = bits 10-19). Codes with target 115 from state 4 (0x1073 = 4211), IDA cc/g19-g21:
+//   case 4  -> sub_1D0EDE0 (E8 at 0x1D64CDC): 4211 when sub_1CE1E30(ctx) is true (handler sub_1CDCC20)
+//   case 58 -> sub_1D23570 (E8 at 0x1D64D03): 4211 on an interface test / float / mode (handler sub_1D1E9D0)
+// (sub_1D6EB00, the third 4211, is a forced transition on token 114 and does not run through 0x1D65CA9.) The evaluator's
+// `this` is the chart helper (path at +0x118), the same object as *(ig+0x90) of a body: that is how a body is matched.
+// [Coop] Brain115Probe (default 0): wrappers on both E8s log every 4211 with the body. [Coop] Brain115Suppress (default 0):
+// on the guest, a 4211 for a registered copy becomes 0 ("no transition from this node"), and the handler slot (+8) the
+// evaluator wrote is put back, so the copy stays in dispatch 4.
 int g_probe115 = 0, g_supp115 = 0;
 volatile LONG c115[2] = {}, c115Copy[2] = {}, c115Native[2] = {}, c115Unmatched = 0, c115Lines = 0, c115Supp = 0, c115SelCalls = 0;
 
-int BodyOfX(uint32_t x, uint64_t* objId) {   // index of the registered body whose HumanGround is x, else -1 (lock held by caller)
-    const int k = FindBy(&Body::ig, x + 0x10);
+int BodyOfFsm(uint32_t fsm, uint64_t* objId) {   // registered body whose Ground helper is fsm, else -1
+    int k = -1;
+    AcquireSRWLockShared(&g_bLock);
+    for (int i = 0; i < g_nb && k < 0; ++i) {
+        __try { if (*(uint32_t*)(g_b[i].ig + 0x90) == fsm) k = i; } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
     if (k >= 0 && objId) *objId = g_b[k].objId;
+    ReleaseSRWLockShared(&g_bLock);
     return k;
 }
-
-void __cdecl Entry115(uint32_t route, uint32_t ecx) {
-    __try {
-        const uint32_t x = Rd((void*)ecx, 4) ? *(uint32_t*)ecx : 0;
-        uint64_t objId = 0;
-        AcquireSRWLockShared(&g_bLock);
-        const int k = BodyOfX(x, &objId);
-        ReleaseSRWLockShared(&g_bLock);
-        InterlockedIncrement(&c115[route & 1]);
-        if (k >= 0) InterlockedIncrement(g_role == 0 ? &c115Copy[route & 1] : &c115Native[route & 1]); else InterlockedIncrement(&c115Unmatched);
-        bool clk = false; const uint32_t now = HostMs(&clk);
-        if (InterlockedIncrement(&c115Lines) <= 300)
-            Log("[Brain] enter115 route=%c role=%s x=%08X id=%016llX matched=%d hostMs=%u\n", route ? 'B' : 'A', g_role == 1 ? "host" : g_role == 0 ? "guest" : "?",
-                x, (unsigned long long)objId, k >= 0 ? 1 : 0, now);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-}
-uint8_t* g_stubs115 = nullptr;
-void Emit115(uint8_t* p, uint32_t route, uint32_t orig) {
-    int k = 0;
-    auto b = [&](uint8_t v) { p[k++] = v; };
-    auto d = [&](uint32_t v) { memcpy(p + k, &v, 4); k += 4; };
-    b(0x60); b(0x9C);                               // pushad; pushfd
-    b(0x51);                                        // push ecx (the transition's this)
-    b(0x68); d(route);                              // push route
-    b(0xB8); d((uint32_t)(uintptr_t)&Entry115);     // mov eax, Entry115
-    b(0xFF); b(0xD0);                               // call eax
-    b(0x83); b(0xC4); b(0x08);                      // add esp, 8
-    b(0x9D); b(0x61);                               // popfd; popad
-    b(0x68); d(orig);                               // push orig
-    b(0xC3);                                        // ret: as if the original E8 had called orig (return address untouched)
-}
-
-typedef int(__thiscall* SelBFn)(uint32_t self, int a2);
-int __fastcall SelB(uint32_t self, uint32_t /*edx*/, int a2) {   // replaces the E8 at 0x1D98B23; thiscall-compatible (ret 4)
+typedef int(__thiscall* EvalFn)(uint32_t self, int a2);
+int Eval115(int which, uint32_t self, int a2, EvalFn orig) {
     InterlockedIncrement(&c115SelCalls);
-    if (g_supp115 && g_role == 0 && g_on == 1) {
-        bool copy = false;
-        __try {
-            const uint32_t p = Rd((void*)(self + 0xC), 4) ? *(uint32_t*)(self + 0xC) : 0;
-            const uint32_t x = Rd((void*)p, 4) ? *(uint32_t*)p : 0;
-            AcquireSRWLockShared(&g_bLock);
-            copy = BodyOfX(x, nullptr) >= 0;
-            ReleaseSRWLockShared(&g_bLock);
-        } __except (EXCEPTION_EXECUTE_HANDLER) { copy = false; }
-        if (copy) { InterlockedIncrement(&c115Supp); return 0; }   // sub_1D91D60's own "no transition" value
+    uint32_t savedHandler = 0;
+    __try { savedHandler = *(uint32_t*)(self + 8); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    const int r = orig(self, a2);
+    if (r != 4211) return r;
+    uint64_t objId = 0;
+    const int k = BodyOfFsm(self, &objId);
+    InterlockedIncrement(&c115[which]);
+    if (k >= 0) InterlockedIncrement(g_role == 0 ? &c115Copy[which] : &c115Native[which]); else InterlockedIncrement(&c115Unmatched);
+    const bool supp = g_supp115 && g_role == 0 && g_on == 1 && k >= 0;
+    if (g_probe115 && InterlockedIncrement(&c115Lines) <= 300) {
+        bool clk = false; const uint32_t now = HostMs(&clk);
+        Log("[Brain] enter115 eval=%s role=%s fsm=%08X id=%016llX matched=%d suppressed=%d hostMs=%u\n", which ? "58" : "4",
+            g_role == 1 ? "host" : g_role == 0 ? "guest" : "?", self, (unsigned long long)objId, k >= 0 ? 1 : 0, supp ? 1 : 0, now);
     }
-    return ((SelBFn)0x01D91D60)(self, a2);
+    if (!supp) return r;
+    __try { *(uint32_t*)(self + 8) = savedHandler; } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    InterlockedIncrement(&c115Supp);
+    return 0;
 }
+int __fastcall Eval4W(uint32_t self, uint32_t, int a2) { return Eval115(0, self, a2, (EvalFn)0x01D0EDE0); }    // thiscall-compatible, ret 4
+int __fastcall Eval58W(uint32_t self, uint32_t, int a2) { return Eval115(1, self, a2, (EvalFn)0x01D23570); }
+
 
 // [Coop] Brain115Watch (default 0): run 7 showed routes A/B explain 7 of 71 entries into 115, so the writer is found with a
 // hardware write watchpoint: DR0 = the u16 path[3] of one registered body in dispatch 4 (LEN 2, R/W 01 = write), set on
@@ -555,20 +540,11 @@ bool PatchCall(uint32_t site, uint32_t expect, uint32_t to) {
 void Install115() {
     g_probe115 = GetPrivateProfileIntA("Coop", "Brain115Probe", 0, Paths::Ini()) != 0 ? 1 : 0;
     g_supp115 = GetPrivateProfileIntA("Coop", "Brain115Suppress", 0, Paths::Ini()) != 0 ? 1 : 0;
-    if (g_probe115) {
-        g_stubs115 = (uint8_t*)VirtualAlloc(nullptr, 2 * 32, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-        if (g_stubs115) {
-            Emit115(g_stubs115, 0, 0x01D87230u); Emit115(g_stubs115 + 32, 1, 0x01D8F3D0u);
-            FlushInstructionCache(GetCurrentProcess(), g_stubs115, 64);
-            const bool a = PatchCall(0x01D894AAu, 0x01D87230u, (uint32_t)(uintptr_t)g_stubs115);
-            const bool b = PatchCall(0x01D90D36u, 0x01D8F3D0u, (uint32_t)(uintptr_t)(g_stubs115 + 32));
-            Log("[Brain] 115 probe: route A %s, route B %s\n", a ? "hooked" : "NOT hooked", b ? "hooked" : "NOT hooked");
-        }
-    }
-    if (g_supp115) {
-        const bool s = PatchCall(0x01D98B23u, 0x01D91D60u, (uint32_t)(uintptr_t)&SelB);
-        Log("[Brain] 115 suppress (guest copies, route B): %s\n", s ? "installed" : "NOT installed");
-    }
+    if (!g_probe115 && !g_supp115) return;
+    const bool a = PatchCall(0x01D64CDCu, 0x01D0EDE0u, (uint32_t)(uintptr_t)&Eval4W);
+    const bool b = PatchCall(0x01D64D03u, 0x01D23570u, (uint32_t)(uintptr_t)&Eval58W);
+    Log("[Brain] 115 evaluators: case 4 %s, case 58 %s (probe=%d suppress=%d)\n", a ? "wrapped" : "NOT wrapped", b ? "wrapped" : "NOT wrapped",
+        g_probe115, g_supp115);
 }
 
 }  // namespace
@@ -814,7 +790,7 @@ void Tick() {
     if (ms >= s_nextReport) {
         s_nextReport = ms + 5000;
         if (g_probe115 || g_supp115)
-            Log("[Brain] 115 role=%s A=%ld B=%ld copyA=%ld copyB=%ld nativeA=%ld nativeB=%ld unmatched=%ld suppressed=%ld selBCalls=%ld\n",
+            Log("[Brain] 115 role=%s eval4=%ld eval58=%ld copy4=%ld copy58=%ld native4=%ld native58=%ld unmatched=%ld suppressed=%ld evalCalls=%ld\n",
                 g_role == 1 ? "host" : "guest", c115[0], c115[1], c115Copy[0], c115Copy[1], c115Native[0], c115Native[1], c115Unmatched, c115Supp, c115SelCalls);
         LONG s[64]; const LONG n = g_lateN < 64 ? g_lateN : 64;
         for (int i = 0; i < n; ++i) s[i] = g_late[i];
