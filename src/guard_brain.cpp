@@ -40,6 +40,13 @@ const SlotSpec kSlots[] = {
     { 160, 0x01D505E0u, 4, 1, 2 },    // PerformCombo(target, n, end, 0)
     { 546, 0x01D4F450u, 2, 1, 2 },    // (target, 7)      sub_14BE2A0 case 27
     { 158, 0, 0, 0, 0 }, { 159, 0, 0, 0, 0 }, { 241, 0, 0, 0, 0 }, { 242, 0, 0, 0, 0 }, { 533, 0, 0, 0, 0 }, { 534, 0, 0, 0, 0 },
+    // [Coop] BrainHitSync (IDA cc/g22-g27): the attack outcome. In attack substate 180 the host guard gets
+    // slot 209 (sub_1D28280 -> sub_1CF5A90: token 512 when sub_17FE210(event) == 2, i.e. *(*(event+12)+32) != 9 and
+    // helper+0x88 == 0; else 513) then slot 210 (sub_1D7A9F0 -> sub_1D674C0: with 512, 180 -> 182 via sub_1851BB0, which
+    // reads *(event+12)+52 = the hit target's HandleContainer). Neighbourhood name in the 360 PDB (slots 194/195):
+    // Can/DoAttackHit(FightDamageResponseEvent&) - UNVERIFIED on PC. argKind 3 = that event. Replay is gated by HitSyncOn().
+    { 210, 0x01D7A9F0u, 1, 1, 3 },
+    { 209, 0x01D28280u, 0, 0, 0 },                        // count only (the Can half; the guest calls it itself)
     // State-115 probe (count + log only, IDA cc/g4-g15): the only actions the Ground chart handles in dispatch 115.
     { 375, 0x01D2AC10u, 0, 0, 0 },                        // -> sub_1D03C20: in 115 pushes token 301
     { 0,   0x01D30600u, 0, 0, 0, 0x026E7C9Cu, -0x24 },    // -> sub_1D04D30: in 115 pushes token 305
@@ -48,7 +55,8 @@ const SlotSpec kSlots[] = {
 uint32_t VtOf(int i) { return kSlots[i].vt ? kSlots[i].vt : 0x026E7DC0u; }
 const int kNSlots = sizeof(kSlots) / sizeof(kSlots[0]);
 
-int  g_on = -1, g_delayMs = 0, g_test = 0, g_testDelayMs = 150;
+int  g_on = -1, g_delayMs = 0, g_test = 0, g_testDelayMs = 150, g_hitSync = 0;   // g_hitSync: [Coop] BrainHitSync (default 0)
+const uint16_t kGate181 = 0xB5B5;   // command: the host guard took attack substate 180 -> 181 itself (permit for the copy)
 volatile LONG g_role = -1;   // 1 host, 0 guest
 
 void Log(const char* fmt, ...) {
@@ -66,7 +74,7 @@ bool Rd(const void* p, size_t n) {
 // ---- bodies --------------------------------------------------------------------------------------
 struct Body {
     uint32_t human, ent, ig; uint64_t objId; uint64_t seenMs;
-    uint64_t watchUntilUs; uint32_t watchExec; uint8_t in173; uint16_t lastPath[12]; uint8_t lastDepth; int pathLines; uint16_t lastGid;
+    uint64_t watchUntilUs; uint32_t watchExec; uint8_t in173; uint16_t lastPath[12]; uint8_t lastDepth; int pathLines; uint16_t lastGid; uint64_t permit181Ms;
 };
 const int kBodies = 256;
 Body    g_b[kBodies]; int g_nb = 0;
@@ -85,7 +93,7 @@ int FindObj(uint64_t o) { for (int i = 0; i < g_nb; ++i) if (g_b[i].objId == o) 
 
 // ---- counters ------------------------------------------------------------------------------------
 volatile LONG c_cap[kNSlots] = {}, c_capUnbound = 0, c_tx = 0, c_txFail = 0, c_rx = 0, c_rxStaleBase = 0, c_exec = 0, c_execFail = 0,
-              c_stale = 0, c_noTarget = 0, c_noBody = 0, c_noClock = 0, c_s173 = 0, c_queueFull = 0, c_notReady = 0, c_enterRefused = 0, c_dupDropped = 0, c_alreadyFight = 0, c_capLines = 0, c_execLines = 0;
+              c_stale = 0, c_noTarget = 0, c_noBody = 0, c_noClock = 0, c_s173 = 0, c_queueFull = 0, c_notReady = 0, c_enterRefused = 0, c_dupDropped = 0, c_alreadyFight = 0, c_gatePermits = 0, c_hitLines = 0, c_hitHeld = 0, c_hitApplied = 0, c_hitRefused = 0, c_gate181Tx = 0, c_gate181Blocked = 0, c_gate181Allowed = 0, c_capLines = 0, c_execLines = 0;
 LONG    g_late[64]; volatile LONG g_lateN = 0;   // last 64 lateness samples (ms) for the report
 
 // Host: the guest is in a world and answering. Its PeerClock role is set only from a player frame (OnFrameInner), so the
@@ -194,11 +202,22 @@ void __cdecl Capture(uint32_t id, uint32_t ecx, const uint32_t* frame) {
             const int32_t* hc = *(const int32_t* const*)frame[1];
             if (Rd(hc, 12)) tent = (uint32_t)(hc[0] & (hc[2] >> 31));  // object = hc[0] & (hc[2] >> 31) (GuardTargetClass)
         } else if (s.argKind == 2) tent = frame[1];
+        else if (s.argKind == 3) {                                       // hit-response event: R = *(E+12); type R+32; target hc R+52
+            const uint32_t e = frame[1];
+            const uint32_t r = Rd((void*)(e + 12), 4) ? *(uint32_t*)(e + 12) : 0;
+            if (Rd((void*)r, 56)) {
+                c.a[0] = *(uint32_t*)(r + 32);
+                const int32_t* hc = *(const int32_t* const*)(r + 52);
+                if (Rd(hc, 12)) tent = (uint32_t)(hc[0] & (hc[2] >> 31));
+            } else c.a[0] = 0xFFFFFFFFu;
+            c.a[1] = c.a[2] = c.a[3] = 0;
+        }
         if (s.argKind) c.tgt = (uint8_t)ClassOf(tent, &c.tgtObj);
         if (InterlockedIncrement(&c_capLines) <= 80)
             Log("[Brain] cap slot=%u id=%016llX tgt=%u tobj=%016llX a=%08X,%08X,%08X,%08X ret=%08X hostMs=%u clk=%d\n", s.slot,
                 (unsigned long long)objId, c.tgt, (unsigned long long)c.tgtObj, c.a[0], c.a[1], c.a[2], c.a[3], frame[0], now, clk ? 1 : 0);
         if (!s.replay || !clk) return;
+        if (s.argKind == 3 && !g_hitSync) return;
         if (!PeerReady()) { InterlockedIncrement(&c_notReady); return; }
         Publish(objId, c);
         if (s.slot == 155 || s.slot == 160 || s.slot == 546) Watch(human, c.execHostMs);
@@ -311,8 +330,49 @@ bool Execute(uint32_t human, uint32_t ig, uint64_t objId, const Cmd& c, int32_t 
         Log("[Brain] exec role=%s slot=mark id=%016llX execMs=%u lateMs=%d\n", g_role == 1 ? "host" : "guest", (unsigned long long)objId, c.execHostMs, lateMs);
         return true;
     }
+    if (c.slot == kGate181) {   // BrainHitSync: the host guard left 180 for 181 on its own; the copy may do the same once
+        AcquireSRWLockExclusive(&g_bLock);
+        const int k = FindBy(&Body::human, human);
+        if (k >= 0) g_b[k].permit181Ms = GetTickCount64() + 1500;
+        ReleaseSRWLockExclusive(&g_bLock);
+        InterlockedIncrement(&c_exec); InterlockedIncrement(&c_gatePermits);
+        return true;
+    }
     bool tok = true;
     const uint32_t t = ResolveTarget(c, &tok);
+    if (c.slot == 210) {   // BrainHitSync: replay the host guard's hit outcome on the copy, in substate 180 (path[5])
+        char ps[96]; PathStr(ig, ps, sizeof(ps));
+        unsigned p5 = 0;
+        __try {
+            const uint32_t fsm = *(uint32_t*)(ig + 0x90);
+            const unsigned d = *(const uint16_t*)(fsm + 0x11E);
+            if (d > 5) p5 = *(const uint16_t*)(*(uint32_t*)(fsm + 0x118) + 10);
+        } __except (EXCEPTION_EXECUTE_HANDLER) { p5 = 0; }
+        if (p5 != 180) {   // not there yet: hold (retried every frame up to 1 s late); a copy past it is reported, not forced
+            if (InterlockedIncrement(&c_hitLines) <= 120)
+                Log("[Brain] hit held id=%016llX path=%s lateMs=%d\n", (unsigned long long)objId, ps, lateMs);
+            InterlockedIncrement(&c_hitHeld);
+            return false;
+        }
+        if (!tok || !Rd((void*)t, 0xCC)) { InterlockedIncrement(&c_noTarget); return true; }
+        // The response event as sub_17FE210 / sub_1868F80 / sub_1851BB0 read it: E+12 -> R; R+32 type; R+52 the hit target's
+        // HandleContainer (the engine takes a reference on it, +4). Everything else zero. UNVERIFIED that nothing else in E/R
+        // is read on these paths beyond what the three decompiles show.
+        __declspec(align(16)) uint8_t r[128] = {};
+        __declspec(align(16)) uint8_t e[64] = {};
+        *(uint32_t*)(r + 32) = c.a[0];
+        *(uint32_t*)(r + 52) = *(uint32_t*)(t + 0xC8);
+        *(uint32_t*)(e + 12) = (uint32_t)(uintptr_t)r;
+        uint32_t ea[4] = { (uint32_t)(uintptr_t)e, 0, 0, 0 };
+        const uint32_t can = CallSlot(ig, 209, 1, ea);
+        uint32_t dr = 0;
+        if (can & 0xFF) dr = CallSlot(ig, 210, 1, ea);
+        char ps2[96]; PathStr(ig, ps2, sizeof(ps2));
+        InterlockedIncrement(&c_exec); InterlockedIncrement((can & 0xFF) ? &c_hitApplied : &c_hitRefused);
+        if (InterlockedIncrement(&c_hitLines) <= 120)
+            Log("[Brain] hit id=%016llX type=%u target=%08X can=%08X do=%08X path %s -> %s lateMs=%d\n", (unsigned long long)objId, c.a[0], t, can, dr, ps, ps2, lateMs);
+        return true;
+    }
     if (!tok || ((c.slot == 76 || c.slot == 155 || c.slot == 160 || c.slot == 546) && !Rd((void*)t, 0xCC))) {
         InterlockedIncrement(&c_noTarget);
         if (InterlockedIncrement(&c_execLines) <= 120)
@@ -466,6 +526,35 @@ int Eval115(int which, uint32_t self, int a2, EvalFn orig) {
 int __fastcall Eval4W(uint32_t self, uint32_t, int a2) { return Eval115(0, self, a2, (EvalFn)0x01D0EDE0); }    // thiscall-compatible, ret 4
 int __fastcall Eval58W(uint32_t self, uint32_t, int a2) { return Eval115(1, self, a2, (EvalFn)0x01D23570); }
 
+// [Coop] BrainHitSync, the 180 -> 181 gate. Attack substate 180's evaluator sub_1CD8D70 (sub_1D634D0 case 180, E8 at
+// 0x1D64756) returns 0x2D0B5 = 184501 (181 from 180) when sub_1816E30(ctx). Havana run 11: copies took it every attack and
+// then chained (181 -> 173 via sub_1CD8DB0's 0x2B4AD), while the host guard left 180 for 182 on the hit outcome. Host: a
+// native guard taking it sends kGate181. Guest: a registered copy may take it only within 1.5 s of that permit; otherwise
+// the answer becomes 0 and the handler slot (+8) is restored, so the copy waits in 180 for the replayed hit (slot 210).
+int __fastcall Eval180W(uint32_t self, uint32_t, int a2) {
+    uint32_t saved = 0;
+    __try { saved = *(uint32_t*)(self + 8); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    const int r = ((EvalFn)0x01CD8D70)(self, a2);
+    if (r != 184501 || !g_hitSync || g_on != 1) return r;
+    uint64_t objId = 0;
+    const int k = BodyOfFsm(self, &objId);
+    if (k < 0) return r;
+    if (g_role == 1) {
+        bool clk = false; const uint32_t now = HostMs(&clk);
+        if (clk && PeerReady()) { Cmd c = {}; c.slot = kGate181; c.execHostMs = now; Publish(objId, c); InterlockedIncrement(&c_gate181Tx); }
+        return r;
+    }
+    if (g_role != 0) return r;
+    bool allow = false;
+    AcquireSRWLockExclusive(&g_bLock);
+    if (k < g_nb && g_b[k].objId == objId && g_b[k].permit181Ms > GetTickCount64()) { allow = true; g_b[k].permit181Ms = 0; }
+    ReleaseSRWLockExclusive(&g_bLock);
+    if (allow) { InterlockedIncrement(&c_gate181Allowed); return r; }
+    __try { *(uint32_t*)(self + 8) = saved; } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    InterlockedIncrement(&c_gate181Blocked);
+    return 0;
+}
+
 
 // [Coop] Brain115Watch (default 0): run 7 showed routes A/B explain 7 of 71 entries into 115, so the writer is found with a
 // hardware write watchpoint: DR0 = the u16 path[3] of one registered body in dispatch 4 (LEN 2, R/W 01 = write), set on
@@ -540,6 +629,10 @@ bool PatchCall(uint32_t site, uint32_t expect, uint32_t to) {
 void Install115() {
     g_probe115 = GetPrivateProfileIntA("Coop", "Brain115Probe", 0, Paths::Ini()) != 0 ? 1 : 0;
     g_supp115 = GetPrivateProfileIntA("Coop", "Brain115Suppress", 0, Paths::Ini()) != 0 ? 1 : 0;
+    if (g_hitSync) {
+        const bool h = PatchCall(0x01D64756u, 0x01CD8D70u, (uint32_t)(uintptr_t)&Eval180W);
+        Log("[Brain] hit sync: case-180 evaluator %s\n", h ? "wrapped" : "NOT wrapped");
+    }
     if (!g_probe115 && !g_supp115) return;
     const bool a = PatchCall(0x01D64CDCu, 0x01D0EDE0u, (uint32_t)(uintptr_t)&Eval4W);
     const bool b = PatchCall(0x01D64D03u, 0x01D23570u, (uint32_t)(uintptr_t)&Eval58W);
@@ -557,6 +650,7 @@ void Init() {
     g_delayMs = GetPrivateProfileIntA("Coop", "BrainDelayMs", 0, Paths::Ini());
     g_test = GetPrivateProfileIntA("Coop", "BrainTest", 0, Paths::Ini());
     g_testDelayMs = GetPrivateProfileIntA("Coop", "BrainTestDelayMs", 150, Paths::Ini());
+    g_hitSync = GetPrivateProfileIntA("Coop", "BrainHitSync", 0, Paths::Ini()) != 0 ? 1 : 0;
     if (g_on) Log("[Brain] Brain=1 delayMs=%d test=%d testDelayMs=%d (needs IntentLane=1, PeerClock=1)\n", g_delayMs, g_test, g_testDelayMs);
     if (g_on) Install115();
 }
@@ -789,6 +883,9 @@ void Tick() {
     }
     if (ms >= s_nextReport) {
         s_nextReport = ms + 5000;
+        if (g_hitSync)
+            Log("[Brain] hitsync role=%s gate181Tx=%ld permits=%ld allowed=%ld blocked=%ld hitApplied=%ld hitRefused=%ld hitHeld=%ld\n",
+                g_role == 1 ? "host" : "guest", c_gate181Tx, c_gatePermits, c_gate181Allowed, c_gate181Blocked, c_hitApplied, c_hitRefused, c_hitHeld);
         if (g_probe115 || g_supp115)
             Log("[Brain] 115 role=%s eval4=%ld eval58=%ld copy4=%ld copy58=%ld native4=%ld native58=%ld unmatched=%ld suppressed=%ld evalCalls=%ld\n",
                 g_role == 1 ? "host" : "guest", c115[0], c115[1], c115Copy[0], c115Copy[1], c115Native[0], c115Native[1], c115Unmatched, c115Supp, c115SelCalls);
