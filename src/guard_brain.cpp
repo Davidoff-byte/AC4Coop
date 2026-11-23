@@ -307,16 +307,22 @@ bool Execute(uint32_t human, uint32_t ig, uint64_t objId, const Cmd& c, int32_t 
             // sub_1CEDC90 returns 3 when (a) the self body's kind (u32 +156 & 7) == 1 and |dz| >= 3.0, or (b) bit 0x20 of
             // *(sub_667230(0,0)+0x14) is clear. dz and the dispatch id are logged here; the global bit is not read (UNVERIFIED
             // which condition refuses at small dz).
-            unsigned gid = 0;
+            // Runs 3-4: every refusal had gid = 115, with and without GuardActionLane. The whole active path is logged so the
+            // state that holds 115 can be named.
+            unsigned gid = 0; char ps[96]; ps[0] = 0;
             __try {
                 const uint32_t fsm = Rd((void*)(ig + 0x90), 4) ? *(uint32_t*)(ig + 0x90) : 0;
                 const uint32_t ss = Rd((void*)(fsm + 0x118), 4) ? *(uint32_t*)(fsm + 0x118) : 0;
                 if (Rd((void*)ss, 8)) gid = *(const uint16_t*)(ss + 6);
+                unsigned d = Rd((void*)(fsm + 0x11E), 2) ? *(const uint16_t*)(fsm + 0x11E) : 0; if (d > 12) d = 12;
+                int o = 0;
+                for (unsigned i = 0; i < d && Rd((void*)(ss + 2 * i), 2) && o < 80; ++i)
+                    o += _snprintf_s(ps + o, sizeof(ps) - o, _TRUNCATE, i ? "/%u" : "%u", *(const uint16_t*)(ss + 2 * i));
             } __except (EXCEPTION_EXECUTE_HANDLER) {}
             InterlockedIncrement(&c_enterRefused);
             if (InterlockedIncrement(&c_execLines) <= 200)
-                Log("[Brain] enter refused slot=%u id=%016llX stage1=%d gid=%u dz=%.2f can=%08X lateMs=%d (held)\n", c.slot, (unsigned long long)objId, st1,
-                    gid, dz, r1, lateMs);
+                Log("[Brain] enter refused slot=%u id=%016llX stage1=%d gid=%u path=%s dz=%.2f can=%08X lateMs=%d (held)\n", c.slot, (unsigned long long)objId,
+                    st1, gid, ps, dz, r1, lateMs);
             return false;
         }
         if (c.slot == 76) a[0] = ha[0];
