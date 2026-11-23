@@ -28,7 +28,10 @@ enum TargetClass : uint8_t { TG_NONE = 0, TG_HOST_PLAYER = 1, TG_GUEST_PLAYER = 
 
 const uint32_t kVtIg = 0x026E7DC0u;   // IHumanGround interface vtable (hg+0x10)
 const uint32_t kVtHg = 0x026E8AE8u;   // HumanGround context vtable (*(Human+0x720))
-struct SlotSpec { uint16_t slot; uint32_t fn; uint8_t nargs; uint8_t replay; uint8_t argKind; };   // argKind 1 = Handle&, 2 = entity, 0 = none
+// argKind 1 = Handle&, 2 = entity, 0 = none. vt 0 = IHumanGround; adj = bytes added to `this` to reach the IHumanGround
+// interface (the body key): HumanGround's constructor sub_16D8690 installs 15 interface vtables, IHumanGround at hg+0x10
+// (0x016D8767) and 0x026E7C9C at hg+0x34 (0x016D87A6), so that interface is IHumanGround + 0x24.
+struct SlotSpec { uint16_t slot; uint32_t fn; uint8_t nargs; uint8_t replay; uint8_t argKind; uint32_t vt; int32_t adj; };
 const SlotSpec kSlots[] = {
     { 76,  0x01D79A50u, 1, 1, 1 },    // DoEnterFight(const Handle&)
     { 113, 0x01D79C30u, 1, 1, 0 },    // DoExitFight(type)
@@ -36,7 +39,12 @@ const SlotSpec kSlots[] = {
     { 160, 0x01D505E0u, 4, 1, 2 },    // PerformCombo(target, n, end, 0)
     { 546, 0x01D4F450u, 2, 1, 2 },    // (target, 7)      sub_14BE2A0 case 27
     { 158, 0, 0, 0, 0 }, { 159, 0, 0, 0, 0 }, { 241, 0, 0, 0, 0 }, { 242, 0, 0, 0, 0 }, { 533, 0, 0, 0, 0 }, { 534, 0, 0, 0, 0 },
+    // State-115 probe (count + log only, IDA cc/g4-g15): the only actions the Ground chart handles in dispatch 115.
+    { 375, 0x01D2AC10u, 0, 0, 0 },                        // -> sub_1D03C20: in 115 pushes token 301
+    { 0,   0x01D30600u, 0, 0, 0, 0x026E7C9Cu, -0x24 },    // -> sub_1D04D30: in 115 pushes token 305
+    { 2,   0x01D30650u, 0, 0, 0, 0x026E7C9Cu, -0x24 },    // -> sub_1D04E30: in 115 pushes token 306
 };
+uint32_t VtOf(int i) { return kSlots[i].vt ? kSlots[i].vt : 0x026E7DC0u; }
 const int kNSlots = sizeof(kSlots) / sizeof(kSlots[0]);
 
 int  g_on = -1, g_delayMs = 0, g_test = 0, g_testDelayMs = 150;
@@ -57,7 +65,7 @@ bool Rd(const void* p, size_t n) {
 // ---- bodies --------------------------------------------------------------------------------------
 struct Body {
     uint32_t human, ent, ig; uint64_t objId; uint64_t seenMs;
-    uint64_t watchUntilUs; uint32_t watchExec; uint8_t in173; uint16_t lastPath[12]; uint8_t lastDepth; int pathLines;
+    uint64_t watchUntilUs; uint32_t watchExec; uint8_t in173; uint16_t lastPath[12]; uint8_t lastDepth; int pathLines; uint16_t lastGid;
 };
 const int kBodies = 256;
 Body    g_b[kBodies]; int g_nb = 0;
@@ -130,12 +138,46 @@ void Publish(uint64_t objId, const Cmd& c) {
     if (ok) Net::PumpIntents();   // Havana run 1: commands waited up to a frame for the next player-lane send (late p50 22 ms)
 }
 
+// The Ground active path of the body whose IHumanGround interface is `ig`: fsm = [ig+0x90] (= [hg+0xA0]), ids u16
+// *(fsm+0x118), depth u16 fsm+0x11E. Returns the dispatch id path[3] (the value sub_1D02DF0 tests), 0 if unreadable.
+unsigned PathStr(uint32_t ig, char* out, size_t cap) {
+    out[0] = 0; unsigned gid = 0;
+    __try {
+        const uint32_t fsm = Rd((void*)(ig + 0x90), 4) ? *(uint32_t*)(ig + 0x90) : 0;
+        if (!Rd((void*)fsm, 0x120)) return 0;
+        unsigned d = *(const uint16_t*)(fsm + 0x11E); if (d > 12) d = 12;
+        const uint32_t ss = *(uint32_t*)(fsm + 0x118);
+        if (!Rd((void*)ss, 2 * (d > 4 ? d : 4))) return 0;
+        if (d > 3) gid = *(const uint16_t*)(ss + 6);
+        int o = 0;
+        for (unsigned i = 0; i < d && (size_t)o + 8 < cap; ++i) o += _snprintf_s(out + o, cap - o, _TRUNCATE, i ? "/%u" : "%u", *(const uint16_t*)(ss + 2 * i));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return gid;
+}
+volatile LONG c_probeLines = 0, c_gidLines = 0;
+
 void __cdecl Capture(uint32_t id, uint32_t ecx, const uint32_t* frame) {
     if (id >= (uint32_t)kNSlots) return;
+    if (kSlots[id].vt || kSlots[id].slot == 375) {   // state-115 probe: who calls the actions dispatch 115 accepts, and from which path
+        __try {
+            const uint32_t ig = ecx + (uint32_t)kSlots[id].adj;
+            uint64_t objId = 0;
+            AcquireSRWLockShared(&g_bLock);
+            const int k = FindBy(&Body::ig, ig);
+            if (k >= 0) objId = g_b[k].objId;
+            ReleaseSRWLockShared(&g_bLock);
+            if (!objId) { InterlockedIncrement(&c_capUnbound); return; }
+            InterlockedIncrement(&c_cap[id]);
+            char ps[96]; const unsigned gid = PathStr(ig, ps, sizeof(ps));
+            if (InterlockedIncrement(&c_probeLines) <= 200)
+                Log("[Brain] probe vt=%08X slot=%u id=%016llX gid=%u path=%s ret=%08X\n", VtOf(id), kSlots[id].slot, (unsigned long long)objId, gid, ps, frame[0]);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        return;
+    }
     __try {
         uint64_t objId = 0; uint32_t human = 0;
         AcquireSRWLockShared(&g_bLock);
-        const int k = FindBy(&Body::ig, ecx);
+        const int k = FindBy(&Body::ig, ecx + (uint32_t)kSlots[id].adj);
         if (k >= 0) { objId = g_b[k].objId; human = g_b[k].human; }
         ReleaseSRWLockShared(&g_bLock);
         if (!objId) { InterlockedIncrement(&c_capUnbound); return; }   // player, puppet, or an unscoped body
@@ -189,13 +231,13 @@ bool SwapSlot(uint32_t* p, uint32_t from, uint32_t to) {   // exchange one vtabl
     return ok;
 }
 void InstallCapture() {
-    uint32_t* tab = (uint32_t*)(uintptr_t)kVtIg;
+    (void)0;
     if (!g_stubs) g_stubs = (uint8_t*)VirtualAlloc(nullptr, kNSlots * 40, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (!g_stubs) { Log("[Brain] VirtualAlloc failed: no capture\n"); return; }
     int ok = 0;
     for (int i = 0; i < kNSlots; ++i) {
         if (g_hooked[i]) { ++ok; continue; }
-        const uint32_t cur = tab[kSlots[i].slot];
+        const uint32_t cur = ((uint32_t*)(uintptr_t)VtOf(i))[kSlots[i].slot];
         // Every slot dword must still hold the target read from the exe (tools/pe.py, 2026-11-22); anything else (another
         // hook, a different build) is refused with the value printed.
         if (kSlots[i].fn && cur != kSlots[i].fn) { Log("[Brain] slot %u is %08X, expected %08X: not hooked\n", kSlots[i].slot, cur, kSlots[i].fn); continue; }
@@ -203,18 +245,18 @@ void InstallCapture() {
         uint8_t* stub = g_stubs + i * 40;
         Emit(stub, (uint32_t)i, cur);
         FlushInstructionCache(GetCurrentProcess(), stub, 40);
-        if (SwapSlot(&tab[kSlots[i].slot], cur, (uint32_t)(uintptr_t)stub)) { g_orig[i] = cur; g_hooked[i] = true; ++ok; }
+        if (SwapSlot(&((uint32_t*)(uintptr_t)VtOf(i))[kSlots[i].slot], cur, (uint32_t)(uintptr_t)stub)) { g_orig[i] = cur; g_hooked[i] = true; ++ok; }
     }
     Log("[Brain] host capture: %d of %d IHumanGround slots hooked (vtable %08X)\n", ok, kNSlots, kVtIg);
 }
 // Audit I-103 (ops/AUDIT-CLAUDE-WORK-2026-11-23.md): put every swapped dword back when [Coop] Brain goes to 0 at runtime. A
 // slot is restored only if it still points at our stub; the stub memory stays allocated.
 void RemoveCapture() {
-    uint32_t* tab = (uint32_t*)(uintptr_t)kVtIg;
+    (void)0;
     int restored = 0, foreign = 0;
     for (int i = 0; i < kNSlots; ++i) {
         if (!g_hooked[i]) continue;
-        if (SwapSlot(&tab[kSlots[i].slot], (uint32_t)(uintptr_t)(g_stubs + i * 40), g_orig[i])) { g_hooked[i] = false; ++restored; }
+        if (SwapSlot(&((uint32_t*)(uintptr_t)VtOf(i))[kSlots[i].slot], (uint32_t)(uintptr_t)(g_stubs + i * 40), g_orig[i])) { g_hooked[i] = false; ++restored; }
         else ++foreign;
     }
     Log("[Brain] host capture removed: restored=%d foreign=%d\n", restored, foreign);
@@ -468,9 +510,23 @@ void OwnUpdate(void* human) {
     uint64_t objId = 0; uint32_t ig = 0; bool watching = false;
     AcquireSRWLockShared(&g_bLock);
     const int k = FindBy(&Body::human, h);
-    if (k >= 0) { objId = g_b[k].objId; ig = g_b[k].ig; watching = g_b[k].watchUntilUs != 0; }
+    uint16_t lastGid = 0;
+    if (k >= 0) { objId = g_b[k].objId; ig = g_b[k].ig; watching = g_b[k].watchUntilUs != 0; lastGid = g_b[k].lastGid; }
     ReleaseSRWLockShared(&g_bLock);
     if (!objId) return;
+    {   // State-115 probe: every change of the dispatch id (path[3]) on a registered body, host and guest, with the whole path
+        char ps[96]; const unsigned gid = PathStr(ig, ps, sizeof(ps));
+        if (gid && gid != lastGid) {
+            bool clk = false; const uint32_t now = HostMs(&clk);
+            if (InterlockedIncrement(&c_gidLines) <= 600)
+                Log("[Brain] gid role=%s id=%016llX %u->%u path=%s hostMs=%u stage1=%d\n", g_role == 1 ? "host" : "guest", (unsigned long long)objId,
+                    (unsigned)lastGid, gid, ps, now, Phase1_HumanStage1(human));
+            AcquireSRWLockExclusive(&g_bLock);
+            const int kk = FindBy(&Body::human, h);
+            if (kk >= 0) g_b[kk].lastGid = (uint16_t)gid;
+            ReleaseSRWLockExclusive(&g_bLock);
+        }
+    }
     if (g_role == 0) {
         bool clk = false; const uint32_t now = HostMs(&clk);
         Cmd held[8]; int nh = 0;   // refused this frame (enter not accepted yet): retried next frame, up to 1 s late
@@ -575,7 +631,7 @@ void Tick() {
         for (int i = 0; i < n; ++i) s[i] = g_late[i];
         for (int i = 1; i < n; ++i) for (int j = i; j > 0 && s[j - 1] > s[j]; --j) { const LONG x = s[j]; s[j] = s[j - 1]; s[j - 1] = x; }
         char caps[160]; int o = 0; caps[0] = 0;
-        for (int i = 0; i < kNSlots && o < 150; ++i) if (c_cap[i]) o += _snprintf_s(caps + o, sizeof(caps) - o, _TRUNCATE, "%u:%ld ", kSlots[i].slot, c_cap[i]);
+        for (int i = 0; i < kNSlots && o < 150; ++i) if (c_cap[i]) o += _snprintf_s(caps + o, sizeof(caps) - o, _TRUNCATE, kSlots[i].vt ? "b%u:%ld " : "%u:%ld ", kSlots[i].slot, c_cap[i]);
         Log("[Brain] stats role=%s bodies=%d clk=%d cap={%s} unbound=%ld tx=%ld txFail=%ld rx=%ld staleBase=%ld exec=%ld execFail=%ld stale=%ld "
             "noTarget=%ld noBody=%ld noClock=%ld queueFull=%ld notReady=%ld enterRefused=%ld alreadyFight=%ld dupDropped=%ld s173=%ld late(ms) n=%ld p50=%ld p95=%ld max=%ld\n",
             g_role == 1 ? "host" : "guest", g_nb, clk ? 1 : 0, caps, c_capUnbound, c_tx, c_txFail, c_rx, c_rxStaleBase, c_exec, c_execFail, c_stale,
