@@ -76,7 +76,7 @@ int FindObj(uint64_t o) { for (int i = 0; i < g_nb; ++i) if (g_b[i].objId == o) 
 
 // ---- counters ------------------------------------------------------------------------------------
 volatile LONG c_cap[kNSlots] = {}, c_capUnbound = 0, c_tx = 0, c_txFail = 0, c_rx = 0, c_rxStaleBase = 0, c_exec = 0, c_execFail = 0,
-              c_stale = 0, c_noTarget = 0, c_noBody = 0, c_noClock = 0, c_s173 = 0, c_queueFull = 0, c_notReady = 0, c_enterRefused = 0, c_capLines = 0, c_execLines = 0;
+              c_stale = 0, c_noTarget = 0, c_noBody = 0, c_noClock = 0, c_s173 = 0, c_queueFull = 0, c_notReady = 0, c_enterRefused = 0, c_dupDropped = 0, c_alreadyFight = 0, c_capLines = 0, c_execLines = 0;
 LONG    g_late[64]; volatile LONG g_lateN = 0;   // last 64 lateness samples (ms) for the report
 
 // Host: the guest is in a world and answering. Its PeerClock role is set only from a player frame (OnFrameInner), so the
@@ -162,7 +162,9 @@ void __cdecl Capture(uint32_t id, uint32_t ecx, const uint32_t* frame) {
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
-uint8_t* g_stubs = nullptr;
+uint8_t* g_stubs = nullptr;           // allocated once and never freed: a thread may still be inside a stub after a restore
+uint32_t g_orig[kNSlots] = {};        // the slot's target before the swap (the verified VA)
+bool     g_hooked[kNSlots] = {};
 void Emit(uint8_t* p, uint32_t id, uint32_t orig) {
     int k = 0;
     auto b = [&](uint8_t v) { p[k++] = v; };
@@ -179,27 +181,50 @@ void Emit(uint8_t* p, uint32_t id, uint32_t orig) {
     b(0x68); d(orig);                               // push orig
     b(0xC3);                                        // ret  (stack and registers exactly as the caller left them)
 }
+bool SwapSlot(uint32_t* p, uint32_t from, uint32_t to) {   // exchange one vtable dword only if it still holds `from`
+    DWORD old = 0;
+    if (!VirtualProtect(p, 4, PAGE_READWRITE, &old)) return false;
+    const bool ok = (uint32_t)InterlockedCompareExchange((volatile LONG*)p, (LONG)to, (LONG)from) == from;
+    VirtualProtect(p, 4, old, &old);
+    return ok;
+}
 void InstallCapture() {
     uint32_t* tab = (uint32_t*)(uintptr_t)kVtIg;
-    g_stubs = (uint8_t*)VirtualAlloc(nullptr, kNSlots * 40, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!g_stubs) g_stubs = (uint8_t*)VirtualAlloc(nullptr, kNSlots * 40, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (!g_stubs) { Log("[Brain] VirtualAlloc failed: no capture\n"); return; }
     int ok = 0;
     for (int i = 0; i < kNSlots; ++i) {
+        if (g_hooked[i]) { ++ok; continue; }
         const uint32_t cur = tab[kSlots[i].slot];
+        // Every slot dword must still hold the target read from the exe (tools/pe.py, 2026-11-22); anything else (another
+        // hook, a different build) is refused with the value printed.
         if (kSlots[i].fn && cur != kSlots[i].fn) { Log("[Brain] slot %u is %08X, expected %08X: not hooked\n", kSlots[i].slot, cur, kSlots[i].fn); continue; }
         if (cur < 0x00401000u || cur >= 0x02400000u) { Log("[Brain] slot %u target %08X outside code: not hooked\n", kSlots[i].slot, cur); continue; }
         uint8_t* stub = g_stubs + i * 40;
         Emit(stub, (uint32_t)i, cur);
-        DWORD old = 0;
-        if (VirtualProtect(&tab[kSlots[i].slot], 4, PAGE_READWRITE, &old)) {
-            InterlockedExchange((volatile LONG*)&tab[kSlots[i].slot], (LONG)(uintptr_t)stub);
-            VirtualProtect(&tab[kSlots[i].slot], 4, old, &old);
-            ++ok;
-        }
+        FlushInstructionCache(GetCurrentProcess(), stub, 40);
+        if (SwapSlot(&tab[kSlots[i].slot], cur, (uint32_t)(uintptr_t)stub)) { g_orig[i] = cur; g_hooked[i] = true; ++ok; }
     }
-    FlushInstructionCache(GetCurrentProcess(), g_stubs, kNSlots * 40);
     Log("[Brain] host capture: %d of %d IHumanGround slots hooked (vtable %08X)\n", ok, kNSlots, kVtIg);
 }
+// Audit I-103 (ops/AUDIT-CLAUDE-WORK-2026-11-23.md): put every swapped dword back when [Coop] Brain goes to 0 at runtime. A
+// slot is restored only if it still points at our stub; the stub memory stays allocated.
+void RemoveCapture() {
+    uint32_t* tab = (uint32_t*)(uintptr_t)kVtIg;
+    int restored = 0, foreign = 0;
+    for (int i = 0; i < kNSlots; ++i) {
+        if (!g_hooked[i]) continue;
+        if (SwapSlot(&tab[kSlots[i].slot], (uint32_t)(uintptr_t)(g_stubs + i * 40), g_orig[i])) { g_hooked[i] = false; ++restored; }
+        else ++foreign;
+    }
+    Log("[Brain] host capture removed: restored=%d foreign=%d\n", restored, foreign);
+}
+
+// ---- guest duplicate filter (audit I-102) ---------------------------------------------------------
+struct SeqRec { uint64_t objId; uint32_t seq; };
+const int kSeq = 256;
+SeqRec   g_seq[kSeq]; int g_nSeq = 0; uint32_t g_seqInc = 0;
+SRWLOCK  g_seqLock = SRWLOCK_INIT;
 
 // ---- guest queue ---------------------------------------------------------------------------------
 struct Pending { uint64_t objId; Cmd c; uint8_t used; };
@@ -266,15 +291,32 @@ bool Execute(uint32_t human, uint32_t ig, uint64_t objId, const Cmd& c, int32_t 
         ReleaseSRWLockShared(&g_bLock);
         if (Rd((void*)self, 0x50) && Rd((void*)t, 0x50)) { dz = *(float*)(self + 0x48) - *(float*)(t + 0x48); if (dz < 0) dz = -dz; }   // M43 (entity+0x40 = M41)
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    // Havana run 2 (guest 14956): of the 187 refusal lines logged (265 counted; the log is capped), 100 were an enter on a
+    // copy already in Fight (stage1 = 5). That is the engine refusing a second enter, not a failure: the command is done.
+    if (c.slot == 76 && st1 == 5) {
+        InterlockedIncrement(&c_alreadyFight); InterlockedIncrement(&c_exec);
+        return true;
+    }
     if (c.slot == 76 || (attack && st1 != 5)) {
         uint32_t hnd = *(uint32_t*)(t + 0xC8);          // the entity's HandleContainer* (as CopyCmdTest / GuardStageApply)
         uint32_t ha[4] = { (uint32_t)(uintptr_t)&hnd, 0, 0, 0 };
         r1 = CallSlot(ig, 75, 1, ha);                   // CanEnterFight pushes node 107 ...
         if (r1 & 0xFF) r2 = CallSlot(ig, 76, 1, ha);    // ... DoEnterFight consumes it
         if (!(r1 & 0xFF)) {
+            // sub_1D02DF0 (IDA cc/g3) pushes 107 only when the dispatch id u16 *(*(fsm+0x118)+6) == 4 and sub_1CEDC90 returns 2.
+            // sub_1CEDC90 returns 3 when (a) the self body's kind (u32 +156 & 7) == 1 and |dz| >= 3.0, or (b) bit 0x20 of
+            // *(sub_667230(0,0)+0x14) is clear. dz and the dispatch id are logged here; the global bit is not read (UNVERIFIED
+            // which condition refuses at small dz).
+            unsigned gid = 0;
+            __try {
+                const uint32_t fsm = Rd((void*)(ig + 0x90), 4) ? *(uint32_t*)(ig + 0x90) : 0;
+                const uint32_t ss = Rd((void*)(fsm + 0x118), 4) ? *(uint32_t*)(fsm + 0x118) : 0;
+                if (Rd((void*)ss, 8)) gid = *(const uint16_t*)(ss + 6);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
             InterlockedIncrement(&c_enterRefused);
             if (InterlockedIncrement(&c_execLines) <= 200)
-                Log("[Brain] enter refused slot=%u id=%016llX stage1=%d dz=%.2f lateMs=%d (held)\n", c.slot, (unsigned long long)objId, st1, dz, lateMs);
+                Log("[Brain] enter refused slot=%u id=%016llX stage1=%d gid=%u dz=%.2f can=%08X lateMs=%d (held)\n", c.slot, (unsigned long long)objId, st1,
+                    gid, dz, r1, lateMs);
             return false;
         }
         if (c.slot == 76) a[0] = ha[0];
@@ -389,7 +431,23 @@ void OnIntent(uint64_t wireId, uint32_t seq, uint8_t flags, const void* payload,
     InterlockedIncrement(&c_rx);
     bool clk = false; const uint32_t now = HostMs(&clk);
     if ((flags & IF_BASE) && clk && (int32_t)(now - c.execHostMs) > 1000) { InterlockedIncrement(&c_rxStaleBase); return; }   // a replayed old command
-    (void)seq;
+    // Audit I-102: each command runs at most once. The lane's chanSeq is strictly increasing per (guard, channel) within one
+    // host incarnation, and a rejoin replays the last command as a base with its old seq. So: drop seq <= the last one
+    // accepted for this guard; forget everything when the host's lane incarnation changes (its seqs restart).
+    {
+        Net::IntentStats st; Net::GetIntentStats(st);
+        AcquireSRWLockExclusive(&g_seqLock);
+        if (st.peerInc != g_seqInc) { g_seqInc = st.peerInc; g_nSeq = 0; }
+        int k = -1;
+        for (int i = 0; i < g_nSeq; ++i) if (g_seq[i].objId == wireId) { k = i; break; }
+        const bool dup = k >= 0 && (int32_t)(seq - g_seq[k].seq) <= 0;
+        if (!dup) {
+            if (k < 0) { k = g_nSeq < kSeq ? g_nSeq++ : (int)(wireId % kSeq); g_seq[k].objId = wireId; }
+            g_seq[k].seq = seq;
+        }
+        ReleaseSRWLockExclusive(&g_seqLock);
+        if (dup) { InterlockedIncrement(&c_dupDropped); return; }
+    }
     AcquireSRWLockExclusive(&g_qLock);
     int k = -1;
     for (int i = 0; i < kQ; ++i) if (!g_q[i].used) { k = i; break; }
@@ -440,8 +498,20 @@ void OwnUpdate(void* human) {
 }
 
 void Tick() {
-    if (!On() || g_role < 0) return;
     const uint64_t ms = GetTickCount64();
+    {   // [Coop] Brain is re-read every 2 s so it can be switched off live; the host then restores its vtable (audit I-103)
+        static uint64_t s_nextFlag = 0;
+        if (g_on >= 0 && ms >= s_nextFlag) {
+            s_nextFlag = ms + 2000;
+            const int v = GetPrivateProfileIntA("Coop", "Brain", 0, Paths::Ini()) != 0 ? 1 : 0;
+            if (v != g_on) {
+                Log("[Brain] Brain=%d (was %d) live\n", v, g_on);
+                g_on = v;
+                if (g_role == 1) { if (v) InstallCapture(); else RemoveCapture(); }
+            }
+        }
+    }
+    if (!On() || g_role < 0) return;
     bool clk = false; const uint32_t now = HostMs(&clk);
     static uint64_t s_nextTest = 0, s_nextSweep = 0, s_nextReport = 0;
     static uint32_t s_lcg = 0x1234567u;
@@ -497,9 +567,9 @@ void Tick() {
         char caps[160]; int o = 0; caps[0] = 0;
         for (int i = 0; i < kNSlots && o < 150; ++i) if (c_cap[i]) o += _snprintf_s(caps + o, sizeof(caps) - o, _TRUNCATE, "%u:%ld ", kSlots[i].slot, c_cap[i]);
         Log("[Brain] stats role=%s bodies=%d clk=%d cap={%s} unbound=%ld tx=%ld txFail=%ld rx=%ld staleBase=%ld exec=%ld execFail=%ld stale=%ld "
-            "noTarget=%ld noBody=%ld noClock=%ld queueFull=%ld notReady=%ld enterRefused=%ld s173=%ld late(ms) n=%ld p50=%ld p95=%ld max=%ld\n",
+            "noTarget=%ld noBody=%ld noClock=%ld queueFull=%ld notReady=%ld enterRefused=%ld alreadyFight=%ld dupDropped=%ld s173=%ld late(ms) n=%ld p50=%ld p95=%ld max=%ld\n",
             g_role == 1 ? "host" : "guest", g_nb, clk ? 1 : 0, caps, c_capUnbound, c_tx, c_txFail, c_rx, c_rxStaleBase, c_exec, c_execFail, c_stale,
-            c_noTarget, c_noBody, c_noClock, c_queueFull, c_notReady, c_enterRefused, c_s173, n, n ? s[n / 2] : 0, n ? s[(n * 95) / 100 < n ? (n * 95) / 100 : n - 1] : 0, n ? s[n - 1] : 0);
+            c_noTarget, c_noBody, c_noClock, c_queueFull, c_notReady, c_enterRefused, c_alreadyFight, c_dupDropped, c_s173, n, n ? s[n / 2] : 0, n ? s[(n * 95) / 100 < n ? (n * 95) / 100 : n - 1] : 0, n ? s[n - 1] : 0);
     }
 }
 
