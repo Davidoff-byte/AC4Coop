@@ -672,7 +672,9 @@ int __fastcall NodeW(uint32_t fsm, uint32_t, int node, int a2) {
         int j = 0;   // expire
         for (int i = 0; i < b.cqn; ++i) { if (ms - b.cq[i].atMs <= 1500) b.cq[j++] = b.cq[i]; else InterlockedIncrement(&c_chartExpired); }
         b.cqn = j;
-        for (int i = 0; i < b.cqn; ++i)
+        // Newest matching entry first (run 16: fight idle flips 168 <-> 169 on the host, and taking the oldest entry replayed
+        // stale idle steps while the host had already attacked; 32 of 47 applications were such substitutions).
+        for (int i = b.cqn - 1; i >= 0; --i)
             if (b.cq[i].node == (uint16_t)node) {
                 age = ms - b.cq[i].atMs;
                 if (r || age >= 100) {
