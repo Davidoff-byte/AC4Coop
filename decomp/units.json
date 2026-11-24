@@ -1312,6 +1312,24 @@
    "receipts": [],
    "size": 43,
    "status": "unknown"
+  },
+  "00666BB0": {
+   "addr": "00666BB0",
+   "claimed_at": null,
+   "name": "ActionControllerLookup",
+   "owner": null,
+   "receipts": [],
+   "size": 118,
+   "status": "unknown"
+  },
+  "004ADD10": {
+   "addr": "004ADD10",
+   "claimed_at": null,
+   "name": "ActionControllerReset",
+   "owner": null,
+   "receipts": [],
+   "size": 54,
+   "status": "unknown"
   }
  }
 }

@@ -2682,9 +2682,21 @@ static void PchanApply(Human* h, uint32_t primaryAlias) {   // the puppet's own 
             if (!todo[j].ours) continue;
         }
         if (!want || want == primaryAlias) {
-            if (!todo[j].ours || curAlias != todo[j].ours || !primaryAlias) { InterlockedIncrement(&s_pchIdleC); continue; }
-            want = primaryAlias;               // (2) release our overlay to the base clip
+            // (2) Run 39: retargeting the overlay to the primary alias froze it on an old climbing clip (owner: "stuck and gliding
+            // across the wall, arms stuck"; the host's controllers stayed idle, so nothing updated it). Instead the controller is
+            // emptied the way the engine does it: sub_4ADD10 (thiscall on the controller, retn; IDA cc/g71-g74) destroys its
+            // evaluator list (+0x44, sub_4ACC10), sets node +0x10 = 0 and evaluator +0x28 = 0 - the host's idle state (GetCurrentAction
+            // -> sub_E10E50 = *(ctrl+40) = 0 -> alias 0). The engine calls it per controller (sub_64E940 / sub_64E990 / sub_658D80).
+            // The controller is the key-table entry (sub_666BB0; the same object, sub_E10E50 reads its +40).
+            if (!todo[j].ours || curAlias != todo[j].ours) { InterlockedIncrement(&s_pchIdleC); continue; }
+            void* ctrl = ((void* (__thiscall*)(void*, int, int))0x00666BB0)(ac, ch, ly);
+            if (ctrl) ((void(__thiscall*)(void*))0x004ADD10)(ctrl);
             InterlockedIncrement(&s_pchReleaseC);
+            AcquireSRWLockExclusive(&s_pchLock);
+            if (todo[j].slot < s_pchRxN && s_pchRx[todo[j].slot].key == todo[j].key) s_pchRx[todo[j].slot].ours = 0;
+            ReleaseSRWLockExclusive(&s_pchLock);
+            if (InterlockedIncrement(&s_pchLines) <= 400) L("[Chan] reset puppet key=%08X ch=%d ly=%d (was %u) ctrl=%p\n", todo[j].key, ch, ly, curAlias, ctrl);
+            continue;
         }
         if (curAlias == want) { InterlockedIncrement(&s_pchSameC); continue; }
         ac->SetTargetAction((int)want, 0, 0, ch, ly);
