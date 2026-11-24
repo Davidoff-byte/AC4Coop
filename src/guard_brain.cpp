@@ -939,10 +939,111 @@ void Init() {
 bool On() { return g_on == 1; }
 bool PuppetMirrorGuest() { return g_on == 1 && g_puppet && g_chartSync && g_role == 0; }
 
+}  // namespace Brain
+
+// ---- [Coop] BrainCensus (default 0): every interface call made on a registered body ---------------------------------------
+// Owner fight 2026-11-24 (run 20) and the run-21 smokes: the puppet / copies miss whatever the host body gets through
+// interface calls (hit reactions are forced by 0x026E7D40 slots 12/14 with a damage event, the hit outcome by IHumanGround
+// 209/210, ...). Instead of finding them one at a time, this hooks every slot of all 15 interface vtables HumanGround's
+// constructor sub_16D8690 installs (0x016D8761..0x016D87C9; offsets +0x10..+0x48 in the object; 1006 slots, read from the exe
+// 2026-11-24) and records, per slot and per body class (player/puppet, guard), the count and the first 4 calls with return
+// address, 4 stack dwords and the body's Ground path. A call on any other object costs one compare against a 64-entry snapshot.
+namespace {
+struct CVt { uint32_t off, vt; };
+const CVt kCVt[] = { { 0x10, 0x026E7DC0u }, { 0x14, 0x026E7DB8u }, { 0x18, 0x026E7DB4u }, { 0x1C, 0x026E7D40u }, { 0x20, 0x026E7D34u },
+                     { 0x24, 0x026E7D2Cu }, { 0x28, 0x026E7D24u }, { 0x2C, 0x026E7D18u }, { 0x30, 0x026E7CC8u }, { 0x34, 0x026E7C9Cu },
+                     { 0x38, 0x026E7C84u }, { 0x3C, 0x026E7C40u }, { 0x40, 0x026E7B40u }, { 0x44, 0x026E7B2Cu }, { 0x48, 0x026E7B1Cu } };
+const uint32_t kCVtEnd = 0x026E8AE8u;   // HumanGround's own vtable follows the interface block
+struct CSlot { uint16_t vti, slot; uint32_t target; volatile LONG n[2]; };
+const int kCMax = 1100;
+CSlot g_cs[kCMax]; int g_csN = 0;
+uint8_t* g_cstubs = nullptr;
+volatile uint32_t g_cIg[64]; volatile LONG g_cIgN = 0;   // registered bodies' IHumanGround pointers, refreshed by Tick
+volatile uint32_t g_cPlayerIg = 0;                         // the kPuppetWire body's
+volatile LONG c_censusLines = 0;
+int g_census = 0;
+
+void __cdecl CensusCall(uint32_t id, uint32_t ecx, const uint32_t* frame) {
+    if (id >= (uint32_t)g_csN) return;
+    const uint32_t ig = ecx - kCVt[g_cs[id].vti].off + 0x10;
+    const LONG n = g_cIgN;
+    bool hit = false;
+    for (LONG i = 0; i < n && i < 64; ++i) if (g_cIg[i] == ig) { hit = true; break; }
+    if (!hit) return;
+    const int cls = ig == g_cPlayerIg ? 0 : 1;
+    const LONG c = InterlockedIncrement(&g_cs[id].n[cls]);
+    if (c > 4 || InterlockedIncrement(&c_censusLines) > 4000) return;
+    __try {
+        char ps[96]; PathStr(ig, ps, sizeof(ps));
+        bool clk = false; const uint32_t now = HostMs(&clk);
+        Log("[Brain] census role=%s cls=%s vt+%02X slot=%u fn=%08X ret=%08X a=%08X,%08X,%08X,%08X path=%s hostMs=%u\n", g_role == 1 ? "host" : "guest",
+            cls ? "guard" : "player", kCVt[g_cs[id].vti].off, g_cs[id].slot, g_cs[id].target, frame[0], frame[1], frame[2], frame[3], frame[4], ps, now);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+void EmitCensus(uint8_t* p, uint32_t id, uint32_t orig) {
+    int k = 0;
+    auto b = [&](uint8_t v) { p[k++] = v; };
+    auto d = [&](uint32_t v) { memcpy(p + k, &v, 4); k += 4; };
+    b(0x60); b(0x9C); b(0x8D); b(0x44); b(0x24); b(0x24); b(0x50); b(0x51);   // pushad; pushfd; lea eax,[esp+24h]; push eax; push ecx
+    b(0x68); d(id); b(0xB8); d((uint32_t)(uintptr_t)&CensusCall); b(0xFF); b(0xD0); b(0x83); b(0xC4); b(0x0C);
+    b(0x9D); b(0x61); b(0x68); d(orig); b(0xC3);
+}
+void InstallCensus() {
+    uint32_t starts[16]; int ns = 0;
+    for (const CVt& v : kCVt) starts[ns++] = v.vt;
+    g_cstubs = (uint8_t*)VirtualAlloc(nullptr, kCMax * 40, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!g_cstubs) { Log("[Brain] census: VirtualAlloc failed\n"); return; }
+    int hooked = 0, skipped = 0;
+    for (int vi = 0; vi < (int)(sizeof(kCVt) / sizeof(kCVt[0])); ++vi) {
+        uint32_t next = kCVtEnd;
+        for (int j = 0; j < ns; ++j) if (starts[j] > kCVt[vi].vt && starts[j] < next) next = starts[j];
+        uint32_t* tab = (uint32_t*)(uintptr_t)kCVt[vi].vt;
+        for (uint32_t s = 0; kCVt[vi].vt + 4 * s < next && g_csN < kCMax; ++s) {
+            const uint32_t cur = tab[s];
+            // An exe code address, or one of the brain's own capture stubs (installed first; wrapped, so both run).
+            const bool ours = g_stubs && cur >= (uint32_t)(uintptr_t)g_stubs && cur < (uint32_t)(uintptr_t)g_stubs + kNSlots * 40;
+            if (!ours && (cur < 0x00401000u || cur >= 0x02400000u)) { ++skipped; break; }   // end of this vtable
+            const int id = g_csN++;
+            g_cs[id].vti = (uint16_t)vi; g_cs[id].slot = (uint16_t)s; g_cs[id].target = ours ? g_orig[(cur - (uint32_t)(uintptr_t)g_stubs) / 40] : cur;
+            uint8_t* stub = g_cstubs + id * 40;
+            EmitCensus(stub, (uint32_t)id, cur);
+            if (SwapSlot(&tab[s], cur, (uint32_t)(uintptr_t)stub)) ++hooked;
+        }
+    }
+    FlushInstructionCache(GetCurrentProcess(), g_cstubs, kCMax * 40);
+    Log("[Brain] census: %d slots hooked over %d vtables (skipped %d)\n", hooked, (int)(sizeof(kCVt) / sizeof(kCVt[0])), skipped);
+}
+void CensusTick(uint64_t ms) {
+    if (!g_census || !g_cstubs) return;
+    AcquireSRWLockShared(&g_bLock);   // snapshot of the registered bodies' interface pointers
+    LONG n = 0;
+    for (int i = 0; i < g_nb && n < 64; ++i) { g_cIg[n++] = g_b[i].ig; if (g_b[i].objId == kPuppetWire) g_cPlayerIg = g_b[i].ig; }
+    ReleaseSRWLockShared(&g_bLock);
+    InterlockedExchange(&g_cIgN, n);
+    static uint64_t s_next = 0; static LONG s_last[kCMax][2];
+    if (ms < s_next) return;
+    s_next = ms + 15000;
+    char line[400]; int o = 0; line[0] = 0;
+    for (int i = 0; i < g_csN; ++i)
+        for (int c = 0; c < 2; ++c) {
+            const LONG v = g_cs[i].n[c];
+            if (v == s_last[i][c]) continue;
+            s_last[i][c] = v;
+            o += _snprintf_s(line + o, sizeof(line) - o, _TRUNCATE, " %s+%02X:%u=%ld", c ? "g" : "p", kCVt[g_cs[i].vti].off, g_cs[i].slot, v);
+            if (o > 330) { Log("[Brain] census sum%s\n", line); o = 0; line[0] = 0; }
+        }
+    if (o) Log("[Brain] census sum%s\n", line);
+}
+}  // namespace
+
+namespace Brain {
+
 void SetRole(bool isHost) {
     if (!On() || InterlockedCompareExchange(&g_role, isHost ? 1 : 0, -1) != -1) return;
     Log("[Brain] role=%s\n", isHost ? "host" : "guest");
     if (isHost) InstallCapture();
+    g_census = GetPrivateProfileIntA("Coop", "BrainCensus", 0, Paths::Ini()) != 0 ? 1 : 0;
+    if (g_census) InstallCensus();   // after the capture hooks: wraps them, so both run
 }
 
 void NoteBody(uint64_t objId, void* human, void* entity) {
@@ -1129,6 +1230,7 @@ void Tick() {
         }
     }
     if (!On() || g_role < 0) return;
+    CensusTick(ms);   // [Coop] BrainCensus: refresh the body snapshot, 15 s summary
     if (g_puppet && g_chartSync) {   // [Coop] BrainPuppet: register the host player (host) / the puppet (guest) as kPuppetWire
         void* ent = g_role == 1 ? Phase1_LocalPlayerEntity() : Phase1_PuppetEntity();
         void* hum = ent ? Phase1_HumanOfEntity(ent) : nullptr;
