@@ -1396,6 +1396,7 @@ static void PuppetOwnNote(Human* h, Entity* e, const HookMath::Transform& m);   
 bool FightIntentOwnsPuppet();   // [Coop] FightIntents (S7 slice 1), defined with OwnDrain
 static volatile LONG s_pfcActive = 0;   // [Coop] PuppetFightCarry: our action copy owns the puppet in this fight
 static volatile LONG s_pfcIssued = 0;   // SetTargetAction calls on the puppet in the current fight window
+static void PchanCapture(ActionComponent* ac);   // [Coop] PuppetChannels, defined with PuppetActionBlock
 static void PuppetOwnClear();
 static Entity* ResolveEntityById(uint64_t id);   // engine registry, defined with the ApplyGuards
 static void ProxySrcClearAll();
@@ -1595,6 +1596,7 @@ bool Phase1::CaptureLocalState(PlayerState& s) {
         {
             ActionComponent* ac = h->GetActionComponent();
             if (readable(ac, 0x40)) {
+                PchanCapture(ac);   // [Coop] PuppetChannels: the other controllers, sent on change over IC_PCHAN
                 s.timeScale = ac->GetTimeScale(0, ACTLAYER_PRIMARY);   // primary-channel clip speed (foot-speed warp)
                 s.actionRatio = ac->GetCurrentActionRatio(0, ACTLAYER_PRIMARY);   // playback phase (seek on switch)
                 // The blend-in the peer's engine actually used for its current action (incl. FSM-generated
@@ -2527,6 +2529,83 @@ static bool PabOn() {
     }
     return s_pabOnCache != 0;
 }
+// ---- [Coop] PuppetChannels (default 0): every action controller of the player, not only channel 0 / layer 0 ------------
+// Owner after run 36: sheathing/unsheathing not carried. The capture read one controller (channel 0, ACTLAYER_PRIMARY). The
+// ActionComponent keeps all controllers in a sorted table *(ac+100) with a u16 count at ac+106, 8-byte entries {key, controller},
+// key = channel | layer << 28 (a non-zero channel asked on layer 0 resolves to layer 1) (sub_666BB0, IDA cc/g63); the current
+// action of one is GetCurrentAction(channel, layer) (sub_666C80: controller -> sub_E10E50 -> +680). Each machine sends every other
+// controller's alias (and its ratio) when it changes, as one persisted IC_PCHAN record per key; the receiver plays it on its
+// puppet with SetTargetAction(alias, 0, 0, channel, layer) and seeks it, only while our action copy owns the puppet.
+// UNVERIFIED: which channel weapon draw/sheathe uses (the [Chan] tx log answers it), whether an alias 0 (idle channel) needs a stop.
+#pragma pack(push, 1)
+struct PchanPayload { uint32_t key; uint32_t alias; float ratio; uint32_t seq; };
+#pragma pack(pop)
+static_assert(sizeof(PchanPayload) == 16, "IC_PCHAN payload is a wire layout");
+static int s_pchOn = -1;
+static bool PchanOn() {
+    if (s_pchOn < 0) { s_pchOn = GetPrivateProfileIntA("Coop", "PuppetChannels", 0, Paths::Ini()) != 0 ? 1 : 0; L("[Chan] PuppetChannels=%d\n", s_pchOn); }
+    return s_pchOn == 1;
+}
+const int kPchMax = 12;
+static struct { uint32_t key, alias; } s_pchTx[kPchMax]; static int s_pchTxN = 0; static uint32_t s_pchSeq = 0;
+static SRWLOCK s_pchLock = SRWLOCK_INIT;
+static struct { uint32_t key, alias; float ratio; uint8_t dirty; } s_pchRx[kPchMax]; static int s_pchRxN = 0;
+static volatile LONG s_pchTxC = 0, s_pchRxC = 0, s_pchSetC = 0, s_pchSameC = 0, s_pchIdleC = 0, s_pchLines = 0;
+static void PchanCapture(ActionComponent* ac) {   // the local player's update
+    if (!PchanOn() || !Net::IntentLaneOn()) return;
+    uint32_t arr = 0; uint16_t n = 0;
+    __try { arr = *(uint32_t*)((char*)ac + 100); n = *(uint16_t*)((char*)ac + 106); } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+    if (!arr || n > 32) return;
+    for (int i = 0; i < n; ++i) {
+        uint32_t key = 0;
+        __try { key = *(uint32_t*)(uintptr_t)(arr + 8 * i); } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+        if (key == 0) continue;   // channel 0 / layer 0: PlayerState.actionAlias
+        const int ch = (int)(key & 0x0FFFFFFFu), ly = (int)(key >> 28);
+        unsigned char mir = 0; void* act = ac->GetCurrentAction(&mir, ch, ly);
+        const uint32_t alias = readable(act, 0x0C) ? *(uint32_t*)((char*)act + 8) : 0;
+        int t = -1; for (int j = 0; j < s_pchTxN; ++j) if (s_pchTx[j].key == key) t = j;
+        if (t < 0) { if (s_pchTxN >= kPchMax) continue; t = s_pchTxN++; s_pchTx[t].key = key; s_pchTx[t].alias = 0xFFFFFFFFu; }
+        if (s_pchTx[t].alias == alias) continue;
+        s_pchTx[t].alias = alias;
+        PchanPayload p = { key, alias, ac->GetCurrentActionRatio(ch, ly), ++s_pchSeq };
+        Net::PublishIntent(0, 0x5043480000000000ull | key, IC_PCHAN, (uint32_t)GetTickCount64(), &p, (uint8_t)sizeof(p));
+        InterlockedIncrement(&s_pchTxC);
+        if (InterlockedIncrement(&s_pchLines) <= 400) L("[Chan] tx key=%08X ch=%d ly=%d alias=%u ratio=%.2f\n", key, ch, ly, alias, p.ratio);
+    }
+}
+static void PchanRx(const Net::IntentMsg& m) {   // lane drain (local player's frame)
+    if (m.len != sizeof(PchanPayload)) return;
+    PchanPayload p; memcpy(&p, m.payload, sizeof(p));
+    AcquireSRWLockExclusive(&s_pchLock);
+    int t = -1; for (int j = 0; j < s_pchRxN; ++j) if (s_pchRx[j].key == p.key) t = j;
+    if (t < 0 && s_pchRxN < kPchMax) { t = s_pchRxN++; s_pchRx[t].key = p.key; }
+    if (t >= 0) { s_pchRx[t].alias = p.alias; s_pchRx[t].ratio = p.ratio; s_pchRx[t].dirty = 1; }
+    ReleaseSRWLockExclusive(&s_pchLock);
+    InterlockedIncrement(&s_pchRxC);
+}
+static void PchanApply(Human* h) {   // the puppet's own update, only while our action copy owns it
+    if (!PchanOn()) return;
+    ActionComponent* ac = h ? h->GetActionComponent() : nullptr;
+    if (!readable(ac, 0x40)) return;
+    struct { uint32_t key, alias; float ratio; } todo[kPchMax]; int nt = 0;
+    AcquireSRWLockExclusive(&s_pchLock);
+    for (int j = 0; j < s_pchRxN; ++j) if (s_pchRx[j].dirty) { todo[nt].key = s_pchRx[j].key; todo[nt].alias = s_pchRx[j].alias; todo[nt].ratio = s_pchRx[j].ratio; ++nt; s_pchRx[j].dirty = 0; }
+    ReleaseSRWLockExclusive(&s_pchLock);
+    for (int j = 0; j < nt; ++j) {
+        const int ch = (int)(todo[j].key & 0x0FFFFFFFu), ly = (int)(todo[j].key >> 28);
+        if (!todo[j].alias) { InterlockedIncrement(&s_pchIdleC); continue; }
+        unsigned char mir = 0; void* cur = ac->GetCurrentAction(&mir, ch, ly);
+        const uint32_t curAlias = readable(cur, 0x0C) ? *(uint32_t*)((char*)cur + 8) : 0;
+        if (curAlias == todo[j].alias) { InterlockedIncrement(&s_pchSameC); continue; }
+        ac->SetTargetAction((int)todo[j].alias, 0, 0, ch, ly);
+        if (todo[j].ratio > 0.0f && todo[j].ratio < 1.0f) ac->SetCurrentActionRatio(todo[j].ratio, ch, false, false, ly);
+        InterlockedIncrement(&s_pchSetC);
+        if (InterlockedIncrement(&s_pchLines) <= 400) L("[Chan] set puppet key=%08X ch=%d ly=%d alias=%u (cur was %u) ratio=%.2f\n", todo[j].key, ch, ly, todo[j].alias, curAlias, todo[j].ratio);
+    }
+    static uint64_t s_last = 0; const uint64_t now = GetTickCount64();
+    if (now - s_last >= 5000) { s_last = now; L("[Chan] stats tx=%ld rx=%ld set=%ld same=%ld idle=%ld\n", s_pchTxC, s_pchRxC, s_pchSetC, s_pchSameC, s_pchIdleC); }
+}
+
 static void PuppetActionBlock(Human* h, const PlayerState& s, bool writeActions) {
         // Give the puppet the local player's CharacterActionSet ONCE so its actions resolve to the right
         // character's clip overrides (both are Edward on this machine) instead of the generic base. The
@@ -2587,6 +2666,8 @@ static void PuppetActionBlock(Human* h, const PlayerState& s, bool writeActions)
                 g_lastActionAlias = s.actionAlias;
             }
         }
+
+        if (writeActions) PchanApply(h);   // [Coop] PuppetChannels: the peer's other action controllers
 
         // Blend-in override: once the puppet's current evaluator IS the action we just targeted, give its
         // blend-in the peer's real length (stored ActionBlend, used if Start() hasn't run yet, AND the runtime
@@ -2870,8 +2951,11 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
         // replica on the ground (run 35: the carry was gated on !replica and never engaged - 0 [PFC] toggles, 0 actions).
         // While the carry owns a fight the puppet is not a replica: our matrix write positions it and our action copy animates it.
         static int s_pfcFlag = -1;
-        if (s_pfcFlag < 0) { s_pfcFlag = GetPrivateProfileIntA("Coop", "PuppetFightCarry", 0, Paths::Ini()) != 0 ? 1 : 0; L("[PFC] PuppetFightCarry=%d\n", s_pfcFlag); }
-        const bool fightCarry = s_pfcFlag == 1 && s.humanGroundStage == 4;
+        // 1 = only while the peer is in a fight; 2 = always (owner after run 36: running, jumping, parkour not tracked - out of
+        // fights the native replica matched the peer's alias 7 % on the ground and 0 % in ctx 6/8/30; the 2026-11-15 A/B measured the
+        // action copy at 95-100 % ground, 86-96 % in air, 71-79 % climbing, docs/evidence/act-match-ab-2026-11-15.md).
+        if (s_pfcFlag < 0) { const int v = GetPrivateProfileIntA("Coop", "PuppetFightCarry", 0, Paths::Ini()); s_pfcFlag = v < 0 ? 0 : v > 2 ? 2 : v; L("[PFC] PuppetFightCarry=%d\n", s_pfcFlag); }
+        const bool fightCarry = s_pfcFlag == 2 || (s_pfcFlag == 1 && s.humanGroundStage == 4);
         const bool replica = NativeReplicaOn() && NativeReplicaMode(s.contextId) && !fightCarry;
         if (!replica) { s_nr.haveLast = false; InterlockedExchange(&s_nrNavOk, 0); }   // not the replica's own movement; no nav calls
         if (!replica)
@@ -9853,7 +9937,7 @@ static void AttackForwardReport() {
 static void FightIntentDrain() {
     const bool fi = FightIntentsOn();
     if (!fi && !(OwnerDamageOn() && Net::IntentLaneOn()) && !(PdrOn() && Net::IntentLaneOn()) && !(AfOn() && Net::IntentLaneOn())
-        && !SailSyncOn() && !CoordSyncOn() && !(g_guardActLane && Net::IntentLaneOn()) && !(Brain::On() && Net::IntentLaneOn())) return;   // [Coop] SailSync/CoordSync/GuardActionLane keep the lane drained with every fight flag off
+        && !SailSyncOn() && !CoordSyncOn() && !(g_guardActLane && Net::IntentLaneOn()) && !(Brain::On() && Net::IntentLaneOn()) && !(PchanOn() && Net::IntentLaneOn())) return;   // [Coop] SailSync/CoordSync/GuardActionLane keep the lane drained with every fight flag off
     OwnerHitStalePoll();   // [Coop] RespawnHitGraceMs
     Net::IntentMsg m;
     while (Net::PollIntent(m)) {
@@ -9862,6 +9946,7 @@ static void FightIntentDrain() {
         if (m.channel == IC_ATK_A || m.channel == IC_ATK_B || m.channel == IC_ATK_C) { AttackForwardOwnerRx(m); continue; }   // [Coop] AttackForward
         if (m.channel == IC_BRAIN) { Brain::OnIntent(m.wireId, m.seq, m.flags, m.payload, m.len); continue; }                 // [Coop] Brain
         if (m.channel == IC_ACTION) { GalGuestRx(m); continue; }                                                              // [Coop] GuardActionLane
+        if (m.channel == IC_PCHAN) { PchanRx(m); continue; }                                                                  // [Coop] PuppetChannels
         if (m.channel == IC_PDAMAGE && m.wireId == kPdrWire && m.len == sizeof(PdrPayload)) {   // [Coop] PlayerDamageRelay
             PdrPayload p; memcpy(&p, m.payload, sizeof(p));
             PlayerDamageOwnerApply(p, (m.flags & IF_BASE) != 0);
@@ -15017,7 +15102,7 @@ static void DumpConfigOnce()
         // The Tune* values are floats (read with strtod, see ShipTuningTick); the dump shows the integer part.
         { "Coop", "TuneConeAngle", 120 }, { "Coop", "TuneConeRange", 350 }, { "Coop", "TuneMaxTime", 30 },
         { "Coop", "TuneAggroTime", 30 }, { "Coop", "TuneHull", 0 },
-        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 },{ "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 },
+        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 },{ "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 },
         { "Coop", "CombatTest", 0 }, { "Coop", "CrashContext", 0 }, { "Coop", "CorpseKeepSec", 30 }, { "Coop", "CrowdProbeIntegrate", 1 },
         { "Coop", "CrowdProbeLiveKeys", 1 }, { "Coop", "DamageRelay", 0 }, { "Coop", "Diag", 0 },
         { "Coop", "DisableCrowd", 0 }, { "Coop", "DisablePuppetAI", 1 }, { "Coop", "DisableSpawns", 0 },

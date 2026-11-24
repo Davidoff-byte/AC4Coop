@@ -356,6 +356,8 @@ enum IntentChannel : uint8_t {
                         //                Payload IntentCoordValue.
     IC_BRAIN     = 13,  // host -> guest: one shared-brain command for one guard ([Coop] Brain, src/guard_brain.h):
                         //                an IHumanGround slot call and the host-clock time to run it. 32 B payload.
+    IC_PCHAN     = 14,  // both ways: one non-primary action controller of the sender's player ([Coop] PuppetChannels): key =
+                        //                channel | layer << 28 (the ActionComponent controller table key), alias, ratio.
     IC_LIMIT     = 16,  // ids 1..15 are legal on the wire, so a later build can add a channel without a
                         // layout change; the receiver delivers a channel id it does not name
 };
