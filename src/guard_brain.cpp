@@ -950,6 +950,9 @@ bool PuppetMirrorGuest() { return g_on == 1 && g_puppet && g_chartSync && g_role
 // address, 4 stack dwords and the body's Ground path. A call on any other object costs one compare against a 64-entry snapshot.
 namespace {
 struct CVt { uint32_t off, vt; };
+// Slot counts per vtable, read from the exe 2026-11-24 (tools/pe.py: code dwords up to the next vtable). At runtime other mod
+// features hook some IHumanGround entries, so the walk must not stop at a non-exe value (first census build stopped at 165).
+const uint16_t kCVtSlots[] = { 841, 2, 1, 29, 2, 2, 2, 3, 20, 10, 6, 17, 63, 4, 4 };
 const CVt kCVt[] = { { 0x10, 0x026E7DC0u }, { 0x14, 0x026E7DB8u }, { 0x18, 0x026E7DB4u }, { 0x1C, 0x026E7D40u }, { 0x20, 0x026E7D34u },
                      { 0x24, 0x026E7D2Cu }, { 0x28, 0x026E7D24u }, { 0x2C, 0x026E7D18u }, { 0x30, 0x026E7CC8u }, { 0x34, 0x026E7C9Cu },
                      { 0x38, 0x026E7C84u }, { 0x3C, 0x026E7C40u }, { 0x40, 0x026E7B40u }, { 0x44, 0x026E7B2Cu }, { 0x48, 0x026E7B1Cu } };
@@ -998,11 +1001,11 @@ void InstallCensus() {
         uint32_t next = kCVtEnd;
         for (int j = 0; j < ns; ++j) if (starts[j] > kCVt[vi].vt && starts[j] < next) next = starts[j];
         uint32_t* tab = (uint32_t*)(uintptr_t)kCVt[vi].vt;
-        for (uint32_t s = 0; kCVt[vi].vt + 4 * s < next && g_csN < kCMax; ++s) {
+        for (uint32_t s = 0; s < kCVtSlots[vi] && kCVt[vi].vt + 4 * s < next && g_csN < kCMax; ++s) {
             const uint32_t cur = tab[s];
             // An exe code address, or one of the brain's own capture stubs (installed first; wrapped, so both run).
             const bool ours = g_stubs && cur >= (uint32_t)(uintptr_t)g_stubs && cur < (uint32_t)(uintptr_t)g_stubs + kNSlots * 40;
-            if (!ours && (cur < 0x00401000u || cur >= 0x02400000u)) { ++skipped; break; }   // end of this vtable
+            if (!ours && (cur < 0x00401000u || cur >= 0x02400000u)) ++skipped;   // another feature's hook: wrapped as it is (target logged = that hook)
             const int id = g_csN++;
             g_cs[id].vti = (uint16_t)vi; g_cs[id].slot = (uint16_t)s; g_cs[id].target = ours ? g_orig[(cur - (uint32_t)(uintptr_t)g_stubs) / 40] : cur;
             uint8_t* stub = g_cstubs + id * 40;
