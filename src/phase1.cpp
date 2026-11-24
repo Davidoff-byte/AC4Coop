@@ -397,12 +397,18 @@ void* reloadBuilder(uint64_t id) {
     HandleContainer* handle = hm->CreateReference(id, nullptr);
     if (!readable(handle, 4)) { L("[Phase1] CreateReference failed\n"); return nullptr; }
     int stream = LoadingThread::GetFastLoadDataStream();
-    char ok = LoadingThread::AddLoadTask_Callback(0, stream, 0xFFFFFFFF, id, (int)&handle, 0, 0, 0, 0, 0);
+    // Review F13 / CR-2: the 5th argument escapes into the queued load task (IDA: sub_A2A6C0 -> sub_A29AF0 passes it to
+    // sub_A29730, the task constructor), so it must outlive this frame - a stack local is written after a timed-out return.
+    // A static slot has the same value and semantics while we wait, and stays valid if the loader completes late.
+    static HandleContainer* s_reloadSlot = nullptr;
+    s_reloadSlot = handle;
+    char ok = LoadingThread::AddLoadTask_Callback(0, stream, 0xFFFFFFFF, id, (int)&s_reloadSlot, 0, 0, 0, 0, 0);
     LoadingThread::GetWaitTasks();
     L("[Phase1] reload AddLoadTask ok=%d handle=%p stream=%d\n", (int)ok, handle, stream);
 
     // object populates at handle->m_Object once the load completes
     for (int i = 0; i < 200; ++i) {
+        handle = s_reloadSlot;
         if (readable(handle, 4)) {
             void* obj = handle->m_Object;
             if (readable(obj, 8)) return obj;
@@ -16449,13 +16455,12 @@ static __declspec(naked) void FrameDetour() {
 
 // --- SetGlobalMatrixInternal hook: log the CALLER (return addr) when the SHIP's transform is written.
 //     This reveals the naval sim's per-frame transform write, which is the seam we drive for shared ship.
-static volatile uint32_t g_sgmThis   = 0;  // Entity* (this) of the current SetGlobalMatrixInternal call
-static volatile uint32_t g_sgmMatrix = 0;  // Transform* arg (the matrix being written)
-static volatile uint32_t g_sgmRet    = 0;  // return address (the caller = the transform writer)
-static volatile uint32_t g_sgmPhysPtr = 0; // address of the updatePhysics bool arg (so we can clear it)
+// Review C4 / CR-2026-11-23 CR-4: this, matrix and &updatePhysics were passed through globals while SetGlobalMatrixInternal runs on
+// many job threads at once (19 measured on the player alone) - one thread could rewrite another's matrix or zero a stale stack slot.
+// They are now stack arguments of LogSetGlobalMatrix.
 static uint32_t g_sgmJmpBack = 0;          // 0x00528200 + 6 (next instruction after stolen bytes)
 
-static void __cdecl LogSetGlobalMatrix(uint32_t thisEnt) {
+static void LogSetGlobalMatrixBody(uint32_t thisEnt, uint32_t sgmMatrix, uint32_t sgmPhysPtr) {
     if (!thisEnt || !readable((void*)thisEnt, 4)) return;
 
     // Immediate probe: log the FIRST time a character (vt 0x01E4CE90) reaches SetGlobalMatrixInternal.
@@ -16486,13 +16491,13 @@ static void __cdecl LogSetGlobalMatrix(uint32_t thisEnt) {
       }
     }
 
-    if (!g_sgmMatrix || !readable((void*)(g_sgmMatrix + 0x30), 12)) return;
-    if (thisEnt == g_capPlayerEnt && readable((void*)g_sgmMatrix, 64)) PlayerWriteNote((const float*)g_sgmMatrix);   // [Coop] CaptureAtWrite
+    if (!sgmMatrix || !readable((void*)(sgmMatrix + 0x30), 12)) return;
+    if (thisEnt == g_capPlayerEnt && readable((void*)sgmMatrix, 64)) PlayerWriteNote((const float*)sgmMatrix);   // [Coop] CaptureAtWrite
 
     // Ghost ship sync: drive the spawned ghost's render to the peer's ship state (position + ROTATION
     // synced; Z = the LOCAL wave height, so it bobs up/down with the local water instead of sinking).
     if (g_ghostShip && g_ghostHasSync && thisEnt == (uint32_t)g_ghostShip) {
-        float* m = (float*)g_sgmMatrix;   // full 4x4 (row-major: m[0..2],m[4..6],m[8..10]=rot; m[12..14]=trans)
+        float* m = (float*)sgmMatrix;   // full 4x4 (row-major: m[0..2],m[4..6],m[8..10]=rot; m[12..14]=trans)
         // Use ToMatrix; never hand-build. The hand-built form used the TRANSPOSED off-diagonals, which
         // only looked right because FromMatrix used to return the conjugate - two errors cancelling
         // (audit 2026-11-20). One convention, one function.
@@ -16513,8 +16518,8 @@ static void __cdecl LogSetGlobalMatrix(uint32_t thisEnt) {
     // 0x00528200 always writes the matrix, then only updates physics components when updatePhysics!=0).
     for (int i = 0; i < g_syncCount; ++i) {
         if (g_syncTargets[i].ent != thisEnt) continue;
-        if (g_sgmPhysPtr) *(uint32_t*)g_sgmPhysPtr = 0;   // render-only: skip the physics update
-        float* m = (float*)g_sgmMatrix;
+        if (sgmPhysPtr) *(uint32_t*)sgmPhysPtr = 0;   // render-only: skip the physics update
+        float* m = (float*)sgmMatrix;
         // ToMatrix, never hand-build: the hand-built off-diagonals were transposed and only appeared
         // correct while FromMatrix returned the conjugate (audit 2026-11-20).
         HookMath::Quaternion q; q.x = g_syncTargets[i].quat[0]; q.y = g_syncTargets[i].quat[1];
@@ -16531,28 +16536,29 @@ static void __cdecl LogSetGlobalMatrix(uint32_t thisEnt) {
     if (*(uint32_t*)thisEnt != 0x01E4A128u) return;
     if (!g_holdShip || !g_holdShipEnt) return;
     if (thisEnt != (uint32_t)g_holdShipEnt) return;
-    float* p = (float*)(g_sgmMatrix + 0x30);   // M41/M42/M43 = translation
+    float* p = (float*)(sgmMatrix + 0x30);   // M41/M42/M43 = translation
     p[0] = g_holdPos[0]; p[1] = g_holdPos[1];
     static long n = 0;
     if (n < 10) { L("[ShipHold] OVERRIDE main ship=%p X/Y -> (%.1f,%.1f) [Z=wave]\n",
                     thisEnt, g_holdPos[0], g_holdPos[1]); ++n; }
 }
 
+static void __cdecl LogSetGlobalMatrix(uint32_t thisEnt, uint32_t matrix, uint32_t physPtr) {
+    __try { LogSetGlobalMatrixBody(thisEnt, matrix, physPtr); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { static volatile LONG s_e = 0; if (InterlockedIncrement(&s_e) <= 5) L("[SGM] exception 0x%08X in the detour body (skipped)\n", GetExceptionCode()); }
+}
+
 static __declspec(naked) void SgmDetour() {
     __asm {
-        pushad
-        mov eax, [esp+0x20]      // return address (caller of SetGlobalMatrixInternal)
-        mov g_sgmRet, eax
-        mov eax, [esp+0x18]      // ECX = this (Entity*)
-        mov g_sgmThis, eax
-        mov eax, [esp+0x24]      // arg1 = matrix* (Transform*)
-        mov g_sgmMatrix, eax
-        lea eax, [esp+0x28]      // &arg2 = the updatePhysics bool
-        mov g_sgmPhysPtr, eax
-        mov eax, [esp+0x18]      // reload `this`
-        push eax                 // thisEnt arg
+        pushad                   // ecx (this) at [esp+0x18]; return at +0x20, arg1 matrix* at +0x24, arg2 updatePhysics at +0x28
+        lea  eax, [esp+0x28]     // &updatePhysics (this call's own stack slot)
+        push eax
+        mov  eax, [esp+0x28]     // matrix* (+0x24, one push deeper)
+        push eax
+        mov  eax, [esp+0x20]     // this (+0x18, two pushes deeper)
+        push eax
         call LogSetGlobalMatrix
-        add  esp, 4
+        add  esp, 12
         popad
         push ebp                 // reproduce stolen bytes: PUSH EBP
         mov  ebp, esp            //                       MOV EBP,ESP
