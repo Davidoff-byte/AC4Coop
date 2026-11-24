@@ -1140,6 +1140,22 @@ typedef int(__thiscall* ExitNotifyFn)(uint32_t fsm, int level, int keep);
 typedef int(__thiscall* ForcedFn)(uint32_t fsm, int code);
 volatile LONG c_pathTx = 0, c_pathRx = 0, c_pathNoBody = 0, c_childOver = 0, c_childSame = 0, c_childNone = 0, c_childLines = 0,
               c_psetApplied = 0, c_psetFail = 0, c_psetSkipReact = 0, c_psetPrefix = 0, c_psetLines = 0;
+// Safe swaps. Run 30 (owner fight): the puppet's 173 entry picked 178 (attack step) and the override put it in the host's 190
+// ("open defense"); 190's chooser sub_1869080 reads the opponent handle *(fsm+0x1B8) (a1[110]), which the local decision had
+// not set, and faulted at 0x1869112 `mov ecx,[esi+8]` with esi = 0 (dump run30-guest-31420: AC4Coop EntryW -> sub_1D5E6E0 ->
+// sub_1CBEFA0 -> sub_1869080). A child can need data that only its own decision prepares, so a child is swapped (and the
+// corrector enters a node) only between siblings listed here; every other pair is refused and logged.
+//   167: 168 <-> 169 (fight idle) - live: run 29b 10 overrides, run 30 1, no fault.
+//   296: 297 <-> 298 - live: run 30 1 override on the puppet, no fault.
+//   282: 283 <-> 287 - static: sub_186F260 runs the same branch for both (+1768 = 9, sub_186E5C0); leaf entries' reads UNVERIFIED.
+struct SafePair { uint16_t parent, a, b; };
+const SafePair kSafe[] = { { 167, 168, 169 }, { 296, 297, 298 }, { 282, 283, 287 } };
+volatile LONG c_childRefused = 0, c_psetRefused = 0;
+bool SwapSafe(uint16_t parent, uint16_t from, uint16_t to) {
+    for (const auto& s : kSafe)
+        if (s.parent == parent && ((s.a == from && s.b == to) || (s.b == from && s.a == to))) return true;
+    return false;
+}
 bool ReadPath(uint32_t fsm, uint16_t* n, unsigned* d) {
     __try {
         const unsigned dd = *(const uint16_t*)(fsm + 0x11E);
@@ -1212,6 +1228,14 @@ void PathChild(uint32_t fsm, int node) {   // guest, right after the entry switc
     ReleaseSRWLockShared(&g_bLock);
     if (!host) { InterlockedIncrement(&c_childNone); return; }
     if (host == local) { InterlockedIncrement(&c_childSame); return; }
+    if (!SwapSafe((uint16_t)node, local, host)) {
+        InterlockedIncrement(&c_childRefused);
+        if (InterlockedIncrement(&c_childLines) <= 300) {
+            char ps[96]; FmtPath(n, d, ps, sizeof(ps));
+            Log("[Brain] pathchild refused id=%016llX at %s local=%u host=%u (pair not in the safe table)\n", (unsigned long long)objId, ps, local, host);
+        }
+        return;
+    }
     __try { *(uint16_t*)(fsm + 4) = host; } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
     InterlockedIncrement(&c_childOver);
     if (InterlockedIncrement(&c_childLines) <= 300) {
@@ -1255,6 +1279,15 @@ void PathCorrect(uint64_t objId, uint32_t ig) {   // guest, at the copy's update
     ReleaseSRWLockExclusive(&g_bLock);
     if (skipReact) { InterlockedIncrement(&c_psetSkipReact); return; }
     if (!apply) return;
+    if (!SwapSafe(C[p - 1], C[p], H[p])) {   // p > index of 163 >= 0, so C[p - 1] (== H[p - 1]) is the common parent
+        InterlockedIncrement(&c_psetRefused);
+        if (InterlockedIncrement(&c_psetLines) <= 300) {
+            char cs[96], hs[96]; FmtPath(C, dc, cs, sizeof(cs)); FmtPath(H, dh, hs, sizeof(hs));
+            Log("[Brain] pathset refused id=%016llX heldMs=%llu copy=%s host=%s (parent %u: %u -> %u not in the safe table)\n",
+                (unsigned long long)objId, (unsigned long long)held, cs, hs, C[p - 1], C[p], H[p]);
+        }
+        return;
+    }
     const int code = ((int)C[p] << 10) | H[p];
     bool ok = false;
     __try {
@@ -1744,9 +1777,9 @@ void Tick() {
         if (g_actId)
             Log("[Brain] actid role=%s tx=%ld same=%ld written=%ld missing=%ld\n", g_role == 1 ? "host" : "guest", c_aidTx, c_aidSame, c_aidWritten, c_aidMissing);
         if (g_pathAuth)
-            Log("[Brain] pathauth role=%s tx=%ld rx=%ld noBody=%ld child over=%ld same=%ld none=%ld set applied=%ld fail=%ld skipReact=%ld prefix=%ld setMs=%d\n",
-                g_role == 1 ? "host" : "guest", c_pathTx, c_pathRx, c_pathNoBody, c_childOver, c_childSame, c_childNone,
-                c_psetApplied, c_psetFail, c_psetSkipReact, c_psetPrefix, g_pathSetMs);
+            Log("[Brain] pathauth role=%s tx=%ld rx=%ld noBody=%ld child over=%ld same=%ld none=%ld refused=%ld set applied=%ld fail=%ld refused=%ld skipReact=%ld prefix=%ld setMs=%d\n",
+                g_role == 1 ? "host" : "guest", c_pathTx, c_pathRx, c_pathNoBody, c_childOver, c_childSame, c_childNone, c_childRefused,
+                c_psetApplied, c_psetFail, c_psetRefused, c_psetSkipReact, c_psetPrefix, g_pathSetMs);
         if (g_chartSync)
             Log("[Brain] chartsync role=%s tx=%ld rx=%ld applied=%ld own=%ld forced=%ld waitFrames=%ld expired=%ld dropped=%ld playoutMs=%d holdSet=%ld holdApplied=%ld holdExpired=%ld\n",
                 g_role == 1 ? "host" : "guest", c_chartTx, c_chartRx, c_chartApplied, c_chartOwn, c_chartForced, c_chartWait, c_chartExpired, c_chartDropped,
