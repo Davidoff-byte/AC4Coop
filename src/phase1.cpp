@@ -2864,7 +2864,13 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
         if (g_puppetParkX != 0.0f) m.M41 += g_puppetParkX;
         // [Coop] NativeReplica: on the ground the character controller moves the puppet; NativeReplicaDrive below
         // writes the matrix only to snap. Everywhere else (flag off, or peer off the ground) the write is as before.
-        const bool replica = NativeReplicaOn() && NativeReplicaMode(s.contextId);
+        // [Coop] PuppetFightCarry (default 0, read once): decided before the replica mode, because the puppet runs as a native
+        // replica on the ground (run 35: the carry was gated on !replica and never engaged - 0 [PFC] toggles, 0 actions).
+        // While the carry owns a fight the puppet is not a replica: our matrix write positions it and our action copy animates it.
+        static int s_pfcFlag = -1;
+        if (s_pfcFlag < 0) { s_pfcFlag = GetPrivateProfileIntA("Coop", "PuppetFightCarry", 0, Paths::Ini()) != 0 ? 1 : 0; L("[PFC] PuppetFightCarry=%d\n", s_pfcFlag); }
+        const bool fightCarry = s_pfcFlag == 1 && s.humanGroundStage == 4;
+        const bool replica = NativeReplicaOn() && NativeReplicaMode(s.contextId) && !fightCarry;
         if (!replica) { s_nr.haveLast = false; InterlockedExchange(&s_nrNavOk, 0); }   // not the replica's own movement; no nav calls
         if (!replica)
         g_puppet->SetGlobalMatrixInternal(&m, phys);
@@ -2896,15 +2902,12 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
         bool actNow  = hybrid ? !peerGround : (g_driveActions   != 0);    // run our action replication?
         bool locoNow = hybrid ?  peerGround : (g_driveLoco       != 0);   // feed HumanGroundData (FSM anim)?
         if (replica) { aiOff = false; actNow = false; locoNow = false; }  // native: its FSM owns actions, we steer
-        // [Coop] PuppetFightCarry (default 0, read once): while the host player is in a fight (peer HumanGroundStage 4 = Fight;
-        // run 33 logs: stage1 = 5 on every host player path containing 163, 1-2 elsewhere, n = 27) the puppet's own behavior is
-        // disabled and our action copy plays the host's primary action with its phase and blend (the parkour path), instead of
-        // the brain making the puppet's fight AI reproduce the host. One action writer: FightIntents' puppet ops are dropped
-        // while this is active (FightIntentApply) and the run sets BrainPuppet=0. UNVERIFIED: paired kill/counter alignment with
-        // the guard copies, actions on other layers, and the old two-writer crash with the behavior off.
-        static int s_pfcFlag = -1;
-        if (s_pfcFlag < 0) { s_pfcFlag = GetPrivateProfileIntA("Coop", "PuppetFightCarry", 0, Paths::Ini()) != 0 ? 1 : 0; L("[PFC] PuppetFightCarry=%d\n", s_pfcFlag); }
-        const bool fightCarry = s_pfcFlag == 1 && !replica && s.humanGroundStage == 4;
+        // [Coop] PuppetFightCarry: while the host player is in a fight (peer HumanGroundStage 4 = Fight; run 33 logs: stage1 = 5
+        // on every host player path containing 163, 1-2 elsewhere, n = 27) the puppet's own behavior is disabled and our action
+        // copy plays the host's primary action with its phase and blend (the parkour path), instead of the brain making the
+        // puppet's fight AI reproduce the host. One action writer: FightIntents' puppet ops are dropped while this is active
+        // (FightIntentApply) and the run sets BrainPuppet=0. UNVERIFIED: paired kill/counter alignment with the guard copies,
+        // actions on other layers, and the old two-writer crash with the behavior off.
         if (InterlockedExchange(&s_pfcActive, fightCarry ? 1 : 0) != (fightCarry ? 1 : 0)) L("[PFC] fight carry %s (peer stage %d ctx %d)\n", fightCarry ? "ON" : "off", s.humanGroundStage, s.contextId);
         if (fightCarry) { aiOff = true; actNow = true; locoNow = false; }
         bool braindead = aiOff && !actNow;                               // position-only (never true in hybrid)
