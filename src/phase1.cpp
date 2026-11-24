@@ -1398,6 +1398,48 @@ static volatile LONG s_pfcActive = 0;   // [Coop] PuppetFightCarry: our action c
 static volatile LONG s_pfcIssued = 0;   // SetTargetAction calls on the puppet in the current fight window
 static void PchanCapture(ActionComponent* ac);   // [Coop] PuppetChannels, defined with PuppetActionBlock
 static void ClimbProbeHostPos(const PlayerState& s);   // [Coop] ClimbProbe baseline, defined with PuppetActionBlock
+// ---- [Coop] CaptureAtWrite (default 0, read once): send the player's matrix as the engine last WROTE it, stamped with that time ----
+// Scripted climb 2026-11-24 (asi ef7f7e67): the host's captured position (m_GlobalMatrix read once per frame from FrameDetour, on a
+// Human update) had a > 50 m/s^2 on 18.9 % of off-ground frames, max 8840 m/s^2 - not motion; the candidate is the read landing before
+// or after the player's own update (a repeat, then a double step). SetGlobalMatrixInternal (0x528200, hooked by SgmDetour) is where the
+// engine writes an entity's matrix: for the local player each write is kept here (seqlock: writers may be other threads) with its time.
+static volatile uint32_t g_capPlayerEnt = 0;          // the local player Entity*, set by CaptureLocalState
+static volatile LONG     g_pwSeq = 0, g_pwCount = 0;   // seqlock counter (odd = writing) / writes seen
+static float             g_pwM[16]; static volatile uint64_t g_pwUs = 0;
+static uint64_t OwnNowUs();                            // QPC microseconds, defined with the smoothing instrumentation
+static void PlayerWriteNote(const float* m) {          // SgmDetour's thread, for the local player's write
+    InterlockedIncrement(&g_pwSeq);
+    for (int i = 0; i < 16; ++i) g_pwM[i] = m[i];
+    g_pwUs = OwnNowUs();
+    InterlockedIncrement(&g_pwSeq);
+    InterlockedIncrement(&g_pwCount);
+}
+static bool PlayerWriteRead(float* m, uint64_t* us) {
+    for (int tries = 0; tries < 4; ++tries) {
+        const LONG a = InterlockedCompareExchange(&g_pwSeq, 0, 0);
+        if (a & 1) continue;
+        float t[16]; for (int i = 0; i < 16; ++i) t[i] = g_pwM[i];
+        const uint64_t u = g_pwUs;
+        if (InterlockedCompareExchange(&g_pwSeq, 0, 0) == a) { memcpy(m, t, sizeof(t)); *us = u; return u != 0; }
+    }
+    return false;
+}
+static_assert(sizeof(HookMath::Transform) == 64, "CaptureAtWrite copies 16 floats into PlayerState.matrix");
+static int s_cawOn = -1; static uint64_t g_capWriteUs = 0;   // 0 = this capture did not use a write
+static struct { uint32_t caps, w0, w1, w2, used, stale; } s_caw = {};
+static void CaptureFromWrite(PlayerState& s, void* player) {   // CaptureLocalState, right after the m_GlobalMatrix read
+    if (s_cawOn < 0) { s_cawOn = GetPrivateProfileIntA("Coop", "CaptureAtWrite", 0, Paths::Ini()) != 0 ? 1 : 0; L("[Climb] CaptureAtWrite=%d\n", s_cawOn); }
+    g_capPlayerEnt = (uint32_t)(uintptr_t)player;
+    g_capWriteUs = 0;
+    static LONG s_lastCount = 0;
+    const LONG c = InterlockedCompareExchange(&g_pwCount, 0, 0), dn = c - s_lastCount; s_lastCount = c;
+    ++s_caw.caps; if (dn <= 0) ++s_caw.w0; else if (dn == 1) ++s_caw.w1; else ++s_caw.w2;
+    float m[16]; uint64_t us = 0;
+    if (!s_cawOn || !PlayerWriteRead(m, &us)) return;
+    if (OwnNowUs() - us > 100000) { ++s_caw.stale; return; }   // no write for 100 ms: keep the plain read
+    memcpy(&s.matrix, m, sizeof(m));
+    g_capWriteUs = us; ++s_caw.used;
+}
 static void PuppetOwnClear();
 static Entity* ResolveEntityById(uint64_t id);   // engine registry, defined with the ApplyGuards
 static void ProxySrcClearAll();
@@ -1538,6 +1580,7 @@ bool Phase1::CaptureLocalState(PlayerState& s) {
         s.sceneCellId = worldLastLoadCellId(world);
 
         s.matrix = player->m_GlobalMatrix;
+        CaptureFromWrite(s, player);   // [Coop] CaptureAtWrite (probe counters always; substitution only with the flag)
         s.curSpeed = s.destSpeed = 0;
         s.sprint = s.curMvt = s.destMvt = 0;
         s.contextId = CTX_GROUND;
@@ -2678,12 +2721,18 @@ static void ClimbProbePos(const PlayerState& s, float x, float y, float z) {   /
 }
 static void ClimbProbeHostPos(const PlayerState& s) {   // the local player's captured position while off the ground: the baseline
     if (!ClimbProbeOn()) return;
-    static struct { uint32_t frames, j2, j5, j10; float jmax; } b = {};
-    static float P[2][3]; static int n = 0; static uint64_t last = 0;
+    static struct { uint32_t frames, j2, j5, j10, repeats; float jmax; } b = {};
+    static float P[2][3]; static int n = 0; static uint64_t last = 0; static float prevStep = 0.0f;
     const float x = s.matrix.M41, y = s.matrix.M42, z = s.matrix.M43;
-    if (!OffGroundCtx(s.contextId)) { n = 0; s_accHost.n = 0; }
+    if (!OffGroundCtx(s.contextId)) { n = 0; s_accHost.n = 0; prevStep = 0.0f; }
     else {
         AccelNote(s_accHost, x, y, z);
+        if (n >= 1) {   // a capture that repeats the previous position while moving (> 8 mm the frame before)
+            const int li = n == 1 ? 0 : 1;
+            const float sx = x - P[li][0], sy = y - P[li][1], sz = z - P[li][2], step = sqrtf(sx * sx + sy * sy + sz * sz);
+            if (step < 0.0005f && prevStep > 0.008f) ++b.repeats;
+            prevStep = step;
+        }
         ++b.frames;
         if (n == 2) {
             const float dx = x - 2 * P[1][0] + P[0][0], dy = y - 2 * P[1][1] + P[0][1], dz = z - 2 * P[1][2] + P[0][2];
@@ -2697,8 +2746,9 @@ static void ClimbProbeHostPos(const PlayerState& s) {   // the local player's ca
     if (!last) last = now;
     if (now - last >= 5000) {
         last = now;
-        if (b.frames) L("[Climb] host-own frames=%u jerk>2cm=%u >5cm=%u >10cm=%u max=%.1fcm\n", b.frames, b.j2, b.j5, b.j10, b.jmax * 100.0f);
-        b = {};
+        if (b.frames) L("[Climb] host-own frames=%u jerk>2cm=%u >5cm=%u >10cm=%u max=%.1fcm repeats=%u | captures=%u playerWrites/capture 0:%u 1:%u 2+:%u usedWrite=%u stale=%u\n",
+                        b.frames, b.j2, b.j5, b.j10, b.jmax * 100.0f, b.repeats, s_caw.caps, s_caw.w0, s_caw.w1, s_caw.w2, s_caw.used, s_caw.stale);
+        b = {}; s_caw = {};
         AccelLog("host-own", s_accHost);
     }
 }
@@ -14235,8 +14285,15 @@ static uint64_t PuppetStampUs(const PlayerState& s, uint64_t nowUs) {
     const int64_t t = hostUs + best;
     return t > 0 ? (uint64_t)t : nowUs;
 }
+static uint32_t s_sameStamp = 0;   // [Coop] CaptureAtWrite + PuppetHostTime: packets merged into the newest (no new engine write)
 static void PushSnapshot(const PlayerState& s, uint64_t nowUs) {
     nowUs = PuppetStampUs(s, nowUs);
+    // With the sender's CaptureAtWrite a packet whose matrix came from the same engine write carries the same host stamp; a new
+    // buffer entry would be a zero-length segment. Update the newest entry's fields instead (its matrix is that same write).
+    if (s_pupHostTime == 1 && g_snapCount && (!g_haveSnapSeq || s.seq > g_lastSnapSeq)) {
+        const int newestIdx = (g_snapHead - 1 + SNAP_MAX) % SNAP_MAX;
+        if (nowUs <= g_snaps[newestIdx].t) { g_snaps[newestIdx].st = s; g_lastSnapSeq = s.seq; g_haveSnapSeq = true; ++s_sameStamp; return; }
+    }
     if (g_haveSnapSeq) {
         if (s.seq == g_lastSnapSeq) return;            // duplicate of the newest — GetRemote holds it
         if (s.seq <  g_lastSnapSeq) {
@@ -15242,7 +15299,7 @@ static void DumpConfigOnce()
         // The Tune* values are floats (read with strtod, see ShipTuningTick); the dump shows the integer part.
         { "Coop", "TuneConeAngle", 120 }, { "Coop", "TuneConeRange", 350 }, { "Coop", "TuneMaxTime", 30 },
         { "Coop", "TuneAggroTime", 30 }, { "Coop", "TuneHull", 0 },
-        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 },{ "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 },
+        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 },{ "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 },
         { "Coop", "CombatTest", 0 }, { "Coop", "CrashContext", 0 }, { "Coop", "CorpseKeepSec", 30 }, { "Coop", "CrowdProbeIntegrate", 1 },
         { "Coop", "CrowdProbeLiveKeys", 1 }, { "Coop", "DamageRelay", 0 }, { "Coop", "Diag", 0 },
         { "Coop", "DisableCrowd", 0 }, { "Coop", "DisablePuppetAI", 1 }, { "Coop", "DisableSpawns", 0 },
@@ -15694,6 +15751,7 @@ static void OnFrameInner(Human* updatedHuman) {
         if (localOk) {
             static uint32_t seq = 0; local.seq = ++seq;
             local.hostTimeMs = (uint32_t)(OwnNowUs() / 1000);   // proto 14: capture time (QPC ms) for the peer's buffer
+            if (g_capWriteUs) local.hostTimeMs = (uint32_t)(g_capWriteUs / 1000);   // [Coop] CaptureAtWrite: the time the engine wrote it
             Net::Send(local); if (stable < 100000) ++stable;
         }
         else stable = 0;
@@ -16223,6 +16281,7 @@ static void __cdecl LogSetGlobalMatrix(uint32_t thisEnt) {
     }
 
     if (!g_sgmMatrix || !readable((void*)(g_sgmMatrix + 0x30), 12)) return;
+    if (thisEnt == g_capPlayerEnt && readable((void*)g_sgmMatrix, 64)) PlayerWriteNote((const float*)g_sgmMatrix);   // [Coop] CaptureAtWrite
 
     // Ghost ship sync: drive the spawned ghost's render to the peer's ship state (position + ROTATION
     // synced; Z = the LOCAL wave height, so it bobs up/down with the local water instead of sinking).
