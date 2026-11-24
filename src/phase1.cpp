@@ -1398,6 +1398,7 @@ static volatile LONG s_pfcActive = 0;   // [Coop] PuppetFightCarry: our action c
 static volatile LONG s_pfcIssued = 0;   // SetTargetAction calls on the puppet in the current fight window
 static void PchanCapture(ActionComponent* ac);   // [Coop] PuppetChannels, defined with PuppetActionBlock
 static void ClimbProbeHostPos(const PlayerState& s);   // [Coop] ClimbProbe baseline, defined with PuppetActionBlock
+static void CtlDump(const char* who, ActionComponent* ac, uint64_t* last);   // [Coop] ClimbProbe controller table, defined with PchanCapture
 // ---- [Coop] CaptureAtWrite (default 0, read once): send the player's matrix as the engine last WROTE it, stamped with that time ----
 // Scripted climb 2026-11-24 (asi ef7f7e67): the host's captured position (m_GlobalMatrix read once per frame from FrameDetour, on a
 // Human update) had a > 50 m/s^2 on 18.9 % of off-ground frames, max 8840 m/s^2 - not motion; the candidate is the read landing before
@@ -1671,6 +1672,7 @@ bool Phase1::CaptureLocalState(PlayerState& s) {
             if (readable(ac, 0x40)) {
                 ClimbProbeHostPos(s);   // [Coop] ClimbProbe: the same jerk measure on the position we send (baseline)
                 PchanCapture(ac);   // [Coop] PuppetChannels: the other controllers, sent on change over IC_PCHAN
+                { static uint64_t s_ctlLast = 0; CtlDump("player", ac, &s_ctlLast); }   // [Coop] ClimbProbe
                 s.timeScale = ac->GetTimeScale(0, ACTLAYER_PRIMARY);   // primary-channel clip speed (foot-speed warp)
                 s.actionRatio = ac->GetCurrentActionRatio(0, ACTLAYER_PRIMARY);   // playback phase (seek on switch)
                 // The blend-in the peer's engine actually used for its current action (incl. FSM-generated
@@ -2625,6 +2627,29 @@ static struct { uint32_t key, alias; } s_pchTx[kPchMax]; static int s_pchTxN = 0
 static SRWLOCK s_pchLock = SRWLOCK_INIT;
 static struct { uint32_t key, alias; float ratio; uint8_t dirty; uint32_t ours; } s_pchRx[kPchMax]; static int s_pchRxN = 0;   // ours: the alias we last set on the puppet
 static volatile LONG s_pchTxC = 0, s_pchRxC = 0, s_pchSetC = 0, s_pchSameC = 0, s_pchIdleC = 0, s_pchLines = 0, s_pchWholeC = 0, s_pchReleaseC = 0;
+// [Coop] ClimbProbe: every controller of an ActionComponent (table *(ac+100), count u16 ac+106, {key, ctrl}; IDA cc/g63) with the alias
+// its current action has (GetCurrentAction), one line per 3 s per side. Run 41 footage: the copy floated ~1 m up with bent knees while its
+// primary alias matched the host's idle (act=48 rx=48 186x) - so the pose comes from a controller the carry does not write.
+static bool ClimbProbeOn();   // [Coop] ClimbProbe, defined with PuppetActionBlock
+static void CtlDump(const char* who, ActionComponent* ac, uint64_t* last) {
+    if (!ClimbProbeOn() || !readable(ac, 0x70)) return;
+    const uint64_t now = GetTickCount64();
+    if (now - *last < 3000) return;
+    *last = now;
+    uint32_t arr = 0; uint16_t n = 0;
+    __try { arr = *(uint32_t*)((char*)ac + 100); n = *(uint16_t*)((char*)ac + 106); } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+    if (!arr || n > 32) return;
+    char b[900]; int o = _snprintf_s(b, sizeof(b), _TRUNCATE, "[Ctl] %s n=%u", who, (unsigned)n);
+    for (int i = 0; i < n && o < 860; ++i) {
+        uint32_t key = 0, ctrl = 0;
+        __try { key = *(uint32_t*)(uintptr_t)(arr + 8 * i); ctrl = *(uint32_t*)(uintptr_t)(arr + 8 * i + 4); } __except (EXCEPTION_EXECUTE_HANDLER) { break; }
+        const int ch = (int)(key & 0x0FFFFFFFu), ly = (int)(key >> 28);
+        unsigned char mir = 0; void* act = ac->GetCurrentAction(&mir, ch, ly);
+        const uint32_t alias = readable(act, 0x0C) ? *(uint32_t*)((char*)act + 8) : 0;
+        o += _snprintf_s(b + o, sizeof(b) - o, _TRUNCATE, " %X:%u", key, alias);
+    }
+    L("%s\n", b);
+}
 static void PchanCapture(ActionComponent* ac) {   // the local player's update
     if (!PchanOn() || !Net::IntentLaneOn()) return;
     uint32_t arr = 0; uint16_t n = 0;
@@ -2835,6 +2860,7 @@ static void ClimbProbeCheck(Human* h) {
 
 static void PuppetActionBlock(Human* h, const PlayerState& s, bool writeActions) {
         if (writeActions) ClimbProbeCheck(h);   // [Coop] ClimbProbe
+        { static uint64_t s_ctlLast = 0; CtlDump("puppet", h ? h->GetActionComponent() : nullptr, &s_ctlLast); }   // [Coop] ClimbProbe
         // Give the puppet the local player's CharacterActionSet ONCE so its actions resolve to the right
         // character's clip overrides (both are Edward on this machine) instead of the generic base. The
         // gameplay path that normally sets it is disabled on the puppet. One-shot: re-setting it every frame
