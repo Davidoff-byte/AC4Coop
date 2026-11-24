@@ -68,12 +68,14 @@ const SlotSpec kSlots[] = {
 uint32_t VtOf(int i) { return kSlots[i].vt ? kSlots[i].vt : 0x026E7DC0u; }
 const int kNSlots = sizeof(kSlots) / sizeof(kSlots[0]);
 
+int  g_actId = 0;   // [Coop] BrainActIdSync (default 0)
 int  g_on = -1, g_delayMs = 0, g_test = 0, g_testDelayMs = 150, g_hitSync = 0, g_chartSync = 0, g_playoutMs = 0, g_puppet = 0, g_react = 0;   // g_react: [Coop] BrainReact (default 0)   // g_puppet: [Coop] BrainPuppet (default 0)   // g_playoutMs: [Coop] BrainPlayoutMs (default 0)   // [Coop] BrainHitSync, [Coop] BrainChartSync (default 0)
 const uint16_t kGate = 0xB5B5;   // command: a host native took attack-substate transition a[1] from state a[0] (permit for the copy)
 const uint16_t kChart = 0xC4A7;   // command: a host native took Ground transition a[1] from node a[0], handler a[2] (BrainChartSync)
 // [Coop] BrainPuppet: the host player (host) and the guest's puppet of it (guest) are one brain body under this fixed id, so capture,
 // the chart mirror and the hit replay apply to them unchanged. Not a guard objId (guard ids are 0x00000000Fxxxxxxx).
 const uint64_t kPuppetWire = 0x5055505045540001ull;
+const uint16_t kActId = 0xA1D5;   // BrainActIdSync: host entered state a[0] with outgoing action-block id a[1] (route a[2])
 const uint16_t kReact = 0xD0D1, kReactData = 0xD0D0;   // BrainReact: header {slot, seq, attacker} and 5 data chunks of 20 bytes (AtkFields)
 volatile LONG g_role = -1;   // 1 host, 0 guest
 
@@ -98,6 +100,7 @@ struct Body {
     uint32_t pathHash;   // BrainPuppet: last logged path of the player / puppet body
     uint32_t rseq[2]; uint8_t rmask[2]; uint8_t rbuf[2][100]; uint32_t rFde; uint32_t rFdeSeq;   // BrainReact guest: reassembly (two in flight, by seq parity), built event
     struct { uint16_t node; int32_t code; uint32_t handler; uint64_t atMs; uint8_t sched; } cq[8]; int cqn;   // BrainChartSync guest queue
+    struct { uint16_t target; uint32_t aid; uint64_t atMs; } aq[4]; int aqn;   // BrainActIdSync guest queue (host ids by entered state)
     struct { uint16_t node; int32_t code; uint32_t handler; uint32_t dueHostMs; uint64_t setMs; } hold;   // BrainPlayoutMs host: a deferred attack start
 };
 const int kBodies = 256;
@@ -502,6 +505,18 @@ bool Execute(uint32_t human, uint32_t ig, uint64_t objId, const Cmd& c, int32_t 
         if (InterlockedIncrement(&c_reactLines) <= 400)
             Log("[Brain] react guest slot=%u id=%016llX seq=%u attacker=%08X cls=%u can=%08X tok=%u,%u,%u pushed=%d do=%08X path %s -> %s lateMs=%d\n", c.nargs,
                 (unsigned long long)objId, c.a[0], att, c.tgt, can, c.a[1], c.a[2], c.a[3], pushed ? 1 : 0, dr, ps, ps2, lateMs);
+        return true;
+    }
+    if (c.slot == kActId) {   // BrainActIdSync: remember the host's outgoing action-block id for the copy's next entry of a[0]
+        AcquireSRWLockExclusive(&g_bLock);
+        const int k = FindBy(&Body::human, human);
+        if (k >= 0) {
+            Body& b = g_b[k];
+            if (b.aqn == 4) { for (int i = 1; i < 4; ++i) b.aq[i - 1] = b.aq[i]; b.aqn = 3; }
+            b.aq[b.aqn].target = (uint16_t)c.a[0]; b.aq[b.aqn].aid = c.a[1]; b.aq[b.aqn].atMs = GetTickCount64(); ++b.aqn;
+        }
+        ReleaseSRWLockExclusive(&g_bLock);
+        InterlockedIncrement(&c_exec);
         return true;
     }
     if (c.slot == kChart) {   // BrainChartSync: queue the host guard's transition for the copy's node wrapper (NodeW)
@@ -1040,18 +1055,74 @@ int EnterLog(int route, uint32_t fsm, int target, void** retSlot) {
     }
     return 0;
 }
-int __fastcall EnterF(uint32_t fsm, uint32_t, int target) { EnterLog(0, fsm, target, (void**)_AddressOfReturnAddress()); return ((EnterFn)0x01D63440)(fsm, target); }
-int __fastcall EnterA(uint32_t fsm, uint32_t, int target) { EnterLog(1, fsm, target, (void**)_AddressOfReturnAddress()); return ((EnterFn)0x01D63440)(fsm, target); }
-int __fastcall EnterD(uint32_t fsm, uint32_t, int target) { EnterLog(2, fsm, target, (void**)_AddressOfReturnAddress()); return ((EnterFn)0x01D63440)(fsm, target); }
+// [Coop] BrainActIdSync (default 0). A state's entry action can pick its child from the action id the previous state left in
+// its action block (IDA cc/g42-g48): the helper has two 0x4A0-byte blocks, fsm+0x130 and fsm+0x5D0, and *(fsm+0xA70) points
+// at the current one; sub_1D63440 (enter) first calls sub_1CBEC30, which makes the other block current (0x1CBEC34..0x1CBEC65),
+// then the entry switch sub_1D5E6E0. 282's entry sub_1CBF400 -> sub_186F260 reads dword 0 of the block that is NOT current
+// (= the one current before the swap; sub_1CBDE60/30/90) and descends to 284 for 458, 287 for 459, else 283
+// (sub_1CBAF50/10/90 write *(fsm+4)). That id is written by the transition's handler (280 -> 282: sub_1CCDA00 writes -11
+// then sub_1859A30), which the dispatch sub_1D65BB0 runs after the evaluator and before sub_1D63440 - so after NodeW.
+// Run 27: host 280 -> 282/283, the puppet (same code and handler from the chart) -> 282/287, and it stayed there.
+//   Host: at each entry of a registered body (dispatch and forced routes), dword 0 of the current block is sent with the target.
+//   Guest: at the same point, the newest host id for this target (<= 1.5 s old) is written into dword 0 of the current block.
+// Only dword 0 is written; UNVERIFIED whether other entry actions also read the block's data (+0x10..) for their choice.
+volatile LONG c_aidTx = 0, c_aidSame = 0, c_aidWritten = 0, c_aidMissing = 0, c_aidLines = 0;
+void ActIdAt(int route, uint32_t fsm, int target) {
+    if (!g_actId || g_on != 1 || g_role < 0) return;
+    uint64_t objId = 0;
+    const int k = BodyOfFsm(fsm, &objId);
+    if (k < 0) return;
+    uint32_t blk = 0, cur = 0; bool fight = false;
+    __try {
+        unsigned d = *(const uint16_t*)(fsm + 0x11E); if (d > 12) d = 12;   // scope: the fight region (163 on the path), as NodeW
+        const uint16_t* p = *(const uint16_t* const*)(fsm + 0x118);
+        for (unsigned i = 0; i < d; ++i) if (p[i] == 163) { fight = true; break; }
+        blk = *(const uint32_t*)(fsm + 0xA70); cur = *(const uint32_t*)blk;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+    if (!fight) return;
+    if (g_role == 1) {
+        bool clk = false; const uint32_t now = HostMs(&clk);
+        if (!clk || !PeerReady()) return;
+        Cmd c = {}; c.slot = kActId; c.a[0] = (uint32_t)target; c.a[1] = cur; c.a[2] = (uint32_t)route; c.execHostMs = now;
+        Publish(objId, c); InterlockedIncrement(&c_aidTx);
+        return;
+    }
+    bool have = false; uint32_t aid = 0; const uint64_t ms = GetTickCount64();
+    AcquireSRWLockExclusive(&g_bLock);
+    if (k < g_nb && g_b[k].objId == objId) {
+        Body& b = g_b[k];
+        for (int i = b.aqn - 1; i >= 0; --i)
+            if (b.aq[i].target == (uint16_t)target && ms - b.aq[i].atMs <= 1500) {
+                aid = b.aq[i].aid; have = true;
+                int m = 0; for (int q = i + 1; q < b.aqn; ++q) b.aq[m++] = b.aq[q];   // drop it and every older entry
+                b.aqn = m;
+                break;
+            }
+    }
+    ReleaseSRWLockExclusive(&g_bLock);
+    if (!have) { InterlockedIncrement(&c_aidMissing); return; }
+    if (aid == cur) { InterlockedIncrement(&c_aidSame); return; }
+    __try { *(uint32_t*)blk = aid; } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+    InterlockedIncrement(&c_aidWritten);
+    if (InterlockedIncrement(&c_aidLines) <= 300)
+        Log("[Brain] actid guest id=%016llX enter=%d route=%c local=%d host=%d\n", (unsigned long long)objId, target, route == 0 ? 'F' : route == 1 ? 'A' : 'D',
+            (int)cur, (int)aid);
+}
+int g_enterLog = 0;
+int __fastcall EnterF(uint32_t fsm, uint32_t, int target) { if (g_enterLog) EnterLog(0, fsm, target, (void**)_AddressOfReturnAddress()); ActIdAt(0, fsm, target); return ((EnterFn)0x01D63440)(fsm, target); }
+int __fastcall EnterA(uint32_t fsm, uint32_t, int target) { if (g_enterLog) EnterLog(1, fsm, target, (void**)_AddressOfReturnAddress()); ActIdAt(1, fsm, target); return ((EnterFn)0x01D63440)(fsm, target); }
+int __fastcall EnterD(uint32_t fsm, uint32_t, int target) { if (g_enterLog) EnterLog(2, fsm, target, (void**)_AddressOfReturnAddress()); ActIdAt(2, fsm, target); return ((EnterFn)0x01D63440)(fsm, target); }
 
 void Install115() {
     g_probe115 = GetPrivateProfileIntA("Coop", "Brain115Probe", 0, Paths::Ini()) != 0 ? 1 : 0;
     g_supp115 = GetPrivateProfileIntA("Coop", "Brain115Suppress", 0, Paths::Ini()) != 0 ? 1 : 0;
-    if (GetPrivateProfileIntA("Coop", "BrainEnterProbe", 0, Paths::Ini()) != 0) {
+    g_enterLog = GetPrivateProfileIntA("Coop", "BrainEnterProbe", 0, Paths::Ini()) != 0 ? 1 : 0;
+    g_actId = GetPrivateProfileIntA("Coop", "BrainActIdSync", 0, Paths::Ini()) != 0 ? 1 : 0;
+    if (g_enterLog || g_actId) {
         const bool f = PatchCall(0x01D65A36u, 0x01D63440u, (uint32_t)(uintptr_t)&EnterF);
         const bool a = PatchCall(0x01D65ADDu, 0x01D63440u, (uint32_t)(uintptr_t)&EnterA);
         const bool d = PatchCall(0x01D65CA4u, 0x01D63440u, (uint32_t)(uintptr_t)&EnterD);
-        Log("[Brain] enter probe: forced %s, 1D65A50 %s, dispatch %s\n", f ? "wrapped" : "NOT", a ? "wrapped" : "NOT", d ? "wrapped" : "NOT");
+        Log("[Brain] enter wrappers (probe=%d actid=%d): forced %s, 1D65A50 %s, dispatch %s\n", g_enterLog, g_actId, f ? "wrapped" : "NOT", a ? "wrapped" : "NOT", d ? "wrapped" : "NOT");
     }
     if (g_hitSync && g_chartSync) {   // the node mirror covers 180/181/182 too, so the per-state gate is not installed
         const bool n = PatchCall(0x01D65BE1u, 0x01D634D0u, (uint32_t)(uintptr_t)&NodeW);
@@ -1493,6 +1564,8 @@ void Tick() {
             Log("[Brain] react role=%s cap=%ld nonFde=%ld applied=%ld tokenForced=%ld tokenRescued=%ld tokOver=%ld refused=%ld held=%ld incomplete=%ld buildFail=%ld veto=%ld\n",
                 g_role == 1 ? "host" : "guest", c_reactCap, c_reactNonFde, c_reactApplied, c_reactTokenForced, c_reactTokenRescued, c_reactTokOver,
                 c_reactRefused, c_reactHeld, c_reactIncomplete, c_reactBuildFail, c_reactVeto);
+        if (g_actId)
+            Log("[Brain] actid role=%s tx=%ld same=%ld written=%ld missing=%ld\n", g_role == 1 ? "host" : "guest", c_aidTx, c_aidSame, c_aidWritten, c_aidMissing);
         if (g_chartSync)
             Log("[Brain] chartsync role=%s tx=%ld rx=%ld applied=%ld own=%ld forced=%ld waitFrames=%ld expired=%ld dropped=%ld playoutMs=%d holdSet=%ld holdApplied=%ld holdExpired=%ld\n",
                 g_role == 1 ? "host" : "guest", c_chartTx, c_chartRx, c_chartApplied, c_chartOwn, c_chartForced, c_chartWait, c_chartExpired, c_chartDropped,
