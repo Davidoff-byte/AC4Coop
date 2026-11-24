@@ -55,7 +55,7 @@ const SlotSpec kSlots[] = {
 uint32_t VtOf(int i) { return kSlots[i].vt ? kSlots[i].vt : 0x026E7DC0u; }
 const int kNSlots = sizeof(kSlots) / sizeof(kSlots[0]);
 
-int  g_on = -1, g_delayMs = 0, g_test = 0, g_testDelayMs = 150, g_hitSync = 0, g_chartSync = 0;   // [Coop] BrainHitSync, [Coop] BrainChartSync (default 0)
+int  g_on = -1, g_delayMs = 0, g_test = 0, g_testDelayMs = 150, g_hitSync = 0, g_chartSync = 0, g_playoutMs = 0;   // g_playoutMs: [Coop] BrainPlayoutMs (default 0)   // [Coop] BrainHitSync, [Coop] BrainChartSync (default 0)
 const uint16_t kGate = 0xB5B5;   // command: a host native took attack-substate transition a[1] from state a[0] (permit for the copy)
 const uint16_t kChart = 0xC4A7;   // command: a host native took Ground transition a[1] from node a[0], handler a[2] (BrainChartSync)
 volatile LONG g_role = -1;   // 1 host, 0 guest
@@ -78,7 +78,8 @@ struct Body {
     uint64_t watchUntilUs; uint32_t watchExec; uint8_t in173; uint16_t lastPath[12]; uint8_t lastDepth; int pathLines; uint16_t lastGid; struct { uint16_t st; int32_t code; uint64_t untilMs; } permit[4];
     Cmd pendAtk; uint8_t pendValid; uint8_t hostIn173;   // BrainHitSync host: last attack call, sent when the guard enters 173
     uint32_t fsm;   // cached Ground helper *(ig+0x90), refreshed by NoteBody
-    struct { uint16_t node; int32_t code; uint32_t handler; uint64_t atMs; } cq[8]; int cqn;   // BrainChartSync guest queue
+    struct { uint16_t node; int32_t code; uint32_t handler; uint64_t atMs; uint8_t sched; } cq[8]; int cqn;   // BrainChartSync guest queue
+    struct { uint16_t node; int32_t code; uint32_t handler; uint32_t dueHostMs; uint64_t setMs; } hold;   // BrainPlayoutMs host: a deferred attack start
 };
 const int kBodies = 256;
 Body    g_b[kBodies]; int g_nb = 0;
@@ -350,7 +351,7 @@ bool Execute(uint32_t human, uint32_t ig, uint64_t objId, const Cmd& c, int32_t 
         if (k >= 0) {
             Body& b = g_b[k];
             if (b.cqn == 8) { for (int i = 1; i < 8; ++i) b.cq[i - 1] = b.cq[i]; b.cqn = 7; InterlockedIncrement(&c_chartDropped); }
-            b.cq[b.cqn].node = (uint16_t)c.a[0]; b.cq[b.cqn].code = (int32_t)c.a[1]; b.cq[b.cqn].handler = c.a[2]; b.cq[b.cqn].atMs = GetTickCount64();
+            b.cq[b.cqn].node = (uint16_t)c.a[0]; b.cq[b.cqn].code = (int32_t)c.a[1]; b.cq[b.cqn].handler = c.a[2]; b.cq[b.cqn].atMs = GetTickCount64(); b.cq[b.cqn].sched = c.a[3] == 1;
             ++b.cqn;
         }
         ReleaseSRWLockExclusive(&g_bLock);
@@ -632,13 +633,14 @@ int EvalGate(uint16_t st, uint32_t self, int a2, EvalFn orig, const GateCode* ta
 //   drop it and every older entry. Otherwise the answer is 0 and fsm+8 is restored (the copy waits). Entries expire at
 //   1.5 s. The handler address is the host's, valid here because both run the same exe (build gate).
 typedef int(__thiscall* NodeFn)(uint32_t fsm, int node, int a2);
+volatile LONG c_holdSet = 0, c_holdApplied = 0, c_holdExpired = 0;
 volatile LONG c_chartTx = 0, c_chartApplied = 0, c_chartOwn = 0, c_chartForced = 0, c_chartWait = 0, c_chartExpired = 0, c_chartLines = 0;
 int __fastcall NodeW(uint32_t fsm, uint32_t, int node, int a2) {
     uint32_t saved = 0;
     __try { saved = *(uint32_t*)(fsm + 8); } __except (EXCEPTION_EXECUTE_HANDLER) {}
     const int r = ((NodeFn)0x01D634D0)(fsm, node, a2);
     if (!g_chartSync || g_on != 1 || a2 != 0 || g_role < 0) return r;
-    if (g_role == 1 && !r) return r;   // host: only answers are interesting
+    if (g_role == 1 && !r && !g_playoutMs) return r;   // host: only answers are interesting (and held attack starts)
     bool below163 = false;
     __try {
         unsigned d = *(const uint16_t*)(fsm + 0x11E); if (d > 12) d = 12;
@@ -655,6 +657,56 @@ int __fastcall NodeW(uint32_t fsm, uint32_t, int node, int a2) {
         bool clk = false; const uint32_t now = HostMs(&clk);
         uint32_t handler = 0;
         __try { handler = *(uint32_t*)(fsm + 8); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        // [Coop] BrainPlayoutMs (design section 3, "the host delays its own execution by the same amount"): only attack starts
+        // (a transition whose target, the low 10 bits, is 173) are held, so animations keep their native length. The host
+        // sends the kept attack call at once (the copy only fills its request record with it) and the transition stamped
+        // now + D; it holds its own transition for D, freezing this guard's other fight transitions meanwhile (at most 500 ms).
+        if (g_playoutMs && clk) {
+            const uint64_t tick = GetTickCount64();
+            bool holding = false, due = false; uint16_t hn = 0; int32_t hc = 0; uint32_t hh = 0;
+            AcquireSRWLockExclusive(&g_bLock);
+            if (k < g_nb && g_b[k].objId == objId && g_b[k].hold.setMs) {
+                if (tick - g_b[k].hold.setMs > 500) { g_b[k].hold.setMs = 0; InterlockedIncrement(&c_holdExpired); }
+                else {
+                    holding = true; hn = g_b[k].hold.node; hc = g_b[k].hold.code; hh = g_b[k].hold.handler;
+                    due = (int32_t)(now - g_b[k].hold.dueHostMs) >= 0;
+                    if (due && hn == (uint16_t)node) g_b[k].hold.setMs = 0;
+                }
+            }
+            ReleaseSRWLockExclusive(&g_bLock);
+            if (holding) {
+                if (due && hn == (uint16_t)node) {
+                    __try { *(uint32_t*)(fsm + 8) = hh; } __except (EXCEPTION_EXECUTE_HANDLER) {}
+                    InterlockedIncrement(&c_holdApplied);
+                    return hc;
+                }
+                __try { *(uint32_t*)(fsm + 8) = saved; } __except (EXCEPTION_EXECUTE_HANDLER) {}
+                return 0;
+            }
+            if (r && !(r & 0x80000000) && (r & 0x3FF) == 173 && PeerReady()) {
+                Cmd atk; bool haveAtk = false; uint32_t human = 0;
+                AcquireSRWLockExclusive(&g_bLock);
+                if (k < g_nb && g_b[k].objId == objId) {
+                    Body& b = g_b[k];
+                    b.hold.node = (uint16_t)node; b.hold.code = r; b.hold.handler = handler; b.hold.dueHostMs = now + (uint32_t)g_playoutMs; b.hold.setMs = tick;
+                    if (b.pendValid) { atk = b.pendAtk; b.pendValid = 0; haveAtk = true; }
+                    human = b.human;
+                }
+                ReleaseSRWLockExclusive(&g_bLock);
+                if (haveAtk) {
+                    atk.execHostMs = now; Publish(objId, atk); InterlockedIncrement(&c_atkSent);
+                    Watch(human, now);   // both sides' s173 lines key on this execMs (tools/brain_check.py)
+                } else InterlockedIncrement(&c_atkNoCall);
+                Cmd c = {}; c.slot = kChart; c.a[0] = (uint32_t)node; c.a[1] = (uint32_t)r; c.a[2] = handler; c.a[3] = 1;
+                c.execHostMs = now + (uint32_t)g_playoutMs;
+                Publish(objId, c); InterlockedIncrement(&c_chartTx); InterlockedIncrement(&c_holdSet);
+                if (InterlockedIncrement(&c_chartLines) <= 150)
+                    Log("[Brain] hold role=host id=%016llX node=%d code=%d (-> 173) dueMs=%u atk=%d\n", (unsigned long long)objId, node, r, now + g_playoutMs, haveAtk ? 1 : 0);
+                __try { *(uint32_t*)(fsm + 8) = saved; } __except (EXCEPTION_EXECUTE_HANDLER) {}
+                return 0;
+            }
+            if (!r) return r;
+        }
         if (clk && PeerReady()) {
             Cmd c = {}; c.slot = kChart; c.a[0] = (uint32_t)node; c.a[1] = (uint32_t)r; c.a[2] = handler; c.execHostMs = now;
             Publish(objId, c); InterlockedIncrement(&c_chartTx);
@@ -677,7 +729,7 @@ int __fastcall NodeW(uint32_t fsm, uint32_t, int node, int a2) {
         for (int i = b.cqn - 1; i >= 0; --i)
             if (b.cq[i].node == (uint16_t)node) {
                 age = ms - b.cq[i].atMs;
-                if (r || age >= 100) {
+                if (r || age >= 100 || b.cq[i].sched) {   // sched: a playout-delayed entry, released by Execute at its execMs
                     code = b.cq[i].code; handler = b.cq[i].handler; apply = true;
                     int m = 0; for (int q = i + 1; q < b.cqn; ++q) b.cq[m++] = b.cq[q];   // drop it and every older entry
                     b.cqn = m;
@@ -804,6 +856,8 @@ void Init() {
     g_testDelayMs = GetPrivateProfileIntA("Coop", "BrainTestDelayMs", 150, Paths::Ini());
     g_hitSync = GetPrivateProfileIntA("Coop", "BrainHitSync", 0, Paths::Ini()) != 0 ? 1 : 0;
     g_chartSync = GetPrivateProfileIntA("Coop", "BrainChartSync", 0, Paths::Ini()) != 0 ? 1 : 0;
+    g_playoutMs = GetPrivateProfileIntA("Coop", "BrainPlayoutMs", 0, Paths::Ini());
+    if (g_playoutMs < 0 || g_playoutMs > 500) g_playoutMs = 0;
     if (g_on) Log("[Brain] Brain=1 delayMs=%d test=%d testDelayMs=%d (needs IntentLane=1, PeerClock=1)\n", g_delayMs, g_test, g_testDelayMs);
     if (g_on) Install115();
 }
@@ -895,7 +949,7 @@ void OwnUpdate(void* human) {
     if (k >= 0) { objId = g_b[k].objId; ig = g_b[k].ig; watching = g_b[k].watchUntilUs != 0; lastGid = g_b[k].lastGid; }
     ReleaseSRWLockShared(&g_bLock);
     if (!objId) return;
-    if (g_role == 1 && g_hitSync) {   // BrainHitSync host: send the kept attack call when this native guard enters 173
+    if (g_role == 1 && g_hitSync && !(g_playoutMs && g_chartSync)) {   // BrainHitSync host: send the kept attack call when this native guard enters 173 (with BrainPlayoutMs it goes at the decision, NodeW)
         bool in173 = false;
         __try {
             const uint32_t fsm = *(uint32_t*)(ig + 0x90);
@@ -1070,8 +1124,9 @@ void Tick() {
                 g_role == 1 ? "host" : "guest", c_gate181Tx, c_gatePermits, c_gate181Allowed, c_gateSubst, c_gate181Blocked, c_hitApplied, c_hitRefused, c_hitHeld,
                 c_attackHeld, c_atkBuffered, c_atkSent, c_atkNoCall);
         if (g_chartSync)
-            Log("[Brain] chartsync role=%s tx=%ld rx=%ld applied=%ld own=%ld forced=%ld waitFrames=%ld expired=%ld dropped=%ld\n",
-                g_role == 1 ? "host" : "guest", c_chartTx, c_chartRx, c_chartApplied, c_chartOwn, c_chartForced, c_chartWait, c_chartExpired, c_chartDropped);
+            Log("[Brain] chartsync role=%s tx=%ld rx=%ld applied=%ld own=%ld forced=%ld waitFrames=%ld expired=%ld dropped=%ld playoutMs=%d holdSet=%ld holdApplied=%ld holdExpired=%ld\n",
+                g_role == 1 ? "host" : "guest", c_chartTx, c_chartRx, c_chartApplied, c_chartOwn, c_chartForced, c_chartWait, c_chartExpired, c_chartDropped,
+                g_playoutMs, c_holdSet, c_holdApplied, c_holdExpired);
         if (g_probe115 || g_supp115)
             Log("[Brain] 115 role=%s eval4=%ld eval58=%ld copy4=%ld copy58=%ld native4=%ld native58=%ld unmatched=%ld suppressed=%ld evalCalls=%ld\n",
                 g_role == 1 ? "host" : "guest", c115[0], c115[1], c115Copy[0], c115Copy[1], c115Native[0], c115Native[1], c115Unmatched, c115Supp, c115SelCalls);
