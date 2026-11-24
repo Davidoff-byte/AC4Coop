@@ -102,7 +102,7 @@ int FindObj(uint64_t o) { for (int i = 0; i < g_nb; ++i) if (g_b[i].objId == o) 
 
 // ---- counters ------------------------------------------------------------------------------------
 volatile LONG c_cap[kNSlots] = {}, c_capUnbound = 0, c_tx = 0, c_txFail = 0, c_rx = 0, c_rxStaleBase = 0, c_exec = 0, c_execFail = 0,
-              c_stale = 0, c_noTarget = 0, c_noBody = 0, c_noClock = 0, c_s173 = 0, c_queueFull = 0, c_notReady = 0, c_enterRefused = 0, c_dupDropped = 0, c_alreadyFight = 0, c_gatePermits = 0, c_hitLines = 0, c_hitHeld = 0, c_hitApplied = 0, c_hitRefused = 0, c_gate181Tx = 0, c_gate181Blocked = 0, c_gate181Allowed = 0, c_gateSubst = 0, c_attackHeld = 0, c_atkBuffered = 0, c_atkSent = 0, c_atkNoCall = 0, c_chartDropped = 0, c_chartRx = 0, c_puppetTx = 0, c_ppathLines = 0, c_pcapLines = 0, c_capLines = 0, c_execLines = 0;
+              c_stale = 0, c_noTarget = 0, c_noBody = 0, c_noClock = 0, c_s173 = 0, c_queueFull = 0, c_notReady = 0, c_enterRefused = 0, c_dupDropped = 0, c_alreadyFight = 0, c_gatePermits = 0, c_hitLines = 0, c_hitHeld = 0, c_hitApplied = 0, c_hitRefused = 0, c_gate181Tx = 0, c_gate181Blocked = 0, c_gate181Allowed = 0, c_gateSubst = 0, c_attackHeld = 0, c_atkBuffered = 0, c_atkSent = 0, c_atkNoCall = 0, c_chartDropped = 0, c_chartRx = 0, c_puppetTx = 0, c_ppathLines = 0, c_pcapLines = 0, c_evtLines = 0, c_capLines = 0, c_execLines = 0;
 LONG    g_late[64]; volatile LONG g_lateN = 0;   // last 64 lateness samples (ms) for the report
 
 // Host: the guest is in a world and answering. Its PeerClock role is set only from a player frame (OnFrameInner), so the
@@ -645,6 +645,18 @@ int __fastcall NodeW(uint32_t fsm, uint32_t, int node, int a2) {
     uint32_t saved = 0;
     __try { saved = *(uint32_t*)(fsm + 8); } __except (EXCEPTION_EXECUTE_HANDLER) {}
     const int r = ((NodeFn)0x01D634D0)(fsm, node, a2);
+    if (g_chartSync && g_on == 1 && g_role == 1 && a2 != 0 && r) {   // probe: event-driven transitions on registered host bodies
+        uint64_t eo = 0;
+        if (BodyOfFsm(fsm, &eo) >= 0 && InterlockedIncrement(&c_evtLines) <= 400) {
+            uint32_t ev[6] = {};
+            __try { for (int i = 0; i < 6; ++i) ev[i] = ((const uint32_t*)(uintptr_t)a2)[i]; } __except (EXCEPTION_EXECUTE_HANDLER) {}
+            uint32_t handler = 0;
+            __try { handler = *(uint32_t*)(fsm + 8); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+            bool clk = false; const uint32_t now = HostMs(&clk);
+            Log("[Brain] evt id=%016llX node=%d code=%d (-> %d, level %d) handler=%08X a2=%08X [%08X %08X %08X %08X %08X %08X] hostMs=%u\n",
+                (unsigned long long)eo, node, r, r & 0x3FF, (r >> 10) & 0x3FF, handler, (uint32_t)a2, ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], now);
+        }
+    }
     if (!g_chartSync || g_on != 1 || a2 != 0 || g_role < 0) return r;
     if (g_role == 1 && !r && !g_playoutMs) return r;   // host: only answers are interesting (and held attack starts)
     bool below163 = false;
