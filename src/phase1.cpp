@@ -1407,12 +1407,41 @@ static volatile uint32_t g_capPlayerEnt = 0;          // the local player Entity
 static volatile LONG     g_pwSeq = 0, g_pwCount = 0;   // seqlock counter (odd = writing) / writes seen
 static float             g_pwM[16]; static volatile uint64_t g_pwUs = 0;
 static uint64_t OwnNowUs();                            // QPC microseconds, defined with the smoothing instrumentation
-static void PlayerWriteNote(const float* m) {          // SgmDetour's thread, for the local player's write
+// Live trace 2026-11-24 (host 18348, probe server WWATCH on player+0x40, 6 s of free-run): 462 writes, all at 0x63C2F5 (sub_63C2D0, the
+// movaps copy called from SetGlobalMatrixInternal at 0x52820F, return 0x528214), on 19 different job threads and never the main thread
+// (18368), while the capture reads m_GlobalMatrix on the main thread. SetGlobalMatrixInternal is reached through a vtable (data ref
+// 0x01E4A160). The installed ini had HookSgm=0, so SgmDetour was not patched in - the 0 writes per capture of the first A/B.
+static volatile LONG g_pwLock = 0;
+static void PlayerWriteNote(const float* m) {          // a job thread, for the local player's write (several may race)
+    while (InterlockedExchange(&g_pwLock, 1)) YieldProcessor();
     InterlockedIncrement(&g_pwSeq);
     for (int i = 0; i < 16; ++i) g_pwM[i] = m[i];
     g_pwUs = OwnNowUs();
     InterlockedIncrement(&g_pwSeq);
+    InterlockedExchange(&g_pwLock, 0);
     InterlockedIncrement(&g_pwCount);
+}
+// A detour of its own on SetGlobalMatrixInternal for CaptureAtWrite when HookSgm=0 (SgmDetour keeps per-call state in globals - review
+// C4 - and runs the ship/entity-sync body on every call). This one passes this and the matrix pointer on the stack and only compares.
+static uint32_t g_pwJmpBack = 0;
+static void __cdecl PwNote(uint32_t thisEnt, const float* m) {
+    if (thisEnt && thisEnt == g_capPlayerEnt && m) { __try { PlayerWriteNote(m); } __except (EXCEPTION_EXECUTE_HANDLER) {} }
+}
+static __declspec(naked) void PwDetour() {
+    __asm {
+        pushad
+        mov  eax, [esp+0x24]     // arg1 = the matrix being written (pushad 0x20 + return address)
+        push eax
+        mov  eax, [esp+0x1C]     // ECX saved by pushad (+0x18), +4 for the push above = this
+        push eax
+        call PwNote
+        add  esp, 8
+        popad
+        push ebp                 // the stolen bytes 55 8B EC 8B 45 08
+        mov  ebp, esp
+        mov  eax, [ebp+0x8]
+        jmp  g_pwJmpBack
+    }
 }
 static bool PlayerWriteRead(float* m, uint64_t* us) {
     for (int tries = 0; tries < 4; ++tries) {
@@ -2670,9 +2699,9 @@ static uint32_t s_cpPend = 0, s_cpPendPrev = 0; static uint64_t s_cpPendMs = 0, 
 // Two copies on one PC render at uneven frame times, and |p - 2p1 + p0| counts that as jerk (at 6 m/s an 8 ms frame-time step alone
 // gives ~5 cm). Buckets a > 20 / 50 / 100 m/s^2 (gravity is 9.8).
 struct AccelStat { uint32_t frames, a20, a50, a100; float amax; float p1[3]; uint64_t t1; float v1[3]; int n; };
-static void AccelNote(AccelStat& st, float x, float y, float z) {
+static void AccelNote(AccelStat& st, float x, float y, float z, uint64_t atUs = 0) {
     LARGE_INTEGER c, f; QueryPerformanceCounter(&c); QueryPerformanceFrequency(&f);
-    const uint64_t t = (uint64_t)(c.QuadPart * 1000000.0 / f.QuadPart);
+    const uint64_t t = atUs ? atUs : (uint64_t)(c.QuadPart * 1000000.0 / f.QuadPart);   // CaptureAtWrite: the write time
     if (st.n >= 1 && t > st.t1) {
         const float dt = (float)(t - st.t1) / 1e6f;
         const float v[3] = { (x - st.p1[0]) / dt, (y - st.p1[1]) / dt, (z - st.p1[2]) / dt };
@@ -2726,7 +2755,7 @@ static void ClimbProbeHostPos(const PlayerState& s) {   // the local player's ca
     const float x = s.matrix.M41, y = s.matrix.M42, z = s.matrix.M43;
     if (!OffGroundCtx(s.contextId)) { n = 0; s_accHost.n = 0; prevStep = 0.0f; }
     else {
-        AccelNote(s_accHost, x, y, z);
+        AccelNote(s_accHost, x, y, z, g_capWriteUs);   // the time of the sample sent (write time with CaptureAtWrite)
         if (n >= 1) {   // a capture that repeats the previous position while moving (> 8 mm the frame before)
             const int li = n == 1 ? 0 : 1;
             const float sx = x - P[li][0], sy = y - P[li][1], sz = z - P[li][2], step = sqrtf(sx * sx + sy * sy + sz * sz);
@@ -16620,6 +16649,18 @@ void Phase1::InstallFrameHook() {
         sgm[5] = 0x90;
         VirtualProtect(sgm, 6, old, &old);
         OutputDebugStringA("[Phase1] SGM hook installed (ship transform-write tracer)\n");
+    } else if (GetPrivateProfileIntA("Coop", "CaptureAtWrite", 0, Paths::Ini()) != 0) {   // [Coop] CaptureAtWrite: PwDetour
+        uint8_t* sgm = (uint8_t*)(b + 0x128200);
+        static const uint8_t kStolen[6] = { 0x55, 0x8B, 0xEC, 0x8B, 0x45, 0x08 };   // push ebp; mov ebp,esp; mov eax,[ebp+8]
+        if (memcmp(sgm, kStolen, 6) == 0) {
+            g_pwJmpBack = (uint32_t)(b + 0x128200 + 6);
+            VirtualProtect(sgm, 6, PAGE_EXECUTE_READWRITE, &old);
+            sgm[0] = 0xE9;
+            *(uint32_t*)(sgm + 1) = (uint32_t)((uint8_t*)&PwDetour - sgm - 5);
+            sgm[5] = 0x90;
+            VirtualProtect(sgm, 6, old, &old);
+            L("[Climb] CaptureAtWrite: PwDetour on SetGlobalMatrixInternal 0x528200\n");
+        } else L("[Climb] CaptureAtWrite: 0x528200 bytes differ, not patched\n");
     }
 }
 
