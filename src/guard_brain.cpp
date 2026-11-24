@@ -653,7 +653,9 @@ int __fastcall NodeW(uint32_t fsm, uint32_t, int node, int a2) {
         const uint16_t* p = *(const uint16_t* const*)(fsm + 0x118);
         int i163 = -1, in = -1;
         for (unsigned i = 0; i < d; ++i) { if (p[i] == 163 && i163 < 0) i163 = (int)i; if (p[i] == (uint16_t)node && in < 0) in = (int)i; }
-        below163 = i163 >= 0 && in > i163;
+        // Run 21 smoke: node 163 itself chooses the fight branch (166 / 268 / 317) and leaving the fight; with it excluded the
+        // puppet left the fight on its own while the host player went 163/317 and 163/268. So 163 is inside the region.
+        below163 = i163 >= 0 && in >= i163;
     } __except (EXCEPTION_EXECUTE_HANDLER) { below163 = false; }
     if (!below163) return r;
     uint64_t objId = 0;
