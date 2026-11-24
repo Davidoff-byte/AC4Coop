@@ -69,6 +69,7 @@ uint32_t VtOf(int i) { return kSlots[i].vt ? kSlots[i].vt : 0x026E7DC0u; }
 const int kNSlots = sizeof(kSlots) / sizeof(kSlots[0]);
 
 int  g_actId = 0;   // [Coop] BrainActIdSync (default 0)
+int  g_blkSync = 0;   // [Coop] BrainBlockSync (default 0)
 int  g_pathAuth = 0, g_pathSetMs = 0;   // [Coop] BrainPathAuthority (default 0), [Coop] BrainPathSetMs (default 0 = no corrector)
 int  g_on = -1, g_delayMs = 0, g_test = 0, g_testDelayMs = 150, g_hitSync = 0, g_chartSync = 0, g_playoutMs = 0, g_puppet = 0, g_react = 0;   // g_react: [Coop] BrainReact (default 0)   // g_puppet: [Coop] BrainPuppet (default 0)   // g_playoutMs: [Coop] BrainPlayoutMs (default 0)   // [Coop] BrainHitSync, [Coop] BrainChartSync (default 0)
 const uint16_t kGate = 0xB5B5;   // command: a host native took attack-substate transition a[1] from state a[0] (permit for the copy)
@@ -76,6 +77,7 @@ const uint16_t kChart = 0xC4A7;   // command: a host native took Ground transiti
 // [Coop] BrainPuppet: the host player (host) and the guest's puppet of it (guest) are one brain body under this fixed id, so capture,
 // the chart mirror and the hit replay apply to them unchanged. Not a guard objId (guard ids are 0x00000000Fxxxxxxx).
 const uint64_t kPuppetWire = 0x5055505045540001ull;
+const uint16_t kBlk = 0xB10C;     // BrainBlockSync: one 24-byte chunk (tgt = index 0..3, execHostMs = message seq) of a BlkMsg
 const uint16_t kPath = 0xBA70;    // BrainPathAuthority: host body's whole Ground path, nargs = depth, 12 u16 in a[0..3] + tgtObj
 const uint16_t kActId = 0xA1D5;   // BrainActIdSync: host entered state a[0] with outgoing action-block id a[1] (route a[2])
 const uint16_t kReact = 0xD0D1, kReactData = 0xD0D0;   // BrainReact: header {slot, seq, attacker} and 5 data chunks of 20 bytes (AtkFields)
@@ -105,6 +107,8 @@ struct Body {
     struct { uint16_t target; uint32_t aid; uint64_t atMs; } aq[4]; int aqn;   // BrainActIdSync guest queue (host ids by entered state)
     struct { uint16_t n[12]; uint8_t d; uint64_t atMs; } hp[8]; int hpn;   // BrainPathAuthority guest: the host's last paths, newest last
     uint32_t ptxHash; uint64_t misSince, lastSetMs;                         // BrainPathAuthority: host last sent path / guest mismatch timer
+    uint32_t bseq; uint8_t bmask; uint8_t bbuf[96];                         // BrainBlockSync guest: reassembly of one request message
+    struct { uint8_t m[96]; uint64_t atMs; } bq[4]; int bqn;                // BrainBlockSync guest: complete host requests, newest last
     struct { uint16_t node; int32_t code; uint32_t handler; uint32_t dueHostMs; uint64_t setMs; } hold;   // BrainPlayoutMs host: a deferred attack start
 };
 const int kBodies = 256;
@@ -1141,7 +1145,8 @@ typedef int(__thiscall* ForcedFn)(uint32_t fsm, int code);
 volatile LONG c_pathTx = 0, c_pathRx = 0, c_pathNoBody = 0, c_childOver = 0, c_childSame = 0, c_childNone = 0, c_childLines = 0,
               c_psetApplied = 0, c_psetFail = 0, c_psetSkipReact = 0, c_psetPrefix = 0, c_psetLines = 0;
 // Safe swaps. Run 30 (owner fight): the puppet's 173 entry picked 178 (attack step) and the override put it in the host's 190
-// ("open defense"); 190's chooser sub_1869080 reads the opponent handle *(fsm+0x1B8) (a1[110]), which the local decision had
+// ("open defense"); 190's chooser sub_1869080 (ecx = *(fsm+0x74), the action object: sub_1CBEFA0 `mov ecx,[eax+74h]`, cc/g56)
+// reads the opponent handle *(ao+0x1B8) (a1[110]), which the local decision had
 // not set, and faulted at 0x1869112 `mov ecx,[esi+8]` with esi = 0 (dump run30-guest-31420: AC4Coop EntryW -> sub_1D5E6E0 ->
 // sub_1CBEFA0 -> sub_1869080). A child can need data that only its own decision prepares, so a child is swapped (and the
 // corrector enters a node) only between siblings listed here; every other pair is refused and logged.
@@ -1304,10 +1309,192 @@ void PathCorrect(uint64_t objId, uint32_t ig) {   // guest, at the copy's update
     }
 }
 
+// ---- [Coop] BrainBlockSync (default 0): the request that drives a state's descent, carried with the state ------------------
+// Map (IDA cc/g56-g60, AC4BFSP.exe md5 2058342866688f780c8b34526a65bc35):
+//   Ground action blocks: two 0x4A0-byte blocks at fsm+0x130 / fsm+0x5D0, current = *(fsm+0xA70); dword 0 = request id, +0x10 =
+//     payload, +0x490 = cleanup fn, cdecl(payload*), run by sub_1CBEC30 when the block is switched to (and then zeroed).
+//   A transition handler (dispatch: after the evaluator, before the pop and sub_1D63440) writes the request into the current
+//     block; e.g. sub_1CCDA00 (cdecl fsm; ecx = *(fsm+0x74)) -> sub_1859A30, which also draws the attack variant with the game's
+//     one shared LCG sub_412340 (*(dword_4DD992C+4) = 1664525 v + 1013904223) into the action object (ao = *(fsm+0x74)) at
+//     +0x168 (this[90]), and writes 457 / 458 / 459 (sub_1CC5930 / 1CC5970 / 1CC59B0).
+//   Parent entries pass ecx = ao to a chooser that tests the request id of the block that is no longer current (predicates
+//     sub_1CBDxxx: 354, 359, 458, 573, ...), reads its payload (sub_1CC9EE0 = that block + 0x10) and ao fields (ao+0x1B8 =
+//     opponent HandleContainer, a1[110]), then a maker writes the next request into the new current block, its cleanup, and the
+//     child into u16 fsm+4 (sub_1CB9D10: 423 -> 303; sub_1CC9930: 488 -> 166 with payload[0]; sub_1CC9980: 435 -> 268 with
+//     payload +0..+40; sub_1CE9490: 493 -> 166 with payload[0] = a HandleContainer + 1 reference, cleanup sub_1CE86A0).
+//   So a copy that reruns the handler draws its own variant and has no request data of the host (run 30: no opponent handle).
+// Host: at each entry of a registered body inside the fight region (wrappers before sub_1D63440), sends the current block's id,
+//   cleanup and payload +0..+40 (each dword: raw, or an entity / that entity's HandleContainer *(ent+0xC8) mapped to an id, or
+//   "keep" when it is another committed address), ao+0x168 and the entity behind ao+0x1B8. 96 bytes in 4 chunks.
+// Guest: at the same entry, installs them before the native enter, so the native choosers pick from the host's data:
+//   the old cleanup is run on the old payload first (as sub_1CBEC30 would later), the payload written, one reference added to a
+//   HandleContainer dword when the cleanup releases it. Only cleanups nullsub_26 (0x1426100) and sub_1CE86A0 (releases
+//   payload[0], verified cc/g59) are handled; any other cleanup on either side: the block is left alone and the id logged.
+//   ao+0x1B8 is replaced with a reference to the mapped entity's container (old one released with sub_1CE86A0).
+// UNVERIFIED: payloads longer than 40 bytes; ao fields other than +0x168 / +0x1B8 that choosers read.
+#pragma pack(push, 1)
+struct BlkMsg {
+    uint16_t target; uint8_t tcls; uint8_t ntab;   // entered node; class of ao+0x1B8's entity (0 none); table entries
+    uint32_t kinds;                                // 2 bits per payload dword: 0 raw, 1 entity tab[i], 2 container of tab[i], 3 keep
+    uint32_t id, cleanup, variant;
+    uint32_t p[10];
+    uint64_t tobj;                                 // ao+0x1B8 entity objId (tcls == TG_GUARD)
+    uint8_t  tabCls[4]; uint64_t tab[3];           // mapped entities: class + objId
+};
+#pragma pack(pop)
+static_assert(sizeof(BlkMsg) == 96, "BlkMsg is 4 chunks of 24 bytes");
+const uint32_t kNullsub26 = 0x01426100u, kHandleRelease = 0x01CE86A0u;
+typedef void(__cdecl* CleanupFn)(uint32_t* payload);
+volatile LONG c_blkTx = 0, c_blkKeep = 0, c_blkRx = 0, c_blkWritten = 0, c_blkSame = 0, c_blkMissing = 0, c_blkUnres = 0,
+              c_blkCleanupRefused = 0, c_blkTgtSet = 0, c_blkVarSet = 0, c_blkLines = 0;
+volatile LONG g_blkSeq = 0;
+bool InFight(uint32_t fsm) { uint16_t n[12]; unsigned d = 0; return ReadPath(fsm, n, &d) && IndexOf(n, d, 163) >= 0; }
+uint32_t HcObj(uint32_t hc) {   // HandleContainer -> object ((*(hc+8) >> 31) & *hc, as sub_1869080 / sub_183F110 read it)
+    __try { return hc ? (uint32_t)(((int32_t) * (const uint32_t*)(hc + 8) >> 31) & *(const uint32_t*)hc) : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+uint32_t EntHc(uint32_t ent) { __try { return ent ? *(const uint32_t*)(ent + 0xC8) : 0; } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; } }
+uint32_t ResolveEnt(uint8_t cls, uint64_t obj) {   // guest
+    if (cls == TG_HOST_PLAYER) return (uint32_t)(uintptr_t)Phase1_PuppetEntity();
+    if (cls == TG_GUEST_PLAYER) return (uint32_t)(uintptr_t)Phase1_LocalPlayerEntity();
+    if (cls != TG_GUARD) return 0;
+    AcquireSRWLockShared(&g_bLock);
+    const int k = FindObj(obj); const uint32_t e = k >= 0 ? g_b[k].ent : 0;
+    ReleaseSRWLockShared(&g_bLock);
+    return e;
+}
+void BlkTx(uint32_t fsm, int target, uint64_t objId) {   // host
+    BlkMsg m = {}; m.target = (uint16_t)target;
+    uint32_t blk = 0, ao = 0, tgtHc = 0;
+    __try {
+        blk = *(const uint32_t*)(fsm + 0xA70); ao = *(const uint32_t*)(fsm + 0x74);
+        m.id = *(const uint32_t*)blk; m.cleanup = *(const uint32_t*)(blk + 0x490);
+        for (int i = 0; i < 10; ++i) m.p[i] = *(const uint32_t*)(blk + 0x10 + 4 * i);
+        if (ao) { m.variant = *(const uint32_t*)(ao + 0x168); tgtHc = *(const uint32_t*)(ao + 0x1B8); }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+    for (int i = 0; i < 10; ++i) {
+        const uint32_t v = m.p[i];
+        if (v < 0x10000u || !Rd((void*)(uintptr_t)v, 4)) continue;   // not a committed address: raw
+        int kind = 3; uint64_t o = 0; TargetClass cls = ClassOf(v, &o);
+        if (cls != TG_OTHER && cls != TG_NONE) kind = 1;
+        else {
+            const uint32_t obj = HcObj(v);   // is v a HandleContainer of a known entity?
+            if (obj && obj != v && Rd((void*)(uintptr_t)obj, 4) && EntHc(obj) == v) { cls = ClassOf(obj, &o); if (cls != TG_OTHER && cls != TG_NONE) kind = 2; }
+        }
+        if (kind != 3) {
+            int t = -1;
+            for (int j = 0; j < m.ntab; ++j) if (m.tabCls[j] == cls && m.tab[j] == o) t = j;
+            if (t < 0 && m.ntab < 3) { t = m.ntab++; m.tabCls[t] = (uint8_t)cls; m.tab[t] = o; }
+            if (t < 0) kind = 3; else m.p[i] = (uint32_t)t;
+        }
+        if (kind == 3) InterlockedIncrement(&c_blkKeep);
+        m.kinds |= (uint32_t)kind << (2 * i);
+    }
+    const uint32_t tobj = HcObj(tgtHc);
+    if (tobj) { uint64_t o = 0; const TargetClass c = ClassOf(tobj, &o); if (c != TG_OTHER && c != TG_NONE) { m.tcls = (uint8_t)c; m.tobj = o; } }
+    bool clk = false; const uint32_t now = HostMs(&clk);
+    if (!clk || !PeerReady()) return;
+    const uint32_t seq = (uint32_t)InterlockedIncrement(&g_blkSeq);
+    const uint8_t* b = (const uint8_t*)&m;
+    for (int i = 0; i < 4; ++i) {
+        Cmd c = {}; c.slot = kBlk; c.tgt = (uint8_t)i; c.nargs = 0; c.execHostMs = seq;
+        memcpy(c.a, b + 24 * i, 16); memcpy(&c.tgtObj, b + 24 * i + 16, 8);
+        Publish(objId, c);
+    }
+    InterlockedIncrement(&c_blkTx);
+    (void)now;
+}
+void BlkRx(uint64_t objId, const Cmd& c) {   // guest, at receive time
+    if (c.tgt > 3) return;
+    AcquireSRWLockExclusive(&g_bLock);
+    const int k = FindObj(objId);
+    if (k >= 0) {
+        Body& b = g_b[k];
+        if (b.bseq != c.execHostMs) { b.bseq = c.execHostMs; b.bmask = 0; }
+        memcpy(b.bbuf + 24 * c.tgt, c.a, 16); memcpy(b.bbuf + 24 * c.tgt + 16, &c.tgtObj, 8);
+        b.bmask |= (uint8_t)(1u << c.tgt);
+        if (b.bmask == 0xF) {
+            if (b.bqn == 4) { for (int i = 1; i < 4; ++i) b.bq[i - 1] = b.bq[i]; b.bqn = 3; }
+            memcpy(b.bq[b.bqn].m, b.bbuf, 96); b.bq[b.bqn].atMs = GetTickCount64(); ++b.bqn;
+            b.bmask = 0; InterlockedIncrement(&c_blkRx);
+        }
+    }
+    ReleaseSRWLockExclusive(&g_bLock);
+}
+void SetHc(uint32_t slot, uint32_t hc) {   // *(slot) = hc with one new reference; the old one released with sub_1CE86A0
+    if (!hc) return;
+    InterlockedIncrement((volatile LONG*)(hc + 4));
+    uint32_t old = (uint32_t)InterlockedExchange((volatile LONG*)slot, (LONG)hc);
+    if (old) ((CleanupFn)kHandleRelease)(&old);
+}
+void BlkAt(uint32_t fsm, int target) {   // both roles, in the enter wrappers before sub_1D63440
+    if (!g_blkSync || g_on != 1 || g_role < 0 || !InFight(fsm)) return;
+    uint64_t objId = 0;
+    const int k = BodyOfFsm(fsm, &objId);
+    if (k < 0) return;
+    if (g_role == 1) { BlkTx(fsm, target, objId); return; }
+    BlkMsg m; bool have = false; const uint64_t ms = GetTickCount64();
+    AcquireSRWLockExclusive(&g_bLock);
+    if (k < g_nb && g_b[k].objId == objId) {
+        Body& b = g_b[k];
+        for (int i = b.bqn - 1; i >= 0; --i) {
+            BlkMsg q; memcpy(&q, b.bq[i].m, sizeof(q));
+            if (q.target == (uint16_t)target && ms - b.bq[i].atMs <= 1500) {
+                m = q; have = true;
+                int n = 0; for (int j = i + 1; j < b.bqn; ++j) b.bq[n++] = b.bq[j];   // drop it and every older entry
+                b.bqn = n; break;
+            }
+        }
+    }
+    ReleaseSRWLockExclusive(&g_bLock);
+    if (!have) { InterlockedIncrement(&c_blkMissing); return; }
+    uint32_t ents[3] = {};
+    for (int j = 0; j < m.ntab && j < 3; ++j) { ents[j] = ResolveEnt(m.tabCls[j], m.tab[j]); if (!ents[j]) { InterlockedIncrement(&c_blkUnres); return; } }
+    uint32_t blk = 0, ao = 0, oldId = 0, oldCleanup = 0;
+    __try { blk = *(const uint32_t*)(fsm + 0xA70); ao = *(const uint32_t*)(fsm + 0x74); oldId = *(const uint32_t*)blk; oldCleanup = *(const uint32_t*)(blk + 0x490); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+    uint32_t p[10];
+    for (int i = 0; i < 10; ++i) {
+        const uint32_t kind = (m.kinds >> (2 * i)) & 3;
+        if (kind == 0) p[i] = m.p[i];
+        else if (kind == 1) p[i] = m.p[i] < 3 ? ents[m.p[i]] : 0;
+        else if (kind == 2) p[i] = m.p[i] < 3 ? EntHc(ents[m.p[i]]) : 0;
+        else { __try { p[i] = *(const uint32_t*)(blk + 0x10 + 4 * i); } __except (EXCEPTION_EXECUTE_HANDLER) { return; } }
+    }
+    const bool okNew = m.cleanup == 0 || m.cleanup == kNullsub26 || (m.cleanup == kHandleRelease && ((m.kinds & 3) == 2));
+    const bool okOld = oldCleanup == 0 || oldCleanup == kNullsub26 || oldCleanup == kHandleRelease;
+    bool wrote = false, same = false;
+    __try {
+        uint32_t cur[10]; for (int i = 0; i < 10; ++i) cur[i] = *(const uint32_t*)(blk + 0x10 + 4 * i);
+        same = oldId == m.id && oldCleanup == m.cleanup && memcmp(cur, p, sizeof(p)) == 0;
+        if (!same && okNew && okOld) {
+            if (oldCleanup && oldCleanup != kNullsub26) ((CleanupFn)oldCleanup)((uint32_t*)(blk + 0x10));   // as sub_1CBEC30 would
+            for (int i = 0; i < 10; ++i) *(uint32_t*)(blk + 0x10 + 4 * i) = p[i];
+            if (m.cleanup == kHandleRelease && p[0]) InterlockedIncrement((volatile LONG*)(p[0] + 4));   // the reference it releases
+            *(uint32_t*)(blk + 0x490) = m.cleanup;
+            *(uint32_t*)blk = m.id;
+            wrote = true;
+        }
+        if (ao) {
+            if (*(const uint32_t*)(ao + 0x168) != m.variant) { *(uint32_t*)(ao + 0x168) = m.variant; InterlockedIncrement(&c_blkVarSet); }
+            if (m.tcls) {
+                const uint32_t e = ResolveEnt(m.tcls, m.tobj), hc = EntHc(e);
+                if (hc && *(const uint32_t*)(ao + 0x1B8) != hc) { SetHc(ao + 0x1B8, hc); InterlockedIncrement(&c_blkTgtSet); }
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+    if (same) InterlockedIncrement(&c_blkSame);
+    else if (wrote) InterlockedIncrement(&c_blkWritten);
+    else InterlockedIncrement(&c_blkCleanupRefused);
+    if (!same && InterlockedIncrement(&c_blkLines) <= 300)
+        Log("[Brain] blk guest id=%016llX enter=%d local=%u host=%u cleanup %08X->%08X %s tgt=%u var=%u\n", (unsigned long long)objId, target,
+            oldId, m.id, oldCleanup, m.cleanup, wrote ? "written" : "REFUSED (cleanup not handled)", m.tcls, m.variant);
+}
+
 int g_enterLog = 0;
-int __fastcall EnterF(uint32_t fsm, uint32_t, int target) { if (g_enterLog) EnterLog(0, fsm, target, (void**)_AddressOfReturnAddress()); ActIdAt(0, fsm, target); const int r = ((EnterFn)0x01D63440)(fsm, target); PathTx(fsm); return r; }
-int __fastcall EnterA(uint32_t fsm, uint32_t, int target) { if (g_enterLog) EnterLog(1, fsm, target, (void**)_AddressOfReturnAddress()); ActIdAt(1, fsm, target); const int r = ((EnterFn)0x01D63440)(fsm, target); PathTx(fsm); return r; }
-int __fastcall EnterD(uint32_t fsm, uint32_t, int target) { if (g_enterLog) EnterLog(2, fsm, target, (void**)_AddressOfReturnAddress()); ActIdAt(2, fsm, target); const int r = ((EnterFn)0x01D63440)(fsm, target); PathTx(fsm); return r; }
+int __fastcall EnterF(uint32_t fsm, uint32_t, int target) { if (g_enterLog) EnterLog(0, fsm, target, (void**)_AddressOfReturnAddress()); ActIdAt(0, fsm, target); BlkAt(fsm, target); const int r = ((EnterFn)0x01D63440)(fsm, target); PathTx(fsm); return r; }
+int __fastcall EnterA(uint32_t fsm, uint32_t, int target) { if (g_enterLog) EnterLog(1, fsm, target, (void**)_AddressOfReturnAddress()); ActIdAt(1, fsm, target); BlkAt(fsm, target); const int r = ((EnterFn)0x01D63440)(fsm, target); PathTx(fsm); return r; }
+int __fastcall EnterD(uint32_t fsm, uint32_t, int target) { if (g_enterLog) EnterLog(2, fsm, target, (void**)_AddressOfReturnAddress()); ActIdAt(2, fsm, target); BlkAt(fsm, target); const int r = ((EnterFn)0x01D63440)(fsm, target); PathTx(fsm); return r; }
 
 void Install115() {
     g_probe115 = GetPrivateProfileIntA("Coop", "Brain115Probe", 0, Paths::Ini()) != 0 ? 1 : 0;
@@ -1315,13 +1502,14 @@ void Install115() {
     g_enterLog = GetPrivateProfileIntA("Coop", "BrainEnterProbe", 0, Paths::Ini()) != 0 ? 1 : 0;
     g_actId = GetPrivateProfileIntA("Coop", "BrainActIdSync", 0, Paths::Ini()) != 0 ? 1 : 0;
     g_pathAuth = GetPrivateProfileIntA("Coop", "BrainPathAuthority", 0, Paths::Ini()) != 0 ? 1 : 0;
+    g_blkSync = GetPrivateProfileIntA("Coop", "BrainBlockSync", 0, Paths::Ini()) != 0 ? 1 : 0;
     g_pathSetMs = GetPrivateProfileIntA("Coop", "BrainPathSetMs", 0, Paths::Ini());
     if (g_pathSetMs < 0) g_pathSetMs = 0;
-    if (g_enterLog || g_actId || g_pathAuth) {
+    if (g_enterLog || g_actId || g_pathAuth || g_blkSync) {
         const bool f = PatchCall(0x01D65A36u, 0x01D63440u, (uint32_t)(uintptr_t)&EnterF);
         const bool a = PatchCall(0x01D65ADDu, 0x01D63440u, (uint32_t)(uintptr_t)&EnterA);
         const bool d = PatchCall(0x01D65CA4u, 0x01D63440u, (uint32_t)(uintptr_t)&EnterD);
-        Log("[Brain] enter wrappers (probe=%d actid=%d path=%d): forced %s, 1D65A50 %s, dispatch %s\n", g_enterLog, g_actId, g_pathAuth,
+        Log("[Brain] enter wrappers (probe=%d actid=%d path=%d blk=%d): forced %s, 1D65A50 %s, dispatch %s\n", g_enterLog, g_actId, g_pathAuth, g_blkSync,
             f ? "wrapped" : "NOT", a ? "wrapped" : "NOT", d ? "wrapped" : "NOT");
     }
     if (g_pathAuth) {   // the two entry-switch calls inside sub_1D63440 (cc/g51-g52: E8 7B B2 FF FF / E8 3F B2 FF FF -> 0x1D5E6E0)
@@ -1555,6 +1743,7 @@ void OnIntent(uint64_t wireId, uint32_t seq, uint8_t flags, const void* payload,
         if (dup) { InterlockedIncrement(&c_dupDropped); return; }
     }
     if (c.slot == kPath) { PathRx(wireId, c); return; }
+    if (c.slot == kBlk) { BlkRx(wireId, c); return; }
     AcquireSRWLockExclusive(&g_qLock);
     int k = -1;
     for (int i = 0; i < kQ; ++i) if (!g_q[i].used) { k = i; break; }
@@ -1776,6 +1965,8 @@ void Tick() {
                 c_reactRefused, c_reactHeld, c_reactIncomplete, c_reactBuildFail, c_reactVeto);
         if (g_actId)
             Log("[Brain] actid role=%s tx=%ld same=%ld written=%ld missing=%ld\n", g_role == 1 ? "host" : "guest", c_aidTx, c_aidSame, c_aidWritten, c_aidMissing);
+        if (g_blkSync)
+            Log("[Brain] blk role=%s tx=%ld keepDwords=%ld rx=%ld written=%ld same=%ld missing=%ld unresolved=%ld cleanupRefused=%ld tgtSet=%ld varSet=%ld\n", g_role == 1 ? "host" : "guest", c_blkTx, c_blkKeep, c_blkRx, c_blkWritten, c_blkSame, c_blkMissing, c_blkUnres, c_blkCleanupRefused, c_blkTgtSet, c_blkVarSet);
         if (g_pathAuth)
             Log("[Brain] pathauth role=%s tx=%ld rx=%ld noBody=%ld child over=%ld same=%ld none=%ld refused=%ld set applied=%ld fail=%ld refused=%ld skipReact=%ld prefix=%ld setMs=%d\n",
                 g_role == 1 ? "host" : "guest", c_pathTx, c_pathRx, c_pathNoBody, c_childOver, c_childSame, c_childNone, c_childRefused,
