@@ -13175,15 +13175,21 @@ static LONG WINAPI WbTrap(PEXCEPTION_POINTERS ep) {
         // the process died with 0x80000004). Ownership is the tid slot alone.
         if (!WbTfRelease(GetCurrentThreadId())) return EXCEPTION_CONTINUE_SEARCH;
         c->EFlags &= ~0x100u;                       // clear it FIRST, whatever happens next
-        if (g_wbArmed) WbApplyGuard();               // TF does not retry, so this cannot re-fault
+        if (g_wbArmed) {
+            WbApplyGuard();                          // TF does not retry, so this cannot re-fault
+            // Review C3 / CR-3: a disarm on another thread between the test and the VirtualProtect leaves a guard nobody
+            // owns. Re-check and take it off again (the guard-fault branch below also tolerates a late guard on our page).
+            if (!g_wbArmed && g_wbPage) { DWORD old = 0; VirtualProtect((void*)g_wbPage, 0x1000, g_wbOrigProt ? g_wbOrigProt : PAGE_READWRITE, &old); }
+        }
         return EXCEPTION_CONTINUE_EXECUTION;
     }
 
     if (code != STATUS_GUARD_PAGE_VIOLATION) return EXCEPTION_CONTINUE_SEARCH;
-    if (!g_wbArmed || !g_wbSvc) return EXCEPTION_CONTINUE_SEARCH;
-
     const unsigned int addr = (unsigned int)(ULONG_PTR)ep->ExceptionRecord->ExceptionInformation[1];
     const unsigned int eip  = (unsigned int)(ULONG_PTR)c->Eip;
+    // Review C3 / CR-3: a guard re-applied by a single step that raced a disarm faults here with g_wbArmed == 0. It is our page
+    // and the OS has already removed the guard for this access, so continuing is safe; returning CONTINUE_SEARCH killed the process.
+    if (!g_wbArmed || !g_wbSvc) return (g_wbPage && (addr & ~0xFFFu) == g_wbPage) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
 
     // Not our page (some other component's guard page): leave it entirely alone, including its trap
     // flag semantics. Only the page we armed is ours to handle and re-arm.
