@@ -1249,6 +1249,15 @@
    "receipts": [],
    "size": 0,
    "status": "unknown"
+  },
+  "01D63440": {
+   "addr": "01D63440",
+   "claimed_at": null,
+   "name": "GroundEnterState",
+   "owner": null,
+   "receipts": [],
+   "size": 0,
+   "status": "unknown"
   }
  }
 }

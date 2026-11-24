@@ -6,6 +6,7 @@
 #include "paths.h"
 #include <windows.h>
 #include <tlhelp32.h>
+#include <intrin.h>
 #include <cstdio>
 #include <cstdarg>
 #include <cstring>
@@ -862,9 +863,44 @@ bool PatchCall(uint32_t site, uint32_t expect, uint32_t to) {
     FlushInstructionCache(GetCurrentProcess(), p, 5);
     return true;
 }
+// [Coop] BrainEnterProbe (default 0): log every Ground state entry on a registered body, host and guest. Run 21 smoke 3: no
+// dispatch call on these bodies carries an event (a2 != 0), so hit reactions / blocks are forced transitions: a caller runs a
+// handler with its event, then sub_1D659D0(fsm, code) (280 callers, IDA cc/g30) exits to the level and enters the target
+// through sub_1D63440. sub_1D63440 has 3 callers, each one E8: 0x1D65A36 (sub_1D659D0, forced), 0x1D65ADD (sub_1D65A50),
+// 0x1D65CA4 (sub_1D65BB0, the dispatch). The wrapper logs the route and the code addresses above it on the stack, which
+// name the function that forced the transition.
+typedef int(__thiscall* EnterFn)(uint32_t fsm, int target);
+volatile LONG c_enterLines = 0;
+int EnterLog(int route, uint32_t fsm, int target, void** retSlot) {
+    uint64_t objId = 0;
+    if (BodyOfFsm(fsm, &objId) >= 0 && InterlockedIncrement(&c_enterLines) <= 3000) {
+        char s[220]; int o = 0; s[0] = 0;
+        __try {
+            const uint32_t* sp = (const uint32_t*)retSlot;
+            for (int i = 1, n = 0; i < 40 && n < 6 && o < 200; ++i) {
+                const uint32_t w = sp[i];
+                if (w >= 0x00401000u && w < 0x02400000u) { o += _snprintf_s(s + o, sizeof(s) - o, _TRUNCATE, " %08X", w); ++n; }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        bool clk = false; const uint32_t now = HostMs(&clk);
+        Log("[Brain] enter role=%s id=%016llX state=%d route=%c hostMs=%u stack:%s\n", g_role == 1 ? "host" : "guest", (unsigned long long)objId, target,
+            route == 0 ? 'F' : route == 1 ? 'A' : 'D', now, s);
+    }
+    return 0;
+}
+int __fastcall EnterF(uint32_t fsm, uint32_t, int target) { EnterLog(0, fsm, target, (void**)_AddressOfReturnAddress()); return ((EnterFn)0x01D63440)(fsm, target); }
+int __fastcall EnterA(uint32_t fsm, uint32_t, int target) { EnterLog(1, fsm, target, (void**)_AddressOfReturnAddress()); return ((EnterFn)0x01D63440)(fsm, target); }
+int __fastcall EnterD(uint32_t fsm, uint32_t, int target) { EnterLog(2, fsm, target, (void**)_AddressOfReturnAddress()); return ((EnterFn)0x01D63440)(fsm, target); }
+
 void Install115() {
     g_probe115 = GetPrivateProfileIntA("Coop", "Brain115Probe", 0, Paths::Ini()) != 0 ? 1 : 0;
     g_supp115 = GetPrivateProfileIntA("Coop", "Brain115Suppress", 0, Paths::Ini()) != 0 ? 1 : 0;
+    if (GetPrivateProfileIntA("Coop", "BrainEnterProbe", 0, Paths::Ini()) != 0) {
+        const bool f = PatchCall(0x01D65A36u, 0x01D63440u, (uint32_t)(uintptr_t)&EnterF);
+        const bool a = PatchCall(0x01D65ADDu, 0x01D63440u, (uint32_t)(uintptr_t)&EnterA);
+        const bool d = PatchCall(0x01D65CA4u, 0x01D63440u, (uint32_t)(uintptr_t)&EnterD);
+        Log("[Brain] enter probe: forced %s, 1D65A50 %s, dispatch %s\n", f ? "wrapped" : "NOT", a ? "wrapped" : "NOT", d ? "wrapped" : "NOT");
+    }
     if (g_hitSync && g_chartSync) {   // the node mirror covers 180/181/182 too, so the per-state gate is not installed
         const bool n = PatchCall(0x01D65BE1u, 0x01D634D0u, (uint32_t)(uintptr_t)&NodeW);
         Log("[Brain] chart sync: dispatch node call %s\n", n ? "wrapped" : "NOT wrapped");
