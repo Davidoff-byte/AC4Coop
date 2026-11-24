@@ -1397,6 +1397,7 @@ bool FightIntentOwnsPuppet();   // [Coop] FightIntents (S7 slice 1), defined wit
 static volatile LONG s_pfcActive = 0;   // [Coop] PuppetFightCarry: our action copy owns the puppet in this fight
 static volatile LONG s_pfcIssued = 0;   // SetTargetAction calls on the puppet in the current fight window
 static void PchanCapture(ActionComponent* ac);   // [Coop] PuppetChannels, defined with PuppetActionBlock
+static void ClimbProbeHostPos(const PlayerState& s);   // [Coop] ClimbProbe baseline, defined with PuppetActionBlock
 static void PuppetOwnClear();
 static Entity* ResolveEntityById(uint64_t id);   // engine registry, defined with the ApplyGuards
 static void ProxySrcClearAll();
@@ -1596,6 +1597,7 @@ bool Phase1::CaptureLocalState(PlayerState& s) {
         {
             ActionComponent* ac = h->GetActionComponent();
             if (readable(ac, 0x40)) {
+                ClimbProbeHostPos(s);   // [Coop] ClimbProbe: the same jerk measure on the position we send (baseline)
                 PchanCapture(ac);   // [Coop] PuppetChannels: the other controllers, sent on change over IC_PCHAN
                 s.timeScale = ac->GetTimeScale(0, ACTLAYER_PRIMARY);   // primary-channel clip speed (foot-speed warp)
                 s.actionRatio = ac->GetCurrentActionRatio(0, ACTLAYER_PRIMARY);   // playback phase (seek on switch)
@@ -2606,7 +2608,122 @@ static void PchanApply(Human* h) {   // the puppet's own update, only while our 
     if (now - s_last >= 5000) { s_last = now; L("[Chan] stats tx=%ld rx=%ld set=%ld same=%ld idle=%ld\n", s_pchTxC, s_pchRxC, s_pchSetC, s_pchSameC, s_pchIdleC); }
 }
 
+// ---- [Coop] ClimbProbe (default 0, read-only): why the carried puppet's climbing/parkour looks choppy (owner, run 37) ------------
+// While the peer is off the ground (ActorContextID 5 Ladder, 6 InAir, 7 Ledge, 8 Walling, 9 NarrowObject, 30 Climbing, 31 Hanging;
+// docs/evidence/traversal-moves-2026-11-16.md) and our action copy owns the puppet, every 5 s: switches issued and the host's blend
+// type of each; the blend-in copy's outcome (written / kept / expired before the evaluator was seen); 100 ms after a switch,
+// whether the puppet holds the target alias (took), the previous one (stillOld) or another (replaced, alias logged); and the
+// second difference of the written position per frame (|p - 2p1 + p0|, > 2 / 5 / 10 cm, max).
+static int s_cpOn = -1;
+static bool ClimbProbeOn() {
+    if (s_cpOn < 0) { s_cpOn = GetPrivateProfileIntA("Coop", "ClimbProbe", 0, Paths::Ini()) != 0 ? 1 : 0; L("[Climb] ClimbProbe=%d\n", s_cpOn); }
+    return s_cpOn == 1;
+}
+static inline bool OffGroundCtx(int c) { return c == 5 || c == 6 || c == 7 || c == 8 || c == 9 || c == 30 || c == 31; }
+static struct { uint32_t frames, j2, j5, j10, issued, type[8], fixW, fixK, fixX, took, old, repl; float jmax; } s_cp = {};
+static float s_cpP[2][3]; static int s_cpPn = 0; static bool s_cpOff = false;
+static uint32_t s_cpPend = 0, s_cpPendPrev = 0; static uint64_t s_cpPendMs = 0, s_cpLog = 0; static int s_cpReplLines = 0;
+// Time-normalised acceleration (frame-pacing independent): v = dp / dt with real frame times (QPC), a = |v - v1| / mean dt.
+// Two copies on one PC render at uneven frame times, and |p - 2p1 + p0| counts that as jerk (at 6 m/s an 8 ms frame-time step alone
+// gives ~5 cm). Buckets a > 20 / 50 / 100 m/s^2 (gravity is 9.8).
+struct AccelStat { uint32_t frames, a20, a50, a100; float amax; float p1[3]; uint64_t t1; float v1[3]; int n; };
+static void AccelNote(AccelStat& st, float x, float y, float z) {
+    LARGE_INTEGER c, f; QueryPerformanceCounter(&c); QueryPerformanceFrequency(&f);
+    const uint64_t t = (uint64_t)(c.QuadPart * 1000000.0 / f.QuadPart);
+    if (st.n >= 1 && t > st.t1) {
+        const float dt = (float)(t - st.t1) / 1e6f;
+        const float v[3] = { (x - st.p1[0]) / dt, (y - st.p1[1]) / dt, (z - st.p1[2]) / dt };
+        if (st.n >= 2) {
+            const float ax = v[0] - st.v1[0], ay = v[1] - st.v1[1], az = v[2] - st.v1[2];
+            const float a = sqrtf(ax * ax + ay * ay + az * az) / dt;
+            ++st.frames; if (a > 20) ++st.a20; if (a > 50) ++st.a50; if (a > 100) ++st.a100; if (a > st.amax) st.amax = a;
+        }
+        memcpy(st.v1, v, sizeof(v)); if (st.n < 2) ++st.n;
+    } else if (st.n == 0) st.n = 1;
+    st.p1[0] = x; st.p1[1] = y; st.p1[2] = z; st.t1 = t;
+}
+static AccelStat s_accHost = {}, s_accCopy = {};
+static void AccelLog(const char* who, AccelStat& st) {
+    if (st.frames) L("[Climb] accel %s frames=%u a>20=%u a>50=%u a>100=%u max=%.0f m/s2\n", who, st.frames, st.a20, st.a50, st.a100, st.amax);
+    const int n = st.n; const uint64_t t1 = st.t1; float p1[3], v1[3]; memcpy(p1, st.p1, sizeof(p1)); memcpy(v1, st.v1, sizeof(v1));
+    st = {}; st.n = n; st.t1 = t1; memcpy(st.p1, p1, sizeof(p1)); memcpy(st.v1, v1, sizeof(v1));
+}
+static void ClimbProbeLog() {
+    const uint64_t now = GetTickCount64();
+    if (!s_cpLog) s_cpLog = now;
+    if (now - s_cpLog < 5000) return;
+    s_cpLog = now;
+    if (!s_cp.frames && !s_cp.issued) return;
+    L("[Climb] frames=%u jerk>2cm=%u >5cm=%u >10cm=%u max=%.1fcm | issued=%u hostBlendType 0:%u 1:%u 2:%u 3:%u 4:%u 5:%u 6:%u 7:%u | "
+      "blendFix written=%u kept=%u expired=%u | after100ms took=%u stillOld=%u replaced=%u\n",
+      s_cp.frames, s_cp.j2, s_cp.j5, s_cp.j10, s_cp.jmax * 100.0f, s_cp.issued, s_cp.type[0], s_cp.type[1], s_cp.type[2], s_cp.type[3],
+      s_cp.type[4], s_cp.type[5], s_cp.type[6], s_cp.type[7], s_cp.fixW, s_cp.fixK, s_cp.fixX, s_cp.took, s_cp.old, s_cp.repl);
+    AccelLog("copy", s_accCopy);
+    s_cp = {};
+}
+static void ClimbProbePos(const PlayerState& s, float x, float y, float z) {   // the written puppet position, per frame
+    if (!ClimbProbeOn()) return;
+    s_cpOff = OffGroundCtx(s.contextId) && InterlockedCompareExchange(&s_pfcActive, 0, 0) != 0;
+    if (!s_cpOff) { s_cpPn = 0; s_accCopy.n = 0; return; }
+    ++s_cp.frames;
+    AccelNote(s_accCopy, x, y, z);
+    if (s_cpPn == 2) {
+        const float dx = x - 2 * s_cpP[1][0] + s_cpP[0][0], dy = y - 2 * s_cpP[1][1] + s_cpP[0][1], dz = z - 2 * s_cpP[1][2] + s_cpP[0][2];
+        const float j = sqrtf(dx * dx + dy * dy + dz * dz);
+        if (j > 0.02f) ++s_cp.j2; if (j > 0.05f) ++s_cp.j5; if (j > 0.10f) ++s_cp.j10; if (j > s_cp.jmax) s_cp.jmax = j;
+    }
+    if (s_cpPn == 2) { memcpy(s_cpP[0], s_cpP[1], sizeof(s_cpP[0])); } else ++s_cpPn;
+    s_cpP[s_cpPn == 1 ? 0 : 1][0] = x; s_cpP[s_cpPn == 1 ? 0 : 1][1] = y; s_cpP[s_cpPn == 1 ? 0 : 1][2] = z;
+    ClimbProbeLog();
+}
+static void ClimbProbeHostPos(const PlayerState& s) {   // the local player's captured position while off the ground: the baseline
+    if (!ClimbProbeOn()) return;
+    static struct { uint32_t frames, j2, j5, j10; float jmax; } b = {};
+    static float P[2][3]; static int n = 0; static uint64_t last = 0;
+    const float x = s.matrix.M41, y = s.matrix.M42, z = s.matrix.M43;
+    if (!OffGroundCtx(s.contextId)) { n = 0; s_accHost.n = 0; }
+    else {
+        AccelNote(s_accHost, x, y, z);
+        ++b.frames;
+        if (n == 2) {
+            const float dx = x - 2 * P[1][0] + P[0][0], dy = y - 2 * P[1][1] + P[0][1], dz = z - 2 * P[1][2] + P[0][2];
+            const float j = sqrtf(dx * dx + dy * dy + dz * dz);
+            if (j > 0.02f) ++b.j2; if (j > 0.05f) ++b.j5; if (j > 0.10f) ++b.j10; if (j > b.jmax) b.jmax = j;
+            memcpy(P[0], P[1], sizeof(P[0]));
+        } else ++n;
+        P[n == 1 ? 0 : 1][0] = x; P[n == 1 ? 0 : 1][1] = y; P[n == 1 ? 0 : 1][2] = z;
+    }
+    const uint64_t now = GetTickCount64();
+    if (!last) last = now;
+    if (now - last >= 5000) {
+        last = now;
+        if (b.frames) L("[Climb] host-own frames=%u jerk>2cm=%u >5cm=%u >10cm=%u max=%.1fcm\n", b.frames, b.j2, b.j5, b.j10, b.jmax * 100.0f);
+        b = {};
+        AccelLog("host-own", s_accHost);
+    }
+}
+static void ClimbProbeIssue(const PlayerState& s, uint32_t prevAlias) {
+    if (!ClimbProbeOn() || !s_cpOff) return;
+    ++s_cp.issued; ++s_cp.type[s.blendInFlags & 7];
+    s_cpPend = s.actionAlias; s_cpPendPrev = prevAlias; s_cpPendMs = GetTickCount64();
+}
+static void ClimbProbeFix(int outcome) {   // 0 written, 1 kept, 2 expired
+    if (!ClimbProbeOn() || !s_cpOff) return;
+    if (outcome == 0) ++s_cp.fixW; else if (outcome == 1) ++s_cp.fixK; else ++s_cp.fixX;
+}
+static void ClimbProbeCheck(Human* h) {
+    if (!ClimbProbeOn() || !s_cpPend || GetTickCount64() - s_cpPendMs < 100) return;
+    ActionComponent* ac = h ? h->GetActionComponent() : nullptr;
+    uint32_t cur = 0;
+    if (readable(ac, 0x40)) { unsigned char mir = 0; void* a = ac->GetCurrentAction(&mir, 0, ACTLAYER_PRIMARY); cur = readable(a, 0x0C) ? *(uint32_t*)((char*)a + 8) : 0; }
+    if (cur == s_cpPend) ++s_cp.took;
+    else if (cur == s_cpPendPrev) ++s_cp.old;
+    else { ++s_cp.repl; if (s_cpReplLines++ < 60) L("[Climb] replaced: target %u -> puppet now %u (prev %u)\n", s_cpPend, cur, s_cpPendPrev); }
+    s_cpPend = 0;
+}
+
 static void PuppetActionBlock(Human* h, const PlayerState& s, bool writeActions) {
+        if (writeActions) ClimbProbeCheck(h);   // [Coop] ClimbProbe
         // Give the puppet the local player's CharacterActionSet ONCE so its actions resolve to the right
         // character's clip overrides (both are Edward on this machine) instead of the generic base. The
         // gameplay path that normally sets it is disabled on the puppet. One-shot: re-setting it every frame
@@ -2648,6 +2765,7 @@ static void PuppetActionBlock(Human* h, const PlayerState& s, bool writeActions)
                     // override (-> base/Connor clip).
                     ac->SetTargetAction((int)s.actionAlias, 0, 0, (int)s.actionChannel, (int)s.actionLayer);
                     if (InterlockedCompareExchange(&s_pfcActive, 0, 0)) InterlockedIncrement(&s_pfcIssued);
+                    ClimbProbeIssue(s, curAlias);   // [Coop] ClimbProbe
                     // Start the new clip at the peer's phase instead of frame 0 — the game does the same right
                     // after its own SetTargetAction calls. Without it every swap pops. processDisplacement=0
                     // (we own position), processEvents=0 (don't fire the skipped span's anim events).
@@ -2738,9 +2856,10 @@ static void PuppetActionBlock(Human* h, const PlayerState& s, bool writeActions)
                 L("[Net] blendIn fix alias=%u len %.2f -> %.2f type %u -> %u (t=%.2f)%s%s\n",
                   g_blendFixAlias, was, len, (unsigned)(wasFl & 7), (unsigned)(fl & 7), t, write ? "" : " [kept]",
                   mapTag);
+                ClimbProbeFix(write ? 0 : 1);   // [Coop] ClimbProbe
                 g_blendFixWait = 0;
             } else {
-                --g_blendFixWait;
+                if (--g_blendFixWait == 0) ClimbProbeFix(2);   // the evaluator never showed the target alias
             }
         }
 
@@ -2945,6 +3064,7 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
         // single machine can see whether local AI treats it as a real body (loopback otherwise puts the
         // puppet exactly inside the player, which makes "did the guard attack the puppet" unobservable).
         if (g_puppetParkX != 0.0f) m.M41 += g_puppetParkX;
+        ClimbProbePos(s, m.M41, m.M42, m.M43);   // [Coop] ClimbProbe (s_pfcActive is from the previous frame's decision)
         // [Coop] NativeReplica: on the ground the character controller moves the puppet; NativeReplicaDrive below
         // writes the matrix only to snap. Everywhere else (flag off, or peer off the ground) the write is as before.
         // [Coop] PuppetFightCarry (default 0, read once): decided before the replica mode, because the puppet runs as a native
@@ -14182,6 +14302,26 @@ static bool ComputeInterpolated(uint64_t nowUs, PlayerState& out) {
                 ++s_eqTFrames;
             }
             lerpState(g_snaps[ai].st, g_snaps[bi].st, t, out);
+            // [Coop] PuppetSplineInterp (default 0, read once): position on a cubic Hermite curve through the snapshots, tangents
+            // from the neighbours by finite differences over the real stamps, so velocity is continuous at every sample. Scripted
+            // climb 2026-11-24 (asi fff8f991): host's own sent position jerk > 5 cm on 15.6 % of off-ground frames, the linearly
+            // interpolated copy 37.8 % - straight segments put a velocity kink at every sample. Linear when a neighbour is missing.
+            static int s_spline = -1;
+            if (s_spline < 0) { s_spline = GetPrivateProfileIntA("Coop", "PuppetSplineInterp", 0, Paths::Ini()) != 0 ? 1 : 0; L("[Net] PuppetSplineInterp=%d\n", s_spline); }
+            if (s_spline && i > 0 && i + 2 < g_snapCount && tb > ta && g_snaps[ai].st.worldId == g_snaps[bi].st.worldId) {
+                const int pi = (oldestIdx + i - 1) % SNAP_MAX, ni = (oldestIdx + i + 2) % SNAP_MAX;
+                const uint64_t tp = g_snaps[pi].t, tn = g_snaps[ni].t;
+                if (tb > tp && tn > ta) {
+                    const float seg = (float)(tb - ta);
+                    const float sa = seg / (float)(tb - tp), sb = seg / (float)(tn - ta);   // tangent scale to this segment
+                    const float t2 = t * t, t3 = t2 * t;
+                    const float h00 = 2 * t3 - 3 * t2 + 1, h10 = t3 - 2 * t2 + t, h01 = -2 * t3 + 3 * t2, h11 = t3 - t2;
+                    const HookMath::Transform &P = g_snaps[pi].st.matrix, &A = g_snaps[ai].st.matrix, &B = g_snaps[bi].st.matrix, &N = g_snaps[ni].st.matrix;
+                    #define PUP_HERMITE(c) (h00 * A.c + h10 * (B.c - P.c) * sa + h01 * B.c + h11 * (N.c - A.c) * sb)
+                    out.matrix.M41 = PUP_HERMITE(M41); out.matrix.M42 = PUP_HERMITE(M42); out.matrix.M43 = PUP_HERMITE(M43);
+                    #undef PUP_HERMITE
+                }
+            }
             return true;
         }
     }
@@ -15102,7 +15242,7 @@ static void DumpConfigOnce()
         // The Tune* values are floats (read with strtod, see ShipTuningTick); the dump shows the integer part.
         { "Coop", "TuneConeAngle", 120 }, { "Coop", "TuneConeRange", 350 }, { "Coop", "TuneMaxTime", 30 },
         { "Coop", "TuneAggroTime", 30 }, { "Coop", "TuneHull", 0 },
-        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 },{ "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 },
+        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 },{ "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 },
         { "Coop", "CombatTest", 0 }, { "Coop", "CrashContext", 0 }, { "Coop", "CorpseKeepSec", 30 }, { "Coop", "CrowdProbeIntegrate", 1 },
         { "Coop", "CrowdProbeLiveKeys", 1 }, { "Coop", "DamageRelay", 0 }, { "Coop", "Diag", 0 },
         { "Coop", "DisableCrowd", 0 }, { "Coop", "DisablePuppetAI", 1 }, { "Coop", "DisableSpawns", 0 },
