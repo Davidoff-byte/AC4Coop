@@ -1258,6 +1258,15 @@
    "receipts": [],
    "size": 0,
    "status": "unknown"
+  },
+  "0059C660": {
+   "addr": "0059C660",
+   "claimed_at": null,
+   "name": "GroundPushToken",
+   "owner": null,
+   "receipts": [],
+   "size": 116,
+   "status": "unknown"
   }
  }
 }

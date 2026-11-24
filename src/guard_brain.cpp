@@ -96,7 +96,7 @@ struct Body {
     Cmd pendAtk; uint8_t pendValid; uint8_t hostIn173;   // BrainHitSync host: last attack call, sent when the guard enters 173
     uint32_t fsm;   // cached Ground helper *(ig+0x90), refreshed by NoteBody
     uint32_t pathHash;   // BrainPuppet: last logged path of the player / puppet body
-    uint32_t rseq; uint8_t rmask; uint8_t rbuf[100]; uint32_t rFde; uint32_t rFdeSeq;   // BrainReact guest: reassembly, built event
+    uint32_t rseq[2]; uint8_t rmask[2]; uint8_t rbuf[2][100]; uint32_t rFde; uint32_t rFdeSeq;   // BrainReact guest: reassembly (two in flight, by seq parity), built event
     struct { uint16_t node; int32_t code; uint32_t handler; uint64_t atMs; uint8_t sched; } cq[8]; int cqn;   // BrainChartSync guest queue
     struct { uint16_t node; int32_t code; uint32_t handler; uint32_t dueHostMs; uint64_t setMs; } hold;   // BrainPlayoutMs host: a deferred attack start
 };
@@ -192,7 +192,7 @@ volatile LONG c_probeLines = 0, c_gidLines = 0;
 // ---- [Coop] BrainReact host side --------------------------------------------------------------------------------------
 static_assert(sizeof(AtkFields) <= 100, "AtkFields must fit the 5 x 20-byte BrainReact chunks");
 volatile LONG g_reactSeq = 0, c_reactCap = 0, c_reactNonFde = 0, c_reactLines = 0, c_reactApplied = 0, c_reactRefused = 0,
-              c_reactIncomplete = 0, c_reactBuildFail = 0, c_reactVeto = 0, c_reactHeld = 0;
+              c_reactIncomplete = 0, c_reactBuildFail = 0, c_reactVeto = 0, c_reactHeld = 0, c_reactTokenForced = 0;
 void ReactCapture(uint32_t id, uint32_t ecx, const uint32_t* frame) {
     if (!g_react || g_role != 1) return;
     __try {
@@ -226,6 +226,15 @@ void ReactCapture(uint32_t id, uint32_t ecx, const uint32_t* frame) {
             Publish(objId, d);
         }
         Cmd h = {}; h.slot = kReact; h.nargs = (uint8_t)kSlots[id].slot; h.a[0] = seq; h.tgt = aCls; h.tgtObj = aObj; h.execHostMs = now;
+        // The Can half ran just before this Do (sub_185DA80: vt+44 then vt+48) and pushed its token into the Ground helper's
+        // list: data *(fsm+0x100), u16 count fsm+0x106 (sub_59C660 at 0x59C668: esi = list+0x20, list = fsm+0xE0). Up to 3 are
+        // sent, so the guest can push them itself when its own Can refuses (run 24: the puppet's Can refused every 268/280).
+        __try {
+            const uint32_t fsm = *(const uint32_t*)(ig + 0x90);
+            const unsigned n = *(const uint16_t*)(fsm + 0x106);
+            const uint32_t* tk = *(const uint32_t* const*)(fsm + 0x100);
+            for (unsigned i = 0; i < n && i < 3 && Rd(tk, 4 * (i + 1)); ++i) h.a[1 + i] = tk[i];
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
         Publish(objId, h);
         InterlockedIncrement(&c_reactCap);
         if (InterlockedIncrement(&c_reactLines) <= 200) {
@@ -420,9 +429,10 @@ bool Execute(uint32_t human, uint32_t ig, uint64_t objId, const Cmd& c, int32_t 
         const int k = FindBy(&Body::human, human);
         if (k >= 0 && c.nargs < 5) {
             Body& b = g_b[k];
-            if (b.rseq != c.a[0]) { b.rseq = c.a[0]; b.rmask = 0; }
-            memcpy(b.rbuf + c.nargs * 20, &c.a[1], 12); memcpy(b.rbuf + c.nargs * 20 + 12, &c.tgtObj, 8);
-            b.rmask |= (uint8_t)(1u << c.nargs);
+            const int pb = (int)(c.a[0] & 1);
+            if (b.rseq[pb] != c.a[0]) { b.rseq[pb] = c.a[0]; b.rmask[pb] = 0; }
+            memcpy(b.rbuf[pb] + c.nargs * 20, &c.a[1], 12); memcpy(b.rbuf[pb] + c.nargs * 20 + 12, &c.tgtObj, 8);
+            b.rmask[pb] |= (uint8_t)(1u << c.nargs);
         }
         ReleaseSRWLockExclusive(&g_bLock);
         InterlockedIncrement(&c_exec);
@@ -434,8 +444,9 @@ bool Execute(uint32_t human, uint32_t ig, uint64_t objId, const Cmd& c, int32_t 
         const int k = FindBy(&Body::human, human);
         if (k >= 0) {
             Body& b = g_b[k];
-            complete = b.rseq == c.a[0] && b.rmask == 0x1F;
-            if (complete) memcpy(raw, b.rbuf, sizeof(raw));
+            const int pb = (int)(c.a[0] & 1);
+            complete = b.rseq[pb] == c.a[0] && b.rmask[pb] == 0x1F;
+            if (complete) memcpy(raw, b.rbuf[pb], sizeof(raw));
             victim = b.ent;
             if (b.rFdeSeq == c.a[0]) fde = b.rFde;   // a retry reuses the event built for this seq
         }
@@ -463,14 +474,27 @@ bool Execute(uint32_t human, uint32_t ig, uint64_t objId, const Cmd& c, int32_t 
         }
         uint32_t ea[4] = { fde, 0, 0, 0 };
         const uint32_t can = CallSlot(iface, c.nargs - 1, 1, ea);
-        if (!(can & 0xFF) && lateMs < 400) { InterlockedIncrement(&c_reactHeld); return false; }   // not in the right state yet: retry
-        uint32_t dr = 0;
+        uint32_t dr = 0; bool pushed = false;
         if (can & 0xFF) dr = CallSlot(iface, c.nargs, 1, ea);
+        else if (c.a[1]) {
+            // The local Can refused (the puppet has no fight / health services; a copy may differ in what the Can reads): push
+            // the host's tokens with the engine's own push (thiscall(fsm+0xE0, token), retn 4, 0x1D02E2C..0x1D02E34; it skips a
+            // token already present) and run the Do, which checks the token against the current path itself.
+            __try {
+                const uint32_t fsm = *(const uint32_t*)(ig + 0x90);
+                for (int i = 1; i <= 3; ++i)
+                    if (c.a[i]) ((void(__thiscall*)(uint32_t, uint32_t))0x0059C660)(fsm + 0xE0, c.a[i]);
+                pushed = true;
+            } __except (EXCEPTION_EXECUTE_HANDLER) { pushed = false; }
+            if (pushed) dr = CallSlot(iface, c.nargs, 1, ea);
+        }
+        if (!(dr & 0xFF) && lateMs < 400) { InterlockedIncrement(&c_reactHeld); return false; }   // not in the right state yet: retry
         char ps2[96]; PathStr(ig, ps2, sizeof(ps2));
-        InterlockedIncrement(&c_exec); InterlockedIncrement((can & 0xFF) ? &c_reactApplied : &c_reactRefused);
+        InterlockedIncrement(&c_exec); InterlockedIncrement((dr & 0xFF) ? &c_reactApplied : &c_reactRefused);
+        if (pushed && (dr & 0xFF)) InterlockedIncrement(&c_reactTokenForced);
         if (InterlockedIncrement(&c_reactLines) <= 400)
             Log("[Brain] react guest slot=%u id=%016llX seq=%u attacker=%08X cls=%u can=%08X do=%08X path %s -> %s lateMs=%d\n", c.nargs,
-                (unsigned long long)objId, c.a[0], att, c.tgt, can, dr, ps, ps2, lateMs);
+                (unsigned long long)objId, c.a[0], att, c.tgt, can, c.a[1], c.a[2], c.a[3], pushed ? 1 : 0, dr, ps, ps2, lateMs);
         return true;
     }
     if (c.slot == kChart) {   // BrainChartSync: queue the host guard's transition for the copy's node wrapper (NodeW)
@@ -1460,7 +1484,7 @@ void Tick() {
                 c_attackHeld, c_atkBuffered, c_atkSent, c_atkNoCall);
         if (g_react)
             Log("[Brain] react role=%s cap=%ld nonFde=%ld applied=%ld refused=%ld held=%ld incomplete=%ld buildFail=%ld veto=%ld\n",
-                g_role == 1 ? "host" : "guest", c_reactCap, c_reactNonFde, c_reactApplied, c_reactRefused, c_reactHeld, c_reactIncomplete,
+                g_role == 1 ? "host" : "guest", c_reactCap, c_reactNonFde, c_reactApplied, c_reactTokenForced, c_reactRefused, c_reactHeld, c_reactIncomplete,
                 c_reactBuildFail, c_reactVeto);
         if (g_chartSync)
             Log("[Brain] chartsync role=%s tx=%ld rx=%ld applied=%ld own=%ld forced=%ld waitFrames=%ld expired=%ld dropped=%ld playoutMs=%d holdSet=%ld holdApplied=%ld holdExpired=%ld\n",
