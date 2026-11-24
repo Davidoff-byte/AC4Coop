@@ -1,6 +1,6 @@
 # Status
 
-Last updated 2026-11-21 on `feat/launcher` (guest combat timing, plan step 1 of `ops/HANDOVER-MP-BLUEPRINT-2026-11-21.md`); the
+Last updated 2026-11-25 on `feat/integration-1121` (puppet animation carry, sinking fix, crash-class CR-2/3/4; rows marked 2026-11-25). Before that 2026-11-21 on `feat/launcher` (guest combat timing, plan step 1 of `ops/HANDOVER-MP-BLUEPRINT-2026-11-21.md`); the
 rest of the file dates from 2026-11-11, at `main` after PR #1 (the live-tests stack). This file replaces every plan,
 journal and handoff in `docs/archive/`. Update it in the same PR as any change that alters what is true here.
 
@@ -26,6 +26,9 @@ common base `b95b7a5`; it is the branch that carries every feature described bel
 | two copies on one PC | two `AC4BFSP.exe` running at once, both started directly from the exe (no Steam), with `proxy/version` `version.dll` | live 2026-11-15, pids 25788 + 26200 (`docs/evidence/single-instance-guard-2026-11-15.md`); render and co-op between them not yet checked |
 | fight decisions (S7 slice 1) | `[Coop] FightIntents` (default 0): fight enter / attack / exit with target on the intention lane drive the puppet's own FSM | same-PC two copies 2026-11-15: enter/exit 3/3, one real attack (`docs/evidence/s7-fight-intents-2026-11-15.md`); needs the target bound by the entity lane |
 | guards hitting the other player | `[Coop] PlayerDamageRelay` (default follows FightIntents): a guard's hit on the puppet (lost there: the puppet has no fight/health services) is scored with the engine's `sub_199A160` and posted as a native DamageEvent on the owner's player | same-PC two copies 2026-11-16: 13/13 hits applied, native death and respawn, no double hits (`docs/evidence/player-damage-relay-2026-11-16.md`); no hurt reaction, the owner's block/counter not consulted |
+| puppet animation carry | `[Coop] PuppetFightCarry=2` (default 0): the peer's primary action copied onto the puppet everywhere, not only in fights; the sword drawn in a fight follows it | same-PC two copies 2026-11-24/25: alias match 92-97 % ground / air / climbing; guest footage shows the puppet swinging a cutlass (`docs/evidence/brain-s0-2026-11-22.md`). Overlay channels (`PuppetChannels`) freeze poses and stay 0 |
+| puppet standing on the ground | `[Coop] PuppetUpdatePhysics=1` (default 0): the matrix write also moves the puppet's CharacterController, on the puppet's own update | 2026-11-25 A/B on the guest screen: without it the puppet sinks to the knees (controller left at the spawn point; IDA 0x528200 -> sub_42D570), with it the boots stand (arms E/F); bodies separate ~0.5 m on contact once (control: none) |
+| SgmDetour thread safety | CR-4: per-call state on the stack, body under `__try` (`HookSgm` ships as 1) | 2026-11-25 run HookSgm=1: both alive, 0 exceptions |
 | guest combat timing | `[Coop] CombatTimingProbe` (read-only) and `[Coop] GuardActionLane` (default 0): a guard's action switch rides the intention lane with the hits | owner fight 2026-11-21 (asi `9da8d40d`): lane off, hits landed 251-378 ms before the swing shown on the guest (action p50 329 ms, hit p50 10 ms, n = 18); lane on, linked copies \|skew\| p95 45 ms (n = 10). Frame time is not the cause (guest p95 21-22 ms, unfocused host 18 ms). **AWAITING OWNER:** whether counters can be timed (`docs/evidence/combat-timing-2026-11-17.md` run 3) |
 
 ## Measured negatives
@@ -35,6 +38,7 @@ common base `b95b7a5`; it is the branch that carries every feature described bel
   continuation jump, fixed in `c718e92`. The investigation is in `docs/archive/ops/HAUL-2026-11-08.md`.
 
 ## Built but not verified live
+- 2026-11-25 crash-class: CR-2 `reloadBuilder` gives the async loader a static slot (path not reached in any run); CR-3 `WbTrap` tolerates a guard re-applied after a disarm (debug trap, default 0). CR-6/CR-7 closed by disassembly with no change; CR-5 (guards written from the player thread) open - `OwnUpdateGuards=1` scored worse.
 - Guest combat, built after the owner fight (default 0, NOT yet run in the game): the 16-byte alignment fix for the forwarded
   attack event (968 of 1086 warning re-posts faulted at `0x018BD72D`); `[Coop] RespawnHitGraceMs` (hits forwarded while the
   guest reloads were applied 2.6-4.5 s late to the respawned player); `[Coop] GuardStageApply` (the guard's Fight stage
