@@ -2623,8 +2623,8 @@ static bool PchanOn() {
 const int kPchMax = 12;
 static struct { uint32_t key, alias; } s_pchTx[kPchMax]; static int s_pchTxN = 0; static uint32_t s_pchSeq = 0;
 static SRWLOCK s_pchLock = SRWLOCK_INIT;
-static struct { uint32_t key, alias; float ratio; uint8_t dirty; } s_pchRx[kPchMax]; static int s_pchRxN = 0;
-static volatile LONG s_pchTxC = 0, s_pchRxC = 0, s_pchSetC = 0, s_pchSameC = 0, s_pchIdleC = 0, s_pchLines = 0;
+static struct { uint32_t key, alias; float ratio; uint8_t dirty; uint32_t ours; } s_pchRx[kPchMax]; static int s_pchRxN = 0;   // ours: the alias we last set on the puppet
+static volatile LONG s_pchTxC = 0, s_pchRxC = 0, s_pchSetC = 0, s_pchSameC = 0, s_pchIdleC = 0, s_pchLines = 0, s_pchWholeC = 0, s_pchReleaseC = 0;
 static void PchanCapture(ActionComponent* ac) {   // the local player's update
     if (!PchanOn() || !Net::IntentLaneOn()) return;
     uint32_t arr = 0; uint16_t n = 0;
@@ -2657,27 +2657,47 @@ static void PchanRx(const Net::IntentMsg& m) {   // lane drain (local player's f
     ReleaseSRWLockExclusive(&s_pchLock);
     InterlockedIncrement(&s_pchRxC);
 }
-static void PchanApply(Human* h) {   // the puppet's own update, only while our action copy owns it
+// Run 38 (owner: "it gets stuck on a ledge hang animation ... and then it's just stuck"): the host played alias 2531761135 on every
+// controller at once (a whole-body action), the puppet got it on ch 3 and ch 0 / layer 1, then the host's controllers all went to alias
+// 0 and the puppet kept the hang on top of its correct primary (PUP act=50 rx=50). SetTargetAction cannot clear a controller (alias 0
+// resolves to no action: sub_65DCB0 -> sub_489970 / sub_48EEC0 return 0), and no per-controller stop was found among the 47 sub_666BB0
+// callers (getters). So: (1) a controller playing the host's primary alias is a whole-body action the primary already carries - not
+// copied; (2) when the host's controller goes idle and the puppet's still plays the alias we set there, it is retargeted to the host's
+// primary alias (an overlay playing the base clip). UNVERIFIED how (2) looks; the owner's retry decides.
+static void PchanApply(Human* h, uint32_t primaryAlias) {   // the puppet's own update, only while our action copy owns it
     if (!PchanOn()) return;
     ActionComponent* ac = h ? h->GetActionComponent() : nullptr;
     if (!readable(ac, 0x40)) return;
-    struct { uint32_t key, alias; float ratio; } todo[kPchMax]; int nt = 0;
+    struct { uint32_t key, alias; float ratio; uint32_t ours; int slot; } todo[kPchMax]; int nt = 0;
     AcquireSRWLockExclusive(&s_pchLock);
-    for (int j = 0; j < s_pchRxN; ++j) if (s_pchRx[j].dirty) { todo[nt].key = s_pchRx[j].key; todo[nt].alias = s_pchRx[j].alias; todo[nt].ratio = s_pchRx[j].ratio; ++nt; s_pchRx[j].dirty = 0; }
+    for (int j = 0; j < s_pchRxN; ++j) if (s_pchRx[j].dirty) { todo[nt].key = s_pchRx[j].key; todo[nt].alias = s_pchRx[j].alias; todo[nt].ratio = s_pchRx[j].ratio; todo[nt].ours = s_pchRx[j].ours; todo[nt].slot = j; ++nt; s_pchRx[j].dirty = 0; }
     ReleaseSRWLockExclusive(&s_pchLock);
     for (int j = 0; j < nt; ++j) {
         const int ch = (int)(todo[j].key & 0x0FFFFFFFu), ly = (int)(todo[j].key >> 28);
-        if (!todo[j].alias) { InterlockedIncrement(&s_pchIdleC); continue; }
         unsigned char mir = 0; void* cur = ac->GetCurrentAction(&mir, ch, ly);
         const uint32_t curAlias = readable(cur, 0x0C) ? *(uint32_t*)((char*)cur + 8) : 0;
-        if (curAlias == todo[j].alias) { InterlockedIncrement(&s_pchSameC); continue; }
-        ac->SetTargetAction((int)todo[j].alias, 0, 0, ch, ly);
-        if (todo[j].ratio > 0.0f && todo[j].ratio < 1.0f) ac->SetCurrentActionRatio(todo[j].ratio, ch, false, false, ly);
+        uint32_t want = todo[j].alias;
+        if (want && want == primaryAlias) {   // (1) whole-body: the primary carries it
+            InterlockedIncrement(&s_pchWholeC);
+            if (!todo[j].ours) continue;
+        }
+        if (!want || want == primaryAlias) {
+            if (!todo[j].ours || curAlias != todo[j].ours || !primaryAlias) { InterlockedIncrement(&s_pchIdleC); continue; }
+            want = primaryAlias;               // (2) release our overlay to the base clip
+            InterlockedIncrement(&s_pchReleaseC);
+        }
+        if (curAlias == want) { InterlockedIncrement(&s_pchSameC); continue; }
+        ac->SetTargetAction((int)want, 0, 0, ch, ly);
+        if (want == todo[j].alias && todo[j].ratio > 0.0f && todo[j].ratio < 1.0f) ac->SetCurrentActionRatio(todo[j].ratio, ch, false, false, ly);
         InterlockedIncrement(&s_pchSetC);
-        if (InterlockedIncrement(&s_pchLines) <= 400) L("[Chan] set puppet key=%08X ch=%d ly=%d alias=%u (cur was %u) ratio=%.2f\n", todo[j].key, ch, ly, todo[j].alias, curAlias, todo[j].ratio);
+        AcquireSRWLockExclusive(&s_pchLock);
+        if (todo[j].slot < s_pchRxN && s_pchRx[todo[j].slot].key == todo[j].key) s_pchRx[todo[j].slot].ours = want == primaryAlias && want != todo[j].alias ? 0 : want;
+        ReleaseSRWLockExclusive(&s_pchLock);
+        if (InterlockedIncrement(&s_pchLines) <= 400) L("[Chan] set puppet key=%08X ch=%d ly=%d alias=%u (cur was %u) ratio=%.2f%s\n", todo[j].key, ch, ly, want, curAlias, todo[j].ratio,
+                                                         want != todo[j].alias ? " [release to primary]" : "");
     }
     static uint64_t s_last = 0; const uint64_t now = GetTickCount64();
-    if (now - s_last >= 5000) { s_last = now; L("[Chan] stats tx=%ld rx=%ld set=%ld same=%ld idle=%ld\n", s_pchTxC, s_pchRxC, s_pchSetC, s_pchSameC, s_pchIdleC); }
+    if (now - s_last >= 5000) { s_last = now; L("[Chan] stats tx=%ld rx=%ld set=%ld same=%ld idle=%ld wholeBody=%ld released=%ld\n", s_pchTxC, s_pchRxC, s_pchSetC, s_pchSameC, s_pchIdleC, s_pchWholeC, s_pchReleaseC); }
 }
 
 // ---- [Coop] ClimbProbe (default 0, read-only): why the carried puppet's climbing/parkour looks choppy (owner, run 37) ------------
@@ -2864,7 +2884,7 @@ static void PuppetActionBlock(Human* h, const PlayerState& s, bool writeActions)
             }
         }
 
-        if (writeActions) PchanApply(h);   // [Coop] PuppetChannels: the peer's other action controllers
+        if (writeActions) PchanApply(h, s.actionAlias);   // [Coop] PuppetChannels: the peer's other action controllers
 
         // Blend-in override: once the puppet's current evaluator IS the action we just targeted, give its
         // blend-in the peer's real length (stored ActionBlend, used if Start() hasn't run yet, AND the runtime
