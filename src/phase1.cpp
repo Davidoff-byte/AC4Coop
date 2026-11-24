@@ -1849,6 +1849,13 @@ static inline int PuppetPhysicsMode() {
         s_puppetPhysics = GetPrivateProfileIntA("Coop", "PuppetPhysics", 0, Paths::Ini()) != 0 ? 1 : 0;
     return s_puppetPhysics;
 }
+// [Coop] PuppetUpdatePhysics (default 0, read once): 1 = updatePhysics on the puppet's own update, 2 = inline in the player's update.
+static int s_pupUpdMode = -1;
+static volatile LONG s_pupPhysPending = 0, s_pupPhysDone = 0;
+static int PupUpdMode() {
+    if (s_pupUpdMode < 0) { const int v = GetPrivateProfileIntA("Coop", "PuppetUpdatePhysics", 0, Paths::Ini()); s_pupUpdMode = v < 0 ? 0 : v > 2 ? 2 : v; L("[Pup] PuppetUpdatePhysics=%d\n", s_pupUpdMode); }
+    return s_pupUpdMode;
+}
 // [Coop] PuppetUpdatePhysics diagnostic (one-shot per puppet): lists the components Entity::SetGlobalMatrixInternal notifies when
 // updatePhysics is set (IDA 0x528249..0x528282: range = sub_5269A0/sub_526A60(ecx = ent+0xDB, arg = ent) over the component array
 // *(ent+0x60), count u16 ent+0x66; each gets vt[0xBC](ent+0x10)), plus the entity's vt[0x80] (called with the flag in both modes,
@@ -3312,11 +3319,14 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
         // [Coop] PuppetUpdatePhysics (default 0): pass updatePhysics=true even when PuppetPhysics=0. IDA 0x528200: with the flag
         // set the write also walks the entity's components (sub_5269A0..sub_526A60) and calls each one's vt[0xBC] with the new
         // matrix; without it the components keep a stale transform. Run 2026-11-25 A/B: PuppetPhysics=0 sinks the puppet to the knees.
-        static int s_pupUpd = -1;
-        if (s_pupUpd < 0) s_pupUpd = GetPrivateProfileIntA("Coop", "PuppetUpdatePhysics", 0, Paths::Ini()) ? 1 : 0;
+        // The only real receiver is the CharacterController (sub_42D570 -> sub_7AF4B0, body transform write). This block runs in the
+        // PLAYER's Human update, the puppet updates on another worker (3626 note, review F1): mode 1 queues the notify for the puppet's
+        // own update (OwnDrain); mode 2 is the inline form measured first (2026-11-25 arm E).
+        const int pupUpd = PupUpdMode();
         { static void* s_compLogged = nullptr; if (ClimbProbeOn() && s_compLogged != (void*)g_puppet) { s_compLogged = (void*)g_puppet; PupCompDump((void*)g_puppet); } }
         if (!replica)
-        g_puppet->SetGlobalMatrixInternal(&m, phys || s_pupUpd);
+        g_puppet->SetGlobalMatrixInternal(&m, phys || pupUpd == 2);
+        if (!replica && !phys && pupUpd == 1) { InterlockedExchange(&s_pupPhysPending, 1); static int s_t = 0; if (!s_t++) L("[Pup] remote-state apply thread=%lu (updatePhysics deferred)\n", GetCurrentThreadId()); }
         { Human* oh = AIEntityHelper::GetHuman(g_puppet); if (oh) PuppetOwnNote(oh, g_puppet, m); }
         // First apply on this puppet: report the effective mode once (the spawn site logs the other one).
         { static void* s_applyLogged = nullptr;
@@ -10714,7 +10724,9 @@ static void OwnDrain(Human* h) {
             const float dx = e->m_GlobalMatrix.M41 - m.M41, dy = e->m_GlobalMatrix.M42 - m.M42, dz = e->m_GlobalMatrix.M43 - m.M43;
             const float d = sqrtf(dx * dx + dy * dy + dz * dz);
             if (d > 0.02f) OwnNoteMove(false, d);
-            if (OwnPuppetOn()) { e->SetGlobalMatrixInternal(&m, false); InterlockedIncrement(&s_pWrites); }
+            const bool updPhys = s_pupPhysPending && InterlockedExchange(&s_pupPhysPending, 0);   // [Coop] PuppetUpdatePhysics=1
+            if (OwnPuppetOn() || updPhys) { e->SetGlobalMatrixInternal(&m, updPhys); InterlockedIncrement(&s_pWrites); }
+            if (updPhys && InterlockedIncrement(&s_pupPhysDone) == 1) L("[Pup] updatePhysics write on the puppet's own update (first) thread=%lu\n", GetCurrentThreadId());
         }
         if (s_pabPending && InterlockedExchange(&s_pabPending, 0)) {   // [Coop] PuppetActionsOwnUpdate
             static PlayerState ps; Human* ph = nullptr; bool pw = false;   // static: this branch runs for one Human only
