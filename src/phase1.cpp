@@ -1394,6 +1394,7 @@ struct ProxyPick { uint32_t srcId; int idx; float srcMax; float tierDelta; uint3
 
 static void PuppetOwnNote(Human* h, Entity* e, const HookMath::Transform& m);   // own-update block, before ApplyGuards
 bool FightIntentOwnsPuppet();   // [Coop] FightIntents (S7 slice 1), defined with OwnDrain
+static volatile LONG s_pfcActive = 0;   // [Coop] PuppetFightCarry: our action copy owns the puppet in this fight
 static void PuppetOwnClear();
 static Entity* ResolveEntityById(uint64_t id);   // engine registry, defined with the ApplyGuards
 static void ProxySrcClearAll();
@@ -2737,8 +2738,22 @@ static void ActMatchNote(Human* h, const PlayerState& s, bool replica) {
     ++k.frames;
     if (s.actionAlias == 0) ++k.rxZero;
     else if (pAlias == s.actionAlias) ++k.match;
+    // Fight bucket (A/B brain vs PuppetFightCarry): frames where the host player is in a fight (peer stage 4), whole session,
+    // plus the same within 150 ms (the puppet runs ~40 ms behind the host, so an exact-frame match undercounts both arms alike).
+    static uint32_t fF = 0, fM = 0, fZ = 0, fM150 = 0; static uint32_t lastHostAlias = 0, prevHostAlias = 0; static uint64_t hostSwitchMs = 0;
+    if (s.actionAlias != lastHostAlias) { prevHostAlias = lastHostAlias; lastHostAlias = s.actionAlias; hostSwitchMs = now; }
+    if (s.humanGroundStage == 4) {
+        ++fF;
+        if (s.actionAlias == 0) ++fZ;
+        else {
+            if (pAlias == s.actionAlias) ++fM;
+            if (pAlias == s.actionAlias || (now - hostSwitchMs <= 150 && pAlias == prevHostAlias && prevHostAlias)) ++fM150;
+        }
+    }
     if (now - s_last >= 5000) {
         s_last = now;
+        if (fF) L("[ActMatch] fight session frames=%u match=%u/%u (%.1f%%) within150=%u (%.1f%%) rxZero=%u\n", fF, fM, fF - fZ,
+                  fF - fZ ? 100.0 * fM / (fF - fZ) : 0.0, fM150, fF - fZ ? 100.0 * fM150 / (fF - fZ) : 0.0, fZ);
         for (int m = 0; m < 2; ++m)
             for (int c = 0; c < 32; ++c) {
                 Bucket& q = b[m][c];
@@ -2881,6 +2896,17 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
         bool actNow  = hybrid ? !peerGround : (g_driveActions   != 0);    // run our action replication?
         bool locoNow = hybrid ?  peerGround : (g_driveLoco       != 0);   // feed HumanGroundData (FSM anim)?
         if (replica) { aiOff = false; actNow = false; locoNow = false; }  // native: its FSM owns actions, we steer
+        // [Coop] PuppetFightCarry (default 0, read once): while the host player is in a fight (peer HumanGroundStage 4 = Fight;
+        // run 33 logs: stage1 = 5 on every host player path containing 163, 1-2 elsewhere, n = 27) the puppet's own behavior is
+        // disabled and our action copy plays the host's primary action with its phase and blend (the parkour path), instead of
+        // the brain making the puppet's fight AI reproduce the host. One action writer: FightIntents' puppet ops are dropped
+        // while this is active (FightIntentApply) and the run sets BrainPuppet=0. UNVERIFIED: paired kill/counter alignment with
+        // the guard copies, actions on other layers, and the old two-writer crash with the behavior off.
+        static int s_pfcFlag = -1;
+        if (s_pfcFlag < 0) { s_pfcFlag = GetPrivateProfileIntA("Coop", "PuppetFightCarry", 0, Paths::Ini()) != 0 ? 1 : 0; L("[PFC] PuppetFightCarry=%d\n", s_pfcFlag); }
+        const bool fightCarry = s_pfcFlag == 1 && !replica && s.humanGroundStage == 4;
+        if (InterlockedExchange(&s_pfcActive, fightCarry ? 1 : 0) != (fightCarry ? 1 : 0)) L("[PFC] fight carry %s (peer stage %d ctx %d)\n", fightCarry ? "ON" : "off", s.humanGroundStage, s.contextId);
+        if (fightCarry) { aiOff = true; actNow = true; locoNow = false; }
         bool braindead = aiOff && !actNow;                               // position-only (never true in hybrid)
 
         // Behavior ownership toggle: ENABLE when the FSM should own the puppet (ground), DISABLE when WE do
@@ -2996,7 +3022,7 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
         }
         // [Coop] FightIntents: while the puppet's own FSM is in a fight it was put into by the peer's decisions, the FSM owns
         // its actions; copying the peer's alias on top would make two writers (docs/design/s7-fight-intents.md).
-        bool writeActions = actNow && g_switchCd == 0 && !FightIntentOwnsPuppet();   // gated on the settle cooldown
+        bool writeActions = actNow && g_switchCd == 0 && (fightCarry || !FightIntentOwnsPuppet());   // gated on the settle cooldown
         if (g_switchCd > 0) --g_switchCd;
         InterlockedExchange(&s_nrNavOk, (replica && g_bhvState == 1 && g_switchCd == 0) ? 1 : 0);   // [Coop] NativeReplica
 
@@ -9890,6 +9916,11 @@ static void FightIntentApply(Human* pup) {
     char* hg = FiHumanGround(pup); uint16_t p[6];
     if (!hg || !FiPath(hg, p, nullptr)) return;
     void* ig = hg + 0x10;
+    if (InterlockedCompareExchange(&s_pfcActive, 0, 0)) {   // [Coop] PuppetFightCarry: our action copy is the one writer
+        InterlockedExchange(&s_fiRing.tail, s_fiRing.head);
+        InterlockedExchange(&s_fiPuppetFsm, 0);
+        return;
+    }
     if (Brain::PuppetMirrorGuest()) {   // [Coop] BrainPuppet: the brain mirrors the host player's chart onto the puppet; the
         // enter/attack/exit ops are dropped here, and only the "puppet in fight" flag (which pauses the action copy) is kept.
         InterlockedExchange(&s_fiRing.tail, s_fiRing.head);
@@ -14971,7 +15002,7 @@ static void DumpConfigOnce()
         // The Tune* values are floats (read with strtod, see ShipTuningTick); the dump shows the integer part.
         { "Coop", "TuneConeAngle", 120 }, { "Coop", "TuneConeRange", 350 }, { "Coop", "TuneMaxTime", 30 },
         { "Coop", "TuneAggroTime", 30 }, { "Coop", "TuneHull", 0 },
-        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 },
+        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 },{ "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 },
         { "Coop", "CombatTest", 0 }, { "Coop", "CrashContext", 0 }, { "Coop", "CorpseKeepSec", 30 }, { "Coop", "CrowdProbeIntegrate", 1 },
         { "Coop", "CrowdProbeLiveKeys", 1 }, { "Coop", "DamageRelay", 0 }, { "Coop", "Diag", 0 },
         { "Coop", "DisableCrowd", 0 }, { "Coop", "DisablePuppetAI", 1 }, { "Coop", "DisableSpawns", 0 },
