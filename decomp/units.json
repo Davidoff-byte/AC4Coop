@@ -1,14 +1,5 @@
 {
  "units": {
-  "017E5DF0": {
-   "addr": "017E5DF0",
-   "claimed_at": null,
-   "name": "GcLNavalTowerACGADamage",
-   "owner": null,
-   "receipts": [],
-   "size": 0,
-   "status": "unknown"
-  },
   "004212A0": {
    "addr": "004212A0",
    "claimed_at": null,
@@ -63,6 +54,24 @@
    "size": 315,
    "status": "unknown"
   },
+  "0049DE60": {
+   "addr": "0049DE60",
+   "claimed_at": null,
+   "name": "BoneGlobalPosition",
+   "owner": null,
+   "receipts": [],
+   "size": 89,
+   "status": "unknown"
+  },
+  "004ADD10": {
+   "addr": "004ADD10",
+   "claimed_at": null,
+   "name": "ActionControllerReset",
+   "owner": null,
+   "receipts": [],
+   "size": 54,
+   "status": "unknown"
+  },
   "004C6380": {
    "addr": "004C6380",
    "claimed_at": null,
@@ -103,6 +112,24 @@
    "owner": null,
    "receipts": [],
    "size": 51,
+   "status": "unknown"
+  },
+  "005269A0": {
+   "addr": "005269A0",
+   "claimed_at": null,
+   "name": "EntityCompRangeBegin",
+   "owner": null,
+   "receipts": [],
+   "size": 183,
+   "status": "unknown"
+  },
+  "00526A60": {
+   "addr": "00526A60",
+   "claimed_at": null,
+   "name": "EntityCompRangeEnd",
+   "owner": null,
+   "receipts": [],
+   "size": 183,
    "status": "unknown"
   },
   "00527BA0": {
@@ -163,6 +190,24 @@
    ],
    "size": 31,
    "status": "claimed"
+  },
+  "0059AA90": {
+   "addr": "0059AA90",
+   "claimed_at": null,
+   "name": "GroundTokenListClear",
+   "owner": null,
+   "receipts": [],
+   "size": 109,
+   "status": "unknown"
+  },
+  "0059C660": {
+   "addr": "0059C660",
+   "claimed_at": null,
+   "name": "GroundPushToken",
+   "owner": null,
+   "receipts": [],
+   "size": 116,
+   "status": "unknown"
   },
   "0059F9D0": {
    "addr": "0059F9D0",
@@ -331,6 +376,15 @@
    ],
    "size": 173,
    "status": "claimed"
+  },
+  "00666BB0": {
+   "addr": "00666BB0",
+   "claimed_at": null,
+   "name": "ActionControllerLookup",
+   "owner": null,
+   "receipts": [],
+   "size": 118,
+   "status": "unknown"
   },
   "0066F630": {
    "addr": "0066F630",
@@ -508,6 +562,24 @@
    ],
    "size": 192,
    "status": "claimed"
+  },
+  "0075A1B0": {
+   "addr": "0075A1B0",
+   "claimed_at": null,
+   "name": "WorldUpdateWalkLeaf75A1B0",
+   "owner": null,
+   "receipts": [],
+   "size": 26,
+   "status": "unknown"
+  },
+  "0075A1F0": {
+   "addr": "0075A1F0",
+   "claimed_at": null,
+   "name": "WorldUpdateWalkLeaf75A1F0",
+   "owner": null,
+   "receipts": [],
+   "size": 29,
+   "status": "unknown"
   },
   "0079B8D0": {
    "addr": "0079B8D0",
@@ -765,13 +837,22 @@
    "status": "unknown"
   },
   "011D9380": {
-    "addr": "011D9380",
-    "claimed_at": null,
-    "name": "GetFortFromEntity",
-    "owner": null,
-    "receipts": [],
-    "size": 0,
-    "status": "unknown"
+   "addr": "011D9380",
+   "claimed_at": null,
+   "name": "GetFortFromEntity",
+   "owner": null,
+   "receipts": [],
+   "size": 0,
+   "status": "unknown"
+  },
+  "011FE840": {
+   "addr": "011FE840",
+   "claimed_at": null,
+   "name": "GcLShipSetCaptainAtWheel",
+   "owner": null,
+   "receipts": [],
+   "size": 0,
+   "status": "unknown"
   },
   "01207960": {
    "addr": "01207960",
@@ -781,15 +862,6 @@
    "receipts": [],
    "size": 85,
    "status": "unknown"
-  },
-  "011FE840": {
-    "addr": "011FE840",
-    "claimed_at": null,
-    "name": "GcLShipSetCaptainAtWheel",
-    "owner": null,
-    "receipts": [],
-    "size": 0,
-    "status": "unknown"
   },
   "01220960": {
    "addr": "01220960",
@@ -1061,6 +1133,15 @@
    "size": 916,
    "status": "unknown"
   },
+  "017E5DF0": {
+   "addr": "017E5DF0",
+   "claimed_at": null,
+   "name": "GcLNavalTowerACGADamage",
+   "owner": null,
+   "receipts": [],
+   "size": 0,
+   "status": "unknown"
+  },
   "018B9EA0": {
    "addr": "018B9EA0",
    "claimed_at": "2026-11-08T12:12:51Z",
@@ -1160,60 +1241,6 @@
    "size": 12,
    "status": "unknown"
   },
-  "01CE0A40": {
-   "addr": "01CE0A40",
-   "claimed_at": null,
-   "name": "HumanGround_WallRunActionAllowed",
-   "owner": null,
-   "receipts": [],
-   "size": 172,
-   "status": "unknown"
-  },
-  "01D51690": {
-   "addr": "01D51690",
-   "claimed_at": null,
-   "name": "IHumanGround_SetSpeedRatio",
-   "owner": null,
-   "receipts": [],
-   "size": 125,
-   "status": "unknown"
-  },
-  "0075A1F0": {
-   "addr": "0075A1F0",
-   "claimed_at": null,
-   "name": "WorldUpdateWalkLeaf75A1F0",
-   "owner": null,
-   "receipts": [],
-   "size": 29,
-   "status": "unknown"
-  },
-  "0075A1B0": {
-   "addr": "0075A1B0",
-   "claimed_at": null,
-   "name": "WorldUpdateWalkLeaf75A1B0",
-   "owner": null,
-   "receipts": [],
-   "size": 26,
-   "status": "unknown"
-  },
-  "01D0EDE0": {
-   "addr": "01D0EDE0",
-   "claimed_at": null,
-   "name": "GroundEval4",
-   "owner": null,
-   "receipts": [],
-   "size": 0,
-   "status": "unknown"
-  },
-  "01D23570": {
-   "addr": "01D23570",
-   "claimed_at": null,
-   "name": "GroundEval58",
-   "owner": null,
-   "receipts": [],
-   "size": 0,
-   "status": "unknown"
-  },
   "01CD8D70": {
    "addr": "01CD8D70",
    "claimed_at": null,
@@ -1241,40 +1268,49 @@
    "size": 0,
    "status": "unknown"
   },
-  "01D634D0": {
-   "addr": "01D634D0",
+  "01CE0A40": {
+   "addr": "01CE0A40",
    "claimed_at": null,
-   "name": "GroundEvalNode",
+   "name": "HumanGround_WallRunActionAllowed",
+   "owner": null,
+   "receipts": [],
+   "size": 172,
+   "status": "unknown"
+  },
+  "01CE86A0": {
+   "addr": "01CE86A0",
+   "claimed_at": null,
+   "name": "HandleContainerRelease",
+   "owner": null,
+   "receipts": [],
+   "size": 43,
+   "status": "unknown"
+  },
+  "01D0EDE0": {
+   "addr": "01D0EDE0",
+   "claimed_at": null,
+   "name": "GroundEval4",
    "owner": null,
    "receipts": [],
    "size": 0,
    "status": "unknown"
   },
-  "01D63440": {
-   "addr": "01D63440",
+  "01D23570": {
+   "addr": "01D23570",
    "claimed_at": null,
-   "name": "GroundEnterState",
+   "name": "GroundEval58",
    "owner": null,
    "receipts": [],
    "size": 0,
    "status": "unknown"
   },
-  "0059C660": {
-   "addr": "0059C660",
+  "01D51690": {
+   "addr": "01D51690",
    "claimed_at": null,
-   "name": "GroundPushToken",
+   "name": "IHumanGround_SetSpeedRatio",
    "owner": null,
    "receipts": [],
-   "size": 116,
-   "status": "unknown"
-  },
-  "0059AA90": {
-   "addr": "0059AA90",
-   "claimed_at": null,
-   "name": "GroundTokenListClear",
-   "owner": null,
-   "receipts": [],
-   "size": 109,
+   "size": 125,
    "status": "unknown"
   },
   "01D5E6E0": {
@@ -1295,6 +1331,24 @@
    "size": 98,
    "status": "unknown"
   },
+  "01D63440": {
+   "addr": "01D63440",
+   "claimed_at": null,
+   "name": "GroundEnterState",
+   "owner": null,
+   "receipts": [],
+   "size": 0,
+   "status": "unknown"
+  },
+  "01D634D0": {
+   "addr": "01D634D0",
+   "claimed_at": null,
+   "name": "GroundEvalNode",
+   "owner": null,
+   "receipts": [],
+   "size": 0,
+   "status": "unknown"
+  },
   "01D659D0": {
    "addr": "01D659D0",
    "claimed_at": null,
@@ -1302,33 +1356,6 @@
    "owner": null,
    "receipts": [],
    "size": 113,
-   "status": "unknown"
-  },
-  "01CE86A0": {
-   "addr": "01CE86A0",
-   "claimed_at": null,
-   "name": "HandleContainerRelease",
-   "owner": null,
-   "receipts": [],
-   "size": 43,
-   "status": "unknown"
-  },
-  "00666BB0": {
-   "addr": "00666BB0",
-   "claimed_at": null,
-   "name": "ActionControllerLookup",
-   "owner": null,
-   "receipts": [],
-   "size": 118,
-   "status": "unknown"
-  },
-  "004ADD10": {
-   "addr": "004ADD10",
-   "claimed_at": null,
-   "name": "ActionControllerReset",
-   "owner": null,
-   "receipts": [],
-   "size": 54,
    "status": "unknown"
   }
  }

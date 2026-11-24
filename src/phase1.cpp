@@ -1847,6 +1847,29 @@ static inline int PuppetPhysicsMode() {
         s_puppetPhysics = GetPrivateProfileIntA("Coop", "PuppetPhysics", 0, Paths::Ini()) != 0 ? 1 : 0;
     return s_puppetPhysics;
 }
+// [Coop] PuppetUpdatePhysics diagnostic (one-shot per puppet): lists the components Entity::SetGlobalMatrixInternal notifies when
+// updatePhysics is set (IDA 0x528249..0x528282: range = sub_5269A0/sub_526A60(ecx = ent+0xDB, arg = ent) over the component array
+// *(ent+0x60), count u16 ent+0x66; each gets vt[0xBC](ent+0x10)), plus the entity's vt[0x80] (called with the flag in both modes,
+// 0x528238). Per component: vtable, vt[0xBC] target, vt[5]() type pointer (the key sub_521370 searches on).
+typedef void** (__thiscall* EntCompRangeFn)(void* cache, void* ent);
+static void PupCompDump(void* ent) {
+    __try {
+        uint8_t* e = (uint8_t*)ent;
+        void** vt = *(void***)e;
+        void** all = *(void***)(e + 0x60);
+        const unsigned n = *(const uint16_t*)(e + 0x66);
+        void** b = ((EntCompRangeFn)0x005269A0)(e + 0xDB, e);
+        void** en = ((EntCompRangeFn)0x00526A60)(e + 0xDB, e);
+        L("[PupComp] ent=%p vt=%p vt80=%p comps=%u notified=[%d..%d)\n", e, vt, vt[0x80 / 4], n, (int)(b - all), (int)(en - all));
+        for (unsigned i = 0; i < n && i < 64; ++i) {
+            void* c = all[i];
+            if (!c) { L("[PupComp] %2u null\n", i); continue; }
+            void** cvt = *(void***)c;
+            void* ti = ((void* (__thiscall*)(void*))cvt[5])(c);
+            L("[PupComp] %2u c=%p vt=%p vtBC=%p type=%p%s\n", i, c, cvt, cvt[0xBC / 4], ti, (all + i >= b && all + i < en) ? " NOTIFIED" : "");
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { L("[PupComp] exception 0x%08X\n", GetExceptionCode()); }
+}
 static void LogPuppetMode() {
     int phys = PuppetPhysicsMode();
     L("[Pup] mode=%s physics=%d collision=%s\n",
@@ -3215,8 +3238,14 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
         const bool fightCarry = s_pfcFlag == 2 || (s_pfcFlag == 1 && s.humanGroundStage == 4);
         const bool replica = NativeReplicaOn() && NativeReplicaMode(s.contextId) && !fightCarry;
         if (!replica) { s_nr.haveLast = false; InterlockedExchange(&s_nrNavOk, 0); }   // not the replica's own movement; no nav calls
+        // [Coop] PuppetUpdatePhysics (default 0): pass updatePhysics=true even when PuppetPhysics=0. IDA 0x528200: with the flag
+        // set the write also walks the entity's components (sub_5269A0..sub_526A60) and calls each one's vt[0xBC] with the new
+        // matrix; without it the components keep a stale transform. Run 2026-11-25 A/B: PuppetPhysics=0 sinks the puppet to the knees.
+        static int s_pupUpd = -1;
+        if (s_pupUpd < 0) s_pupUpd = GetPrivateProfileIntA("Coop", "PuppetUpdatePhysics", 0, Paths::Ini()) ? 1 : 0;
+        { static void* s_compLogged = nullptr; if (ClimbProbeOn() && s_compLogged != (void*)g_puppet) { s_compLogged = (void*)g_puppet; PupCompDump((void*)g_puppet); } }
         if (!replica)
-        g_puppet->SetGlobalMatrixInternal(&m, phys);
+        g_puppet->SetGlobalMatrixInternal(&m, phys || s_pupUpd);
         { Human* oh = AIEntityHelper::GetHuman(g_puppet); if (oh) PuppetOwnNote(oh, g_puppet, m); }
         // First apply on this puppet: report the effective mode once (the spawn site logs the other one).
         { static void* s_applyLogged = nullptr;
@@ -3397,10 +3426,17 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
                 // &CharacterController::m_FilterInfo, 0x28 = Layer::Disabled - FIX A, it used to pass
                 // 0x29 = FloatingObject, which is a live layer) so it can neither push the player
                 // nor be blocked by geometry. One-shot per puppet (re-armed on respawn).
+                // [Coop] PuppetCollisionLayer (default 40 = Layer::Disabled, the old behaviour; read once). 2026-11-25 A/B on the guest's
+                // screen (scratchpad legs_rec.ps1, host walking near the guest camera): with Disabled the puppet's legs vanish below the
+                // knees - it sinks through the ground (owner: "he's through the ground"); with PuppetPhysics=1 (filter untouched) the boots
+                // stand on the ground. PS3 Layer enum (ops/evidence/ps3_enums_focus.txt): NoCharacterCollision = 7, OnlyStatic = 11 -
+                // world contact without pushing characters (UNVERIFIED on PC beyond Disabled = 40 matching).
+                static int s_pupLayer = -1;
+                if (s_pupLayer < 0) { s_pupLayer = GetPrivateProfileIntA("Coop", "PuppetCollisionLayer", kCollisionLayerDisabled, Paths::Ini()); if (s_pupLayer < 0 || s_pupLayer > 68) s_pupLayer = kCollisionLayerDisabled; }
                 if (!phys && s_pupCollisionEnt != (void*)g_puppet) {
-                    ((char (__thiscall*)(void*, int))0x636480)((void*)&cc->m_FilterInfo, kCollisionLayerDisabled);
+                    ((char (__thiscall*)(void*, int))0x636480)((void*)&cc->m_FilterInfo, s_pupLayer);
                     s_pupCollisionEnt = (void*)g_puppet;
-                    L("[Pup] collision filter -> Disabled(0x%02X) puppet=%p\n", kCollisionLayerDisabled, (void*)g_puppet);
+                    L("[Pup] collision filter -> layer %d (0x%02X) puppet=%p\n", s_pupLayer, s_pupLayer, (void*)g_puppet);
                 }
             }
         }
@@ -15386,7 +15422,7 @@ static void DumpConfigOnce()
         // The Tune* values are floats (read with strtod, see ShipTuningTick); the dump shows the integer part.
         { "Coop", "TuneConeAngle", 120 }, { "Coop", "TuneConeRange", 350 }, { "Coop", "TuneMaxTime", 30 },
         { "Coop", "TuneAggroTime", 30 }, { "Coop", "TuneHull", 0 },
-        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 },{ "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 },
+        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 },{ "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 },
         { "Coop", "CombatTest", 0 }, { "Coop", "CrashContext", 0 }, { "Coop", "CorpseKeepSec", 30 }, { "Coop", "CrowdProbeIntegrate", 1 },
         { "Coop", "CrowdProbeLiveKeys", 1 }, { "Coop", "DamageRelay", 0 }, { "Coop", "Diag", 0 },
         { "Coop", "DisableCrowd", 0 }, { "Coop", "DisablePuppetAI", 1 }, { "Coop", "DisableSpawns", 0 },
