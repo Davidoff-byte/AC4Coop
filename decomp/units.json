@@ -1267,6 +1267,15 @@
    "receipts": [],
    "size": 116,
    "status": "unknown"
+  },
+  "0059AA90": {
+   "addr": "0059AA90",
+   "claimed_at": null,
+   "name": "GroundTokenListClear",
+   "owner": null,
+   "receipts": [],
+   "size": 109,
+   "status": "unknown"
   }
  }
 }

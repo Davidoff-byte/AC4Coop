@@ -192,7 +192,7 @@ volatile LONG c_probeLines = 0, c_gidLines = 0;
 // ---- [Coop] BrainReact host side --------------------------------------------------------------------------------------
 static_assert(sizeof(AtkFields) <= 100, "AtkFields must fit the 5 x 20-byte BrainReact chunks");
 volatile LONG g_reactSeq = 0, c_reactCap = 0, c_reactNonFde = 0, c_reactLines = 0, c_reactApplied = 0, c_reactRefused = 0,
-              c_reactIncomplete = 0, c_reactBuildFail = 0, c_reactVeto = 0, c_reactHeld = 0, c_reactTokenForced = 0;
+              c_reactIncomplete = 0, c_reactBuildFail = 0, c_reactVeto = 0, c_reactHeld = 0, c_reactTokenForced = 0, c_reactTokenRescued = 0, c_reactTokOver = 0;
 void ReactCapture(uint32_t id, uint32_t ecx, const uint32_t* frame) {
     if (!g_react || g_role != 1) return;
     __try {
@@ -234,6 +234,7 @@ void ReactCapture(uint32_t id, uint32_t ecx, const uint32_t* frame) {
             const unsigned n = *(const uint16_t*)(fsm + 0x106);
             const uint32_t* tk = *(const uint32_t* const*)(fsm + 0x100);
             for (unsigned i = 0; i < n && i < 3 && Rd(tk, 4 * (i + 1)); ++i) h.a[1 + i] = tk[i];
+            if (n > 3) InterlockedIncrement(&c_reactTokOver);   // the guest would get a partial list: counted, never seen yet
         } __except (EXCEPTION_EXECUTE_HANDLER) {}
         Publish(objId, h);
         InterlockedIncrement(&c_reactCap);
@@ -473,27 +474,33 @@ bool Execute(uint32_t human, uint32_t ig, uint64_t objId, const Cmd& c, int32_t 
             ReleaseSRWLockExclusive(&g_bLock);
         }
         uint32_t ea[4] = { fde, 0, 0, 0 };
+        // The local Can runs first so whatever its predicates do happens as in the native order (sub_185DA80: vt+44 then vt+48).
+        // UNVERIFIED: whether those predicates (sub_17FEBC0, sub_18068D0, ...) have side effects beyond the token push.
         const uint32_t can = CallSlot(iface, c.nargs - 1, 1, ea);
         uint32_t dr = 0; bool pushed = false;
-        if (can & 0xFF) dr = CallSlot(iface, c.nargs, 1, ea);
-        else if (c.a[1]) {
-            // The local Can refused (the puppet has no fight / health services; a copy may differ in what the Can reads): push
-            // the host's tokens with the engine's own push (thiscall(fsm+0xE0, token), retn 4, 0x1D02E2C..0x1D02E34; it skips a
-            // token already present) and run the Do, which checks the token against the current path itself.
+        if (c.a[1]) {
+            // The Can's only routing output is the token it pushes, and the Do picks its target from that token: sub_1CF6030 (+1C
+            // slot 13) pushes 645 / 646 / 647 by which FDE predicate passes, sub_1D68C50 (slot 14) maps them to 280 / 271 / 270
+            // (cc/g38, g40). Run 25: host token 645 -> 280, the puppet's own Can passed with 646 -> 271, and it stuck there.
+            // So the host's list replaces the local one: clear it with the engine's own clear (sub_59AA90(fsm+0xE0), as the Do
+            // does at its end; count u16 at +0x106, data +0x100), push the host's tokens (sub_59C660, thiscall(fsm+0xE0, tok),
+            // retn 4, 0x1D02E2C), then run the Do, which checks the token against the current path itself.
             __try {
                 const uint32_t fsm = *(const uint32_t*)(ig + 0x90);
+                ((void(__thiscall*)(uint32_t))0x0059AA90)(fsm + 0xE0);
                 for (int i = 1; i <= 3; ++i)
                     if (c.a[i]) ((void(__thiscall*)(uint32_t, uint32_t))0x0059C660)(fsm + 0xE0, c.a[i]);
                 pushed = true;
             } __except (EXCEPTION_EXECUTE_HANDLER) { pushed = false; }
             if (pushed) dr = CallSlot(iface, c.nargs, 1, ea);
-        }
+        } else if (can & 0xFF) dr = CallSlot(iface, c.nargs, 1, ea);   // the host sent no token: the local Can decides
         if (!(dr & 0xFF) && lateMs < 400) { InterlockedIncrement(&c_reactHeld); return false; }   // not in the right state yet: retry
         char ps2[96]; PathStr(ig, ps2, sizeof(ps2));
         InterlockedIncrement(&c_exec); InterlockedIncrement((dr & 0xFF) ? &c_reactApplied : &c_reactRefused);
         if (pushed && (dr & 0xFF)) InterlockedIncrement(&c_reactTokenForced);
+        if (pushed && (dr & 0xFF) && !(can & 0xFF)) InterlockedIncrement(&c_reactTokenRescued);
         if (InterlockedIncrement(&c_reactLines) <= 400)
-            Log("[Brain] react guest slot=%u id=%016llX seq=%u attacker=%08X cls=%u can=%08X do=%08X path %s -> %s lateMs=%d\n", c.nargs,
+            Log("[Brain] react guest slot=%u id=%016llX seq=%u attacker=%08X cls=%u can=%08X tok=%u,%u,%u pushed=%d do=%08X path %s -> %s lateMs=%d\n", c.nargs,
                 (unsigned long long)objId, c.a[0], att, c.tgt, can, c.a[1], c.a[2], c.a[3], pushed ? 1 : 0, dr, ps, ps2, lateMs);
         return true;
     }
@@ -1483,9 +1490,9 @@ void Tick() {
                 g_role == 1 ? "host" : "guest", c_gate181Tx, c_gatePermits, c_gate181Allowed, c_gateSubst, c_gate181Blocked, c_hitApplied, c_hitRefused, c_hitHeld,
                 c_attackHeld, c_atkBuffered, c_atkSent, c_atkNoCall);
         if (g_react)
-            Log("[Brain] react role=%s cap=%ld nonFde=%ld applied=%ld refused=%ld held=%ld incomplete=%ld buildFail=%ld veto=%ld\n",
-                g_role == 1 ? "host" : "guest", c_reactCap, c_reactNonFde, c_reactApplied, c_reactTokenForced, c_reactRefused, c_reactHeld, c_reactIncomplete,
-                c_reactBuildFail, c_reactVeto);
+            Log("[Brain] react role=%s cap=%ld nonFde=%ld applied=%ld tokenForced=%ld tokenRescued=%ld tokOver=%ld refused=%ld held=%ld incomplete=%ld buildFail=%ld veto=%ld\n",
+                g_role == 1 ? "host" : "guest", c_reactCap, c_reactNonFde, c_reactApplied, c_reactTokenForced, c_reactTokenRescued, c_reactTokOver,
+                c_reactRefused, c_reactHeld, c_reactIncomplete, c_reactBuildFail, c_reactVeto);
         if (g_chartSync)
             Log("[Brain] chartsync role=%s tx=%ld rx=%ld applied=%ld own=%ld forced=%ld waitFrames=%ld expired=%ld dropped=%ld playoutMs=%d holdSet=%ld holdApplied=%ld holdExpired=%ld\n",
                 g_role == 1 ? "host" : "guest", c_chartTx, c_chartRx, c_chartApplied, c_chartOwn, c_chartForced, c_chartWait, c_chartExpired, c_chartDropped,
