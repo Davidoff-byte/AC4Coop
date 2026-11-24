@@ -34,6 +34,7 @@ void Phase1_PuppetHitPosted(uintptr_t attacker, int damage, uint32_t contact, ui
 
 #include "player_damage_probe.h"
 #include "attack_forward.h"
+#include "guard_brain.h"   // [Coop] BrainReact veto (Brain::VetoLocalFde)
 #include "combat_timing.h"
 
 namespace {
@@ -122,6 +123,9 @@ int WhoByAttacker(const void* fde)
 typedef int(__thiscall* Vt9Fn)(void* ev, void* recv);
 int __fastcall H1(void* ev, void* /*edx*/, void* recv)
 {
+    // [Coop] BrainReact (guest): a hit between two brain bodies (the puppet and the copies) is decided on the host and replayed
+    // from there; the local one is dropped here by answering "no listener" (0), which drops the post (0x64A035 / 0x64D8D8).
+    if (!t_afPosting && Brain::VetoLocalFde(ev, recv)) return 0;
     const int r = ((Vt9Fn)g_t1)(ev, recv);
     __try {
         int w = Who((uintptr_t)recv);
@@ -347,7 +351,8 @@ void PlayerDamageProbe::Init()
     g_relayIni = GetPrivateProfileIntA("Coop", "PlayerDamageRelay", fi, Paths::Ini()) != 0;
     g_relay = g_relayIni;
     g_atkFwd = GetPrivateProfileIntA("Coop", "AttackForward", 0, Paths::Ini()) != 0;   // default 0 until verified live
-    if (!g_probe && !g_relay && !g_atkFwd) return;
+    const bool brainReact = GetPrivateProfileIntA("Coop", "Brain", 0, Paths::Ini()) && GetPrivateProfileIntA("Coop", "BrainReact", 0, Paths::Ini());   // H1 hosts its veto
+    if (!g_probe && !g_relay && !g_atkFwd && !brainReact) return;
     static const BYTE p1[6] = { 0x55, 0x8B, 0xEC, 0x8B, 0x4D, 0x08 };
     static const BYTE p2[8] = { 0x55, 0x8B, 0xEC, 0x51, 0x56, 0x8B, 0x75, 0x08 };
     static const BYTE p3[12] = { 0x53, 0x8B, 0xDC, 0x83, 0xEC, 0x08, 0x83, 0xE4, 0xF0, 0x83, 0xC4, 0x04 };
@@ -399,6 +404,28 @@ static int AfFaultNote(EXCEPTION_POINTERS* ep)
     }
     return EXCEPTION_EXECUTE_HANDLER;
 }
+// [Coop] BrainReact: the same rebuild as AttackForward_Post, without the post. The caller hands the event straight to a
+// reaction Can/Do pair (interface +0x1C) and owns it afterwards; nothing here frees it (UNVERIFIED whether the pair keeps a
+// reference, so the event is deliberately not released).
+void* AttackForward_Build(void* attacker, const AtkFields& a)
+{
+    __try {
+        char* f = ((char* (__cdecl*)())0x010EFC30)();
+        if (!f) return nullptr;
+        __declspec(align(16)) float dir[4]; __declspec(align(16)) float pos[4];
+        memcpy(dir, a.dir, 16); memcpy(pos, a.pos, 16);
+        ((void* (__thiscall*)(void*, int, int, int, void*, void*, char, char, void*))0x018BD690)(
+            f, a.type, a.sub, (int)a.f336, dir, pos, (char)a.b331, (char)a.b328, attacker);
+        auto SB = [&](int o, uint8_t v) { *(uint8_t*)(f + o) = v; };
+        auto SD = [&](int o, uint32_t v) { *(uint32_t*)(f + o) = v; };
+        SD(0x60, a.f60); SB(0x146, a.b326); SB(0x147, a.b327); SD(0x110, a.f110); SB(0x14A, a.b330); SB(0x142, a.b322);
+        SB(0x145, a.b325); SB(0x149, a.b329); SD(0x124, a.f124); SD(0x128, a.f128); SD(0x120, a.f120); SD(0x50, a.f50);
+        SB(0x169, a.b361); SB(0x143, a.b323); SB(0x144, a.b324); SD(0x11C, a.f11C); SD(0x114, a.f114);
+        SD(0x130, a.f130); SB(0x134, a.b308); SD(0x5C, a.f5C); SD(0x54, a.phase ? 1u : 0u); SB(0x1C, a.b1C);
+        return f;
+    } __except (AfFaultNote(GetExceptionInformation())) { return nullptr; }
+}
+
 bool AttackForward_Post(void* victim, void* attacker, const AtkFields& a)
 {
     __try {

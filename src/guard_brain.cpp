@@ -4,6 +4,7 @@
 #include "net.h"
 #include "netstate.h"
 #include "paths.h"
+#include "attack_forward.h"   // [Coop] BrainReact: AtkFields, AttackForward_Capture / AttackForward_Build
 #include <windows.h>
 #include <tlhelp32.h>
 #include <intrin.h>
@@ -48,6 +49,17 @@ const SlotSpec kSlots[] = {
     // Can/DoAttackHit(FightDamageResponseEvent&) - UNVERIFIED on PC. argKind 3 = that event. Replay is gated by HitSyncOn().
     { 210, 0x01D7A9F0u, 1, 1, 3 },
     { 209, 0x01D28280u, 0, 0, 0 },                        // count only (the Can half; the guest calls it itself)
+    // [Coop] BrainReact (IDA cc/g31-g36, census run 22): reactions forced through the +0x1C interface (vtable 0x026E7D40 at
+    // hg+0x1C, installed at 0x016D877C; this - 0x0C = the IHumanGround key) with a FightDamageEvent argument, Can = slot - 1:
+    //   1 (0x1D79010; Can 0 0x1D49D20)  guards and player 317 / 334 / 336 / 343 / 344
+    //   6 (0x1D7A3C0; Can 5 0x1D275D0)  312
+    //  12 (0x1D7A600; Can 11 0x1D5E480) 268 (sub_1D66BA0); called by sub_185DA80 (vt+44/+48)
+    //  14 (0x1D7A660; Can 13 0x1D27940) 280 (sub_1D68C50); called by sub_18644D0 (hit resolution)
+    // argKind 4 = FightDamageEvent (vtable 0x02700720). And IHumanGround 208 (0x1D7A990; Can 207 0x1D28210): guard reaction
+    // 217 / 225 / 232 / 233, called from sub_1809C10 next to 209/210, so the same response-event argument (argKind 3).
+    { 1,  0x01D79010u, 1, 1, 4, 0x026E7D40u, -0x0C }, { 6,  0x01D7A3C0u, 1, 1, 4, 0x026E7D40u, -0x0C },
+    { 12, 0x01D7A600u, 1, 1, 4, 0x026E7D40u, -0x0C }, { 14, 0x01D7A660u, 1, 1, 4, 0x026E7D40u, -0x0C },
+    { 208, 0x01D7A990u, 1, 1, 3 },
     // State-115 probe (count + log only, IDA cc/g4-g15): the only actions the Ground chart handles in dispatch 115.
     { 375, 0x01D2AC10u, 0, 0, 0 },                        // -> sub_1D03C20: in 115 pushes token 301
     { 0,   0x01D30600u, 0, 0, 0, 0x026E7C9Cu, -0x24 },    // -> sub_1D04D30: in 115 pushes token 305
@@ -56,12 +68,13 @@ const SlotSpec kSlots[] = {
 uint32_t VtOf(int i) { return kSlots[i].vt ? kSlots[i].vt : 0x026E7DC0u; }
 const int kNSlots = sizeof(kSlots) / sizeof(kSlots[0]);
 
-int  g_on = -1, g_delayMs = 0, g_test = 0, g_testDelayMs = 150, g_hitSync = 0, g_chartSync = 0, g_playoutMs = 0, g_puppet = 0;   // g_puppet: [Coop] BrainPuppet (default 0)   // g_playoutMs: [Coop] BrainPlayoutMs (default 0)   // [Coop] BrainHitSync, [Coop] BrainChartSync (default 0)
+int  g_on = -1, g_delayMs = 0, g_test = 0, g_testDelayMs = 150, g_hitSync = 0, g_chartSync = 0, g_playoutMs = 0, g_puppet = 0, g_react = 0;   // g_react: [Coop] BrainReact (default 0)   // g_puppet: [Coop] BrainPuppet (default 0)   // g_playoutMs: [Coop] BrainPlayoutMs (default 0)   // [Coop] BrainHitSync, [Coop] BrainChartSync (default 0)
 const uint16_t kGate = 0xB5B5;   // command: a host native took attack-substate transition a[1] from state a[0] (permit for the copy)
 const uint16_t kChart = 0xC4A7;   // command: a host native took Ground transition a[1] from node a[0], handler a[2] (BrainChartSync)
 // [Coop] BrainPuppet: the host player (host) and the guest's puppet of it (guest) are one brain body under this fixed id, so capture,
 // the chart mirror and the hit replay apply to them unchanged. Not a guard objId (guard ids are 0x00000000Fxxxxxxx).
 const uint64_t kPuppetWire = 0x5055505045540001ull;
+const uint16_t kReact = 0xD0D1, kReactData = 0xD0D0;   // BrainReact: header {slot, seq, attacker} and 5 data chunks of 20 bytes (AtkFields)
 volatile LONG g_role = -1;   // 1 host, 0 guest
 
 void Log(const char* fmt, ...) {
@@ -83,6 +96,7 @@ struct Body {
     Cmd pendAtk; uint8_t pendValid; uint8_t hostIn173;   // BrainHitSync host: last attack call, sent when the guard enters 173
     uint32_t fsm;   // cached Ground helper *(ig+0x90), refreshed by NoteBody
     uint32_t pathHash;   // BrainPuppet: last logged path of the player / puppet body
+    uint32_t rseq; uint8_t rmask; uint8_t rbuf[100]; uint32_t rFde; uint32_t rFdeSeq;   // BrainReact guest: reassembly, built event
     struct { uint16_t node; int32_t code; uint32_t handler; uint64_t atMs; uint8_t sched; } cq[8]; int cqn;   // BrainChartSync guest queue
     struct { uint16_t node; int32_t code; uint32_t handler; uint32_t dueHostMs; uint64_t setMs; } hold;   // BrainPlayoutMs host: a deferred attack start
 };
@@ -175,8 +189,56 @@ unsigned PathStr(uint32_t ig, char* out, size_t cap) {
 }
 volatile LONG c_probeLines = 0, c_gidLines = 0;
 
+// ---- [Coop] BrainReact host side --------------------------------------------------------------------------------------
+static_assert(sizeof(AtkFields) <= 100, "AtkFields must fit the 5 x 20-byte BrainReact chunks");
+volatile LONG g_reactSeq = 0, c_reactCap = 0, c_reactNonFde = 0, c_reactLines = 0, c_reactApplied = 0, c_reactRefused = 0,
+              c_reactIncomplete = 0, c_reactBuildFail = 0, c_reactVeto = 0, c_reactHeld = 0;
+void ReactCapture(uint32_t id, uint32_t ecx, const uint32_t* frame) {
+    if (!g_react || g_role != 1) return;
+    __try {
+        const uint32_t ig = ecx + (uint32_t)kSlots[id].adj;
+        uint64_t objId = 0;
+        AcquireSRWLockShared(&g_bLock);
+        const int k = FindBy(&Body::ig, ig);
+        if (k >= 0) objId = g_b[k].objId;
+        ReleaseSRWLockShared(&g_bLock);
+        if (!objId) { InterlockedIncrement(&c_capUnbound); return; }
+        InterlockedIncrement(&c_cap[id]);
+        const uint32_t fde = frame[1];
+        if (!Rd((void*)fde, 0x170) || *(const uint32_t*)fde != 0x02700720u) {   // FightDamageEvent vtable (player_damage_probe.cpp VT_FDE)
+            if (InterlockedIncrement(&c_reactNonFde) <= 20)
+                Log("[Brain] react slot=%u id=%016llX arg %08X is not a FightDamageEvent (vt %08X): not sent\n", kSlots[id].slot, (unsigned long long)objId, fde,
+                    Rd((void*)fde, 4) ? *(const uint32_t*)fde : 0);
+            return;
+        }
+        AtkFields af; memset(&af, 0, sizeof(af));
+        AttackForward_Capture((const void*)fde, af);
+        const uint32_t ah = *(const uint32_t*)(fde + 0x58);   // attacker handle -> entity: [h+8] < 0 ? [h] : 0
+        const uint32_t att = Rd((void*)ah, 12) && *(const int32_t*)(ah + 8) < 0 ? *(const uint32_t*)ah : 0;
+        uint64_t aObj = 0; const uint8_t aCls = (uint8_t)ClassOf(att, &aObj);
+        bool clk = false; const uint32_t now = HostMs(&clk);
+        if (!clk || !PeerReady()) return;
+        const uint32_t seq = (uint32_t)InterlockedIncrement(&g_reactSeq);
+        uint8_t raw[100] = {}; memcpy(raw, &af, sizeof(af));
+        for (int i = 0; i < 5; ++i) {   // data first: the lane delivers one guard's messages in order, so the header finds them all
+            Cmd d = {}; d.slot = kReactData; d.nargs = (uint8_t)i; d.a[0] = seq; d.execHostMs = now;
+            memcpy(&d.a[1], raw + i * 20, 12); memcpy(&d.tgtObj, raw + i * 20 + 12, 8);
+            Publish(objId, d);
+        }
+        Cmd h = {}; h.slot = kReact; h.nargs = (uint8_t)kSlots[id].slot; h.a[0] = seq; h.tgt = aCls; h.tgtObj = aObj; h.execHostMs = now;
+        Publish(objId, h);
+        InterlockedIncrement(&c_reactCap);
+        if (InterlockedIncrement(&c_reactLines) <= 200) {
+            char ps[96]; PathStr(ig, ps, sizeof(ps));
+            Log("[Brain] react cap slot=%u id=%016llX seq=%u phase=%u type=%u sub=%u attacker=%08X cls=%u aobj=%016llX path=%s hostMs=%u\n",
+                kSlots[id].slot, (unsigned long long)objId, seq, af.phase, af.type, af.sub, att, aCls, (unsigned long long)aObj, ps, now);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
 void __cdecl Capture(uint32_t id, uint32_t ecx, const uint32_t* frame) {
     if (id >= (uint32_t)kNSlots) return;
+    if (kSlots[id].argKind == 4) { ReactCapture(id, ecx, frame); return; }   // [Coop] BrainReact
     if (kSlots[id].vt || kSlots[id].slot == 375) {   // state-115 probe: who calls the actions dispatch 115 accepts, and from which path
         __try {
             const uint32_t ig = ecx + (uint32_t)kSlots[id].adj;
@@ -282,6 +344,7 @@ void InstallCapture() {
         const uint32_t cur = ((uint32_t*)(uintptr_t)VtOf(i))[kSlots[i].slot];
         // Every slot dword must still hold the target read from the exe (tools/pe.py, 2026-11-22); anything else (another
         // hook, a different build) is refused with the value printed.
+        if ((kSlots[i].argKind == 4 || kSlots[i].slot == 208 && !kSlots[i].vt) && !g_react) continue;   // BrainReact slots only when on
         if (kSlots[i].fn && cur != kSlots[i].fn) { Log("[Brain] slot %u is %08X, expected %08X: not hooked\n", kSlots[i].slot, cur, kSlots[i].fn); continue; }
         if (cur < 0x00401000u || cur >= 0x02400000u) { Log("[Brain] slot %u target %08X outside code: not hooked\n", kSlots[i].slot, cur); continue; }
         uint8_t* stub = g_stubs + i * 40;
@@ -352,6 +415,64 @@ bool Execute(uint32_t human, uint32_t ig, uint64_t objId, const Cmd& c, int32_t 
         Log("[Brain] exec role=%s slot=mark id=%016llX execMs=%u lateMs=%d\n", g_role == 1 ? "host" : "guest", (unsigned long long)objId, c.execHostMs, lateMs);
         return true;
     }
+    if (c.slot == kReactData) {   // BrainReact: one 20-byte chunk of the host's FightDamageEvent fields
+        AcquireSRWLockExclusive(&g_bLock);
+        const int k = FindBy(&Body::human, human);
+        if (k >= 0 && c.nargs < 5) {
+            Body& b = g_b[k];
+            if (b.rseq != c.a[0]) { b.rseq = c.a[0]; b.rmask = 0; }
+            memcpy(b.rbuf + c.nargs * 20, &c.a[1], 12); memcpy(b.rbuf + c.nargs * 20 + 12, &c.tgtObj, 8);
+            b.rmask |= (uint8_t)(1u << c.nargs);
+        }
+        ReleaseSRWLockExclusive(&g_bLock);
+        InterlockedIncrement(&c_exec);
+        return true;
+    }
+    if (c.slot == kReact) {   // BrainReact: rebuild the event and play the host's reaction (+0x1C Can = slot - 1, then Do)
+        uint8_t raw[100]; bool complete = false; uint32_t victim = 0, fde = 0;
+        AcquireSRWLockExclusive(&g_bLock);
+        const int k = FindBy(&Body::human, human);
+        if (k >= 0) {
+            Body& b = g_b[k];
+            complete = b.rseq == c.a[0] && b.rmask == 0x1F;
+            if (complete) memcpy(raw, b.rbuf, sizeof(raw));
+            victim = b.ent;
+            if (b.rFdeSeq == c.a[0]) fde = b.rFde;   // a retry reuses the event built for this seq
+        }
+        ReleaseSRWLockExclusive(&g_bLock);
+        // Commands with equal execMs run in queue-slot order, not arrival order, so the header can come before its chunks: wait.
+        if (!complete) { if (lateMs < 400) return false; InterlockedIncrement(&c_reactIncomplete); return true; }
+        bool tok = true;
+        const uint32_t att = ResolveTarget(c, &tok);
+        const uint32_t iface = ig + 0x0C;   // the +0x1C interface: hg + 0x1C = (ig = hg + 0x10) + 0x0C
+        char ps[96]; PathStr(ig, ps, sizeof(ps));
+        if (!fde) {
+            AtkFields af; memcpy(&af, raw, sizeof(af));
+            fde = (uint32_t)(uintptr_t)AttackForward_Build(tok ? (void*)(uintptr_t)att : nullptr, af);
+            if (!fde) { InterlockedIncrement(&c_reactBuildFail); return true; }
+            // FDE+0xA4 = the victim's HandleContainer with one reference, as sub_185DA80 sets it before the reaction calls
+            // (`v4 = *(entity+200)`, two increments, exchange into a2+164, one decrement).
+            __try {
+                const uint32_t hc = *(const uint32_t*)(victim + 0xC8);
+                if (hc) { InterlockedIncrement((volatile LONG*)(hc + 4)); *(uint32_t*)(fde + 0xA4) = hc; }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
+            AcquireSRWLockExclusive(&g_bLock);
+            const int kk = FindBy(&Body::human, human);
+            if (kk >= 0) { g_b[kk].rFde = fde; g_b[kk].rFdeSeq = c.a[0]; }
+            ReleaseSRWLockExclusive(&g_bLock);
+        }
+        uint32_t ea[4] = { fde, 0, 0, 0 };
+        const uint32_t can = CallSlot(iface, c.nargs - 1, 1, ea);
+        if (!(can & 0xFF) && lateMs < 400) { InterlockedIncrement(&c_reactHeld); return false; }   // not in the right state yet: retry
+        uint32_t dr = 0;
+        if (can & 0xFF) dr = CallSlot(iface, c.nargs, 1, ea);
+        char ps2[96]; PathStr(ig, ps2, sizeof(ps2));
+        InterlockedIncrement(&c_exec); InterlockedIncrement((can & 0xFF) ? &c_reactApplied : &c_reactRefused);
+        if (InterlockedIncrement(&c_reactLines) <= 400)
+            Log("[Brain] react guest slot=%u id=%016llX seq=%u attacker=%08X cls=%u can=%08X do=%08X path %s -> %s lateMs=%d\n", c.nargs,
+                (unsigned long long)objId, c.a[0], att, c.tgt, can, dr, ps, ps2, lateMs);
+        return true;
+    }
     if (c.slot == kChart) {   // BrainChartSync: queue the host guard's transition for the copy's node wrapper (NodeW)
         AcquireSRWLockExclusive(&g_bLock);
         const int k = FindBy(&Body::human, human);
@@ -379,7 +500,7 @@ bool Execute(uint32_t human, uint32_t ig, uint64_t objId, const Cmd& c, int32_t 
     }
     bool tok = true;
     const uint32_t t = ResolveTarget(c, &tok);
-    if (c.slot == 210) {   // BrainHitSync: replay the host guard's hit outcome on the copy, in substate 180 (path[5])
+    if (c.slot == 210 || c.slot == 208) {   // BrainHitSync / BrainReact: replay the host guard's hit (210) or blocked (208) outcome, in substate 180
         char ps[96]; PathStr(ig, ps, sizeof(ps));
         unsigned p5 = 0;
         __try {
@@ -403,9 +524,9 @@ bool Execute(uint32_t human, uint32_t ig, uint64_t objId, const Cmd& c, int32_t 
         *(uint32_t*)(r + 52) = *(uint32_t*)(t + 0xC8);
         *(uint32_t*)(e + 12) = (uint32_t)(uintptr_t)r;
         uint32_t ea[4] = { (uint32_t)(uintptr_t)e, 0, 0, 0 };
-        const uint32_t can = CallSlot(ig, 209, 1, ea);
+        const uint32_t can = CallSlot(ig, c.slot - 1, 1, ea);
         uint32_t dr = 0;
-        if (can & 0xFF) dr = CallSlot(ig, 210, 1, ea);
+        if (can & 0xFF) dr = CallSlot(ig, c.slot, 1, ea);
         char ps2[96]; PathStr(ig, ps2, sizeof(ps2));
         InterlockedIncrement(&c_exec); InterlockedIncrement((can & 0xFF) ? &c_hitApplied : &c_hitRefused);
         if (InterlockedIncrement(&c_hitLines) <= 120)
@@ -931,6 +1052,7 @@ void Init() {
     g_chartSync = GetPrivateProfileIntA("Coop", "BrainChartSync", 0, Paths::Ini()) != 0 ? 1 : 0;
     g_playoutMs = GetPrivateProfileIntA("Coop", "BrainPlayoutMs", 0, Paths::Ini());
     g_puppet = GetPrivateProfileIntA("Coop", "BrainPuppet", 0, Paths::Ini()) != 0 ? 1 : 0;
+    g_react = GetPrivateProfileIntA("Coop", "BrainReact", 0, Paths::Ini()) != 0 ? 1 : 0;
     if (g_playoutMs < 0 || g_playoutMs > 500) g_playoutMs = 0;
     if (g_on) Log("[Brain] Brain=1 delayMs=%d test=%d testDelayMs=%d (needs IntentLane=1, PeerClock=1)\n", g_delayMs, g_test, g_testDelayMs);
     if (g_on) Install115();
@@ -938,6 +1060,21 @@ void Init() {
 
 bool On() { return g_on == 1; }
 bool PuppetMirrorGuest() { return g_on == 1 && g_puppet && g_chartSync && g_role == 0; }
+bool VetoLocalFde(const void* ev, const void* recv) {
+    if (!g_react || g_on != 1 || g_role != 0 || !ev || !recv) return false;
+    __try {
+        if (*(const uint32_t*)ev != 0x02700720u) return false;   // FightDamageEvent only
+        const uint32_t ah = *(const uint32_t*)((const char*)ev + 0x58);
+        const uint32_t att = ah && *(const int32_t*)(ah + 8) < 0 ? *(const uint32_t*)ah : 0;
+        const uint32_t pup = (uint32_t)(uintptr_t)Phase1_PuppetEntity(), r = (uint32_t)(uintptr_t)recv;
+        AcquireSRWLockShared(&g_bLock);
+        const bool recvBody = r == pup || FindBy(&Body::ent, r) >= 0;
+        const bool attBody = att && (att == pup || FindBy(&Body::ent, att) >= 0);
+        ReleaseSRWLockShared(&g_bLock);
+        if (recvBody && attBody) { InterlockedIncrement(&c_reactVeto); return true; }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return false;
+}
 
 }  // namespace Brain
 
@@ -1321,6 +1458,10 @@ void Tick() {
             Log("[Brain] hitsync role=%s gateTx=%ld permits=%ld allowed=%ld substituted=%ld blocked=%ld hitApplied=%ld hitRefused=%ld hitHeld=%ld attackHeld=%ld atkCalls=%ld atkSent=%ld atkNoCall=%ld\n",
                 g_role == 1 ? "host" : "guest", c_gate181Tx, c_gatePermits, c_gate181Allowed, c_gateSubst, c_gate181Blocked, c_hitApplied, c_hitRefused, c_hitHeld,
                 c_attackHeld, c_atkBuffered, c_atkSent, c_atkNoCall);
+        if (g_react)
+            Log("[Brain] react role=%s cap=%ld nonFde=%ld applied=%ld refused=%ld held=%ld incomplete=%ld buildFail=%ld veto=%ld\n",
+                g_role == 1 ? "host" : "guest", c_reactCap, c_reactNonFde, c_reactApplied, c_reactRefused, c_reactHeld, c_reactIncomplete,
+                c_reactBuildFail, c_reactVeto);
         if (g_chartSync)
             Log("[Brain] chartsync role=%s tx=%ld rx=%ld applied=%ld own=%ld forced=%ld waitFrames=%ld expired=%ld dropped=%ld playoutMs=%d holdSet=%ld holdApplied=%ld holdExpired=%ld\n",
                 g_role == 1 ? "host" : "guest", c_chartTx, c_chartRx, c_chartApplied, c_chartOwn, c_chartForced, c_chartWait, c_chartExpired, c_chartDropped,

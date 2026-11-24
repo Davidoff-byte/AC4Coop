@@ -36,6 +36,9 @@ namespace Brain {
     void Tick();
     // [Coop] BrainPuppet on the guest: the puppet is driven by the host player's mirrored chart (FightIntents must not apply to it).
     bool PuppetMirrorGuest();
+    // [Coop] BrainReact (guest): true for a FightDamageEvent between two brain bodies (puppet / registered copies), which the
+    // host decides and replays; H1 then drops the local post.
+    bool VetoLocalFde(const void* ev, const void* recv);
 }
 
 // phase1.cpp exports used here.

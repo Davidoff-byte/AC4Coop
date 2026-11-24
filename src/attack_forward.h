@@ -26,6 +26,8 @@ bool AttackForward_On();                               // [Coop] AttackForward a
 void AttackForward_Capture(const void* fde, AtkFields& out);   // fill from a posted FightDamageEvent
 // Post a native FightDamageEvent built from `a` (attacker = the owner's copy, victim = the owner's player). Game thread.
 bool AttackForward_Post(void* victim, void* attacker, const AtkFields& a);
+// [Coop] BrainReact: build the same event without posting it (the caller gives it to a reaction Can/Do pair). Game thread.
+void* AttackForward_Build(void* attacker, const AtkFields& a);
 
 // phase1.cpp
 void Phase1_PuppetAttackPosted(uintptr_t attacker, const AtkFields& a);   // host, H1 (any thread)
