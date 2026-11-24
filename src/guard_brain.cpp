@@ -1253,6 +1253,8 @@ int __fastcall EntryW(uint32_t fsm, uint32_t, int node) {
     if (g_pathAuth && g_on == 1 && g_role == 0) PathChild(fsm, node);
     return r;
 }
+bool BlkBacked(uint64_t objId, uint32_t fsm, uint16_t target);   // BrainBlockSync section below
+volatile LONG c_psetBacked = 0;
 void PathCorrect(uint64_t objId, uint32_t ig) {   // guest, at the copy's update
     if (!g_pathAuth || g_pathSetMs <= 0 || g_on != 1 || g_role != 0) return;
     uint32_t fsm = 0;
@@ -1284,15 +1286,20 @@ void PathCorrect(uint64_t objId, uint32_t ig) {   // guest, at the copy's update
     ReleaseSRWLockExclusive(&g_bLock);
     if (skipReact) { InterlockedIncrement(&c_psetSkipReact); return; }
     if (!apply) return;
-    if (!SwapSafe(C[p - 1], C[p], H[p])) {   // p > index of 163 >= 0, so C[p - 1] (== H[p - 1]) is the common parent
+    // p > index of 163 >= 0, so C[p - 1] (== H[p - 1]) is the common parent. Allowed: a safe-table pair, or (BrainBlockSync) a
+    // target whose host request is queued and resolves here - the forced enter goes through EnterF -> BlkAt, which installs it.
+    const bool safe = SwapSafe(C[p - 1], C[p], H[p]);
+    const bool backed = !safe && BlkBacked(objId, fsm, H[p]);
+    if (!safe && !backed) {
         InterlockedIncrement(&c_psetRefused);
         if (InterlockedIncrement(&c_psetLines) <= 300) {
             char cs[96], hs[96]; FmtPath(C, dc, cs, sizeof(cs)); FmtPath(H, dh, hs, sizeof(hs));
-            Log("[Brain] pathset refused id=%016llX heldMs=%llu copy=%s host=%s (parent %u: %u -> %u not in the safe table)\n",
+            Log("[Brain] pathset refused id=%016llX heldMs=%llu copy=%s host=%s (parent %u: %u -> %u not in the safe table, no host request)\n",
                 (unsigned long long)objId, (unsigned long long)held, cs, hs, C[p - 1], C[p], H[p]);
         }
         return;
     }
+    if (backed) InterlockedIncrement(&c_psetBacked);
     const int code = ((int)C[p] << 10) | H[p];
     bool ok = false;
     __try {
@@ -1426,6 +1433,29 @@ void SetHc(uint32_t slot, uint32_t hc) {   // *(slot) = hc with one new referenc
     InterlockedIncrement((volatile LONG*)(hc + 4));
     uint32_t old = (uint32_t)InterlockedExchange((volatile LONG*)slot, (LONG)hc);
     if (old) ((CleanupFn)kHandleRelease)(&old);
+}
+// Run 31: the puppet missed the owner's input-driven transitions (167 -> 173/190 defense, 167 -> 209, 167 -> 255, 173 -> 167):
+// they are event calls (a2 != 0) that the chart mirror does not carry, and the corrector refused 46 times on the safe table.
+// The host's enter of that target did send its request. A forced entry backed by it is entered with the host's data, so the
+// corrector may force a target when: a host request for it is queued (<= 1.5 s), every mapped entity resolves here, and the
+// action object has an opponent afterwards (the host's mapped one, or its own non-null one) - the run 30 null-opponent fault.
+bool BlkBacked(uint64_t objId, uint32_t fsm, uint16_t target) {
+    if (!g_blkSync) return false;
+    BlkMsg m; bool have = false; const uint64_t ms = GetTickCount64();
+    AcquireSRWLockShared(&g_bLock);
+    const int k = FindObj(objId);
+    if (k >= 0)
+        for (int i = g_b[k].bqn - 1; i >= 0; --i) {
+            BlkMsg q; memcpy(&q, g_b[k].bq[i].m, sizeof(q));
+            if (q.target == target && ms - g_b[k].bq[i].atMs <= 1500) { m = q; have = true; break; }
+        }
+    ReleaseSRWLockShared(&g_bLock);
+    if (!have) return false;
+    for (int j = 0; j < m.ntab && j < 3; ++j) if (!ResolveEnt(m.tabCls[j], m.tab[j])) return false;
+    if (m.tcls) return EntHc(ResolveEnt(m.tcls, m.tobj)) != 0;
+    uint32_t ao = 0;
+    __try { ao = *(const uint32_t*)(fsm + 0x74); return ao && HcObj(*(const uint32_t*)(ao + 0x1B8)) != 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 void BlkAt(uint32_t fsm, int target) {   // both roles, in the enter wrappers before sub_1D63440
     if (!g_blkSync || g_on != 1 || g_role < 0 || !InFight(fsm)) return;
@@ -1968,9 +1998,9 @@ void Tick() {
         if (g_blkSync)
             Log("[Brain] blk role=%s tx=%ld keepDwords=%ld rx=%ld written=%ld same=%ld missing=%ld unresolved=%ld cleanupRefused=%ld tgtSet=%ld varSet=%ld\n", g_role == 1 ? "host" : "guest", c_blkTx, c_blkKeep, c_blkRx, c_blkWritten, c_blkSame, c_blkMissing, c_blkUnres, c_blkCleanupRefused, c_blkTgtSet, c_blkVarSet);
         if (g_pathAuth)
-            Log("[Brain] pathauth role=%s tx=%ld rx=%ld noBody=%ld child over=%ld same=%ld none=%ld refused=%ld set applied=%ld fail=%ld refused=%ld skipReact=%ld prefix=%ld setMs=%d\n",
+            Log("[Brain] pathauth role=%s tx=%ld rx=%ld noBody=%ld child over=%ld same=%ld none=%ld refused=%ld set applied=%ld (backed %ld) fail=%ld refused=%ld skipReact=%ld prefix=%ld setMs=%d\n",
                 g_role == 1 ? "host" : "guest", c_pathTx, c_pathRx, c_pathNoBody, c_childOver, c_childSame, c_childNone, c_childRefused,
-                c_psetApplied, c_psetFail, c_psetRefused, c_psetSkipReact, c_psetPrefix, g_pathSetMs);
+                c_psetApplied, c_psetBacked, c_psetFail, c_psetRefused, c_psetSkipReact, c_psetPrefix, g_pathSetMs);
         if (g_chartSync)
             Log("[Brain] chartsync role=%s tx=%ld rx=%ld applied=%ld own=%ld forced=%ld waitFrames=%ld expired=%ld dropped=%ld playoutMs=%d holdSet=%ld holdApplied=%ld holdExpired=%ld\n",
                 g_role == 1 ? "host" : "guest", c_chartTx, c_chartRx, c_chartApplied, c_chartOwn, c_chartForced, c_chartWait, c_chartExpired, c_chartDropped,
