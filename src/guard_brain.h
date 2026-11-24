@@ -34,10 +34,13 @@ namespace Brain {
     void OwnUpdate(void* human);
     // Once per player frame: test driver, sweep, report.
     void Tick();
+    // [Coop] BrainPuppet on the guest: the puppet is driven by the host player's mirrored chart (FightIntents must not apply to it).
+    bool PuppetMirrorGuest();
 }
 
 // phase1.cpp exports used here.
 void* Phase1_PuppetEntity();
 void* Phase1_LocalPlayerEntity();
+void* Phase1_HumanOfEntity(void* entity);   // AIEntityHelper::GetHuman
 void  Phase1_LogLine(const char* s);
 int   Phase1_HumanStage1(void* human);   // HumanGroundStage + 1 (5 = Fight, 0 = unreadable)

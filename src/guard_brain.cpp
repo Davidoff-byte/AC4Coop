@@ -55,9 +55,12 @@ const SlotSpec kSlots[] = {
 uint32_t VtOf(int i) { return kSlots[i].vt ? kSlots[i].vt : 0x026E7DC0u; }
 const int kNSlots = sizeof(kSlots) / sizeof(kSlots[0]);
 
-int  g_on = -1, g_delayMs = 0, g_test = 0, g_testDelayMs = 150, g_hitSync = 0, g_chartSync = 0, g_playoutMs = 0;   // g_playoutMs: [Coop] BrainPlayoutMs (default 0)   // [Coop] BrainHitSync, [Coop] BrainChartSync (default 0)
+int  g_on = -1, g_delayMs = 0, g_test = 0, g_testDelayMs = 150, g_hitSync = 0, g_chartSync = 0, g_playoutMs = 0, g_puppet = 0;   // g_puppet: [Coop] BrainPuppet (default 0)   // g_playoutMs: [Coop] BrainPlayoutMs (default 0)   // [Coop] BrainHitSync, [Coop] BrainChartSync (default 0)
 const uint16_t kGate = 0xB5B5;   // command: a host native took attack-substate transition a[1] from state a[0] (permit for the copy)
 const uint16_t kChart = 0xC4A7;   // command: a host native took Ground transition a[1] from node a[0], handler a[2] (BrainChartSync)
+// [Coop] BrainPuppet: the host player (host) and the guest's puppet of it (guest) are one brain body under this fixed id, so capture,
+// the chart mirror and the hit replay apply to them unchanged. Not a guard objId (guard ids are 0x00000000Fxxxxxxx).
+const uint64_t kPuppetWire = 0x5055505045540001ull;
 volatile LONG g_role = -1;   // 1 host, 0 guest
 
 void Log(const char* fmt, ...) {
@@ -78,6 +81,7 @@ struct Body {
     uint64_t watchUntilUs; uint32_t watchExec; uint8_t in173; uint16_t lastPath[12]; uint8_t lastDepth; int pathLines; uint16_t lastGid; struct { uint16_t st; int32_t code; uint64_t untilMs; } permit[4];
     Cmd pendAtk; uint8_t pendValid; uint8_t hostIn173;   // BrainHitSync host: last attack call, sent when the guard enters 173
     uint32_t fsm;   // cached Ground helper *(ig+0x90), refreshed by NoteBody
+    uint32_t pathHash;   // BrainPuppet: last logged path of the player / puppet body
     struct { uint16_t node; int32_t code; uint32_t handler; uint64_t atMs; uint8_t sched; } cq[8]; int cqn;   // BrainChartSync guest queue
     struct { uint16_t node; int32_t code; uint32_t handler; uint32_t dueHostMs; uint64_t setMs; } hold;   // BrainPlayoutMs host: a deferred attack start
 };
@@ -98,7 +102,7 @@ int FindObj(uint64_t o) { for (int i = 0; i < g_nb; ++i) if (g_b[i].objId == o) 
 
 // ---- counters ------------------------------------------------------------------------------------
 volatile LONG c_cap[kNSlots] = {}, c_capUnbound = 0, c_tx = 0, c_txFail = 0, c_rx = 0, c_rxStaleBase = 0, c_exec = 0, c_execFail = 0,
-              c_stale = 0, c_noTarget = 0, c_noBody = 0, c_noClock = 0, c_s173 = 0, c_queueFull = 0, c_notReady = 0, c_enterRefused = 0, c_dupDropped = 0, c_alreadyFight = 0, c_gatePermits = 0, c_hitLines = 0, c_hitHeld = 0, c_hitApplied = 0, c_hitRefused = 0, c_gate181Tx = 0, c_gate181Blocked = 0, c_gate181Allowed = 0, c_gateSubst = 0, c_attackHeld = 0, c_atkBuffered = 0, c_atkSent = 0, c_atkNoCall = 0, c_chartDropped = 0, c_chartRx = 0, c_capLines = 0, c_execLines = 0;
+              c_stale = 0, c_noTarget = 0, c_noBody = 0, c_noClock = 0, c_s173 = 0, c_queueFull = 0, c_notReady = 0, c_enterRefused = 0, c_dupDropped = 0, c_alreadyFight = 0, c_gatePermits = 0, c_hitLines = 0, c_hitHeld = 0, c_hitApplied = 0, c_hitRefused = 0, c_gate181Tx = 0, c_gate181Blocked = 0, c_gate181Allowed = 0, c_gateSubst = 0, c_attackHeld = 0, c_atkBuffered = 0, c_atkSent = 0, c_atkNoCall = 0, c_chartDropped = 0, c_chartRx = 0, c_puppetTx = 0, c_ppathLines = 0, c_pcapLines = 0, c_capLines = 0, c_execLines = 0;
 LONG    g_late[64]; volatile LONG g_lateN = 0;   // last 64 lateness samples (ms) for the report
 
 // Host: the guest is in a world and answering. Its PeerClock role is set only from a player frame (OnFrameInner), so the
@@ -196,6 +200,8 @@ void __cdecl Capture(uint32_t id, uint32_t ecx, const uint32_t* frame) {
         ReleaseSRWLockShared(&g_bLock);
         if (!objId) { InterlockedIncrement(&c_capUnbound); return; }   // player, puppet, or an unscoped body
         InterlockedIncrement(&c_cap[id]);
+        if (objId == kPuppetWire && InterlockedIncrement(&c_pcapLines) <= 200)   // BrainPuppet: which slots the player's own moves use
+            Log("[Brain] pcap slot=%u a=%08X,%08X,%08X ret=%08X\n", kSlots[id].slot, frame[1], frame[2], frame[3], frame[0]);
         const SlotSpec& s = kSlots[id];
         bool clk = false;
         const uint32_t now = HostMs(&clk);
@@ -661,6 +667,23 @@ int __fastcall NodeW(uint32_t fsm, uint32_t, int node, int a2) {
         // (a transition whose target, the low 10 bits, is 173) are held, so animations keep their native length. The host
         // sends the kept attack call at once (the copy only fills its request record with it) and the transition stamped
         // now + D; it holds its own transition for D, freezing this guard's other fight transitions meanwhile (at most 500 ms).
+        if (objId == kPuppetWire) {   // [Coop] BrainPuppet: the host player is never held (no input delay). Each transition goes at
+            // once and is applied by the puppet as soon as it arrives (a[3] = 1); an attack start carries the kept attack call.
+            if (!r) return r;
+            if (clk && PeerReady()) {
+                if (!(r & 0x80000000) && (r & 0x3FF) == 173) {
+                    Cmd atk; bool haveAtk = false;
+                    AcquireSRWLockExclusive(&g_bLock);
+                    if (k < g_nb && g_b[k].objId == objId && g_b[k].pendValid) { atk = g_b[k].pendAtk; g_b[k].pendValid = 0; haveAtk = true; }
+                    ReleaseSRWLockExclusive(&g_bLock);
+                    if (haveAtk) { atk.execHostMs = now; Publish(objId, atk); InterlockedIncrement(&c_atkSent); }
+                    else InterlockedIncrement(&c_atkNoCall);
+                }
+                Cmd c = {}; c.slot = kChart; c.a[0] = (uint32_t)node; c.a[1] = (uint32_t)r; c.a[2] = handler; c.a[3] = 1; c.execHostMs = now;
+                Publish(objId, c); InterlockedIncrement(&c_chartTx); InterlockedIncrement(&c_puppetTx);
+            }
+            return r;
+        }
         if (g_playoutMs && clk) {
             const uint64_t tick = GetTickCount64();
             bool holding = false, due = false; uint16_t hn = 0; int32_t hc = 0; uint32_t hh = 0;
@@ -857,12 +880,14 @@ void Init() {
     g_hitSync = GetPrivateProfileIntA("Coop", "BrainHitSync", 0, Paths::Ini()) != 0 ? 1 : 0;
     g_chartSync = GetPrivateProfileIntA("Coop", "BrainChartSync", 0, Paths::Ini()) != 0 ? 1 : 0;
     g_playoutMs = GetPrivateProfileIntA("Coop", "BrainPlayoutMs", 0, Paths::Ini());
+    g_puppet = GetPrivateProfileIntA("Coop", "BrainPuppet", 0, Paths::Ini()) != 0 ? 1 : 0;
     if (g_playoutMs < 0 || g_playoutMs > 500) g_playoutMs = 0;
     if (g_on) Log("[Brain] Brain=1 delayMs=%d test=%d testDelayMs=%d (needs IntentLane=1, PeerClock=1)\n", g_delayMs, g_test, g_testDelayMs);
     if (g_on) Install115();
 }
 
 bool On() { return g_on == 1; }
+bool PuppetMirrorGuest() { return g_on == 1 && g_puppet && g_chartSync && g_role == 0; }
 
 void SetRole(bool isHost) {
     if (!On() || InterlockedCompareExchange(&g_role, isHost ? 1 : 0, -1) != -1) return;
@@ -977,6 +1002,19 @@ void OwnUpdate(void* human) {
             }
         }
     }
+    if (objId == kPuppetWire) {   // [Coop] BrainPuppet: every change of the player's (host) / puppet's (guest) whole path, timed
+        char ps[96]; PathStr(ig, ps, sizeof(ps));
+        uint32_t hsh = 2166136261u; for (const char* q = ps; *q; ++q) hsh = (hsh ^ (uint8_t)*q) * 16777619u;
+        bool changed = false;
+        AcquireSRWLockExclusive(&g_bLock);
+        const int kk = FindBy(&Body::human, h);
+        if (kk >= 0 && g_b[kk].pathHash != hsh) { g_b[kk].pathHash = hsh; changed = true; }
+        ReleaseSRWLockExclusive(&g_bLock);
+        if (changed && ps[0] && InterlockedIncrement(&c_ppathLines) <= 3000) {
+            bool clk = false; const uint32_t now = HostMs(&clk);
+            Log("[Brain] ppath role=%s hostMs=%u path=%s\n", g_role == 1 ? "host" : "guest", now, ps);
+        }
+    }
     {   // State-115 probe: every change of the dispatch id (path[3]) on a registered body, host and guest, with the whole path
         char ps[96]; const unsigned gid = PathStr(ig, ps, sizeof(ps));
         if (gid && gid != lastGid) {
@@ -1041,6 +1079,11 @@ void Tick() {
         }
     }
     if (!On() || g_role < 0) return;
+    if (g_puppet && g_chartSync) {   // [Coop] BrainPuppet: register the host player (host) / the puppet (guest) as kPuppetWire
+        void* ent = g_role == 1 ? Phase1_LocalPlayerEntity() : Phase1_PuppetEntity();
+        void* hum = ent ? Phase1_HumanOfEntity(ent) : nullptr;
+        if (hum) NoteBody(kPuppetWire, hum, ent);
+    }
     {   // [Coop] Brain115Watch: arm once a registered body is in dispatch 4, re-apply every 5 s, clear when done or after 90 s
         static int s_w = -1; static uint64_t s_wNext = 0, s_wStart = 0;
         if (s_w < 0) s_w = GetPrivateProfileIntA("Coop", "Brain115Watch", 0, Paths::Ini()) != 0 ? 1 : 0;
