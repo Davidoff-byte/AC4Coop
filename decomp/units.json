@@ -1276,6 +1276,33 @@
    "receipts": [],
    "size": 109,
    "status": "unknown"
+  },
+  "01D5E6E0": {
+   "addr": "01D5E6E0",
+   "claimed_at": null,
+   "name": "GroundEntrySwitch",
+   "owner": null,
+   "receipts": [],
+   "size": 7624,
+   "status": "unknown"
+  },
+  "01D60EC0": {
+   "addr": "01D60EC0",
+   "claimed_at": null,
+   "name": "GroundExitNotify",
+   "owner": null,
+   "receipts": [],
+   "size": 98,
+   "status": "unknown"
+  },
+  "01D659D0": {
+   "addr": "01D659D0",
+   "claimed_at": null,
+   "name": "GroundForcedTransition",
+   "owner": null,
+   "receipts": [],
+   "size": 113,
+   "status": "unknown"
   }
  }
 }

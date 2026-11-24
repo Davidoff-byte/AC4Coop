@@ -69,12 +69,14 @@ uint32_t VtOf(int i) { return kSlots[i].vt ? kSlots[i].vt : 0x026E7DC0u; }
 const int kNSlots = sizeof(kSlots) / sizeof(kSlots[0]);
 
 int  g_actId = 0;   // [Coop] BrainActIdSync (default 0)
+int  g_pathAuth = 0, g_pathSetMs = 0;   // [Coop] BrainPathAuthority (default 0), [Coop] BrainPathSetMs (default 0 = no corrector)
 int  g_on = -1, g_delayMs = 0, g_test = 0, g_testDelayMs = 150, g_hitSync = 0, g_chartSync = 0, g_playoutMs = 0, g_puppet = 0, g_react = 0;   // g_react: [Coop] BrainReact (default 0)   // g_puppet: [Coop] BrainPuppet (default 0)   // g_playoutMs: [Coop] BrainPlayoutMs (default 0)   // [Coop] BrainHitSync, [Coop] BrainChartSync (default 0)
 const uint16_t kGate = 0xB5B5;   // command: a host native took attack-substate transition a[1] from state a[0] (permit for the copy)
 const uint16_t kChart = 0xC4A7;   // command: a host native took Ground transition a[1] from node a[0], handler a[2] (BrainChartSync)
 // [Coop] BrainPuppet: the host player (host) and the guest's puppet of it (guest) are one brain body under this fixed id, so capture,
 // the chart mirror and the hit replay apply to them unchanged. Not a guard objId (guard ids are 0x00000000Fxxxxxxx).
 const uint64_t kPuppetWire = 0x5055505045540001ull;
+const uint16_t kPath = 0xBA70;    // BrainPathAuthority: host body's whole Ground path, nargs = depth, 12 u16 in a[0..3] + tgtObj
 const uint16_t kActId = 0xA1D5;   // BrainActIdSync: host entered state a[0] with outgoing action-block id a[1] (route a[2])
 const uint16_t kReact = 0xD0D1, kReactData = 0xD0D0;   // BrainReact: header {slot, seq, attacker} and 5 data chunks of 20 bytes (AtkFields)
 volatile LONG g_role = -1;   // 1 host, 0 guest
@@ -101,6 +103,8 @@ struct Body {
     uint32_t rseq[2]; uint8_t rmask[2]; uint8_t rbuf[2][100]; uint32_t rFde; uint32_t rFdeSeq;   // BrainReact guest: reassembly (two in flight, by seq parity), built event
     struct { uint16_t node; int32_t code; uint32_t handler; uint64_t atMs; uint8_t sched; } cq[8]; int cqn;   // BrainChartSync guest queue
     struct { uint16_t target; uint32_t aid; uint64_t atMs; } aq[4]; int aqn;   // BrainActIdSync guest queue (host ids by entered state)
+    struct { uint16_t n[12]; uint8_t d; uint64_t atMs; } hp[8]; int hpn;   // BrainPathAuthority guest: the host's last paths, newest last
+    uint32_t ptxHash; uint64_t misSince, lastSetMs;                         // BrainPathAuthority: host last sent path / guest mismatch timer
     struct { uint16_t node; int32_t code; uint32_t handler; uint32_t dueHostMs; uint64_t setMs; } hold;   // BrainPlayoutMs host: a deferred attack start
 };
 const int kBodies = 256;
@@ -1108,21 +1112,189 @@ void ActIdAt(int route, uint32_t fsm, int target) {
         Log("[Brain] actid guest id=%016llX enter=%d route=%c local=%d host=%d\n", (unsigned long long)objId, target, route == 0 ? 'F' : route == 1 ? 'A' : 'D',
             (int)cur, (int)aid);
 }
+// ---- [Coop] BrainPathAuthority (default 0): the copy is put in the host's state instead of deciding it -----------------------
+// Runs 3-28 synced one decision point at a time (115, attack exits, chart exits, reactions, token list, action-block id) and each
+// fix exposed the next. This sends the result instead: the host body's whole Ground path, and the guest makes its copy's path equal.
+// Ground mechanics (IDA cc/g49-g53, AC4BFSP.exe md5 2058342866688f780c8b34526a65bc35):
+//   enter sub_1D63440(fsm, node), thiscall retn 4: push node (sub_1CFFFE0), u16 [fsm+4] = 0, swap action block (sub_1CBEC30),
+//     entry switch sub_1D5E6E0(fsm, node) (E8 at 0x1D63460; retn 4); then while the node is not a leaf (bit node-1 of
+//     byte_2ABC488 clear): node = u16 [fsm+4], push, [fsm+4] = 0, swap, entry switch (E8 at 0x1D6349C). The entry of a
+//     non-leaf picks the child by writing [fsm+4].
+//   Fight parents (163 166 167 173 186 190 209 217 255 257 268 282 293 296 303 321 324 334 343) all enter as
+//     `**(fsm+0xA70) = -11; chooser(...)` (sub_1D3A750, sub_1CBEE50 ... sub_1CBF790, cc/g51). 282's chooser sub_186F260 also
+//     writes 10 (-> 284) or 9 (-> 283/287) at +1768 and calls sub_186E5C0 on the 283/287 branch: overriding 287 <-> 283 keeps
+//     the same side effects, 284 <-> 283/287 does not (UNVERIFIED effect). Other choosers' side effects: not read.
+//   Native forced transition (slot-14 Do sub_1D68C50): token-list clear, exit notify sub_1D60EC0(fsm, level, keep)
+//     (thiscall retn 8: sub_1D5A900 on every node above `level`, and on `level` unless keep), the transition handler, then
+//     sub_1D659D0(fsm, code) (thiscall retn 4: sub_1D65960 pops down to and incl. level via sub_1D611E0 = pop + exit, then
+//     sub_1D63440(target)). sub_1D659D0's enter is the E8 at 0x1D65A36 (EnterF), so its descent passes EntryW below.
+//   Host: every registered body's path, whenever it changes (after each enter, and at the body's update), as kPath.
+//   Guest (1) child authority: after each entry switch of a registered copy inside the fight region (163 on the path), if a
+//     host path <= 1.5 s old starts with the copy's current path, the next host node replaces the child the entry picked.
+//   Guest (2) corrector, [Coop] BrainPathSetMs > 0: when the copy's fight path has differed from the host's newest path for that
+//     long, the first differing node is left and the host's node entered with the native pair (exit notify + forced
+//     transition), with no transition handler (UNVERIFIED: what a leaf entered without its handler's data does). A target
+//     inside the reaction branch (268) is not forced: BrainReact replays those with the host's event data.
+typedef int(__thiscall* EntryFn)(uint32_t fsm, int node);
+typedef int(__thiscall* ExitNotifyFn)(uint32_t fsm, int level, int keep);
+typedef int(__thiscall* ForcedFn)(uint32_t fsm, int code);
+volatile LONG c_pathTx = 0, c_pathRx = 0, c_pathNoBody = 0, c_childOver = 0, c_childSame = 0, c_childNone = 0, c_childLines = 0,
+              c_psetApplied = 0, c_psetFail = 0, c_psetSkipReact = 0, c_psetPrefix = 0, c_psetLines = 0;
+bool ReadPath(uint32_t fsm, uint16_t* n, unsigned* d) {
+    __try {
+        const unsigned dd = *(const uint16_t*)(fsm + 0x11E);
+        if (dd > 12) return false;
+        const uint16_t* p = *(const uint16_t* const*)(fsm + 0x118);
+        if (!p && dd) return false;
+        for (unsigned i = 0; i < dd; ++i) n[i] = p[i];
+        *d = dd; return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+int IndexOf(const uint16_t* n, unsigned d, uint16_t v) { for (unsigned i = 0; i < d; ++i) if (n[i] == v) return (int)i; return -1; }
+void FmtPath(const uint16_t* n, unsigned d, char* out, size_t cap) {
+    int o = 0; out[0] = 0;
+    for (unsigned i = 0; i < d && (size_t)o + 8 < cap; ++i) o += _snprintf_s(out + o, cap - o, _TRUNCATE, i ? "/%u" : "%u", n[i]);
+}
+void PathTx(uint32_t fsm) {   // host
+    if (!g_pathAuth || g_on != 1 || g_role != 1) return;
+    uint16_t n[12]; unsigned d = 0;
+    if (!ReadPath(fsm, n, &d) || !d) return;
+    uint64_t objId = 0;
+    const int k = BodyOfFsm(fsm, &objId);
+    if (k < 0) return;
+    uint32_t h = 2166136261u; for (unsigned i = 0; i < d; ++i) h = (h ^ n[i]) * 16777619u;
+    bool send = false;
+    AcquireSRWLockExclusive(&g_bLock);
+    if (k < g_nb && g_b[k].objId == objId && g_b[k].ptxHash != h) { g_b[k].ptxHash = h; send = true; }
+    ReleaseSRWLockExclusive(&g_bLock);
+    if (!send) return;
+    bool clk = false; const uint32_t now = HostMs(&clk);
+    if (!clk || !PeerReady()) return;
+    Cmd c = {}; c.slot = kPath; c.nargs = (uint8_t)d; c.execHostMs = now;
+    uint16_t t[12] = {}; memcpy(t, n, d * 2); memcpy(c.a, t, 16); memcpy(&c.tgtObj, t + 8, 8);
+    Publish(objId, c); InterlockedIncrement(&c_pathTx);
+}
+void PathRx(uint64_t objId, const Cmd& c) {   // guest, at receive time (not queued: Execute would treat the slot as a call)
+    if (c.nargs > 12) return;
+    uint16_t t[12]; memcpy(t, c.a, 16); memcpy(t + 8, &c.tgtObj, 8);
+    InterlockedIncrement(&c_pathRx);
+    AcquireSRWLockExclusive(&g_bLock);
+    const int k = FindObj(objId);
+    if (k >= 0) {
+        Body& b = g_b[k];
+        if (b.hpn == 8) { for (int i = 1; i < 8; ++i) b.hp[i - 1] = b.hp[i]; b.hpn = 7; }
+        memcpy(b.hp[b.hpn].n, t, sizeof(t)); b.hp[b.hpn].d = c.nargs; b.hp[b.hpn].atMs = GetTickCount64(); ++b.hpn;
+    }
+    ReleaseSRWLockExclusive(&g_bLock);
+    if (k < 0) InterlockedIncrement(&c_pathNoBody);
+}
+void PathChild(uint32_t fsm, int node) {   // guest, right after the entry switch of `node`
+    __try {
+        const unsigned nb = (unsigned)(uint16_t)node - 1;
+        if (*(const uint8_t*)(0x02ABC488u + (nb >> 3)) & (1u << (nb & 7))) return;   // a leaf: the enter loop stops here
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+    uint16_t local = 0;
+    __try { local = *(const uint16_t*)(fsm + 4); } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+    if (!local) return;
+    uint16_t n[12]; unsigned d = 0;
+    if (!ReadPath(fsm, n, &d) || !d || n[d - 1] != (uint16_t)node || IndexOf(n, d, 163) < 0) return;
+    uint64_t objId = 0;
+    const int k = BodyOfFsm(fsm, &objId);
+    if (k < 0) return;
+    uint16_t host = 0; const uint64_t ms = GetTickCount64();
+    AcquireSRWLockShared(&g_bLock);
+    if (k < g_nb && g_b[k].objId == objId)
+        for (int i = g_b[k].hpn - 1; i >= 0; --i) {
+            const auto& e = g_b[k].hp[i];
+            if (ms - e.atMs > 1500) break;
+            if (e.d > d && memcmp(e.n, n, d * 2) == 0) { host = e.n[d]; break; }
+        }
+    ReleaseSRWLockShared(&g_bLock);
+    if (!host) { InterlockedIncrement(&c_childNone); return; }
+    if (host == local) { InterlockedIncrement(&c_childSame); return; }
+    __try { *(uint16_t*)(fsm + 4) = host; } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+    InterlockedIncrement(&c_childOver);
+    if (InterlockedIncrement(&c_childLines) <= 300) {
+        char ps[96]; FmtPath(n, d, ps, sizeof(ps));
+        Log("[Brain] pathchild id=%016llX at %s local=%u host=%u\n", (unsigned long long)objId, ps, local, host);
+    }
+}
+int __fastcall EntryW(uint32_t fsm, uint32_t, int node) {
+    const int r = ((EntryFn)0x01D5E6E0)(fsm, node);
+    if (g_pathAuth && g_on == 1 && g_role == 0) PathChild(fsm, node);
+    return r;
+}
+void PathCorrect(uint64_t objId, uint32_t ig) {   // guest, at the copy's update
+    if (!g_pathAuth || g_pathSetMs <= 0 || g_on != 1 || g_role != 0) return;
+    uint32_t fsm = 0;
+    __try { fsm = *(const uint32_t*)(ig + 0x90); } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+    uint16_t C[12], H[12]; unsigned dc = 0, dh = 0;
+    if (!fsm || !ReadPath(fsm, C, &dc)) return;
+    const uint64_t ms = GetTickCount64();
+    int p = -1; bool apply = false, skipReact = false; uint64_t held = 0;
+    AcquireSRWLockExclusive(&g_bLock);
+    const int k = FindObj(objId);
+    if (k >= 0) {
+        Body& b = g_b[k];
+        bool have = false;
+        if (b.hpn && ms - b.hp[b.hpn - 1].atMs <= 1500) { memcpy(H, b.hp[b.hpn - 1].n, sizeof(H)); dh = b.hp[b.hpn - 1].d; have = true; }
+        const int ic = IndexOf(C, dc, 163), ih = have ? IndexOf(H, dh, 163) : -1;
+        if (have && ic >= 0 && ic == ih && memcmp(C, H, (ic + 1) * 2) == 0) {
+            const unsigned m = dc < dh ? dc : dh;
+            for (unsigned i = (unsigned)ic + 1; i < m; ++i) if (C[i] != H[i]) { p = (int)i; break; }
+            if (p < 0 && dc != dh) { p = -2; InterlockedIncrement(&c_psetPrefix); }
+        }
+        if (p < 0) b.misSince = 0;
+        else if (!b.misSince) b.misSince = ms;
+        else if (ms - b.misSince >= (uint64_t)g_pathSetMs && ms - b.lastSetMs >= 500) {
+            held = ms - b.misSince; b.misSince = 0; b.lastSetMs = ms;
+            for (unsigned j = (unsigned)p; j < dh; ++j) if (H[j] == 268) skipReact = true;
+            apply = !skipReact;
+        }
+    }
+    ReleaseSRWLockExclusive(&g_bLock);
+    if (skipReact) { InterlockedIncrement(&c_psetSkipReact); return; }
+    if (!apply) return;
+    const int code = ((int)C[p] << 10) | H[p];
+    bool ok = false;
+    __try {
+        ((ExitNotifyFn)0x01D60EC0)(fsm, C[p], 0);
+        ((ForcedFn)0x01D659D0)(fsm, code);
+        ok = true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { ok = false; }
+    InterlockedIncrement(ok ? &c_psetApplied : &c_psetFail);
+    if (InterlockedIncrement(&c_psetLines) <= 300) {
+        uint16_t A[12]; unsigned da = 0; ReadPath(fsm, A, &da);
+        char cs[96], hs[96], as[96]; FmtPath(C, dc, cs, sizeof(cs)); FmtPath(H, dh, hs, sizeof(hs)); FmtPath(A, da, as, sizeof(as));
+        Log("[Brain] pathset id=%016llX ok=%d heldMs=%llu copy=%s host=%s code=%d -> %s %s\n", (unsigned long long)objId, ok ? 1 : 0,
+            (unsigned long long)held, cs, hs, code, as, (da == dh && memcmp(A, H, dh * 2) == 0) ? "MATCH" : "DIFF");
+    }
+}
+
 int g_enterLog = 0;
-int __fastcall EnterF(uint32_t fsm, uint32_t, int target) { if (g_enterLog) EnterLog(0, fsm, target, (void**)_AddressOfReturnAddress()); ActIdAt(0, fsm, target); return ((EnterFn)0x01D63440)(fsm, target); }
-int __fastcall EnterA(uint32_t fsm, uint32_t, int target) { if (g_enterLog) EnterLog(1, fsm, target, (void**)_AddressOfReturnAddress()); ActIdAt(1, fsm, target); return ((EnterFn)0x01D63440)(fsm, target); }
-int __fastcall EnterD(uint32_t fsm, uint32_t, int target) { if (g_enterLog) EnterLog(2, fsm, target, (void**)_AddressOfReturnAddress()); ActIdAt(2, fsm, target); return ((EnterFn)0x01D63440)(fsm, target); }
+int __fastcall EnterF(uint32_t fsm, uint32_t, int target) { if (g_enterLog) EnterLog(0, fsm, target, (void**)_AddressOfReturnAddress()); ActIdAt(0, fsm, target); const int r = ((EnterFn)0x01D63440)(fsm, target); PathTx(fsm); return r; }
+int __fastcall EnterA(uint32_t fsm, uint32_t, int target) { if (g_enterLog) EnterLog(1, fsm, target, (void**)_AddressOfReturnAddress()); ActIdAt(1, fsm, target); const int r = ((EnterFn)0x01D63440)(fsm, target); PathTx(fsm); return r; }
+int __fastcall EnterD(uint32_t fsm, uint32_t, int target) { if (g_enterLog) EnterLog(2, fsm, target, (void**)_AddressOfReturnAddress()); ActIdAt(2, fsm, target); const int r = ((EnterFn)0x01D63440)(fsm, target); PathTx(fsm); return r; }
 
 void Install115() {
     g_probe115 = GetPrivateProfileIntA("Coop", "Brain115Probe", 0, Paths::Ini()) != 0 ? 1 : 0;
     g_supp115 = GetPrivateProfileIntA("Coop", "Brain115Suppress", 0, Paths::Ini()) != 0 ? 1 : 0;
     g_enterLog = GetPrivateProfileIntA("Coop", "BrainEnterProbe", 0, Paths::Ini()) != 0 ? 1 : 0;
     g_actId = GetPrivateProfileIntA("Coop", "BrainActIdSync", 0, Paths::Ini()) != 0 ? 1 : 0;
-    if (g_enterLog || g_actId) {
+    g_pathAuth = GetPrivateProfileIntA("Coop", "BrainPathAuthority", 0, Paths::Ini()) != 0 ? 1 : 0;
+    g_pathSetMs = GetPrivateProfileIntA("Coop", "BrainPathSetMs", 0, Paths::Ini());
+    if (g_pathSetMs < 0) g_pathSetMs = 0;
+    if (g_enterLog || g_actId || g_pathAuth) {
         const bool f = PatchCall(0x01D65A36u, 0x01D63440u, (uint32_t)(uintptr_t)&EnterF);
         const bool a = PatchCall(0x01D65ADDu, 0x01D63440u, (uint32_t)(uintptr_t)&EnterA);
         const bool d = PatchCall(0x01D65CA4u, 0x01D63440u, (uint32_t)(uintptr_t)&EnterD);
-        Log("[Brain] enter wrappers (probe=%d actid=%d): forced %s, 1D65A50 %s, dispatch %s\n", g_enterLog, g_actId, f ? "wrapped" : "NOT", a ? "wrapped" : "NOT", d ? "wrapped" : "NOT");
+        Log("[Brain] enter wrappers (probe=%d actid=%d path=%d): forced %s, 1D65A50 %s, dispatch %s\n", g_enterLog, g_actId, g_pathAuth,
+            f ? "wrapped" : "NOT", a ? "wrapped" : "NOT", d ? "wrapped" : "NOT");
+    }
+    if (g_pathAuth) {   // the two entry-switch calls inside sub_1D63440 (cc/g51-g52: E8 7B B2 FF FF / E8 3F B2 FF FF -> 0x1D5E6E0)
+        const bool e0 = PatchCall(0x01D63460u, 0x01D5E6E0u, (uint32_t)(uintptr_t)&EntryW);
+        const bool e1 = PatchCall(0x01D6349Cu, 0x01D5E6E0u, (uint32_t)(uintptr_t)&EntryW);
+        Log("[Brain] path authority: entry switch %s/%s, corrector %d ms\n", e0 ? "wrapped" : "NOT", e1 ? "wrapped" : "NOT", g_pathSetMs);
     }
     if (g_hitSync && g_chartSync) {   // the node mirror covers 180/181/182 too, so the per-state gate is not installed
         const bool n = PatchCall(0x01D65BE1u, 0x01D634D0u, (uint32_t)(uintptr_t)&NodeW);
@@ -1349,6 +1521,7 @@ void OnIntent(uint64_t wireId, uint32_t seq, uint8_t flags, const void* payload,
         ReleaseSRWLockExclusive(&g_seqLock);
         if (dup) { InterlockedIncrement(&c_dupDropped); return; }
     }
+    if (c.slot == kPath) { PathRx(wireId, c); return; }
     AcquireSRWLockExclusive(&g_qLock);
     int k = -1;
     for (int i = 0; i < kQ; ++i) if (!g_q[i].used) { k = i; break; }
@@ -1367,6 +1540,10 @@ void OwnUpdate(void* human) {
     if (k >= 0) { objId = g_b[k].objId; ig = g_b[k].ig; watching = g_b[k].watchUntilUs != 0; lastGid = g_b[k].lastGid; }
     ReleaseSRWLockShared(&g_bLock);
     if (!objId) return;
+    if (g_pathAuth) {   // BrainPathAuthority: host sends a path change the enter wrappers did not see; guest runs the corrector
+        if (g_role == 1) { uint32_t fsm = 0; __try { fsm = *(const uint32_t*)(ig + 0x90); } __except (EXCEPTION_EXECUTE_HANDLER) {} if (fsm) PathTx(fsm); }
+        else PathCorrect(objId, ig);
+    }
     if (g_role == 1 && g_hitSync && !(g_playoutMs && g_chartSync)) {   // BrainHitSync host: send the kept attack call when this native guard enters 173 (with BrainPlayoutMs it goes at the decision, NodeW)
         bool in173 = false;
         __try {
@@ -1566,6 +1743,10 @@ void Tick() {
                 c_reactRefused, c_reactHeld, c_reactIncomplete, c_reactBuildFail, c_reactVeto);
         if (g_actId)
             Log("[Brain] actid role=%s tx=%ld same=%ld written=%ld missing=%ld\n", g_role == 1 ? "host" : "guest", c_aidTx, c_aidSame, c_aidWritten, c_aidMissing);
+        if (g_pathAuth)
+            Log("[Brain] pathauth role=%s tx=%ld rx=%ld noBody=%ld child over=%ld same=%ld none=%ld set applied=%ld fail=%ld skipReact=%ld prefix=%ld setMs=%d\n",
+                g_role == 1 ? "host" : "guest", c_pathTx, c_pathRx, c_pathNoBody, c_childOver, c_childSame, c_childNone,
+                c_psetApplied, c_psetFail, c_psetSkipReact, c_psetPrefix, g_pathSetMs);
         if (g_chartSync)
             Log("[Brain] chartsync role=%s tx=%ld rx=%ld applied=%ld own=%ld forced=%ld waitFrames=%ld expired=%ld dropped=%ld playoutMs=%d holdSet=%ld holdApplied=%ld holdExpired=%ld\n",
                 g_role == 1 ? "host" : "guest", c_chartTx, c_chartRx, c_chartApplied, c_chartOwn, c_chartForced, c_chartWait, c_chartExpired, c_chartDropped,

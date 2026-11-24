@@ -44,6 +44,13 @@ function Test-Hung([int]$id) {
   if (-not $p.Responding -and ($p.CPU - $c1) -lt 0.5) {
     New-Item -ItemType Directory -Force $dumpDir | Out-Null
     $dmp = Join-Path $dumpDir "hang-$id-$(Get-Date -Format yyyyMMdd-HHmmss).dmp"
+    # The game is 32-bit. A dump written by 64-bit Python holds only the WOW64 host stacks (run 28, 2026-11-24: "Guest (WoW)
+    # stack is not available" on every thread), so the x86 debugger attaches non-invasively first and writes the 32-bit stacks.
+    $cdb86 = "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers\x86\cdb.exe"
+    if (Test-Path $cdb86) {
+      & $cdb86 -pv -p $id -c "~*kv 40; .dump /mt `"$dmp.x86.dmp`"; qd" 2>&1 | Out-File -Encoding utf8 "$dmp.stacks.txt"
+      "  stacks: $dmp.stacks.txt"
+    }
     & py -I (Join-Path $tools 'minidump.py') $id $dmp 2>&1 | ForEach-Object { "  dump: $_" }
     return "pid $id HUNG (not responding, cpu +$([math]::Round($p.CPU - $c1,2))s in 3s); dump $dmp"
   }
