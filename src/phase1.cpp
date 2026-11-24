@@ -1397,6 +1397,7 @@ bool FightIntentOwnsPuppet();   // [Coop] FightIntents (S7 slice 1), defined wit
 static volatile LONG s_pfcActive = 0;   // [Coop] PuppetFightCarry: our action copy owns the puppet in this fight
 static volatile LONG s_pfcIssued = 0;   // SetTargetAction calls on the puppet in the current fight window
 static void PchanCapture(ActionComponent* ac);   // [Coop] PuppetChannels, defined with PuppetActionBlock
+static void WeaponCapture(void* playerEnt);   // [Coop] WeaponSync, defined after PchanApply
 static void ClimbProbeHostPos(const PlayerState& s);   // [Coop] ClimbProbe baseline, defined with PuppetActionBlock
 static void CtlDump(const char* who, ActionComponent* ac, uint64_t* last);   // [Coop] ClimbProbe controller table, defined with PchanCapture
 // ---- [Coop] CaptureAtWrite (default 0, read once): send the player's matrix as the engine last WROTE it, stamped with that time ----
@@ -1672,6 +1673,7 @@ bool Phase1::CaptureLocalState(PlayerState& s) {
             if (readable(ac, 0x40)) {
                 ClimbProbeHostPos(s);   // [Coop] ClimbProbe: the same jerk measure on the position we send (baseline)
                 PchanCapture(ac);   // [Coop] PuppetChannels: the other controllers, sent on change over IC_PCHAN
+                WeaponCapture((void*)player);   // [Coop] WeaponSync
                 { static uint64_t s_ctlLast = 0; CtlDump("player", ac, &s_ctlLast); }   // [Coop] ClimbProbe
                 s.timeScale = ac->GetTimeScale(0, ACTLAYER_PRIMARY);   // primary-channel clip speed (foot-speed warp)
                 s.actionRatio = ac->GetCurrentActionRatio(0, ACTLAYER_PRIMARY);   // playback phase (seek on switch)
@@ -2760,6 +2762,74 @@ static void PchanApply(Human* h, uint32_t primaryAlias) {   // the puppet's own 
     if (now - s_last >= 5000) { s_last = now; L("[Chan] stats tx=%ld rx=%ld set=%ld same=%ld idle=%ld wholeBody=%ld released=%ld\n", s_pchTxC, s_pchRxC, s_pchSetC, s_pchSameC, s_pchIdleC, s_pchWholeC, s_pchReleaseC); }
 }
 
+// ---- [Coop] WeaponSync (default 0): the peer's drawn / sheathed weapon as state ----------------------------------------------
+// Owner after run 36: sheathing / unsheathing not carried. The engine's own scripted path is ActionSheatheWeapon (vtable 0x026BDD20,
+// execute sub_13E31E0, undo sub_13E3250): w = sub_6F5FF0(entity) (cdecl: *(*(ent+0xE8)+0x24)) -> w->vt[0x48](15) = the weapon
+// interface W; mode 0 (sheathe) saves W->vt[0x38](0) (5 bits, the weapon type in hand) then sub_13DC4D0: W->vt[8]() ? W->vt[0xC]()
+// : W->vt[0xA8](0, 1); mode 1 (draw type t) sub_13DC510: W->vt[0](t) ? W->vt[4](t) : W->vt[0xA4](t, 1) (bit 0x40 of the action
+// forces the second form). Live (2026-11-25): W resolves on player and puppet, vtable 0x026E7A70 (vt0 sub_1CC12F0, vt4 sub_1CC1350 ->
+// sub_1D9BAE0, vt8 sub_1D4E710, vtC sub_1D4E790 -> sub_1D9BB20, vt38 sub_1D512B0 -> sub_1D41610 = *(X+472) with 11 -> 0, vtA4
+// sub_1D51480, vtA8 sub_1D514F0). In a Havana fight with the host attacking (sword visibly in hand on both screens) vt38(0) stayed 0,
+// vt38(1) toggled 0/11, vt8() stayed 0, HumanData hand states stayed 1/1: none of them is a "sword in hand" signal, so no sync is
+// built on them. READ-ONLY: WeaponSync=1 logs W, its vtable and those values on change. In fights the sword already follows the
+// primary action copy (guest footage: the puppet swings a cutlass).
+static int s_wpnOn = -1;
+static int WeaponSyncMode() {
+    if (s_wpnOn < 0) { const int v = GetPrivateProfileIntA("Coop", "WeaponSync", 0, Paths::Ini()); s_wpnOn = v ? 1 : 0; L("[Wpn] WeaponSync=%d\n", s_wpnOn); }
+    return s_wpnOn;
+}
+static void* WeaponIface(void* ent) {
+    if (!ent) return nullptr;
+    void* o = ((void* (__cdecl*)(void*))0x006F5FF0)(ent);
+    if (!readable(o, 4)) return nullptr;
+    void** vt = *(void***)o;
+    if (!readable(vt, 0x4C)) return nullptr;
+    void* w = ((void* (__thiscall*)(void*, int))vt[0x48 / 4])(o, 15);
+    return readable(w, 4) ? w : nullptr;
+}
+static int WeaponCur(void* w) { return (int)(((unsigned char (__thiscall*)(void*, int))(*(void***)w)[0x38 / 4])(w, 0) & 0x1F); }
+static void WeaponVtLog(const char* who, void* ent, void* w) {
+    void** vt = *(void***)w;
+    L("[Wpn] %s ent=%p W=%p vt=%p | vt0=%p vt4=%p vt8=%p vtC=%p vt38=%p vtA4=%p vtA8=%p | cur=%d\n", who, ent, w, vt,
+      vt[0], vt[1], vt[2], vt[3], vt[0x38 / 4], vt[0xA4 / 4], vt[0xA8 / 4], WeaponCur(w));
+}
+static void WeaponCapture(void* playerEnt) {   // the local player's update
+    if (!WeaponSyncMode()) return;
+    static uint32_t s_last = 0xFFFFFFFFu, s_seq = 0; static void* s_logged = nullptr;
+    __try {
+        void* w = WeaponIface(playerEnt);
+        if (!w) return;
+        if (s_logged != playerEnt) { s_logged = playerEnt; WeaponVtLog("player", playerEnt, w); }
+        const uint32_t t = (uint32_t)WeaponCur(w);
+        {   // read-only diagnostics: raw = vt[0x38](1) (sub_1D41610 keeps 11), canSheathe = vt[8]() (sub_1D4E710: a state == 2)
+            void** vt = *(void***)w;
+            const int raw = (int)((unsigned char (__thiscall*)(void*, int))vt[0x38 / 4])(w, 1);
+            const int cs = (int)((char (__thiscall*)(void*))vt[2])(w);
+            static int s_raw = -1, s_cs = -1;
+            if (raw != s_raw || cs != s_cs) { L("[Wpn] player raw %d -> %d canSheathe %d -> %d (type %u)\n", s_raw, raw, s_cs, cs, t); s_raw = raw; s_cs = cs; }
+            // HumanData::m_Left/RightHandWeaponState (Human.h: None 0, Sheathed 1, Grabbed 2, Unsheathed 3), offset from the header
+            // (UNVERIFIED; it follows m_HumanDataBundle, which the carry reads correctly).
+            Human* hh = AIEntityHelper::GetHuman((Entity*)playerEnt);
+            if (hh) {
+                const int ls = (int)hh->m_Data.m_LeftHandWeaponState, rs = (int)hh->m_Data.m_RightHandWeaponState;
+                static int s_ls = -9, s_rs = -9;
+                if (ls != s_ls || rs != s_rs) { L("[Wpn] player handState L %d -> %d R %d -> %d (+0x%X)\n", s_ls, ls, s_rs, rs, (unsigned)((uintptr_t)&hh->m_Data.m_RightHandWeaponState - (uintptr_t)hh)); s_ls = ls; s_rs = rs; }
+            }
+        }
+        if (t == s_last) return;
+        L("[Wpn] player type %d -> %u\n", (int)s_last, t);
+        s_last = t;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { static int s_e = 0; if (!s_e++) L("[Wpn] capture exception 0x%08X\n", GetExceptionCode()); }
+}
+static void WeaponApply(void* puppetEnt) {   // the puppet's update: read-only, logs the puppet's interface once
+    if (!WeaponSyncMode()) return;
+    static void* s_logged = nullptr;
+    __try {
+        void* w = WeaponIface(puppetEnt);
+        if (w && s_logged != puppetEnt) { s_logged = puppetEnt; WeaponVtLog("puppet", puppetEnt, w); }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { static int s_e = 0; if (!s_e++) L("[Wpn] apply exception 0x%08X\n", GetExceptionCode()); }
+}
+
 // ---- [Coop] ClimbProbe (default 0, read-only): why the carried puppet's climbing/parkour looks choppy (owner, run 37) ------------
 // While the peer is off the ground (ActorContextID 5 Ladder, 6 InAir, 7 Ledge, 8 Walling, 9 NarrowObject, 30 Climbing, 31 Hanging;
 // docs/evidence/traversal-moves-2026-11-16.md) and our action copy owns the puppet, every 5 s: switches issued and the host's blend
@@ -2946,6 +3016,7 @@ static void PuppetActionBlock(Human* h, const PlayerState& s, bool writeActions)
         }
 
         if (writeActions) PchanApply(h, s.actionAlias);   // [Coop] PuppetChannels: the peer's other action controllers
+        WeaponApply((void*)g_puppet);   // [Coop] WeaponSync (read-only): logs the puppet's weapon interface once
 
         // Blend-in override: once the puppet's current evaluator IS the action we just targeted, give its
         // blend-in the peer's real length (stored ActionBlend, used if Start() hasn't run yet, AND the runtime
@@ -15422,7 +15493,7 @@ static void DumpConfigOnce()
         // The Tune* values are floats (read with strtod, see ShipTuningTick); the dump shows the integer part.
         { "Coop", "TuneConeAngle", 120 }, { "Coop", "TuneConeRange", 350 }, { "Coop", "TuneMaxTime", 30 },
         { "Coop", "TuneAggroTime", 30 }, { "Coop", "TuneHull", 0 },
-        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 },{ "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 },
+        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 }, { "Coop", "WeaponSync", 0 },{ "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 },
         { "Coop", "CombatTest", 0 }, { "Coop", "CrashContext", 0 }, { "Coop", "CorpseKeepSec", 30 }, { "Coop", "CrowdProbeIntegrate", 1 },
         { "Coop", "CrowdProbeLiveKeys", 1 }, { "Coop", "DamageRelay", 0 }, { "Coop", "Diag", 0 },
         { "Coop", "DisableCrowd", 0 }, { "Coop", "DisablePuppetAI", 1 }, { "Coop", "DisableSpawns", 0 },

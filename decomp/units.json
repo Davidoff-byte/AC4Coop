@@ -461,6 +461,15 @@
    "size": 29,
    "status": "claimed"
   },
+  "006F5FF0": {
+   "addr": "006F5FF0",
+   "claimed_at": null,
+   "name": "EntityAiActor",
+   "owner": null,
+   "receipts": [],
+   "size": 29,
+   "status": "unknown"
+  },
   "00703090": {
    "addr": "00703090",
    "claimed_at": null,
