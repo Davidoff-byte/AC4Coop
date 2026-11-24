@@ -1395,6 +1395,7 @@ struct ProxyPick { uint32_t srcId; int idx; float srcMax; float tierDelta; uint3
 static void PuppetOwnNote(Human* h, Entity* e, const HookMath::Transform& m);   // own-update block, before ApplyGuards
 bool FightIntentOwnsPuppet();   // [Coop] FightIntents (S7 slice 1), defined with OwnDrain
 static volatile LONG s_pfcActive = 0;   // [Coop] PuppetFightCarry: our action copy owns the puppet in this fight
+static volatile LONG s_pfcIssued = 0;   // SetTargetAction calls on the puppet in the current fight window
 static void PuppetOwnClear();
 static Entity* ResolveEntityById(uint64_t id);   // engine registry, defined with the ApplyGuards
 static void ProxySrcClearAll();
@@ -2567,6 +2568,7 @@ static void PuppetActionBlock(Human* h, const PlayerState& s, bool writeActions)
                     // CharacterActionSetManager doesn't take the kit-lookup path that bails and drops the CAS
                     // override (-> base/Connor clip).
                     ac->SetTargetAction((int)s.actionAlias, 0, 0, (int)s.actionChannel, (int)s.actionLayer);
+                    if (InterlockedCompareExchange(&s_pfcActive, 0, 0)) InterlockedIncrement(&s_pfcIssued);
                     // Start the new clip at the peer's phase instead of frame 0 — the game does the same right
                     // after its own SetTargetAction calls. Without it every swap pops. processDisplacement=0
                     // (we own position), processEvents=0 (don't fire the skipped span's anim events).
@@ -2908,7 +2910,17 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
         // puppet's fight AI reproduce the host. One action writer: FightIntents' puppet ops are dropped while this is active
         // (FightIntentApply) and the run sets BrainPuppet=0. UNVERIFIED: paired kill/counter alignment with the guard copies,
         // actions on other layers, and the old two-writer crash with the behavior off.
-        if (InterlockedExchange(&s_pfcActive, fightCarry ? 1 : 0) != (fightCarry ? 1 : 0)) L("[PFC] fight carry %s (peer stage %d ctx %d)\n", fightCarry ? "ON" : "off", s.humanGroundStage, s.contextId);
+        {   // per fight window: the peer's alias changes vs the SetTargetAction calls we issued (run 35b: 8 issued, 257 peer switches
+            // over the whole session - how many fell inside fight windows was not measured)
+            static uint32_t s_wPeer = 0, s_wLast = 0; static uint64_t s_wStart = 0;
+            if (fightCarry && s.actionAlias != s_wLast) { ++s_wPeer; s_wLast = s.actionAlias; }
+            if (InterlockedExchange(&s_pfcActive, fightCarry ? 1 : 0) != (fightCarry ? 1 : 0)) {
+                if (fightCarry) { s_wPeer = 1; s_wLast = s.actionAlias; InterlockedExchange(&s_pfcIssued, 0); s_wStart = GetTickCount64(); }
+                L("[PFC] fight carry %s (peer stage %d ctx %d)%s\n", fightCarry ? "ON" : "off", s.humanGroundStage, s.contextId, fightCarry ? "" : "");
+                if (!fightCarry && s_wStart)
+                    L("[PFC] window %llu ms: peer alias changes=%u issued=%ld\n", (unsigned long long)(GetTickCount64() - s_wStart), s_wPeer, InterlockedCompareExchange(&s_pfcIssued, 0, 0));
+            }
+        }
         if (fightCarry) { aiOff = true; actNow = true; locoNow = false; }
         bool braindead = aiOff && !actNow;                               // position-only (never true in hybrid)
 
