@@ -125,6 +125,14 @@ namespace {
         if (!f) f = _fsopen(Paths::LogPath("net_log.txt"), "a", _SH_DENYWR);   // next to the ASI, not the CWD
         if (f) { fputs(s, f); fflush(f); }
     }
+    // Per-process twin of dbg: net_log.txt is opened _SH_DENYWR, so on a same-PC two-copy run only the first copy can
+    // write it and the second copy's lines are lost. Used by the kill-lane trace.
+    void dbgp(const char* s) {
+        static FILE* f = nullptr;
+        if (!f) { char name[48]; wsprintfA(name, "net_log_%u.txt", (unsigned)GetCurrentProcessId()); f = _fsopen(Paths::LogPath(name), "a", _SH_DENYWR); }
+        if (f) { fputs(s, f); fflush(f); }
+        dbg(s);
+    }
 
     // ---- same-PC instance slot marker (D-018) ----------------------------------------------------
     // A named mutex is an OWNED marker: whoever creates it first is slot 1, a second process that
@@ -2200,6 +2208,7 @@ namespace {
                     } else {
                         EntityPacket decoded{};
                         int killDrops = 0;   // kill-ring entries overwritten by this datagram
+                        int krN = 0; uint64_t krId[4] = {}; unsigned krHp[4] = {};   // kill-lane trace
                         // Both packet types put magic first and protoVer second, so the version is
                         // readable before the type-specific decode (a player datagram is exactly
                         // sizeof(PlayerState) = 576 B, an entity one >= ENTITY_WIRE_HEADER_SIZE, so
@@ -2264,6 +2273,7 @@ namespace {
                                 // could vanish with no trace. Count it here, log the first few below
                                 // (outside the lock).
                                 if (g_killCount == NET_KILLQ) ++killDrops;
+                                if (krN < 4) { krId[krN] = ks.objId; krHp[krN] = ks.hp; ++krN; }   // kill-lane trace, logged after the lock
                                 g_killRing[g_killHead] = ks;
                                 g_killHead = (g_killHead + 1) % NET_KILLQ;
                                 if (g_killCount < NET_KILLQ) ++g_killCount;
@@ -2285,6 +2295,14 @@ namespace {
                         InterlockedIncrement(&g_rxPackets);
                         InterlockedAdd(&g_rxBytes, (LONG)n);
                         LeaveCriticalSection(&g_lock);
+                        for (int ki = 0; ki < krN; ++ki) {
+                            static LONG s_kr = 0;
+                            if (InterlockedIncrement(&s_kr) > 60) break;
+                            char m[160];
+                            wsprintfA(m, "[Net] kill rx objId=%08X%08X hp=%u queued (pkt count=%u)\n", (unsigned)(krId[ki] >> 32),
+                                      (unsigned)krId[ki], (unsigned)krHp[ki], (unsigned)decoded.count);
+                            dbgp(m);
+                        }
                         if (killDrops) {
                             static int s_dropLogs = 0;
                             if (s_dropLogs < NET_KILL_DROP_LOGS) {
@@ -2837,6 +2855,15 @@ void SendEntities(const EntityPacket& p) {
         InterlockedAdd(&g_txBytes, (LONG)len);   // actual bytes on the wire (per chunk)
     }
     InterlockedAdd(&g_txEnts, (LONG)g_wireRecs);
+    if (p.count == 1 && p.ents[0].kind == NET_KIND_KILL) {   // kill-lane trace: did the death record make it into the datagram?
+        static LONG s_kt = 0;
+        if (InterlockedIncrement(&s_kt) <= 60) {
+            char m[200];
+            wsprintfA(m, "[Net] kill tx objId=%08X%08X hp=%u bytes=%u written=%u seq=%u\n", (unsigned)(p.ents[0].objId >> 32),
+                      (unsigned)p.ents[0].objId, (unsigned)p.ents[0].hp, (unsigned)n, (unsigned)g_wireRecs, (unsigned)p.seq);
+            dbgp(m);
+        }
+    }
     PumpIntents();                             // proto 15: no-op unless [Coop] IntentLane=1
     static uint32_t s_logCounter = 0;
     if ((++s_logCounter % 60) == 0) {

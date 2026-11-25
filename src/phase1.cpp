@@ -11910,7 +11910,11 @@ static void EntitySyncTick() {
     {
         static EntityPacket kp;
         std::memset(&kp, 0, sizeof(kp));
-        if (Net::GetKillEntities(kp, 16) > 0) ProcessKillEvents(kp);
+        if (Net::GetKillEntities(kp, 16) > 0) {
+            static int s_kdl = 0;
+            if (s_kdl < 60) { ++s_kdl; L("[Kill] drain %u death(s) from the kill ring (first objId=%llu hp=%u)\n", kp.count, (unsigned long long)kp.ents[0].objId, (unsigned)kp.ents[0].hp); }
+            ProcessKillEvents(kp);
+        }
     }
     // Order is deliberate: the exactly-once ring is applied BEFORE the retained snapshot's kill lane.
     // `in` stays in the slot and is re-processed on every throttled tick, so if it went first a replayed
@@ -13417,11 +13421,11 @@ static void MirrorVisualDeathInner(Entity* e) {
 // stands there. Every pre-existing call site goes through KillGuardEntity(Entity*) and still notifies.
 // C2-M1: the return value is "the ENGINE says this body is dead after this call", never "the function
 // reached its end". notifyPeer selects only the peer push; the verdict means the same on both paths.
-static bool KillGuardEntityInner(Entity* e, bool notifyPeer, KillRefusal* why);     // wrapped below
+static bool KillGuardEntityInner(Entity* e, bool notifyPeer, KillRefusal* why, bool playClip);     // wrapped below
 static bool KillGuardEntity(Entity* e) {
     if (!e || !readable(e, 4)) return false;
     bool dead = false;
-    __try { dead = KillGuardEntityInner(e, true, nullptr); }
+    __try { dead = KillGuardEntityInner(e, true, nullptr, true); }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         L("[KF] EXCEPTION 0x%08X (ent=%08X) - kill aborted\n", GetExceptionCode(), e);
         dead = false;
@@ -13429,12 +13433,13 @@ static bool KillGuardEntity(Entity* e) {
     return dead;
 }
 
-static bool KillGuardEntityQuiet(Entity* e, KillRefusal* why) {
+static bool KillGuardEntityQuiet(Entity* e, KillRefusal* why, bool playClip) {
     if (why) *why = KILL_OK;
     if (!e || !readable(e, 4)) { if (why) *why = KILL_REFUSED_NO_ID; return false; }
     bool dead = false;
-    __try { dead = KillGuardEntityInner(e, false, why); }
+    __try { dead = KillGuardEntityInner(e, false, why, playClip); }
     __except (EXCEPTION_EXECUTE_HANDLER) {
+        t_odRelay = 0;   // a fault inside SetLife must not leave this thread's writes unblocked
         L("[KF] EXCEPTION 0x%08X (ent=%08X) - kill aborted\n", GetExceptionCode(), e);
         dead = false;
         if (why) *why = KILL_REFUSED_EXCEPTION;
@@ -13442,7 +13447,7 @@ static bool KillGuardEntityQuiet(Entity* e, KillRefusal* why) {
     return dead;
 }
 
-static bool KillGuardEntityInner(Entity* e, bool notifyPeer, KillRefusal* why) {
+static bool KillGuardEntityInner(Entity* e, bool notifyPeer, KillRefusal* why, bool playClip) {
     if (!e) { if (why) *why = KILL_REFUSED_NO_ID; return false; }   // no body: engine says nothing
 
     unsigned int ai = (unsigned int)AIEntityHelper::GetEntityAI(e);
@@ -13466,7 +13471,12 @@ static bool KillGuardEntityInner(Entity* e, bool notifyPeer, KillRefusal* why) {
         // value IS the engine's own death write (Life lands on 0xFFFF) AND it posts the health event
         // that drives the death state machine — which is what should trigger the ragdoll/animation.
         int prev = *(unsigned short*)(hp + 0x5C);
+        // t_odRelay: on the guest this is the HOST's death being applied to its linked copy. Without the mark, OwnerDamage's
+        // SetLife detour (OwnerDamageShouldBlock) treated it as local damage, blocked it and sent it back to the host as a
+        // request - 2026-11-25 run: "SetLife(-1) rc=-1 life 34 -> 34" on all three host kills, so the copies stayed alive.
+        t_odRelay = 1;
         int rc = ((int (__thiscall*)(void*, int))0x19FB4C0)((void*)hp, -1);
+        t_odRelay = 0;
         L("[KF] SetLife(-1) rc=%d  life %d -> %u\n", rc, prev, *(unsigned short*)(hp + 0x5C));
         *(unsigned int*)(hp + 0x60) |= 0x01000000u;   // the engine sets this on death too
     }
@@ -13495,7 +13505,8 @@ static bool KillGuardEntityInner(Entity* e, bool notifyPeer, KillRefusal* why) {
     // so the corpse actually falls instead of standing there.
     static const bool kPlayDeathClip = true;
     Human* h = AIEntityHelper::GetHuman(e);
-    if (h && readable(h, 4)) {
+    if (!playClip) L("[KF] death clip skipped (body already in the host's death pose)\n");
+    else if (h && readable(h, 4)) {
         ActionComponent* ac = h->GetActionComponent();
         if (ac && readable(ac, 0x40)) {
             ac->SetTargetAction((int)1818493434u, 0, 0, 0xFFFF, ACTLAYER_PRIMARY);
@@ -13664,11 +13675,19 @@ static bool GuestKillMirrorEntity(uint64_t objId, unsigned int ent, bool viaGues
     // life 65535 -> 65535") but still walks the health-event path that drives the action/blend
     // dispatcher - the state in which this->[0x114] is null (crash at 0x67B2EA, 0xC0000005).
     // A body that is dead on any of the two proven predicates is never killed a second time.
-    if (hpOk && (life == 0xFFFFu || deadFlag)) {
+    // 2026-11-25 (owner: host kills "fall on the guest's screen but don't register as dead"): a mirror that played the host's
+    // death clip can carry the +0x60 death bit with Life still alive (live: "skipped reason=already-dead life=28") - SetLife
+    // (sub_19FB4C0) never writes that bit, so it is not the engine's death write, and skipping here left the copy alive to
+    // combat for good. Already dead is Life == 0xFFFF only (the value SetLife(-1) lands; sub_19FB4C0 refuses a second negative
+    // write when GetLife < 0, so the crash case D above is a Life == 0xFFFF body). A flag-only body gets the engine kill
+    // without the recorded death clip: it is already lying in the host's death pose.
+    if (hpOk && life == 0xFFFFu) {
         if (alreadyDead) *alreadyDead = true;   // settled: the engine predicate already says dead
         L("[Mirror] dead ent=%08X skipped reason=already-dead life=%u\n", ent, (unsigned)life);
         return false;
     }
+    const bool flagOnlyDeath = hpOk && deadFlag;
+    if (flagOnlyDeath) L("[Mirror] dead ent=%08X death bit set with life=%u -> engine kill without the death clip\n", ent, (unsigned)life);
     if (hpOk) {
         // D: restore the state the host path runs under. Every snapshot the mirror tick disables the
         // behaviour component (SetEnabled(false), phase1.cpp:3494) and clears the drive flag (:3499);
@@ -13701,7 +13720,7 @@ static bool GuestKillMirrorEntity(uint64_t objId, unsigned int ent, bool viaGues
                 L("[Mirror] dead ent=%08X skipped reason=no-behaviour-component\n", ent);
             return false;
         }
-        const bool engineDead = KillGuardEntityQuiet((Entity*)ent, why);   // own __try/__except; real verdict
+        const bool engineDead = KillGuardEntityQuiet((Entity*)ent, why, !flagOnlyDeath);   // own __try/__except; real verdict
         if (!engineDead) {
             // C2-M1: no SetLife, or the engine refused it. Do NOT arm the latch here -- CorpseLatchTick
             // does SetEnabled(false) + m_DriveEntity = false, which would freeze a body that is still
@@ -13721,7 +13740,8 @@ static bool GuestKillMirrorEntity(uint64_t objId, unsigned int ent, bool viaGues
     }
     if (why && *why == KILL_OK) *why = KILL_REFUSED_NO_HEALTH;   // C2-m1: no valid service -> nothing attempted
     if (ClaimLogAllowed())
-        L("[Mirror] dead ent=%08X -> KillGuardEntity applied=0 reason=no-health-service (GuestKillMirror=%d)\n", ent, flag);
+        L("[Mirror] dead ent=%08X -> KillGuardEntity applied=0 reason=%s (GuestKillMirror=%d)\n", ent,
+          (why && *why == KILL_REFUSED_NO_ID) ? "identity-unproven" : "no-health-service", flag);
     return false;
 }
 
