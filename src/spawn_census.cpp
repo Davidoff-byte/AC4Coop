@@ -19,6 +19,7 @@
 #include "paths.h"
 #include "Scimitar/Entity.h"
 #include "Scimitar/AI/AIEntityHelper.h"
+#include "Scimitar/ManagedObject.h"
 
 #include <windows.h>
 #include <winternl.h>
@@ -33,7 +34,7 @@ namespace {
 uintptr_t g_lo = 0, g_hi = 0;
 bool g_on = false;
 DWORD g_tF = 0, g_tR = 0, g_tA = 0, g_tD = 0;
-volatile LONG g_lock = 0, g_lines = 0;
+volatile LONG g_lock = 0, g_lines = 0, g_watch = 0;
 
 struct Spin { Spin() { while (InterlockedExchange(&g_lock, 1)) YieldProcessor(); } ~Spin() { InterlockedExchange(&g_lock, 0); } };
 
@@ -151,6 +152,7 @@ uintptr_t __fastcall DetF(void* params, void*, int a2)
         const uint32_t pvt = *(const uint32_t*)params;
         if (e) { Made& m = g_made[(InterlockedIncrement(&g_madePos) - 1) & (kRing - 1)]; m.e = 0; m.pvt = pvt; m.e = e; }
         NoteF(pvt, *(const uint32_t*)fr, e != 0, e && IsHuman(e));
+        if (g_watch > 0 && InterlockedDecrement(&g_watch) >= 0) { char line[160]; float p[3]; Pos(e, p); _snprintf_s(line, sizeof(line), _TRUNCATE, "[Replay] build after fire: params=%08X pvt=%08X -> ent=%08X human=%d\n", (unsigned)(uintptr_t)params, pvt, (unsigned)e, e && IsHuman(e) ? 1 : 0); Phase1_LogLine(line); }
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
     return e;
 }
@@ -184,6 +186,47 @@ __declspec(naked) void DetD()
             add esp, 4
             popad
             jmp dword ptr [g_tD] }
+}
+
+// ---- Request capture + replay (also under SpawnCensus) -------------------------------------------------------------
+// The whole submit is one cdecl function, sub_569560(item, owner, ctx, id_lo, id_hi) (disasm 0x569560..0x5695A0):
+//   req = singleton(dword_2AC1E88)->vt[0x84/4](ctx, item)   = sub_F72ED0, thiscall, retn 8 (singleton unused)
+//   sub_79C6C0(req, owner, id_lo, id_hi)                    thiscall, retn 0Ch: req+0xC = owner, req+0x18/+0x1C = id
+//                                                           (id 0 -> taken from owner->vt[0x48])
+//   sub_79B8D0(req)                                         submit
+// Other submitters (sub_56F8E0, CrowdHerder) inline the same three calls. We hook the factory (55 8B EC 8B 45 08) and
+// the source setter (55 8B EC 53 8B 5D 10, 7 bytes) and join them by req.
+DWORD g_tFac = 0, g_tSrc = 0;
+struct Cap { volatile uintptr_t req; uintptr_t ctx, item, itemVt, owner; uint32_t idLo, idHi; ULONGLONG t; volatile LONG printed; };
+constexpr int kCap = 1024;
+Cap g_cap[kCap];
+volatile LONG g_capPos = 0, g_facN = 0, g_srcN = 0;
+typedef uintptr_t(__thiscall* FacFn)(void*, uintptr_t, uintptr_t);
+typedef void(__thiscall* SrcFn)(void*, uintptr_t, uint32_t, uint32_t);
+uintptr_t __fastcall DetFac(void* self, void*, uintptr_t ctx, uintptr_t item)
+{
+    const uintptr_t req = ((FacFn)g_tFac)(self, ctx, item);
+    __try {
+        InterlockedIncrement(&g_facN);
+        if (req) {
+            Cap& c = g_cap[(InterlockedIncrement(&g_capPos) - 1) & (kCap - 1)];
+            c.req = 0; c.ctx = ctx; c.item = item; c.itemVt = item ? *(const uintptr_t*)item : 0; c.owner = 0;
+            c.idLo = c.idHi = 0; c.t = GetTickCount64(); c.printed = 0; c.req = req;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return req;
+}
+void __fastcall DetSrc(void* req, void*, uintptr_t owner, uint32_t lo, uint32_t hi)
+{
+    ((SrcFn)g_tSrc)(req, owner, lo, hi);
+    __try {
+        InterlockedIncrement(&g_srcN);
+        const LONG pos = g_capPos;
+        for (int i = 0; i < 64; ++i) {
+            Cap& c = g_cap[(pos - 1 - i) & (kCap - 1)];
+            if (c.req == (uintptr_t)req) { c.owner = owner; c.idLo = lo; c.idHi = hi; break; }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
 bool Install(uintptr_t va, const BYTE* pro, int n, void* det, DWORD* slot, const char* name)
@@ -235,9 +278,13 @@ void SpawnCensusInit()
     const bool r = spawnsOwned ? false : Install(0x0079B8D0, pR, 5, (void*)&DetR, &g_tR, "SpawningRequestSpawn");
     const bool a = Install(0x005A8A80, pA, 6, (void*)&DetA, &g_tA, "WorldAddCore");
     const bool d = Install(0x005A8AC0, pD, 6, (void*)&DetD, &g_tD, "WorldRemoveCore");
-    g_on = f || r || a || d;
+    static const BYTE pFac[6] = { 0x55, 0x8B, 0xEC, 0x8B, 0x45, 0x08 };
+    static const BYTE pSrc[7] = { 0x55, 0x8B, 0xEC, 0x53, 0x8B, 0x5D, 0x10 };
+    const bool fac = Install(0x00F72ED0, pFac, 6, (void*)&DetFac, &g_tFac, "RequestFactory");
+    const bool src = Install(0x0079C6C0, pSrc, 7, (void*)&DetSrc, &g_tSrc, "RequestSetSource");
+    g_on = f || r || a || d || fac || src;
     char line[128];
-    _snprintf_s(line, sizeof(line), _TRUNCATE, "[Census] SpawnCensus on: F=%d R=%d A=%d D=%d\n", f, r, a, d);
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[Census] SpawnCensus on: F=%d R=%d A=%d D=%d fac=%d src=%d\n", f, r, a, d, fac, src);
     Phase1_LogLine(line);
 }
 
@@ -256,4 +303,81 @@ int SpawnCensusReport(char* out, int cap)
     }
     return _snprintf_s(out, cap, _TRUNCATE, "[Census] totals adds=%ld dels=%ld funnel=%ld reqs=%ld | rows adds=%d(+%ld) funnel=%d reqs=%d dels=%d",
                        g_nAdd, g_nDel, g_nF, g_nR, g_adds.used, g_adds.overflow, g_funnel.used, g_reqs.used, g_dels.used);
+}
+
+static unsigned ReadVt(uintptr_t p) { __try { return p ? *(const unsigned*)p : 0u; } __except (EXCEPTION_EXECUTE_HANDLER) { return 0u; } }
+
+// Player-update thread (phase1.cpp OnFrameInner). Prints each newly captured request's key once (cap 400 lines):
+// the item's own ObjectID (authored ids have hi != 0) and whether HandleContainer_GetObjectByID 0xA1F160 (stdcall
+// (lo, hi) -> object) resolves it back to the same item here. [Coop] SpawnReplayFire (once a second; acts when the value
+// changes to non-zero; [Coop] SpawnReplayFirePid limits it to one process): v % 10 = 1 newest ship item (vt 0x0270A538),
+// 2 newest NPC item (vt 0x026FD610), 3 newest any; re-submits it through sub_569560(item, owner, ctx, id_lo, id_hi).
+void SpawnReplayTick()
+{
+    if (!g_on || !g_tFac) return;
+    static ULONGLONG s_nextKey = 0, s_nextFire = 0;
+    static LONG s_keyLines = 0, s_seen = 0;
+    static uintptr_t s_items[512]; static int s_nItems = 0;
+    static int s_last = 0;
+    const ULONGLONG now = GetTickCount64();
+    char line[300];
+    if (now >= s_nextKey && s_keyLines < 400) {
+        s_nextKey = now + 2000;
+        const LONG pos = g_capPos;
+        for (LONG i = s_seen; i < pos && s_keyLines < 400; ++i) {
+            Cap& c = g_cap[i & (kCap - 1)];
+            if (!c.req || c.printed) continue;
+            c.printed = 1;
+            bool dup = false; for (int k = 0; k < s_nItems; ++k) if (s_items[k] == c.item) { dup = true; break; }
+            if (dup) continue;
+            if (s_nItems < 512) s_items[s_nItems++] = c.item;
+            uint64_t id = 0, rqid = 0; uintptr_t back = 0, rq = 0, rqBack = 0; DWORD code = 0;
+            __try {
+                if (c.item && *(const uintptr_t*)c.item == c.itemVt) {
+                    id = ((ManagedObject*)c.item)->GetObjectID();
+                    (void)back;   // no by-id lookup here: 0xA1F160 faulted on a minted id INSIDE the engine object lock 0x4DD601C
+                }
+                // The requester: GameplayCoordinator (vt 0x026BDEE0) holds the owner sub-object at +0x38 (live 2026-11-25:
+                // owner vt 0x026BDE50 at coordinator+0x38, 129/144 requests). Its ObjectID is the portable-key candidate.
+                if (c.owner && ReadVt(c.owner - 0x38) == 0x026BDEE0u) rq = c.owner - 0x38;
+                if (rq) rqid = ((ManagedObject*)rq)->GetObjectID();
+                // 2026-11-25 run 2: A1F160(0x56FDD448, 0) raised C0000005 while holding the lock; the __except swallowed it and the
+                // lock stayed held -> both copies deadlocked at boot. Never call an engine function that takes a lock under __try.
+            } __except (code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER) {}
+            ++s_keyLines;
+            _snprintf_s(line, sizeof(line), _TRUNCATE,
+                        "[Key] item=%08X ivt=%08X iid=%08X:%08X resolves=%d ctx=%08X owner=%08X ovt=%08X rid=%08X:%08X rq=%08X rqid=%08X:%08X rqres=%d exc=%08X\n",
+                        (unsigned)c.item, (unsigned)c.itemVt, (unsigned)(id >> 32), (unsigned)id, back == c.item ? 1 : 0, (unsigned)c.ctx,
+                        (unsigned)c.owner, ReadVt(c.owner),
+                        c.idHi, c.idLo, (unsigned)rq, (unsigned)(rqid >> 32), (unsigned)rqid, rq && rqBack == rq ? 1 : 0, (unsigned)code);
+            Phase1_LogLine(line);
+        }
+        s_seen = pos;
+    }
+    if (now < s_nextFire) return;
+    s_nextFire = now + 1000;
+    const int v = GetPrivateProfileIntA("Coop", "SpawnReplayFire", 0, Paths::Ini());
+    if (v == s_last) return;
+    s_last = v;
+    if (!v) return;
+    const int pid = GetPrivateProfileIntA("Coop", "SpawnReplayFirePid", 0, Paths::Ini());
+    if (pid && (DWORD)pid != GetCurrentProcessId()) return;
+    const int mode = v % 10;
+    const uintptr_t want = mode == 1 ? 0x0270A538u : mode == 2 ? 0x026FD610u : 0u;
+    const LONG pos = g_capPos;
+    Cap pick = {}; bool have = false;
+    for (int i = 0; i < kCap && !have; ++i) {
+        const Cap& c = g_cap[(pos - 1 - i) & (kCap - 1)];
+        if (c.req && c.owner && (!want || c.itemVt == want)) { pick.ctx = c.ctx; pick.item = c.item; pick.itemVt = c.itemVt; pick.owner = c.owner; pick.idLo = c.idLo; pick.idHi = c.idHi; pick.t = c.t; have = true; }
+    }
+    if (!have) { Phase1_LogLine("[Replay] fire: no captured request of that kind\n"); return; }
+    char ok = 0; DWORD code = 0;
+    InterlockedExchange(&g_watch, 3);
+    __try {
+        if (*(const uintptr_t*)pick.item != pick.itemVt) { Phase1_LogLine("[Replay] fire: item vtable changed - skipped\n"); return; }
+        ok = ((char(__cdecl*)(uintptr_t, uintptr_t, uintptr_t, uint32_t, uint32_t))0x00569560)(pick.item, pick.owner, pick.ctx, pick.idLo, pick.idHi);
+    } __except (code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER) {}
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[Replay] fire v=%d item=%08X ivt=%08X owner=%08X ctx=%08X id=%08X:%08X captured %llums ago -> submitted=%d exc=%08X\n",
+                v, (unsigned)pick.item, (unsigned)pick.itemVt, (unsigned)pick.owner, (unsigned)pick.ctx, pick.idHi, pick.idLo, now - pick.t, (int)ok, (unsigned)code);
+    Phase1_LogLine(line);
 }

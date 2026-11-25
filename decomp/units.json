@@ -200,6 +200,15 @@
    "size": 31,
    "status": "claimed"
   },
+  "00569560": {
+   "addr": "00569560",
+   "claimed_at": null,
+   "name": "SpawnSubmitRequest",
+   "owner": null,
+   "receipts": [],
+   "size": 65,
+   "status": "unknown"
+  },
   "0059AA90": {
    "addr": "0059AA90",
    "claimed_at": null,

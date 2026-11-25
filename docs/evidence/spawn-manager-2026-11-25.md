@@ -68,3 +68,21 @@ reused - not decoded.
 - **Identity:** engine ids are minted per process and cannot be rewritten (prior); keep hostId -> local entity, as the
   guard lane does.
 Design and open questions: `docs/design/host-spawn-authority.md`.
+
+## 4. Replaying a request, and the portable key (2026-11-25, builds 3CAF4CC5 / 8B2DD07F / 60981F22)
+Static: the whole submit is one cdecl function `sub_569560(item, owner, ctx, id_lo, id_hi)` (disasm 0x569560..0x5695A0):
+`req = dword_2AC1E88->vt[0x84/4](ctx, item)` (`sub_F72ED0`, thiscall, retn 8), `sub_79C6C0(req, owner, id_lo, id_hi)`
+(thiscall, retn 0Ch; req+0xC = owner, req+0x18/+0x1C = id; id 0 -> taken from `owner->vt[0x48/4]`), `0x79B8D0(req)`.
+| Test (pre-registered) | Result |
+|---|---|
+| K: the request item's ObjectID is a portable key (>= 90 % authored and shared by both copies) | **FAIL**: 144 + 147 requests, every item is a SpawningSpecification (vt 0x01E4A278) with ObjectID **0**; request ids high half 0 (minted) |
+| Who requests | owner vt 0x026BDE50 = GameplayCoordinator (vt 0x026BDEE0) + 0x38: **129/144**; 0x02708E80: 9; 0x01E60988: 4; 0x026E11F8: 1; only 2 distinct ctx values per copy |
+| R: re-submit a captured request through `sub_569560` (host, newest request, captured 93 s earlier) | **PASS (n=1)**: submitted=1, the manager built a SpawnNPCParams human (`[Replay] build after fire`), its manager add count went 57 -> 58, host alive after |
+| K2: the GameplayCoordinator's ObjectID is authored | **FAIL (n=1)**: `00000000:56FDD448` - high half 0, minted |
+**Defect found and fixed (mine):** the K2 probe called HandleContainer_GetObjectByID `0xA1F160` on that minted id from
+inside `__try`; it raised C0000005 while holding the engine object lock `0x4DD601C`, the handler swallowed it, the lock
+stayed held and **both copies deadlocked at boot** (hang dump `D:\AC4-RE\dumps\hang-18148-20261125-130944.dmp`: three
+game threads in RtlEnterCriticalSection(0x4DD6020)). Build 60981F22 removes every by-id lookup from the probe.
+Rule: never call an engine function that takes a lock under `__try`.
+**Consequence:** no id identifies a spawn on both machines (spec 0, request minted, coordinator minted). The portable key
+has to be built from what both machines share: the requester's world position + its spec index + the params class.
