@@ -5,15 +5,20 @@
 #   files\coop_ui\  overlay.rml / overlay.rcss / Lato fonts + licence
 # eos.ini holds the EOS client credentials: it comes from the ignored local\eos.ini, goes into the package only, and is
 # never printed. The package and zip must never be committed.
+# -Overrides <file>: key=value lines applied to the packaged AC4Coop.ini's [Coop] section (replace in place, else add).
+# -Guide <file>: copied into the package as GUIDE.md. -Tag <name>: appended to the package name (e.g. test-2026-11-25).
 param(
     [string]$Out = (Join-Path $PSScriptRoot "..\..\..\dist"),
-    [string]$Loader = (Join-Path $PSScriptRoot "..\..\..\dist\AC4Coop-Launcher-8afd481\files\dinput8.dll")
+    [string]$Loader = (Join-Path $PSScriptRoot "..\..\..\dist\AC4Coop-Launcher-8afd481\files\dinput8.dll"),
+    [string]$Overrides = "",
+    [string]$Guide = "",
+    [string]$Tag = ""
 )
 $ErrorActionPreference = "Stop"
 $root = Resolve-Path (Join-Path $PSScriptRoot "..")
 $commit = (git -C $root rev-parse --short HEAD).Trim()
 $dirty = (git -C $root status --porcelain --untracked-files=no) -ne $null
-$name = "AC4Coop-Launcher-$commit" + $(if ($dirty) { "-dirty" } else { "" })
+$name = "AC4Coop-Launcher-$commit" + $(if ($dirty) { "-dirty" } else { "" }) + $(if ($Tag) { "-$Tag" } else { "" })
 $pkg = Join-Path $Out $name
 $need = @{
     "bin\AC4CoopLauncher.exe" = "AC4CoopLauncher.exe"; "bin\AC4Coop.asi" = "files\AC4Coop.asi";
@@ -31,6 +36,23 @@ if (Test-Path $pkg) { Remove-Item -Recurse -Force $pkg }
 New-Item -ItemType Directory -Force (Join-Path $pkg "files\eos"), (Join-Path $pkg "files\coop_ui") | Out-Null
 foreach ($k in $need.Keys) { Copy-Item -LiteralPath (Join-Path $root $k) -Destination (Join-Path $pkg $need[$k]) }
 Copy-Item -LiteralPath $Loader -Destination (Join-Path $pkg "files\dinput8.dll")
+if ($Overrides) {
+    $iniPath = Join-Path $pkg "files\AC4Coop.ini"
+    $ini = [IO.File]::ReadAllText($iniPath)
+    foreach ($line in Get-Content $Overrides) {
+        if ($line -match '^\s*#' -or $line -notmatch '^\s*(\w+)\s*=\s*(.*)$') { continue }
+        $k = $Matches[1]; $v = $Matches[2].Trim()
+        $coop = [regex]::Match($ini, '(?ms)^\[Coop\][^\r\n]*\r?\n.*?(?=^\[|\z)')
+        if (-not $coop.Success) { throw "no [Coop] section in the ini" }
+        $body = $coop.Value
+        if ($body -match "(?m)^$k\s*=") { $body = [regex]::Replace($body, "(?m)^$k\s*=.*$", "$k=$v") }
+        else { $body = [regex]::Replace($body, '^(\[Coop\][^\r\n]*\r?\n)', "`$1$k=$v`r`n") }
+        $ini = $ini.Substring(0, $coop.Index) + $body + $ini.Substring($coop.Index + $coop.Length)
+        "override $k=$v"
+    }
+    [IO.File]::WriteAllText($iniPath, $ini)
+}
+if ($Guide) { Copy-Item -LiteralPath $Guide -Destination (Join-Path $pkg "GUIDE.md") }
 @"
 AC4 Co-op ($name)
 

@@ -1,0 +1,14 @@
+# [Coop] overrides applied to the shipped AC4Coop.ini for the 2026-11-25 test kit (tools/package_launcher.ps1 -Overrides).
+# One key=value per line; an existing key in [Coop] is replaced in place, a missing one is added under [Coop].
+# Why each: docs/guides/TEST-KIT-2026-11-25.md section 4.
+IntentLane=1
+DisableSpawns=0
+FightIntents=1
+GuardActionLane=1
+AttackForward=1
+CoordSync=1
+ShipSync=1
+ShipGhost=1
+ShipMirror=0
+ShipClassBind=2
+SpawnKeyBind=1
