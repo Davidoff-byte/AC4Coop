@@ -5476,6 +5476,14 @@ struct ShipCB { uint64_t hostId; Entity* ent; uint32_t cls; uint64_t lastMs; };
 static ShipCB s_scb[64]; static int s_scbN = 0;
 static LONG s_scbNew = 0, s_scbNoCls = 0, s_scbNoShip = 0, s_scbLost = 0, s_scbHost = 0, s_scbBound = 0;
 static double s_scbErr = 0.0; static float s_scbErrMax = 0.0f; static int s_scbErrN = 0;
+uintptr_t Phase1_ScbGuestOfLo(uint32_t hostLo) {   // spawn_census.cpp crew-key diagnostics: the guest ship bound to a host ship
+    for (int i = 0; i < s_scbN; ++i) if ((uint32_t)s_scb[i].hostId == hostLo) return (uintptr_t)s_scb[i].ent;
+    return 0;
+}
+uint64_t Phase1_ScbHostOf(uintptr_t guestShip) {   // spawn_census.cpp crew keys: the host ship bound to this guest ship
+    for (int i = 0; i < s_scbN; ++i) if ((uintptr_t)s_scb[i].ent == guestShip) return s_scb[i].hostId;
+    return 0;
+}
 // Guest: the bound local ship for one host ship record, or nullptr. live[] = this frame's candidate local AI ships.
 static Entity* ShipClassBindFor(const EntityState& es, Entity* const* live, const uint32_t* liveCls, int liveN, uint64_t now) {
     ++s_scbHost;
@@ -5488,6 +5496,7 @@ static Entity* ShipClassBindFor(const EntityState& es, Entity* const* live, cons
         ++s_scbLost; s_scb[slot] = s_scb[--s_scbN]; slot = -1;   // its body left the naval list: bind again
     }
     if (!es.arch) { ++s_scbNoCls; return nullptr; }
+    if (es.arch == 7) { ++s_scbNoCls; return nullptr; }   // class 7 = Jackdaw, a player's own ship (run 2026-11-25: two docked Jackdaws bound 0 m apart)
     int best = -1; float bd = 3000.0f * 3000.0f;
     for (int k = 0; k < liveN; ++k) {
         if (liveCls[k] != es.arch) continue;
@@ -5537,7 +5546,8 @@ static void ApplyShips(const EntityPacket& pkt) {
                 Entity* c = GetShipEntity(mgr, s);
                 if (!c || c == localShip || c == player || c == (Entity*)g_ghostShip || !readable(c, 0xA0)) continue;
                 if (IsMirrorProxy(c) || *(uint32_t*)c != 0x01E4A128u) continue;
-                scbLive[scbLiveN] = c; scbLiveCls[scbLiveN] = ReadShipClass(c); ++scbLiveN;
+                scbLive[scbLiveN] = c; scbLiveCls[scbLiveN] = ReadShipClass(c); if (scbLiveCls[scbLiveN] == 7) continue;   // never a player's Jackdaw
+                ++scbLiveN;
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) { scbLiveN = 0; }
         for (int i = 0; i < s_scbN; ) if (scbNow - s_scb[i].lastMs > 10000) s_scb[i] = s_scb[--s_scbN]; else ++i;   // host ship gone 10 s

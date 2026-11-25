@@ -666,14 +666,14 @@ void SpawnShareTick()
 // its own entity built for the same key (phase1.cpp WideBindPrepass, key round before the distance rounds).
 // Static anchors only (ship-anchored crews and random traffic have no shared key yet). Lock-free reads only.
 namespace {
-struct RK { volatile uintptr_t req; uint64_t key; int kind; uintptr_t anc; uint32_t avt; };   // kind: SpawnPoint frame (1 static, 0 none, 2 parent, 3 no anchor), 4 = frame 1 with a non-Entity anchor
-struct EK { volatile uintptr_t ent; uint64_t key; int kind; uintptr_t anc; uint32_t avt; };
+struct RK { volatile uintptr_t req; uint64_t key; int kind; uintptr_t anc; uint32_t avt; float loc[3]; };   // kind: SpawnPoint frame (1 static, 0 none, 2 parent, 3 no anchor), 4 = frame 1 with a non-Entity anchor
+struct EK { volatile uintptr_t ent; uint64_t key; int kind; uintptr_t anc; uint32_t avt; float loc[3]; };
 constexpr int kRK = 2048, kEK = 2048, kHK = 1024, kHP = 2048;
 RK g_rk[kRK]; volatile LONG g_rkPos = 0;
 EK g_ek[kEK]; volatile LONG g_ekPos = 0;
 struct HK { uint64_t obj, key; }; HK g_hk[kHK]; volatile LONG g_hkPos = 0;      // guest: host objId -> key
 uint64_t g_hostPub[kHP]; int g_hostPubN = 0;                                     // host: objIds already published
-volatile LONG k_req = 0, k_ent = 0, k_entNoKey = 0, k_pub = 0, k_rx = 0, k_hostNoKey = 0, k_hostKeyed = 0;
+volatile LONG k_req = 0, k_ent = 0, k_entNoKey = 0, k_pub = 0, k_rx = 0, k_hostNoKey = 0, k_hostKeyed = 0, k_hostCrew = 0, k_crewResolved = 0, k_crewNoShip = 0;
 }
 void SpawnKeyNoteReq(uintptr_t req)
 {
@@ -683,7 +683,7 @@ void SpawnKeyNoteReq(uintptr_t req)
     int kind = SpawnPoint(c.item, w, loc, &anc);
     const uint32_t avt = ReadVt(anc);
     if (kind == 1 && avt == 0x01E4CE90u) key = KeyOf(w); else if (kind == 1) kind = 4;
-    RK& r = g_rk[(InterlockedIncrement(&g_rkPos) - 1) & (kRK - 1)]; r.req = 0; r.key = key; r.kind = kind; r.anc = anc; r.avt = avt; r.req = req;
+    RK& r = g_rk[(InterlockedIncrement(&g_rkPos) - 1) & (kRK - 1)]; r.req = 0; r.key = key; r.kind = kind; r.anc = anc; r.avt = avt; r.loc[0] = loc[0]; r.loc[1] = loc[1]; r.loc[2] = loc[2]; r.req = req;
     InterlockedIncrement(&k_req);
 }
 extern "C" void __cdecl SpawnKeyNoteEnt(const uint32_t* esp)   // esp[1] = request, esp[2] = entity
@@ -695,13 +695,30 @@ extern "C" void __cdecl SpawnKeyNoteEnt(const uint32_t* esp)   // esp[1] = reque
     for (int i = 0; i < kRK; ++i) {
         const RK& r = g_rk[(pos - 1 - i) & (kRK - 1)];
         if (r.req == req) {
-            EK& e = g_ek[(InterlockedIncrement(&g_ekPos) - 1) & (kEK - 1)]; e.ent = 0; e.key = r.key; e.kind = r.kind; e.anc = r.anc; e.avt = r.avt; e.ent = ent;
+            EK& e = g_ek[(InterlockedIncrement(&g_ekPos) - 1) & (kEK - 1)]; e.ent = 0; e.key = r.key; e.kind = r.kind; e.anc = r.anc; e.avt = r.avt; e.loc[0] = r.loc[0]; e.loc[1] = r.loc[1]; e.loc[2] = r.loc[2]; e.ent = ent;
             InterlockedIncrement(r.key ? &k_ent : &k_entNoKey); return;
         }
     }
     InterlockedIncrement(&k_entNoKey);
 }
 bool SpawnKeyBindOn() { return g_keyBind; }
+uintptr_t Phase1_ScbGuestOfLo(uint32_t hostLo);    // phase1.cpp
+uint64_t Phase1_ScbHostOf(uintptr_t guestShip);   // phase1.cpp [Coop] ShipClassBind: host ship objId bound to this guest ship, 0 = none
+// Crew keys (2026-11-25): a crew member's spawn spec is anchored to its ship (kind 4, anchor vt EntityGroup 0x01E4A128)
+// with a local offset that is equal on two copies (s5: 71/71). Key = (ship objId lo32 << 32) | local offset on a 0.1 m
+// grid (11/11/10 bits). Ship objId = the ship's HandleContainer id: hc = *(entity+0xC8) (sub_109B500 reads the same
+// +200), id at hc+0x0C (BaseTypes.h). Minted ship ids are 0xF0000000..0xF7FFFFFF, so a crew key's top nibble is F;
+// static keys' is 5. On the guest the ship part is translated through the ShipClassBind table.
+static uint32_t CrewQ(const float* loc)
+{
+    const int32_t qx = (int32_t)floorf(loc[0] * 10.f + 0.5f), qy = (int32_t)floorf(loc[1] * 10.f + 0.5f), qz = (int32_t)floorf(loc[2] * 10.f + 0.5f);
+    return ((uint32_t)(qx & 0x7FF) << 21) | ((uint32_t)(qy & 0x7FF) << 10) | (uint32_t)(qz & 0x3FF);
+}
+static uint64_t ShipIdOf(uintptr_t ship)
+{
+    __try { const uintptr_t hc = *(const uintptr_t*)(ship + 0xC8); return hc ? *(const uint64_t*)(hc + 0x0C) : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
 uint64_t SpawnKeyOfEntity(uintptr_t ent)
 {
     const LONG pos = g_ekPos;
@@ -711,6 +728,26 @@ uint64_t SpawnKeyOfEntity(uintptr_t ent)
 uintptr_t SpawnEntityOfKey(uint64_t key)
 {
     const LONG pos = g_ekPos;
+    if ((key >> 60) == 0xF) {   // crew key: this guest's crew member on the ship bound to that host ship, same offset
+        const uint32_t shipLo = (uint32_t)(key >> 32), q = (uint32_t)key;
+        for (int i = 0; i < kEK; ++i) {
+            const EK& e = g_ek[(pos - 1 - i) & (kEK - 1)];
+            if (!e.ent || (e.kind != 4 && e.kind != 2) || e.avt != 0x01E4A128u || CrewQ(e.loc) != q) continue;
+            if ((uint32_t)Phase1_ScbHostOf(e.anc) == shipLo) { InterlockedIncrement(&k_crewResolved); return e.ent; }
+        }
+        InterlockedIncrement(&k_crewNoShip);
+        {   // diagnostics (first 40): is the host ship bound, and which crew offsets does our bound ship have?
+            static LONG s_cd = 0;
+            if (InterlockedIncrement(&s_cd) <= 40) {
+                const uintptr_t gs = Phase1_ScbGuestOfLo(shipLo);
+                int nOn = 0; char qs[160]; int k = 0; qs[0] = 0;
+                if (gs) for (int i = 0; i < kEK; ++i) { const EK& e = g_ek[(pos - 1 - i) & (kEK - 1)]; if (e.ent && e.anc == gs) { ++nOn; if (k < 140) k += _snprintf_s(qs + k, sizeof(qs) - k, _TRUNCATE, " %08X/k%d", CrewQ(e.loc), e.kind); } }
+                char line[320]; _snprintf_s(line, sizeof(line), _TRUNCATE, "[KeyBind] crew miss hostShip=%08X q=%08X boundGuestShip=%08X guestSpawnsOnIt=%d:%s\n", shipLo, q, (unsigned)gs, nOn, qs);
+                Phase1_LogLine(line);
+            }
+        }
+        return 0;
+    }
     for (int i = 0; i < kEK; ++i) { const EK& e = g_ek[(pos - 1 - i) & (kEK - 1)]; if (e.ent && e.key == key) return e.ent; }
     return 0;
 }
@@ -732,10 +769,22 @@ void SpawnKeyHostNote(uint64_t objId, uintptr_t ent)
     if (!g_keyBind || !objId || !Phase1_EntityHost() || !Net::IntentLaneOn()) return;
     for (int i = 0; i < g_hostPubN; ++i) if (g_hostPub[i] == objId) return;
     const uint64_t key = SpawnKeyOfEntity(ent);
-    if (!key) {   // counted once per objId; the first 40 are classified by their request's anchor (ship-crew check)
+    if (!key) {   // no static key: a crew member gets a crew key (ship id + local offset); counted once per objId
+        int kind = -1; uintptr_t anc = 0; uint32_t avt = 0; float loc[3] = {};
+        { const LONG pos = g_ekPos; for (int i = 0; i < kEK; ++i) { const EK& e = g_ek[(pos - 1 - i) & (kEK - 1)]; if (e.ent == ent) { kind = e.kind; anc = e.anc; avt = e.avt; loc[0] = e.loc[0]; loc[1] = e.loc[1]; loc[2] = e.loc[2]; break; } } }
+        // kind 2 = the anchor ship has a parent (*(e+8) != 0; run 2026-11-25: the other 20/20 unkeyed host guards): the local
+        // offset and the ship are still known, so they get a crew key too.
+        const uint64_t sid = ((kind == 4 || kind == 2) && avt == 0x01E4A128u) ? ShipIdOf(anc) : 0;
+        if (sid &&(sid >> 32) == 0 && ((uint32_t)sid >> 28) == 0xF) {   // minted ship id (the player's own ship has an authored id: skipped)
+            const uint64_t ck = ((uint64_t)(uint32_t)sid << 32) | CrewQ(loc);
+            uint8_t pl[16] = { 2, 2 }; memcpy(pl + 8, &ck, 8);
+            if (Net::PublishIntent(0, objId, 15 /* IC_SPAWN */, 0, pl, (uint8_t)sizeof(pl))) {
+                InterlockedIncrement(&k_pub); InterlockedIncrement(&k_hostCrew);
+                if (g_hostPubN < kHP) g_hostPub[g_hostPubN++] = objId;
+            }
+            return;
+        }
         InterlockedIncrement(&k_hostNoKey); if (g_hostPubN < kHP) g_hostPub[g_hostPubN++] = objId;
-        int kind = -1; uintptr_t anc = 0; uint32_t avt = 0;
-        { const LONG pos = g_ekPos; for (int i = 0; i < kEK; ++i) { const EK& e = g_ek[(pos - 1 - i) & (kEK - 1)]; if (e.ent == ent) { kind = e.kind; anc = e.anc; avt = e.avt; break; } } }
         static LONG s_un = 0;
         if (InterlockedIncrement(&s_un) <= 40) {
             float p[3]; Pos(ent, p); char line[200];
@@ -755,6 +804,6 @@ void SpawnKeyHostNote(uint64_t objId, uintptr_t ent)
 int SpawnKeyReport(char* out, int cap)
 {
     if (!g_keyBind) return 0;
-    return _snprintf_s(out, cap, _TRUNCATE, "[KeyBind] reqKeys=%ld entKeys=%ld entNoKey=%ld | host guards keyed=%ld unkeyed=%ld published=%ld | guestReceived=%ld",
-                       k_req, k_ent, k_entNoKey, k_hostKeyed, k_hostNoKey, k_pub, k_rx);
+    return _snprintf_s(out, cap, _TRUNCATE, "[KeyBind] reqKeys=%ld entKeys=%ld entNoKey=%ld | host guards keyed=%ld crew=%ld unkeyed=%ld published=%ld | guestReceived=%ld crewResolved=%ld crewNoShip=%ld",
+                       k_req, k_ent, k_entNoKey, k_hostKeyed, k_hostCrew, k_hostNoKey, k_pub, k_rx, k_crewResolved, k_crewNoShip);
 }
