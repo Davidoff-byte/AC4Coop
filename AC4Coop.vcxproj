@@ -143,6 +143,7 @@
     <ClCompile Include="src\combat_timing.cpp" />
     <ClCompile Include="src\sense_guard.cpp" />
     <ClCompile Include="src\ship_spawn_probe.cpp" />
+    <ClCompile Include="src\spawn_census.cpp" />
     <ClCompile Include="src\traversal_probe.cpp" />
     <ClCompile Include="src\puppet_stim.cpp" />
     <ClCompile Include="src\pilot.cpp" />

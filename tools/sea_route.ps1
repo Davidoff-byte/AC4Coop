@@ -3,6 +3,7 @@
 # Map fast travel to the sea point north of Havana (map (235,649)), the route of
 # docs/evidence/fast-travel-and-havana-2026-11-22.md, replayed through the Pilot virtual pad ([Pilot] Enabled=1).
 # Two boot places seen (2026-11-25): Havana city (x near 0) and Dry Tortuga (about (-4035, 4087)); the stick moves differ.
+# Known miss (2026-11-25, 3/3): the Dry Tortuga moves end at the Havana docks (~(107,-77)); run the script again from there.
 # Arrival: about (-4400..-4500, 2440..2560) at the helm, ~35 s after the confirm. Open-loop timings: if a copy reports
 # NOT AT SEA, read %TEMP%\sea_route_<pid>.png (the map right before X) and nudge by hand.
 param([Parameter(Mandatory = $true, ValueFromRemainingArguments = $true)][int[]]$Pids)
@@ -26,8 +27,9 @@ foreach ($p in $Pids) {
         py -3.14 $pilot --pid $p stick -0.15 1 --sec 0.27 | Out-Null; Start-Sleep 0.5
         py -3.14 $pilot --pid $p stick -0.05 1 --sec 0.1 | Out-Null; Start-Sleep 1
         $havanaEdge = $pos -and [math]::Abs($pos[0] - 104) -lt 30 -and [math]::Abs($pos[1] + 74) -lt 30
-        if ($havanaEdge) {                                                          # boot at (104,-74): cursor lands at ~(240,639)
+        if ($havanaEdge) {                                                          # (104..108,-74..-78): cursor lands at ~(238,640)
             py -3.14 $pilot --pid $p stick -0.4 0.9 --sec 0.12 | Out-Null; Start-Sleep 1
+            py -3.14 $pilot --pid $p stick -0.3 0.9 --sec 0.08 | Out-Null; Start-Sleep 1   # 2026-11-25: needed to reach (235,649)
         }
     }
     py -3.14 $pilot --pid $p frame --out (Join-Path $env:TEMP "sea_route_$p.png") | Out-Null

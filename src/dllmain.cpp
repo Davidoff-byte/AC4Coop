@@ -656,6 +656,7 @@ BOOL APIENTRY DllMain(HMODULE hMod, DWORD reason, LPVOID)
         PlayerDamageProbe::Init();   // [Coop] PlayerDamageProbe (default 0) / PlayerDamageRelay (default follows FightIntents)
         CombatTiming::Init();        // [Coop] CombatTimingProbe (default 0): read-only attack timing lines
         { void SenseGuardInit(); SenseGuardInit(); }
+        { void SpawnCensusInit(); SpawnCensusInit(); }   // [Coop] SpawnCensus, default 0: origin of every world add
         { void ShipSpawnProbeInit(); ShipSpawnProbeInit(); }   // [Coop] ShipSpawnProbe, default 0: who creates naval-list ships
         { void TraversalProbeInit(); TraversalProbeInit(); }   // [Coop] TraversalProbe, default 0: context transitions   // [Coop] SenseOwnerGuard, default 1: sight check with a non-object owner
 
