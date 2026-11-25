@@ -8040,6 +8040,7 @@ static bool OwnGuardsOn() {
     return s_ownGOnce == 1;
 }
 static void BindNoteStep(float cx, float cy, float cz, const float* w, unsigned int ent = 0, const char* via = "", int approaching = 0, uint64_t objId = 0);   // [Bind] pop metric, defined with BindApproachStep
+static bool BindApproachStep(unsigned int ent, float cx, float cy, float cz, const float* target, float* out);   // [Bind] approach, defined with BindNoteStep
 static float s_bindMaxStep = 0.0f; static LONG s_bindApproaches = 0;    // [Bind] pop metric (OwnPublish, BindApproachStep)
 static bool OwnPuppetOn() { return OwnFlag("OwnUpdatePuppet", &s_ownP, &s_ownPNext) != 0; }
 // ---- [Coop] GuardAnimFull (default 0; re-read every 2 s) --------------------------------------------------------
@@ -8247,7 +8248,10 @@ struct OwnBody {
     float    plLast[3];       // last position written by the place writer
     float    plPrevBody[3];   // body position seen on the previous frame (stuck test)
     uint64_t plLastUs;
+    float    smPos[3];        // [Own] smooth metric: on-screen position at the previous own-update frame
+    uint8_t  smHave;
 };
+static volatile LONG s_smFrames = 0, s_smStall = 0, s_smBig = 0;   // [Own] smooth: moving-host frames, frames the body stood still, steps > 0.5 m
 static const int OWN_MAX = 128;
 static OwnBody s_own[OWN_MAX];
 static volatile LONG s_ownN = 0;
@@ -10779,6 +10783,30 @@ static void OwnDrain(Human* h) {
         const float d = sqrtf(dx * dx + dy * dy + dz * dz);
         if (d > 0.02f) OwnNoteMove(true, d);
     }
+    // [Own] smooth (2026-11-25, owner: guards' motion is jarring): of the frames where the host's guard is moving (> 0.5 m/s
+    // between its two newest samples), how many showed the body not moving at all on screen (< 1 mm since its previous own
+    // update) - the stepping of packet-rate writes - and how many moved > 0.5 m at once (a pop). Both writers, read-only.
+    {
+        const float bx = e->m_GlobalMatrix.M41, by = e->m_GlobalMatrix.M42, bz = e->m_GlobalMatrix.M43;
+        if (o.smHave && o.ringN >= 2) {
+            const OwnSnap& a = o.ring[o.ringHead % OWN_RING];
+            const OwnSnap& b = o.ring[(o.ringHead - 1 + OWN_RING) % OWN_RING];
+            const float hx = a.pos[0] - b.pos[0], hy = a.pos[1] - b.pos[1], hz = a.pos[2] - b.pos[2];
+            const double hdt = (double)(a.hostUs - b.hostUs) * 1e-6;
+            const float hv = hdt > 0.0 ? (float)(sqrtf(hx * hx + hy * hy + hz * hz) / hdt) : 0.0f;
+            if (hv > 0.5f && hv < 15.0f) {
+                const float dx = bx - o.smPos[0], dy = by - o.smPos[1], dz = bz - o.smPos[2];
+                const float d = sqrtf(dx * dx + dy * dy + dz * dz);
+                InterlockedIncrement(&s_smFrames);
+                if (d < 0.001f) InterlockedIncrement(&s_smStall);
+                else if (d > 0.5f) InterlockedIncrement(&s_smBig);
+            }
+        }
+        AcquireSRWLockExclusive(&s_ownLock);
+        const int js = OwnFind(key);
+        if (js >= 0) { s_own[js].smPos[0] = bx; s_own[js].smPos[1] = by; s_own[js].smPos[2] = bz; s_own[js].smHave = 1; }
+        ReleaseSRWLockExclusive(&s_ownLock);
+    }
     // context probe: 2 = ground (default), 6 = in air (phase1.cpp:98, DriveContextMask)
     {
         const int cx = h->GetCurrentContextID(MAIN_AI_TRACK);
@@ -10887,6 +10915,13 @@ static void OwnDrain(Human* h) {
     m.M41 = pos[0]; m.M42 = pos[1]; m.M43 = pos[2];
     const int physMs = OwnPhysMs();
     const bool phys = o.snap || (physMs > 0 && now - o.lastPhysUs >= (uint64_t)physMs * 1000ull);
+    // 2026-11-25 (owner: guards' motion is jarring; per-frame mode measured 5-7 m "via=own" pops right after a link): the
+    // per-frame writer jumped a newly linked body straight onto the host's position. It now closes the gap the way the
+    // packet-rate writer does (BindApproachStep: from where the body is, at most 9 m/s, >= 30 m still snaps).
+    if (!o.snap) {
+        float ap[3];
+        if (BindApproachStep(o.ent, e->m_GlobalMatrix.M41, e->m_GlobalMatrix.M42, e->m_GlobalMatrix.M43, pos, ap)) { pos[0] = ap[0]; pos[1] = ap[1]; pos[2] = ap[2]; m.M41 = ap[0]; m.M42 = ap[1]; m.M43 = ap[2]; }
+    }
     if (!o.snap) BindNoteStep(e->m_GlobalMatrix.M41, e->m_GlobalMatrix.M42, e->m_GlobalMatrix.M43, pos, o.ent, "own", o.durUs > 300000 ? 1 : 0);   // per-frame pop metric
     e->SetGlobalMatrixInternal(&m, phys);
     InterlockedIncrement(&s_gWrites);
@@ -10936,6 +10971,10 @@ static void OwnReport() {
       s_gLegacyWrites, s_gStarvedFallback, s_ownReseeds, gaf, gam, gaf ? 100.0 * gam / gaf : 0.0, (long)s_ownN,
       pf, pm, pf ? 100.0 * pm / pf : 0.0, pm ? (double)psum / pm / 1e6 : 0.0, pmax / 1e6, pw);
     s_gLegacyWrites = 0; s_gStarvedFallback = 0;
+    {
+        const LONG sf = InterlockedExchange(&s_smFrames, 0), ss = InterlockedExchange(&s_smStall, 0), sb = InterlockedExchange(&s_smBig, 0);
+        if (sf) L("[Own] smooth movingFrames=%ld stalled=%ld (%.1f%%) pops>0.5m=%ld\n", sf, ss, 100.0 * ss / sf, sb);
+    }
     const LONG cf = InterlockedExchange(&s_cxFrames, 0), cg = InterlockedExchange(&s_cxGround, 0);
     const LONG ca = InterlockedExchange(&s_cxAir, 0), co = InterlockedExchange(&s_cxOther, 0);
     const LONG mf = InterlockedExchange(&s_mvFrames, 0), mm = InterlockedExchange(&s_mvActMatch, 0);
@@ -11047,8 +11086,17 @@ static void TakeoverSweep() {
 // most 0.9 m. Ends within 0.3 m of the target (the normal write then places it); >= 30 m still snaps.
 static const float kBindApproachMS = 9.0f;   // m/s: faster than a running guard (~6) so it catches up, slower than a slide
 static struct { unsigned int ent; uint64_t lastUs; } s_bap[128]; static int s_bapN = 0;
+// 2026-11-25: the per-frame writer (OwnDrain, each guard's own update - several worker threads) calls this too, so the table is locked.
+static SRWLOCK s_bapLock = SRWLOCK_INIT;
+static bool BindApproachStepLocked(unsigned int ent, float cx, float cy, float cz, const float* target, float* out);
 static bool BindApproachStep(unsigned int ent, float cx, float cy, float cz, const float* target, float* out) {
     if (!BindLockOn()) return false;
+    AcquireSRWLockExclusive(&s_bapLock);
+    const bool r = BindApproachStepLocked(ent, cx, cy, cz, target, out);
+    ReleaseSRWLockExclusive(&s_bapLock);
+    return r;
+}
+static bool BindApproachStepLocked(unsigned int ent, float cx, float cy, float cz, const float* target, float* out) {
     const uint64_t now = OwnNowUs();
     int k = -1; for (int i = 0; i < s_bapN; ++i) if (s_bap[i].ent == ent) { k = i; break; }
     const float dx = target[0] - cx, dy = target[1] - cy, dz = target[2] - cz, d = sqrtf(dx * dx + dy * dy + dz * dz);
@@ -11077,8 +11125,11 @@ static void BindNoteStep(float cx, float cy, float cz, const float* w, unsigned 
 }
 
 static bool BindApproachActive(unsigned int ent) {
-    for (int i = 0; i < s_bapN; ++i) if (s_bap[i].ent == ent) return true;
-    return false;
+    bool r = false;
+    AcquireSRWLockShared(&s_bapLock);
+    for (int i = 0; i < s_bapN; ++i) if (s_bap[i].ent == ent) { r = true; break; }
+    ReleaseSRWLockShared(&s_bapLock);
+    return r;
 }
 
 // ---- [Place] placement metrics, guest (docs/design/enemy-placement.md section 5; on whatever GuardPlace says) --------
@@ -11554,7 +11605,7 @@ static void ApplyGuards(const EntityPacket& pkt) {
                 // approach runs the body is written every packet, even when the host guard stands still.
                 const float bcx = best->m_GlobalMatrix.M41, bcy = best->m_GlobalMatrix.M42, bcz = best->m_GlobalMatrix.M43;
                 float wpos[3] = { es.pos[0], es.pos[1], es.pos[2] };
-                const bool approaching = !(place && ownWrites) && BindApproachStep((unsigned int)best, bcx, bcy, bcz, es.pos, wpos);
+                const bool approaching = !ownWrites && BindApproachStep((unsigned int)best, bcx, bcy, bcz, es.pos, wpos);
                 if (approaching) moved = true;
                 if (moved && !ownWrites) {
                     HookMath::Quaternion q; q.x=es.quat[0]; q.y=es.quat[1]; q.z=es.quat[2]; q.w=es.quat[3];
@@ -13755,7 +13806,13 @@ static void ApplyPeerHealth(uint64_t objId, unsigned short life, float x, float 
         // Guest side: objId -> local mirror, learned from the snapshots. A miss is no longer final: the
         // resolve variant also asks the engine registry (the same id resolver ApplyGuards uses) and
         // re-binds on a hit - see GuestObjFindResolve.
-        unsigned int ge = GuestObjFindResolve(objId);
+        // 2026-11-25: the table the snapshots fill first. GuestObjFindResolve is only the miss path (engine registry), and
+        // that registry call is refused in this build ("resolver retry ... REFUSED (0x4DD601C not held)"), so every host
+        // death on this lane fell back to the position search and failed the kill's identity gate (applied=0) - the copy
+        // fell in the host's death pose and stayed alive. A table hit is exactly what that gate checks (GuestObjFind == ent).
+        unsigned int ge = GuestObjFind(objId);
+        if (ge && GuestObjEntGone(ge)) ge = 0;
+        if (!ge) ge = GuestObjFindResolve(objId);
         if (ge) { ent = ge; byId = true; viaGuestObj = true; hp = CachedHealthForEntity(ge); }
     }
     if (!byId) {
