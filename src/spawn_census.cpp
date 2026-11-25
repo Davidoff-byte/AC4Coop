@@ -17,6 +17,7 @@
 // Aggregates are printed by SpawnCensusReport ([Census] lines); the first 120 adds/removes are also printed one by one.
 #include "Hook.h"
 #include "paths.h"
+#include "net.h"
 #include "Scimitar/Entity.h"
 #include "Scimitar/AI/AIEntityHelper.h"
 #include "Scimitar/ManagedObject.h"
@@ -27,6 +28,8 @@
 #include <cstring>
 #include <cstdint>
 #include <intrin.h>
+#include <cmath>
+#include <cstdlib>
 
 void Phase1_LogLine(const char* s);
 
@@ -35,6 +38,8 @@ uintptr_t g_lo = 0, g_hi = 0;
 bool g_on = false;
 DWORD g_tF = 0, g_tR = 0, g_tA = 0, g_tD = 0;
 volatile LONG g_lock = 0, g_lines = 0, g_watch = 0;
+bool g_share = false;      // [Coop] SpawnShare (see the SpawnShare section at the end of this file)
+float g_shareR = 150.f;    // [Coop] SpawnShareRadiusM
 
 struct Spin { Spin() { while (InterlockedExchange(&g_lock, 1)) YieldProcessor(); } ~Spin() { InterlockedExchange(&g_lock, 0); } };
 
@@ -134,6 +139,7 @@ extern "C" void __cdecl CensusDel(const uint32_t* esp)   // esp[1] = world, esp[
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
+int SpawnShareDecide(uintptr_t req);   // defined below ([Coop] SpawnShare)
 extern "C" void __cdecl CensusReq(uintptr_t req, const uint32_t* esp)
 {
     __try {
@@ -156,16 +162,15 @@ uintptr_t __fastcall DetF(void* params, void*, int a2)
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
     return e;
 }
-__declspec(naked) void DetR()
+// SpawningRequest::Spawn 0x79B8D0 is thiscall(req), no stack args, plain retn (disasm 0x79B8D0..0x79B91A). Returning 0
+// without calling it = declined, the same answer the request's own vt[0] gate gives ([Coop] DisableSpawns does this).
+typedef char(__thiscall* SubmitFn)(void*);
+char __fastcall DetR(void* req, void*)
 {
-    __asm { pushad
-            lea eax, [esp + 32]
-            push eax
-            push ecx
-            call CensusReq
-            add esp, 8
-            popad
-            jmp dword ptr [g_tR] }
+    const uint32_t ret[1] = { *(const uint32_t*)_AddressOfReturnAddress() };
+    CensusReq((uintptr_t)req, ret);
+    if (SpawnShareDecide((uintptr_t)req) == 1) return 0;   // [Coop] SpawnShare: guest holds this request
+    return ((SubmitFn)g_tR)(req);
 }
 __declspec(naked) void DetA()
 {
@@ -282,9 +287,11 @@ void SpawnCensusInit()
     static const BYTE pSrc[7] = { 0x55, 0x8B, 0xEC, 0x53, 0x8B, 0x5D, 0x10 };
     const bool fac = Install(0x00F72ED0, pFac, 6, (void*)&DetFac, &g_tFac, "RequestFactory");
     const bool src = Install(0x0079C6C0, pSrc, 7, (void*)&DetSrc, &g_tSrc, "RequestSetSource");
+    g_share = GetPrivateProfileIntA("Coop", "SpawnShare", 0, Paths::Ini()) != 0 && r && fac && src;   // the lane is checked at use: Net::Init runs after this init (run 2026-11-25 13:5x)
+    { char rb[32]; GetPrivateProfileStringA("Coop", "SpawnShareRadiusM", "150", rb, sizeof(rb), Paths::Ini()); g_shareR = (float)atof(rb); }
     g_on = f || r || a || d || fac || src;
     char line[128];
-    _snprintf_s(line, sizeof(line), _TRUNCATE, "[Census] SpawnCensus on: F=%d R=%d A=%d D=%d fac=%d src=%d\n", f, r, a, d, fac, src);
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[Census] SpawnCensus on: F=%d R=%d A=%d D=%d fac=%d src=%d | SpawnShare=%d radius=%.0f\n", f, r, a, d, fac, src, g_share ? 1 : 0, g_shareR);
     Phase1_LogLine(line);
 }
 
@@ -307,6 +314,44 @@ int SpawnCensusReport(char* out, int cap)
 
 static unsigned ReadVt(uintptr_t p) { __try { return p ? *(const unsigned*)p : 0u; } __except (EXCEPTION_EXECUTE_HANDLER) { return 0u; } }
 
+// One dword per word; a value that is a readable address whose first dword lies in the image is printed as value@vt.
+static int DumpWords(char* out, size_t cap, uintptr_t base, int n)
+{
+    int k = 0;
+    for (int i = 0; i < n; ++i) {
+        uint32_t v = 0, vt = 0; bool okv = false, okt = false;
+        __try { v = *(const uint32_t*)(base + 4 * i); okv = true; } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        if (!okv) { k += _snprintf_s(out + k, cap - k, _TRUNCATE, " ?"); continue; }
+        if (v >= 0x10000 && (v & 3) == 0) { __try { vt = *(const uint32_t*)(uintptr_t)v; okt = vt >= 0x00400000 && vt < 0x05300000; } __except (EXCEPTION_EXECUTE_HANDLER) {} }
+        const int w = okt ? _snprintf_s(out + k, cap - k, _TRUNCATE, " %X@%X", v, vt) : _snprintf_s(out + k, cap - k, _TRUNCATE, " %X", v);
+        if (w <= 0) break;
+        k += w;
+    }
+    return k;
+}
+// Predicted world spawn point of a request (static: sub_69D090, the position params' local->world, 2026-11-25):
+//   pos = spec+0x28 (SpawnPositionStaticParams, vt 0x01E5F428); local xyz at pos+0x10; anchor handle at pos+0x30;
+//   anchor entity e = *handle; if *(e+8) == 0 the frame is e's matrix at e+0x10 (rows at +0x10/+0x20/+0x30, translation
+//   +0x40), else sub_6BC3A0(*(e+8)) (not read here: reported as frame=2). World = local.x*r0 + local.y*r1 + local.z*r2 + t.
+// Lock-free reads only. Returns 0 no position params, 1 anchored world point, 2 frame not readable, 3 no anchor (local
+// treated as world).
+static int SpawnPoint(uintptr_t item, float* w, float* loc, uintptr_t* anc)
+{
+    w[0] = w[1] = w[2] = loc[0] = loc[1] = loc[2] = 0.f; *anc = 0;
+    __try {
+        const uintptr_t pos = *(const uintptr_t*)(item + 0x28);
+        if (!pos || *(const uint32_t*)pos != 0x01E5F428u) return 0;
+        const float* l = (const float*)(pos + 0x10); loc[0] = l[0]; loc[1] = l[1]; loc[2] = l[2];
+        const uintptr_t hc = *(const uintptr_t*)(pos + 0x30);
+        const uintptr_t e = hc ? *(const uintptr_t*)hc : 0;
+        *anc = e;
+        if (!e) { w[0] = loc[0]; w[1] = loc[1]; w[2] = loc[2]; return 3; }
+        if (*(const uintptr_t*)(e + 8)) return 2;
+        const float* m = (const float*)(e + 0x10);
+        for (int j = 0; j < 3; ++j) w[j] = loc[0] * m[0 + j] + loc[1] * m[4 + j] + loc[2] * m[8 + j] + m[12 + j];
+        return 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
 // Player-update thread (phase1.cpp OnFrameInner). Prints each newly captured request's key once (cap 400 lines):
 // the item's own ObjectID (authored ids have hi != 0) and whether HandleContainer_GetObjectByID 0xA1F160 (stdcall
 // (lo, hi) -> object) resolves it back to the same item here. [Coop] SpawnReplayFire (once a second; acts when the value
@@ -315,6 +360,7 @@ static unsigned ReadVt(uintptr_t p) { __try { return p ? *(const unsigned*)p : 0
 void SpawnReplayTick()
 {
     if (!g_on || !g_tFac) return;
+    { void SpawnShareTick(); SpawnShareTick(); }
     static ULONGLONG s_nextKey = 0, s_nextFire = 0;
     static LONG s_keyLines = 0, s_seen = 0;
     static uintptr_t s_items[512]; static int s_nItems = 0;
@@ -331,27 +377,35 @@ void SpawnReplayTick()
             bool dup = false; for (int k = 0; k < s_nItems; ++k) if (s_items[k] == c.item) { dup = true; break; }
             if (dup) continue;
             if (s_nItems < 512) s_items[s_nItems++] = c.item;
-            uint64_t id = 0, rqid = 0; uintptr_t back = 0, rq = 0, rqBack = 0; DWORD code = 0;
-            __try {
-                if (c.item && *(const uintptr_t*)c.item == c.itemVt) {
-                    id = ((ManagedObject*)c.item)->GetObjectID();
-                    (void)back;   // no by-id lookup here: 0xA1F160 faulted on a minted id INSIDE the engine object lock 0x4DD601C
-                }
-                // The requester: GameplayCoordinator (vt 0x026BDEE0) holds the owner sub-object at +0x38 (live 2026-11-25:
-                // owner vt 0x026BDE50 at coordinator+0x38, 129/144 requests). Its ObjectID is the portable-key candidate.
-                if (c.owner && ReadVt(c.owner - 0x38) == 0x026BDEE0u) rq = c.owner - 0x38;
-                if (rq) rqid = ((ManagedObject*)rq)->GetObjectID();
-                // 2026-11-25 run 2: A1F160(0x56FDD448, 0) raised C0000005 while holding the lock; the __except swallowed it and the
-                // lock stayed held -> both copies deadlocked at boot. Never call an engine function that takes a lock under __try.
-            } __except (code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER) {}
+            // Differential key dump (2026-11-25): no engine calls here (lock-free reads only; see the deadlock note in
+            // docs/evidence/spawn-manager-2026-11-25.md section 4). Both copies boot the same save; offline, find fields that
+            // are equal across copies and unique per request: tools/oneoff/spawn_key_diff.py.
+            const uintptr_t rq = (c.owner && ReadVt(c.owner - 0x38) == 0x026BDEE0u) ? c.owner - 0x38 : 0;
+            static char big[6000];
+            float w[3], lc[3]; uintptr_t anc = 0; const int fr = SpawnPoint(c.item, w, lc, &anc);
+            { char kl[220]; _snprintf_s(kl, sizeof(kl), _TRUNCATE, "[K3] n=%ld ovt=%08X frame=%d w=(%.2f, %.2f, %.2f) local=(%.2f, %.2f, %.2f) anc=%08X avt=%08X apar=%08X\n",
+                                        s_keyLines, ReadVt(c.owner), fr, w[0], w[1], w[2], lc[0], lc[1], lc[2], (unsigned)anc, ReadVt(anc), anc ? ReadVt(anc + 8) : 0u); Phase1_LogLine(kl); }
+            int k = _snprintf_s(big, sizeof(big), _TRUNCATE, "[KD] n=%ld t=%llu item=%08X ivt=%08X owner=%08X ovt=%08X rq=%08X ctx=%08X | I:",
+                                s_keyLines, now, (unsigned)c.item, (unsigned)c.itemVt, (unsigned)c.owner, ReadVt(c.owner), (unsigned)rq, (unsigned)c.ctx);
+            if (k > 0) k += DumpWords(big + k, sizeof(big) - k, c.item, 32);
+            if (k > 0) k += _snprintf_s(big + k, sizeof(big) - k, _TRUNCATE, " | R:");
+            if (k > 0) k += DumpWords(big + k, sizeof(big) - k, rq ? rq : c.owner, rq ? 96 : 48);
+            // One level deeper (run 2026-11-25 13:2x): spec+0x1C -> vt 0x01E56940, +0x24 -> SpawnStrategyParams 0x01E581A8,
+            // +0x28 -> SpawnPositionStaticParams 0x01E5F428 (the authored spawn position is expected there: UNVERIFIED).
+            static const int kSub[3] = { 0x1C, 0x24, 0x28 }; static const char* kTag[3] = { " | X:", " | S:", " | P:" };
+            for (int s = 0; s < 3 && k > 0; ++s) {
+                const uintptr_t sub = c.item ? (uintptr_t)ReadVt(c.item + kSub[s]) : 0;
+                k += _snprintf_s(big + k, sizeof(big) - k, _TRUNCATE, "%s", kTag[s]);
+                if (sub) k += DumpWords(big + k, sizeof(big) - k, sub, 28);
+            }
+            // L() truncates at 1024 chars (phase1.cpp:196): emit numbered parts "[KD+] n=<n> p=<i> <text>", joined offline.
+            Phase1_LogLine("[KD] begin\n");
+            for (int off = 0, part = 0; off < k; off += 900, ++part) {
+                char seg[1000]; _snprintf_s(seg, sizeof(seg), _TRUNCATE, "[KD+] n=%ld p=%d %.900s\n", s_keyLines, part, big + off);
+                Phase1_LogLine(seg);
+            }
             ++s_keyLines;
-            _snprintf_s(line, sizeof(line), _TRUNCATE,
-                        "[Key] item=%08X ivt=%08X iid=%08X:%08X resolves=%d ctx=%08X owner=%08X ovt=%08X rid=%08X:%08X rq=%08X rqid=%08X:%08X rqres=%d exc=%08X\n",
-                        (unsigned)c.item, (unsigned)c.itemVt, (unsigned)(id >> 32), (unsigned)id, back == c.item ? 1 : 0, (unsigned)c.ctx,
-                        (unsigned)c.owner, ReadVt(c.owner),
-                        c.idHi, c.idLo, (unsigned)rq, (unsigned)(rqid >> 32), (unsigned)rqid, rq && rqBack == rq ? 1 : 0, (unsigned)code);
-            Phase1_LogLine(line);
-        }
+            (void)line;        }
         s_seen = pos;
     }
     if (now < s_nextFire) return;
@@ -379,5 +433,183 @@ void SpawnReplayTick()
     } __except (code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER) {}
     _snprintf_s(line, sizeof(line), _TRUNCATE, "[Replay] fire v=%d item=%08X ivt=%08X owner=%08X ctx=%08X id=%08X:%08X captured %llums ago -> submitted=%d exc=%08X\n",
                 v, (unsigned)pick.item, (unsigned)pick.itemVt, (unsigned)pick.owner, (unsigned)pick.ctx, pick.idHi, pick.idLo, now - pick.t, (int)ok, (unsigned)code);
+    Phase1_LogLine(line);
+}
+// ==== [Coop] SpawnShare (default 0): Storm-style spawner-keyed spawning, slice 1 (static anchors) ====================
+// Design: docs/design/host-spawn-authority.md; key evidence: docs/evidence/spawn-manager-2026-11-25.md section 5.
+// Key = the request's predicted world spawn point (SpawnPoint frame 1, anchor class Entity 0x01E4CE90), on a 0.5 m grid:
+// measured equal on two copies of the same save for 68/69 such requests and unique per request (max reuse 1).
+// Host (EntityHost=1): every such request it submits is published on IC_SPAWN, wireId = key (the lane persists the last
+//   value per key and replays it to a (re)joining guest = the connect snapshot).
+// Guest: while the host's player state is fresh (< 3 s) and the spawn point is within [Coop] SpawnShareRadiusM (150) of
+//   the host's player, its own matching request is HELD (0x79B8D0 declined) until the host's key arrives; then it is
+//   re-submitted through sub_569560(item, owner, ctx, id) - the replay measured working 2026-11-25 (NPC, n=1). A request
+//   whose key the host already published passes at once. Ship-anchored and position-less (random sea traffic) requests
+//   are NOT handled in this slice: they pass unchanged and are counted.
+// UNVERIFIED: that the requester re-requests after a decline (only matters for keys the host never sends: expiry count).
+void Phase1_LogLine(const char* s);
+bool Phase1_EntityHost();                 // phase1.cpp: [Coop] EntityHost == 1
+bool Phase1_HostPos(float* out);          // phase1.cpp: the peer's player position, fresh (< 3 s)
+bool Phase1_InSave();                     // phase1.cpp: this player's update ran in world < 1 s ago (lock-free)
+namespace {
+volatile LONG g_shLock = 0;
+struct ShSpin { ShSpin() { while (InterlockedExchange(&g_shLock, 1)) YieldProcessor(); } ~ShSpin() { InterlockedExchange(&g_shLock, 0); } };
+struct Held { uint64_t key; uintptr_t item, owner, ctx; uint32_t lo, hi; ULONGLONG t; uint32_t itemVt, ownerVt; float w[3]; int pending; };
+constexpr int kHeld = 512, kRel = 2048, kPub = 256;
+Held g_held[kHeld]; int g_nHeld = 0;
+uint64_t g_rel[kRel]; ULONGLONG g_relT[kRel]; int g_nRel = 0;           // keys the host spawned (guest side)
+struct Pub { uint64_t key; float w[3]; uint32_t ivt; };
+Pub g_pub[kPub]; volatile LONG g_pubW = 0, g_pubR = 0;                  // host side: ring, published on the player thread
+volatile LONG c_pub = 0, c_held = 0, c_relArr = 0, c_relReq = 0, c_passShip = 0, c_passNone = 0, c_passOut = 0,
+              c_passNoHost = 0, c_expired = 0, c_rx = 0, c_replayFail = 0, c_pubDrop = 0, c_pending = 0, c_lateLocal = 0,
+              c_fallback = 0, c_stale = 0;
+__declspec(thread) int t_replay = 0;
+
+uint64_t KeyOf(const float* w)
+{
+    const int32_t q[3] = { (int32_t)floorf(w[0] * 2.f), (int32_t)floorf(w[1] * 2.f), (int32_t)floorf(w[2] * 2.f) };
+    return 0x5300000000000000ull | ((uint64_t)(q[0] & 0xFFFFF) << 40) | ((uint64_t)(q[1] & 0xFFFFF) << 20) | (uint64_t)(q[2] & 0xFFFFF);
+}
+bool RelHas(uint64_t k) { for (int i = 0; i < g_nRel; ++i) if (g_rel[i] == k) return true; return false; }
+void RelAdd(uint64_t k, ULONGLONG now)
+{
+    for (int i = 0; i < g_nRel; ++i) if (g_rel[i] == k) { g_relT[i] = now; return; }
+    if (g_nRel < kRel) { g_rel[g_nRel] = k; g_relT[g_nRel++] = now; }
+}
+bool CapFor(uintptr_t req, Cap& out)
+{
+    const LONG pos = g_capPos;
+    for (int i = 0; i < 64; ++i) {
+        const Cap& c = g_cap[(pos - 1 - i) & (kCap - 1)];
+        if (c.req == req) { out.req = c.req; out.ctx = c.ctx; out.item = c.item; out.itemVt = c.itemVt; out.owner = c.owner;
+                            out.idLo = c.idLo; out.idHi = c.idHi; out.t = c.t; return true; }
+    }
+    return false;
+}
+// 0 = not static-keyed, 1 = static key computed.
+int StaticKey(uintptr_t item, uint64_t* key, float* w)
+{
+    float loc[3]; uintptr_t anc = 0;
+    if (SpawnPoint(item, w, loc, &anc) != 1) return 0;
+    if (ReadVt(anc) != 0x01E4CE90u) return 0;
+    *key = KeyOf(w);
+    return 1;
+}
+}  // namespace
+
+// Called from DetR (any game thread) for every request submitted. 1 = hold (decline), 0 = let it through.
+int SpawnShareDecide(uintptr_t req)
+{
+    if (!g_share || t_replay || !Net::IntentLaneOn()) return 0;
+    Cap c = {}; if (!CapFor(req, c) || !c.item || !c.owner) return 0;
+    uint64_t key = 0; float w[3] = {};
+    if (!StaticKey(c.item, &key, w)) {
+        float loc[3]; uintptr_t anc = 0;
+        const int fr = SpawnPoint(c.item, w, loc, &anc);
+        InterlockedIncrement(fr == 0 ? &c_passNone : &c_passShip);
+        return 0;
+    }
+    if (Phase1_EntityHost()) {   // host: publish, never hold
+        const LONG wi = InterlockedIncrement(&g_pubW) - 1;
+        if (wi - g_pubR >= kPub) { InterlockedIncrement(&c_pubDrop); return 0; }
+        Pub& p = g_pub[wi & (kPub - 1)]; p.key = key; p.w[0] = w[0]; p.w[1] = w[1]; p.w[2] = w[2]; p.ivt = (uint32_t)c.itemVt;
+        return 0;
+    }
+    // Run 2026-11-25 14:0x: boot and fast-travel spawns all happen while neither side sends player state (loading), so
+    // "host position fresh" missed every one of them (noHost 93/93). Now: unknown host position -> hold as PENDING and
+    // decide in SpawnShareTick once the host's position is fresh (outside the radius -> replay locally).
+    // Run 2026-11-25 14:1x: a request held during the guest's BOOT froze the load (frame 10 for 6 min, reqs=1): the loader
+    // waits for it and the tick that would release it does not run while loading. Hold only while the guest's player
+    // update runs in world (Phase1_InSave: lock-free, < 1 s old). Load-time spawns pass; reconciling them is the next slice.
+    if (!Phase1_InSave()) { InterlockedIncrement(&c_passNoHost); return 0; }
+    float hp[3];
+    const bool fresh = Phase1_HostPos(hp);
+    if (fresh) {
+        const float dx = w[0] - hp[0], dy = w[1] - hp[1], dz = w[2] - hp[2];
+        if (dx * dx + dy * dy + dz * dz > g_shareR * g_shareR) { InterlockedIncrement(&c_passOut); return 0; }
+    }
+    ShSpin s;
+    if (RelHas(key)) { InterlockedIncrement(&c_relReq); return 0; }
+    int slot = -1;
+    for (int i = 0; i < g_nHeld; ++i) if (g_held[i].key == key) { slot = i; break; }
+    if (slot < 0 && g_nHeld < kHeld) slot = g_nHeld++;
+    if (slot < 0) return 0;   // table full: let it through (fail open)
+    g_held[slot] = { key, c.item, c.owner, c.ctx, c.idLo, c.idHi, GetTickCount64(), (uint32_t)c.itemVt, ReadVt(c.owner), { w[0], w[1], w[2] }, fresh ? 0 : 1 };
+    InterlockedIncrement(fresh ? &c_held : &c_pending);
+    return 1;
+}
+
+// Re-submit a held request through sub_569560. Refuses (returns false, nothing called) when the spec or the owner no
+// longer has the vtable it had when held: a travel unloads the requesters and the pointers may be freed - calling into
+// the engine with a freed object could fault inside an engine lock (see the 0xA1F160 deadlock note).
+static bool ReplayHeld(const Held& h)
+{
+    if (ReadVt(h.item) != h.itemVt || ReadVt(h.owner) != h.ownerVt) return false;
+    char ok = 0;
+    t_replay = 1;
+    __try { ok = ((char(__cdecl*)(uintptr_t, uintptr_t, uintptr_t, uint32_t, uint32_t))0x00569560)(h.item, h.owner, h.ctx, h.lo, h.hi); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { ok = 0; }
+    t_replay = 0;
+    return ok != 0;
+}
+
+static bool TakeHeld(uint64_t key, Held* h)   // marks the key released; takes its held request if any
+{
+    ShSpin s;
+    RelAdd(key, GetTickCount64());
+    for (int i = 0; i < g_nHeld; ++i) if (g_held[i].key == key) { *h = g_held[i]; g_held[i] = g_held[--g_nHeld]; return true; }
+    return false;
+}
+
+// Guest: one IC_SPAWN message (player thread, from FightIntentDrain).
+void SpawnShareRx(uint64_t key)
+{
+    if (!g_share) return;
+    InterlockedIncrement(&c_rx);
+    Held h = {};
+    if (!TakeHeld(key, &h)) return;
+    InterlockedIncrement(ReplayHeld(h) ? &c_relArr : &c_replayFail);
+}
+bool SpawnShareOn() { return g_share; }
+
+// Player thread: host publishes queued keys; guest expires held requests (60 s); stats every 10 s.
+void SpawnShareTick()
+{
+    if (!g_share || !Net::IntentLaneOn()) return;
+    const ULONGLONG now = GetTickCount64();
+    while (g_pubR < g_pubW) {
+        const Pub p = g_pub[g_pubR & (kPub - 1)];
+        struct { uint8_t ver, kind; uint16_t pad; float w[3]; uint32_t ivt; } pl = { 1, 1, 0, { p.w[0], p.w[1], p.w[2] }, p.ivt };
+        if (Net::PublishIntent(0, p.key, 15 /* IC_SPAWN */, 0, &pl, (uint8_t)sizeof(pl))) InterlockedIncrement(&c_pub);
+        else InterlockedIncrement(&c_pubDrop);
+        InterlockedIncrement(&g_pubR);
+    }
+    // Guest: decide pending holds once the host's position is fresh; replay locally what lies outside the radius, and
+    // as a fallback what waited 60 s for a key that never came (no permanently missing NPCs). Replays run outside the
+    // lock (a replay re-enters DetR; t_replay makes it pass without locking).
+    Held todo[64]; int nTodo = 0; int why[64];
+    {
+        float hp[3]; const bool fresh = Phase1_HostPos(hp);
+        ShSpin s;
+        for (int i = 0; i < g_nHeld && nTodo < 64; ) {
+            Held& h = g_held[i];
+            int act = 0;
+            if (now - h.t > 60000) act = 2;
+            else if (h.pending && fresh) {
+                const float dx = h.w[0] - hp[0], dy = h.w[1] - hp[1], dz = h.w[2] - hp[2];
+                if (dx * dx + dy * dy + dz * dz > g_shareR * g_shareR) act = 1; else h.pending = 0;
+            }
+            if (act) { why[nTodo] = act; todo[nTodo++] = h; g_held[i] = g_held[--g_nHeld]; } else ++i;
+        }
+    }
+    for (int i = 0; i < nTodo; ++i) InterlockedIncrement(ReplayHeld(todo[i]) ? (why[i] == 1 ? &c_lateLocal : &c_fallback) : &c_stale);
+    static ULONGLONG s_next = 0;
+    if (now < s_next) return;
+    s_next = now + 10000;
+    char line[320];
+    _snprintf_s(line, sizeof(line), _TRUNCATE,
+                "[Share] role=%s pub=%ld drop=%ld | rx=%ld held=%ld pending=%ld heldNow=%d relOnArrival=%ld relOnRequest=%ld lateLocal=%ld fallback=%ld stale=%ld replayFail=%ld | pass ship=%ld none=%ld outside=%ld loading=%ld rel=%d\n",
+                Phase1_EntityHost() ? "host" : "guest", c_pub, c_pubDrop, c_rx, c_held, c_pending, g_nHeld, c_relArr, c_relReq, c_lateLocal,
+                c_fallback, c_stale, c_replayFail, c_passShip, c_passNone, c_passOut, c_passNoHost, g_nRel);
     Phase1_LogLine(line);
 }

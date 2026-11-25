@@ -358,6 +358,8 @@ enum IntentChannel : uint8_t {
                         //                an IHumanGround slot call and the host-clock time to run it. 32 B payload.
     IC_PCHAN     = 14,  // both ways: one non-primary action controller of the sender's player ([Coop] PuppetChannels): key =
                         //                channel | layer << 28 (the ActionComponent controller table key), alias, ratio.
+    IC_SPAWN     = 15,  // host -> guest: a spawner key the host submitted ([Coop] SpawnShare, src/spawn_census.cpp): wireId = key,
+                        //                payload {ver, kind, pad, float w[3], u32 spec vt}
     IC_LIMIT     = 16,  // ids 1..15 are legal on the wire, so a later build can add a channel without a
                         // layout change; the receiver delivers a channel id it does not name
 };

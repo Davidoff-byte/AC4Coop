@@ -165,6 +165,7 @@ int    g_interpMaxExtrapMs = 100; // [Net] InterpMaxExtrapMs (bounded forward ex
 // needs no engine data. 0 (or an unknown peer) disables the filter entirely (fail-open).
 static float g_peerPos[3] = { 0.0f, 0.0f, 0.0f };
 static bool  g_peerPosValid = false;
+static volatile ULONGLONG g_peerPosTick = 0;   // [Coop] SpawnShare: when g_peerPos was last set
 static float g_relevanceRadiusM = 250.0f;       // characters
 static float g_shipRelevanceRadiusM = 1000.0f;  // ships (sparse, so a wide radius is cheap)
 
@@ -1933,7 +1934,12 @@ static float s_nrSnapM = 3.0f;
 static volatile float g_nrLatestDest = 0.0f; static volatile bool g_nrLatestSprint = false;
 static volatile uint8_t g_nrLatestMvt = 0;
 static volatile int g_nrLatestCtx = 4;     // newest packet's contextId
-int Phase1_PeerContextId() { return g_nrLatestCtx; }   // traversal_probe.cpp ([Coop] NativeReplicaClimbExitGate)
+int Phase1_PeerContextId() { return g_nrLatestCtx; }
+bool Phase1_EntityHost();   // defined after g_entHost ([Coop] SpawnShare)
+bool Phase1_HostPos(float* out) {   // [Coop] SpawnShare: the peer player's position if received in the last 3 s
+    if (!g_peerPosValid || GetTickCount64() - g_peerPosTick > 3000) return false;
+    out[0] = g_peerPos[0]; out[1] = g_peerPos[1]; out[2] = g_peerPos[2]; return true;
+}   // traversal_probe.cpp ([Coop] NativeReplicaClimbExitGate)
 static volatile bool g_nrClimbValid = false; static float g_nrClimbIn[3] = { 0, 0, 0 };   // newest packet's ClimbBlock
 static volatile LONG s_nrClimbReal = 0, s_nrClimbDerived = 0, s_nrClimbHold = 0, s_nrHoldPush = 0, s_nrHoldReached = 0, s_nrHoldDropped = 0;
 // [Coop] NativeReplicaClimbMoves: queue of the peer's climbing holds (hand midpoint per move, oldest first).
@@ -3230,6 +3236,7 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
         g_peerPos[1] = s.matrix.M42;
         g_peerPos[2] = s.matrix.M43;
         g_peerPosValid = true;
+        g_peerPosTick = GetTickCount64();
     }
     // Ship sync (independent of the puppet): drive the spawned ghost ship to the peer's ship position.
     if (s.valid && s.shipValid) {
@@ -4455,6 +4462,7 @@ void Phase1::DespawnGhostShip() {
 // same vt 0x01E4A128 EntityGroup class). Character sync is a separate, still-unRE'd effort.
 static int   g_entSync = -1;   // ini [Coop] EntitySync (read once)
 static int   g_entHost = -1;   // ini [Coop] EntityHost (read once): 1 = authoritative sender
+bool Phase1_EntityHost() { return g_entHost == 1; }
 static uint32_t g_entSeq = 0;  // entity-packet sequence
 
 
@@ -10370,11 +10378,12 @@ static void AttackForwardReport() {
       s_afSeen[0], s_afSeen[1], s_afTx[0], s_afTx[1], s_afDropped, s_afRx[0], s_afRx[1], s_afPost[0], s_afPost[1], s_afUnres, s_afFallback, s_afFail);
 }
 
+bool SpawnShareOn(); void SpawnShareRx(uint64_t key);   // spawn_census.cpp ([Coop] SpawnShare)
 // Receiver part 1, the local player's frame: drain the lane (the only consumer) and queue IC_FIGHT for the puppet.
 static void FightIntentDrain() {
     const bool fi = FightIntentsOn();
     if (!fi && !(OwnerDamageOn() && Net::IntentLaneOn()) && !(PdrOn() && Net::IntentLaneOn()) && !(AfOn() && Net::IntentLaneOn())
-        && !SailSyncOn() && !CoordSyncOn() && !(g_guardActLane && Net::IntentLaneOn()) && !(Brain::On() && Net::IntentLaneOn()) && !(PchanOn() && Net::IntentLaneOn())) return;   // [Coop] SailSync/CoordSync/GuardActionLane keep the lane drained with every fight flag off
+        && !SailSyncOn() && !CoordSyncOn() && !(g_guardActLane && Net::IntentLaneOn()) && !(Brain::On() && Net::IntentLaneOn()) && !(PchanOn() && Net::IntentLaneOn()) && !SpawnShareOn()) return;   // [Coop] SailSync/CoordSync/GuardActionLane keep the lane drained with every fight flag off
     OwnerHitStalePoll();   // [Coop] RespawnHitGraceMs
     Net::IntentMsg m;
     while (Net::PollIntent(m)) {
@@ -10383,7 +10392,8 @@ static void FightIntentDrain() {
         if (m.channel == IC_ATK_A || m.channel == IC_ATK_B || m.channel == IC_ATK_C) { AttackForwardOwnerRx(m); continue; }   // [Coop] AttackForward
         if (m.channel == IC_BRAIN) { Brain::OnIntent(m.wireId, m.seq, m.flags, m.payload, m.len); continue; }                 // [Coop] Brain
         if (m.channel == IC_ACTION) { GalGuestRx(m); continue; }                                                              // [Coop] GuardActionLane
-        if (m.channel == IC_PCHAN) { PchanRx(m); continue; }                                                                  // [Coop] PuppetChannels
+        if (m.channel == IC_PCHAN) { PchanRx(m); continue; }
+        if (m.channel == IC_SPAWN) { SpawnShareRx(m.wireId); continue; }                                                     // [Coop] SpawnShare                                                                  // [Coop] PuppetChannels
         if (m.channel == IC_PDAMAGE && m.wireId == kPdrWire && m.len == sizeof(PdrPayload)) {   // [Coop] PlayerDamageRelay
             PdrPayload p; memcpy(&p, m.payload, sizeof(p));
             PlayerDamageOwnerApply(p, (m.flags & IF_BASE) != 0);
@@ -15647,7 +15657,7 @@ static void DumpConfigOnce()
         // The Tune* values are floats (read with strtod, see ShipTuningTick); the dump shows the integer part.
         { "Coop", "TuneConeAngle", 120 }, { "Coop", "TuneConeRange", 350 }, { "Coop", "TuneMaxTime", 30 },
         { "Coop", "TuneAggroTime", 30 }, { "Coop", "TuneHull", 0 },
-        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 }, { "Coop", "WeaponSync", 0 }, { "Coop", "ShipPeerZ", 0 }, { "Coop", "ShipBindProbe", 0 }, { "Coop", "ShipSpawnProbe", 0 }, { "Coop", "ShipSpawnFire", 0 }, { "Coop", "ShipSpawnFirePid", 0 }, { "Coop", "SpawnCensus", 0 }, { "Coop", "SpawnReplayFire", 0 }, { "Coop", "SpawnReplayFirePid", 0 },{ "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 },
+        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 }, { "Coop", "WeaponSync", 0 }, { "Coop", "ShipPeerZ", 0 }, { "Coop", "ShipBindProbe", 0 }, { "Coop", "ShipSpawnProbe", 0 }, { "Coop", "ShipSpawnFire", 0 }, { "Coop", "ShipSpawnFirePid", 0 }, { "Coop", "SpawnCensus", 0 }, { "Coop", "SpawnReplayFire", 0 }, { "Coop", "SpawnReplayFirePid", 0 }, { "Coop", "SpawnShare", 0 }, { "Coop", "SpawnShareRadiusM", 150 },{ "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 },
         { "Coop", "CombatTest", 0 }, { "Coop", "CrashContext", 0 }, { "Coop", "CorpseKeepSec", 30 }, { "Coop", "CrowdProbeIntegrate", 1 },
         { "Coop", "CrowdProbeLiveKeys", 1 }, { "Coop", "DamageRelay", 0 }, { "Coop", "Diag", 0 },
         { "Coop", "DisableCrowd", 0 }, { "Coop", "DisablePuppetAI", 1 }, { "Coop", "DisableSpawns", 0 },

@@ -86,3 +86,37 @@ game threads in RtlEnterCriticalSection(0x4DD6020)). Build 60981F22 removes ever
 Rule: never call an engine function that takes a lock under `__try`.
 **Consequence:** no id identifies a spawn on both machines (spec 0, request minted, coordinator minted). The portable key
 has to be built from what both machines share: the requester's world position + its spec index + the params class.
+## 5. A spawner key both machines share (2026-11-25, builds DB2EB1FE .. 794A4B48, differential on two copies)
+Method: both copies boot the same save; each request's spawn spec (SpawningSpecification, vt 0x01E4A278), its requester
+and the spec's sub-objects are dumped with lock-free reads (`[KD]`, `[K3]` lines); `tools/oneoff/spawn_key_diff.py`
+compares the copies. Request ORDER at boot was identical (148/148, 151/151) in two runs and off by one in a third, so
+order is not a key.
+- spec+0x28 -> SpawnPositionStaticParams (vt 0x01E5F428): local position at +0x10 (also +0x40), anchor handle at +0x30.
+  Static: `sub_69D090` (local -> world through the anchor entity's matrix at e+0x10, or `sub_6BC3A0(*(e+8))` when e has
+  a parent), called from slot 22 `sub_6A92E0`.
+- Predicted world spawn point W = local x anchor matrix (no engine call). Result by anchor class (run 794A4B48, as sets):
+
+| Anchor | Requests | Equal on both copies | Unique |
+|---|---|---|---|
+| Entity (vt 0x01E4CE90, static) | 69 / 68 | **68 W points (99 %)** | yes (max reuse 1) |
+| EntityGroup (vt 0x01E4A128 = ships) | 71 / 71 | all 71 **local** offsets; W differs (the ships themselves are placed at random) | 32 offsets, reused up to 6x (same crew layout per ship class) |
+| none (no position params) | 10 / 10 | owner classes equal; 9 are owner 0x02708E80 with sea-level world points that differ per copy (random sea traffic) | - |
+
+Key, therefore: static anchor -> W on a 0.5 m grid; ship anchor -> (ship's sync identity, local offset); none -> the host
+must say where (random).
+
+## 6. [Coop] SpawnShare slice 1 (static anchors) - built, runs, but has almost nothing to hold (builds 94D7B552 .. 545F3ADB)
+Host publishes each static key on intent channel 15 (IC_SPAWN, wireId = key); the guest holds its own matching request
+inside the radius and replays it through sub_569560 when the key arrives.
+
+| Run | Result |
+|---|---|
+| 23695D42 | host published 67 keys at boot; the guest **received all 67 on connect** (the lane's join replay = the connect snapshot). Every guest request passed as "host position unknown": all were made while loading |
+| 529BF92B (hold while loading too) | **FAIL, guest froze at boot** (frame 10 for 6 min, 1 request): a held boot request stalls the loader; the tick that would release it does not run while loading |
+| 545F3ADB (hold only in world, `Phase1_InSave`) | both alive through boot, travel to Havana and 50 s running into town; host published 104 keys, guest received 106; guest static requests: **90/90 during loading, 0 in world**, so nothing was held |
+
+**Verdict:** for static-anchored spawns the two games already spawn the same NPC at the same point from the same data
+(section 5: 99 %), and they do it during loads, when holding is unsafe. Holding them is the wrong tool. What they need is
+the **binding**: guest entity <-> host entity by key (the entity spawned at W), replacing today's nearest-body binding.
+What genuinely diverges and needs the host: ship-anchored crews (ships placed at random) and position-less random
+traffic. SpawnShare stays default 0.
