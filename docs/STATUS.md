@@ -34,6 +34,7 @@ common base `b95b7a5`; it is the branch that carries every feature described bel
 | spawn: request replay | re-submitting a captured request through `sub_569560` makes the manager build it | 2026-11-25, NPC n=1 (s4) |
 | spawn: shared spawner key | the world spawn point of a static-anchored spec, computed without engine calls, is equal on two copies | 2026-11-25: 68/69, unique (s5) |
 | spawn: key binding | `[Coop] SpawnKeyBind` (default 0): host guard objId -> spawn key on IC_SPAWN; the guest binds its own body built for the same key | 2026-11-25 two copies: 12/12 keyed guards at 0.0 m; coverage 12/32 (the rest are ship crews) (s7-8) || ship class binding | `[Coop] ShipClassBind=2` (default 0): each host ship bound to a guest AI ship of the same class and driven to the host transform with physics, 20 Hz | 2026-11-25 two copies at sea: bound 168/168, error mean 1.3-2.5 m, 0 exceptions (`naval-s0-2026-11-25.md` s9); crews/AI/cannons/hull not yet synced |
+| crew keys | `[Coop] SpawnKeyBind` also keys ship crews by (ship objId, local offset) through the ShipClassBind table | 2026-11-25: 37 crew bound at median 1.4 m, but on the players' docked Jackdaws (now excluded); AI-ship crews 0 bound, cause not measured (`naval-s0-2026-11-25.md` s10) |
 | SgmDetour thread safety | CR-4: per-call state on the stack, body under `__try` (`HookSgm` ships as 1) | 2026-11-25 run HookSgm=1: both alive, 0 exceptions |
 | guest combat timing | `[Coop] CombatTimingProbe` (read-only) and `[Coop] GuardActionLane` (default 0): a guard's action switch rides the intention lane with the hits | owner fight 2026-11-21 (asi `9da8d40d`): lane off, hits landed 251-378 ms before the swing shown on the guest (action p50 329 ms, hit p50 10 ms, n = 18); lane on, linked copies \|skew\| p95 45 ms (n = 10). Frame time is not the cause (guest p95 21-22 ms, unfocused host 18 ms). **AWAITING OWNER:** whether counters can be timed (`docs/evidence/combat-timing-2026-11-17.md` run 3) |
 
@@ -48,6 +49,7 @@ common base `b95b7a5`; it is the branch that carries every feature described bel
 - spawn: holding the guest's own spawn requests (`[Coop] SpawnShare`) has nothing to hold: 90/90 static spawns happen
   during loads, and a hold during a load froze the guest's boot (fixed by holding only in world).
 - spawn: AI ship spawn data has no per-ship identity (builder id 0, identical SpawnShipParams on both copies).
+- The repo's shipped `AC4Coop.ini` has `IntentLane=0` and `DisableSpawns=1`: every lane feature (Brain set, OwnerDamage, SailSync, SpawnKeyBind) is inert in a kit built from it, and SpawnKeyBind is also off under DisableSpawns. Owner sessions ran on the install ini (IntentLane=1, DisableSpawns=0). The 2026-11-25 test kit ships its own ini.
 - Fast-travel guest crash (`sub_76E0F0` release during the sea -> Havana unload) needs ship clones alive: 5/5;
   `ReleaseStaleGuard` only moves it. OPEN; mitigation ShipMirror/ShipGhost=0.
 ## Built but not verified live
