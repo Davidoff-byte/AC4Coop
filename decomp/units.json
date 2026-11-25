@@ -27,6 +27,15 @@
    "size": 29,
    "status": "unknown"
   },
+  "0045E330": {
+   "addr": "0045E330",
+   "claimed_at": null,
+   "name": "SpawnParamsSpawn",
+   "owner": null,
+   "receipts": [],
+   "size": 72,
+   "status": "unknown"
+  },
   "0047A980": {
    "addr": "0047A980",
    "claimed_at": null,
