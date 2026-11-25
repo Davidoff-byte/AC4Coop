@@ -1,6 +1,6 @@
 # Status
 
-Last updated 2026-11-25 on `feat/integration-1121` (puppet animation carry, sinking fix, crash-class CR-2/3/4; rows marked 2026-11-25). Before that 2026-11-21 on `feat/launcher` (guest combat timing, plan step 1 of `ops/HANDOVER-MP-BLUEPRINT-2026-11-21.md`); the
+Last updated 2026-11-25 (afternoon) on `feat/integration-1121`: the spawn manager, spawner keys and key binding (rows marked "spawn"; day trail in the parent `ops/JOURNAL-2026-11-25.md`); earlier the same day puppet animation carry, sinking fix, crash-class CR-2/3/4. Before that 2026-11-21 on `feat/launcher` (guest combat timing, plan step 1 of `ops/HANDOVER-MP-BLUEPRINT-2026-11-21.md`); the
 rest of the file dates from 2026-11-11, at `main` after PR #1 (the live-tests stack). This file replaces every plan,
 journal and handoff in `docs/archive/`. Update it in the same PR as any change that alters what is true here.
 
@@ -28,7 +28,12 @@ common base `b95b7a5`; it is the branch that carries every feature described bel
 | guards hitting the other player | `[Coop] PlayerDamageRelay` (default follows FightIntents): a guard's hit on the puppet (lost there: the puppet has no fight/health services) is scored with the engine's `sub_199A160` and posted as a native DamageEvent on the owner's player | same-PC two copies 2026-11-16: 13/13 hits applied, native death and respawn, no double hits (`docs/evidence/player-damage-relay-2026-11-16.md`); no hurt reaction, the owner's block/counter not consulted |
 | puppet animation carry | `[Coop] PuppetFightCarry=2` (default 0): the peer's primary action copied onto the puppet everywhere, not only in fights; the sword drawn in a fight follows it | same-PC two copies 2026-11-24/25: alias match 92-97 % ground / air / climbing; guest footage shows the puppet swinging a cutlass (`docs/evidence/brain-s0-2026-11-22.md`). Overlay channels (`PuppetChannels`) freeze poses and stay 0 |
 | puppet standing on the ground | `[Coop] PuppetUpdatePhysics=1` (default 0): the matrix write also moves the puppet's CharacterController, on the puppet's own update | 2026-11-25 A/B on the guest screen: without it the puppet sinks to the knees (controller left at the spawn point; IDA 0x528200 -> sub_42D570), with it the boots stand (arms E/F); bodies separate ~0.5 m on contact once (control: none) |
-| SgmDetour thread safety | CR-4: per-call state on the stack, body under `__try` (`HookSgm` ships as 1) | 2026-11-25 run HookSgm=1: both alive, 0 exceptions |
+| host kills on the guest | fixed: flag-only deaths get the engine kill, OwnerDamage no longer blocks the relay, the lane resolves by the snapshot table | 2026-11-25 two copies: 17/17 (`13ac6e0`) |
+| mirrored guard motion | per-frame writer with a bounded approach (no takeover pops) | 2026-11-25: stall 83 % -> ~2 %, pops 64 -> 1 (`20b7ab0`) |
+| spawn: the spawn manager | every AI ship (21/21) and 132/141 characters come out of one funnel (`0x46D8E0`, SpawnEntityParams::Spawn) behind one request factory and `0x79B8D0`; FX/props are local | 2026-11-25 census, 1785 world adds (`docs/evidence/spawn-manager-2026-11-25.md` s1-2) |
+| spawn: request replay | re-submitting a captured request through `sub_569560` makes the manager build it | 2026-11-25, NPC n=1 (s4) |
+| spawn: shared spawner key | the world spawn point of a static-anchored spec, computed without engine calls, is equal on two copies | 2026-11-25: 68/69, unique (s5) |
+| spawn: key binding | `[Coop] SpawnKeyBind` (default 0): host guard objId -> spawn key on IC_SPAWN; the guest binds its own body built for the same key | 2026-11-25 two copies: 12/12 keyed guards at 0.0 m; coverage 12/32 (the rest are ship crews) (s7-8) || SgmDetour thread safety | CR-4: per-call state on the stack, body under `__try` (`HookSgm` ships as 1) | 2026-11-25 run HookSgm=1: both alive, 0 exceptions |
 | guest combat timing | `[Coop] CombatTimingProbe` (read-only) and `[Coop] GuardActionLane` (default 0): a guard's action switch rides the intention lane with the hits | owner fight 2026-11-21 (asi `9da8d40d`): lane off, hits landed 251-378 ms before the swing shown on the guest (action p50 329 ms, hit p50 10 ms, n = 18); lane on, linked copies \|skew\| p95 45 ms (n = 10). Frame time is not the cause (guest p95 21-22 ms, unfocused host 18 ms). **AWAITING OWNER:** whether counters can be timed (`docs/evidence/combat-timing-2026-11-17.md` run 3) |
 
 ## Measured negatives
@@ -37,6 +42,13 @@ common base `b95b7a5`; it is the branch that carries every feature described bel
 - The 2026-11-08 launch crash was not gated by any ini flag; its root cause was the action-guard trampoline
   continuation jump, fixed in `c718e92`. The investigation is in `docs/archive/ops/HAUL-2026-11-08.md`.
 
+- spawn: calling SpawnShipParams::Spawn and then World::AddEntity ourselves crashed 3/3 (SSrvNavigation+0xEC NULL in the
+  GcLShip activation): the manager's post-spawn step is required (`naval-s0-2026-11-25.md`).
+- spawn: holding the guest's own spawn requests (`[Coop] SpawnShare`) has nothing to hold: 90/90 static spawns happen
+  during loads, and a hold during a load froze the guest's boot (fixed by holding only in world).
+- spawn: AI ship spawn data has no per-ship identity (builder id 0, identical SpawnShipParams on both copies).
+- Fast-travel guest crash (`sub_76E0F0` release during the sea -> Havana unload) needs ship clones alive: 5/5;
+  `ReleaseStaleGuard` only moves it. OPEN; mitigation ShipMirror/ShipGhost=0.
 ## Built but not verified live
 - 2026-11-25 crash-class: CR-2 `reloadBuilder` gives the async loader a static slot (path not reached in any run); CR-3 `WbTrap` tolerates a guard re-applied after a disarm (debug trap, default 0). CR-6/CR-7 closed by disassembly with no change; CR-5 (guards written from the player thread) open - `OwnUpdateGuards=1` scored worse.
 - Guest combat, built after the owner fight (default 0, NOT yet run in the game): the 16-byte alignment fix for the forwarded
@@ -78,5 +90,6 @@ intention lane, slices S0–S10). It refines the R1–R7 roadmap of `docs/design
 `docs/ops/PLAN-COOP-V2.md` (outcome-sync architecture, gates P0–P8), with `docs/ops/SOLO-PLAN.md` for what one
 machine can prove.
 
-Next slice: lobby codes (host shows a code, guest enters it), serverless, one guest. Design and PR stack in
-`docs/design/lobby-code.md`.
+Next slice (owner, 2026-11-25): ship sync - each guest AI ship bound to a host ship of the same class and driven to the
+host's transform (AI off), then ship-crew keys = (bound ship, local offset). Design: `docs/design/host-spawn-authority.md`.
+Lobby codes: `docs/design/lobby-code.md` (their state was not re-checked on 2026-11-25).
