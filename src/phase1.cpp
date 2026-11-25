@@ -1591,6 +1591,17 @@ static bool    g_ghostPeerNoShip = false;    // 1 = that apply said "peer not ab
 static const uint64_t kPeerLiveMs = 2000;
 static bool    g_ghostAuto = false;          // 1 = spawned by the net path (despawn on disembark); 0 = manual F12
 static float   g_localShipZ = 0.0f;          // the LOCAL ship's current Z (water height, bobs with waves)
+// [Coop] ShipPeerZ (default 0, read once): a mirrored ship's Z = the SENDER's ship Z instead of this machine's own ship Z.
+// 2026-11-25 measurement (docs/evidence/naval-s0-2026-11-25.md S0.3): two copies' ships parked at the same spot rode the same
+// swell - player Z corr 0.99, mean |dz| 0.23 m over a 5.4 m range, 20 s at 10 Hz - so the oceans are in phase across copies and
+// the sender's Z is the water height at that spot here too. The local ship's Z belongs to another point of the swell (the
+// ghost floated keel-out in rough sea, same day). Falls back to the local Z when the sender's value is 0 (no ship reported).
+static int s_shipPeerZ = -1;
+static float MirroredShipZ(float senderZ) {
+    if (s_shipPeerZ < 0) s_shipPeerZ = GetPrivateProfileIntA("Coop", "ShipPeerZ", 0, Paths::Ini()) != 0 ? 1 : 0;
+    if (s_shipPeerZ && senderZ != 0.0f) return senderZ;
+    return g_localShipZ != 0.0f ? g_localShipZ : senderZ;
+}
 // A1 ([Coop] ActionDeathLog): the local player's current action alias, mirrored here by
 // CaptureLocalState so EntitySyncTick can print it at a death without re-reading the engine.
 static uint32_t g_capPlayerAlias = 0;
@@ -5367,7 +5378,7 @@ static float MirrorApply(void* mgr, int n, const EntityState& es, int* created, 
     __try {
         HookMath::Quaternion q; q.x = es.quat[0]; q.y = es.quat[1]; q.z = es.quat[2]; q.w = es.quat[3];
         HookMath::Transform m; HookMath::ToMatrix(&q, &m);
-        m.M41 = es.pos[0]; m.M42 = es.pos[1]; m.M43 = (g_localShipZ != 0.0f) ? g_localShipZ : es.pos[2];
+        m.M41 = es.pos[0]; m.M42 = es.pos[1]; m.M43 = MirroredShipZ(es.pos[2]);   // [Coop] ShipPeerZ: the host's own Z of that ship
         ((Entity*)slot->proxy)->SetGlobalMatrixInternal(&m, true);
         const HookMath::Transform& got = ((BaseEntity*)slot->proxy)->m_GlobalMatrix;
         const float dx = got.M41 - es.pos[0], dy = got.M42 - es.pos[1];
@@ -15594,7 +15605,7 @@ static void DumpConfigOnce()
         // The Tune* values are floats (read with strtod, see ShipTuningTick); the dump shows the integer part.
         { "Coop", "TuneConeAngle", 120 }, { "Coop", "TuneConeRange", 350 }, { "Coop", "TuneMaxTime", 30 },
         { "Coop", "TuneAggroTime", 30 }, { "Coop", "TuneHull", 0 },
-        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 }, { "Coop", "WeaponSync", 0 },{ "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 },
+        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 }, { "Coop", "WeaponSync", 0 }, { "Coop", "ShipPeerZ", 0 },{ "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 },
         { "Coop", "CombatTest", 0 }, { "Coop", "CrashContext", 0 }, { "Coop", "CorpseKeepSec", 30 }, { "Coop", "CrowdProbeIntegrate", 1 },
         { "Coop", "CrowdProbeLiveKeys", 1 }, { "Coop", "DamageRelay", 0 }, { "Coop", "Diag", 0 },
         { "Coop", "DisableCrowd", 0 }, { "Coop", "DisablePuppetAI", 1 }, { "Coop", "DisableSpawns", 0 },
@@ -16438,7 +16449,7 @@ static void OnFrameInner(Human* updatedHuman) {
             // X/Y and the quaternion are sender-authoritative, but m.M43 must use this machine's water
             // height at the peer's XZ - taking the peer's hull Z would make vertical lead horizontal by
             // the ~100 ms render delay. The solo F12 self-test below also uses the local Z.
-            m.M41 = g_ghostSyncPos[0]; m.M42 = g_ghostSyncPos[1]; m.M43 = g_localShipZ;
+            m.M41 = g_ghostSyncPos[0]; m.M42 = g_ghostSyncPos[1]; m.M43 = MirroredShipZ(g_ghostSyncPos[2]);   // [Coop] ShipPeerZ (see MirroredShipZ)
             // [Coop] ShipHPSync: apply a pending hull HP; a fresh ghost is normally spawned after the packet
             // that carried the value, so this cannot live only on the receive path.
             if (ShipHPSyncEnabled() && g_ghostShip && g_ghostSyncHP != g_ghostAppliedHP) {
@@ -16590,9 +16601,9 @@ static void LogSetGlobalMatrixBody(uint32_t thisEnt, uint32_t sgmMatrix, uint32_
         m[0] = tm.M11;  m[1] = tm.M12;  m[2]  = tm.M13;
         m[4] = tm.M21;  m[5] = tm.M22;  m[6]  = tm.M23;
         m[8] = tm.M31;  m[9] = tm.M32;  m[10] = tm.M33;
-        m[12] = g_ghostSyncPos[0]; m[13] = g_ghostSyncPos[1]; m[14] = g_localShipZ;
+        m[12] = g_ghostSyncPos[0]; m[13] = g_ghostSyncPos[1]; m[14] = MirroredShipZ(g_ghostSyncPos[2]);   // [Coop] ShipPeerZ
         { static int g_shipDriveLog = 0; if ((g_shipDriveLog++ & 0x3F) == 0)
-            L("[ShipSync] driving ghost to (%.1f, %.1f, %.1f)\n", g_ghostSyncPos[0], g_ghostSyncPos[1], g_localShipZ); }
+            L("[ShipSync] driving ghost to (%.1f, %.1f, %.1f) peerZ=%.2f localZ=%.2f\n", g_ghostSyncPos[0], g_ghostSyncPos[1], m[14], g_ghostSyncPos[2], g_localShipZ); }
         return;
     }
 
