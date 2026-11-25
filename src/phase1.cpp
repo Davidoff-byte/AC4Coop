@@ -4935,6 +4935,19 @@ static int ShipMirrorEnabled() {
     return s;
 }
 
+// [Coop] ShipClassBind (default 0; re-read once a second so one session can A/B it): the guest binds each host ship to
+// one of ITS OWN AI ships of the same class (ReadShipClass, entity+0x9C) at any distance up to 3 km, sticky per host
+// objId, and drives it to the host's transform. 1 = render override (the existing SgmDetour path, physics skipped),
+// 2 = the same write also updates the ship's physics (updatePhysics forced to 1: the hull, not only the picture, moves).
+// Why class, not position: AI ships are placed at random per game (spawn-manager-2026-11-25.md s5/s8), the old 15 m
+// nearest match almost never fires, and ShipMirror proxies are clones that crash the fast travel (naval-s0, 5/5).
+// UNVERIFIED: that a mode-2 write each frame does not fight the ship's own physics/AI badly (this is the test).
+static int ShipClassBindMode() {
+    static int s_mode = 0; static uint64_t s_next = 0;
+    const uint64_t now = GetTickCount64();
+    if (now >= s_next) { s_next = now + 1000; s_mode = GetPrivateProfileIntA("Coop", "ShipClassBind", 0, Paths::Ini()); if (s_mode < 0 || s_mode > 2) s_mode = 0; }
+    return s_mode;
+}
 static void fillShipState(EntityState& es, Entity* ent, uint32_t key, uint64_t objId) {
     es.key = key; es.kind = 1;
     // Real identity, from the same HandleContainer accessor the guard lane uses (phase1.cpp:3217).
@@ -4955,6 +4968,7 @@ static void fillShipState(EntityState& es, Entity* ent, uint32_t key, uint64_t o
         }
         es.arch = (uint16_t)ReadShipClass(ent);
     }
+    if (ShipClassBindMode()) es.arch = (uint16_t)ReadShipClass(ent);   // [Coop] ShipClassBind needs the class without ShipMirror
 }
 
 static void CaptureShips(EntityPacket& pkt) {
@@ -5458,6 +5472,41 @@ static void ShipBindProbeTick(const EntityPacket& pkt, void* mgr, int n, Entity*
     L("[ShipBind] host=%d local=%d sameClassWithin 100m=%d 300m=%d 1000m=%d | localCls:%s |%s\n", hostN, ln, w100, w300, w1000, cl, line);
 }
 
+struct ShipCB { uint64_t hostId; Entity* ent; uint32_t cls; uint64_t lastMs; };
+static ShipCB s_scb[64]; static int s_scbN = 0;
+static LONG s_scbNew = 0, s_scbNoCls = 0, s_scbNoShip = 0, s_scbLost = 0, s_scbHost = 0, s_scbBound = 0;
+static double s_scbErr = 0.0; static float s_scbErrMax = 0.0f; static int s_scbErrN = 0;
+// Guest: the bound local ship for one host ship record, or nullptr. live[] = this frame's candidate local AI ships.
+static Entity* ShipClassBindFor(const EntityState& es, Entity* const* live, const uint32_t* liveCls, int liveN, uint64_t now) {
+    ++s_scbHost;
+    int slot = -1;
+    for (int i = 0; i < s_scbN; ++i) if (s_scb[i].hostId == es.objId) { slot = i; break; }
+    if (slot >= 0) {
+        bool ok = false;
+        for (int k = 0; k < liveN; ++k) if (live[k] == s_scb[slot].ent && liveCls[k] == s_scb[slot].cls) { ok = true; break; }
+        if (ok) { s_scb[slot].lastMs = now; ++s_scbBound; return s_scb[slot].ent; }
+        ++s_scbLost; s_scb[slot] = s_scb[--s_scbN]; slot = -1;   // its body left the naval list: bind again
+    }
+    if (!es.arch) { ++s_scbNoCls; return nullptr; }
+    int best = -1; float bd = 3000.0f * 3000.0f;
+    for (int k = 0; k < liveN; ++k) {
+        if (liveCls[k] != es.arch) continue;
+        bool taken = false;
+        for (int i = 0; i < s_scbN; ++i) if (s_scb[i].ent == live[k]) { taken = true; break; }
+        if (taken) continue;
+        const float dx = live[k]->m_GlobalMatrix.M41 - es.pos[0], dy = live[k]->m_GlobalMatrix.M42 - es.pos[1];
+        const float d2 = dx * dx + dy * dy;
+        if (d2 < bd) { bd = d2; best = k; }
+    }
+    if (best < 0) { ++s_scbNoShip; return nullptr; }
+    if (s_scbN < 64) {
+        s_scb[s_scbN++] = { es.objId, live[best], liveCls[best], now };
+        ++s_scbNew; ++s_scbBound;
+        L("[ShipClassBind] host=%016llX cls=%u -> local ship %p (was %.0f m away)\n", (unsigned long long)es.objId, (unsigned)es.arch, live[best], sqrtf(bd));
+        return live[best];
+    }
+    return nullptr;
+}
 static void ApplyShips(const EntityPacket& pkt) {
     if (!ShipSyncEnabled()) { g_syncCount = 0; return; }
     void* mgr = GetNavalManager();
@@ -5478,6 +5527,29 @@ static void ApplyShips(const EntityPacket& pkt) {
     static int s_mCreated = 0, s_mMiss = 0, s_mSamples = 0; static double s_mErrSum = 0.0; static float s_mErrMax = 0.0f;
     static uint64_t s_mNextLog = 0;
     int mProxied = 0;
+    // [Coop] ShipClassBind: this frame's candidate local AI ships (never the local ship, the player, the ghost or a proxy).
+    const int scbMode = ShipClassBindMode();
+    const uint64_t scbNow = GetTickCount64();
+    Entity* scbLive[128]; uint32_t scbLiveCls[128]; int scbLiveN = 0;
+    if (scbMode) {
+        __try {
+            for (int s = 0; s < (int)n && scbLiveN < 128; ++s) {
+                Entity* c = GetShipEntity(mgr, s);
+                if (!c || c == localShip || c == player || c == (Entity*)g_ghostShip || !readable(c, 0xA0)) continue;
+                if (IsMirrorProxy(c) || *(uint32_t*)c != 0x01E4A128u) continue;
+                scbLive[scbLiveN] = c; scbLiveCls[scbLiveN] = ReadShipClass(c); ++scbLiveN;
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) { scbLiveN = 0; }
+        for (int i = 0; i < s_scbN; ) if (scbNow - s_scb[i].lastMs > 10000) s_scb[i] = s_scb[--s_scbN]; else ++i;   // host ship gone 10 s
+        static uint64_t s_scbLog = 0;
+        if (scbNow >= s_scbLog) {
+            s_scbLog = scbNow + 5000;
+            L("[ShipClassBind] mode=%d hostRecs=%ld bound=%ld new=%ld lost=%ld noClass=%ld noLocalOfClass=%ld table=%d localAI=%d | err mean=%.2f max=%.2f n=%d\n",
+              scbMode, s_scbHost, s_scbBound, s_scbNew, s_scbLost, s_scbNoCls, s_scbNoShip, s_scbN, scbLiveN,
+              s_scbErrN ? s_scbErr / s_scbErrN : -1.0, s_scbErrMax, s_scbErrN);
+            s_scbHost = s_scbBound = s_scbNew = s_scbLost = s_scbNoCls = s_scbNoShip = 0; s_scbErr = 0.0; s_scbErrMax = 0.0f; s_scbErrN = 0;
+        }
+    }
     __try {
         for (uint32_t i = 0; i < pkt.count && i < (uint32_t)MAX_SYNC_ENTITIES; ++i) {
             const EntityState& es = pkt.ents[i];
@@ -5489,13 +5561,20 @@ static void ApplyShips(const EntityPacket& pkt) {
             }
 
             Entity* ent = nullptr;
+            if (scbMode) {   // [Coop] ShipClassBind replaces (a)/(b): same class, any distance, sticky
+                ent = (es.objId) ? ShipClassBindFor(es, scbLive, scbLiveCls, scbLiveN, scbNow) : nullptr;
+                if (ent) {   // error of the previous write: where the bound ship is now vs where the host ship is
+                    const float dx = ent->m_GlobalMatrix.M41 - es.pos[0], dy = ent->m_GlobalMatrix.M42 - es.pos[1], dz = ent->m_GlobalMatrix.M43 - es.pos[2];
+                    const float e = sqrtf(dx * dx + dy * dy + dz * dz); s_scbErr += e; ++s_scbErrN; if (e > s_scbErrMax) s_scbErrMax = e;
+                }
+            }
             // (a) stable identity from the host
-            if (es.objId) {
+            if (!scbMode && es.objId) {
                 ent = FindLocalShipByObjId(mgr, (int)n, es.objId);
                 if (ent) ++nObj;
             }
             // (b) nearest local ship of the same archetype within tolerance
-            if (!ent) {
+            if (!ent && !scbMode) {
                 float bestD2 = SHIP_MATCH_TOL_M * SHIP_MATCH_TOL_M;
                 for (int s = 0; s < (int)n; ++s) {
                     Entity* c = GetShipEntity(mgr, s);
@@ -5537,6 +5616,16 @@ static void ApplyShips(const EntityPacket& pkt) {
             t.pos[0] = es.pos[0]; t.pos[1] = es.pos[1]; t.pos[2] = es.pos[2];
             t.quat[0] = es.quat[0]; t.quat[1] = es.quat[1]; t.quat[2] = es.quat[2]; t.quat[3] = es.quat[3];
             ++count;
+            // [Coop] ShipClassBind=2: drive the bound ship's whole entity (and its physics) to the host transform here,
+            // on the player thread, once per applied snapshot. Run 2026-11-25 15:xx: the SgmDetour render override never
+            // reached AI ships (err mean 360-425 m in mode 1 and with the physics flag) - their pose does not pass the
+            // hook. The ghost ship does, which is why ghost driving works. Same call as pilot.py teleport --ship.
+            if (scbMode == 2) {
+                HookMath::Quaternion q; q.x = es.quat[0]; q.y = es.quat[1]; q.z = es.quat[2]; q.w = es.quat[3];
+                HookMath::Transform m; HookMath::ToMatrix(&q, &m);
+                m.M41 = es.pos[0]; m.M42 = es.pos[1]; m.M43 = es.pos[2];
+                ent->SetGlobalMatrixInternal(&m, true);
+            }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
     g_syncCount = count;
@@ -15686,7 +15775,7 @@ static void DumpConfigOnce()
         // The Tune* values are floats (read with strtod, see ShipTuningTick); the dump shows the integer part.
         { "Coop", "TuneConeAngle", 120 }, { "Coop", "TuneConeRange", 350 }, { "Coop", "TuneMaxTime", 30 },
         { "Coop", "TuneAggroTime", 30 }, { "Coop", "TuneHull", 0 },
-        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 }, { "Coop", "WeaponSync", 0 }, { "Coop", "ShipPeerZ", 0 }, { "Coop", "ShipBindProbe", 0 }, { "Coop", "ShipSpawnProbe", 0 }, { "Coop", "ShipSpawnFire", 0 }, { "Coop", "ShipSpawnFirePid", 0 }, { "Coop", "SpawnCensus", 0 }, { "Coop", "SpawnReplayFire", 0 }, { "Coop", "SpawnReplayFirePid", 0 }, { "Coop", "SpawnShare", 0 }, { "Coop", "SpawnKeyBind", 0 }, { "Coop", "SpawnShareRadiusM", 150 },{ "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 },
+        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 }, { "Coop", "WeaponSync", 0 }, { "Coop", "ShipPeerZ", 0 }, { "Coop", "ShipBindProbe", 0 }, { "Coop", "ShipSpawnProbe", 0 }, { "Coop", "ShipSpawnFire", 0 }, { "Coop", "ShipSpawnFirePid", 0 }, { "Coop", "SpawnCensus", 0 }, { "Coop", "SpawnReplayFire", 0 }, { "Coop", "SpawnReplayFirePid", 0 }, { "Coop", "SpawnShare", 0 }, { "Coop", "SpawnKeyBind", 0 }, { "Coop", "ShipClassBind", 0 }, { "Coop", "SpawnShareRadiusM", 150 },{ "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 },
         { "Coop", "CombatTest", 0 }, { "Coop", "CrashContext", 0 }, { "Coop", "CorpseKeepSec", 30 }, { "Coop", "CrowdProbeIntegrate", 1 },
         { "Coop", "CrowdProbeLiveKeys", 1 }, { "Coop", "DamageRelay", 0 }, { "Coop", "Diag", 0 },
         { "Coop", "DisableCrowd", 0 }, { "Coop", "DisablePuppetAI", 1 }, { "Coop", "DisableSpawns", 0 },
@@ -16698,7 +16787,7 @@ static void LogSetGlobalMatrixBody(uint32_t thisEnt, uint32_t sgmMatrix, uint32_
     // 0x00528200 always writes the matrix, then only updates physics components when updatePhysics!=0).
     for (int i = 0; i < g_syncCount; ++i) {
         if (g_syncTargets[i].ent != thisEnt) continue;
-        if (sgmPhysPtr) *(uint32_t*)sgmPhysPtr = 0;   // render-only: skip the physics update
+        if (sgmPhysPtr) *(uint32_t*)sgmPhysPtr = (ShipClassBindMode() == 2 && *(uint32_t*)thisEnt == 0x01E4A128u) ? 1u : 0u;   // render-only, or [Coop] ShipClassBind=2: the hull moves too
         float* m = (float*)sgmMatrix;
         // ToMatrix, never hand-build: the hand-built off-diagonals were transposed and only appeared
         // correct while FromMatrix returned the conjugate (audit 2026-11-20).
