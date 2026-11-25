@@ -230,12 +230,89 @@ void InstallVecGuards()
 }
 
 
+// ---- [Coop] ReleaseStaleGuard (default 0): the fast-travel crash in the shared-resource registry ------------------
+// Guest dumps 31660 (2026-11-22) and 24860 (2026-11-25, full memory): leaving the sea world 73CA8CEE by fast travel, the
+// world-update worker calls sub_773B60(registry dword_2AC08A8, component) (from sub_50A240, slot 7 of class vt 0x01E4B160);
+// the record's count reaches 0 and sub_76E0F0 destroys the record's object through its vtable - but that object had been
+// destroyed already (its vtable word held a heap address, 0xFCD37C50 -> call 0xFCD38190). Registration is the class's clone
+// (sub_517270 -> sub_773A40); who releases once too often is not proven. sub_76E0F0 has ONE caller (0x773C16), so this guard
+// only touches that registry: before the destroy, the object's vtable must lie inside the game image; if not, the destroy and
+// the free of the dead object are skipped and the function continues at its own tail (0x76E124: clear holder, release the
+// record's other members), exactly the null-object path. A live object is untouched.
+//   76E0F0  56 57 8B F9 8B 37   push esi; push edi; mov edi,ecx; mov esi,[edi]   (stolen, whole instructions)
+//   76E0F6  85 F6 74 2A         test esi,esi; jz 76E124                          (resume point)
+const uintptr_t REL_SITE   = 0x0076E0F0;
+const uintptr_t REL_RESUME = 0x0076E0F6;
+const uintptr_t REL_TAIL   = 0x0076E124;
+const BYTE REL_STOLEN[6]   = { 0x56, 0x57, 0x8B, 0xF9, 0x8B, 0x37 };
+const BYTE REL_RESUMEB[4]  = { 0x85, 0xF6, 0x74, 0x2A };
+volatile LONG g_hitsRel = 0;
+volatile LONG g_relLastVt = 0, g_relLastObj = 0;
+uintptr_t g_imgLo = 0, g_imgHi = 0;
+bool g_relInstalled = false;
+
+int __cdecl RelObjAlive(const void* obj)
+{
+    uint32_t vt = 0;
+    __try { vt = *(const uint32_t*)obj; } __except (EXCEPTION_EXECUTE_HANDLER) { vt = 0; }
+    if (vt >= g_imgLo && vt < g_imgHi) return 1;
+    InterlockedExchange(&g_relLastVt, (LONG)vt);
+    InterlockedExchange(&g_relLastObj, (LONG)(uintptr_t)obj);
+    return 0;
+}
+
+void InstallReleaseGuard(HMODULE game)
+{
+    const BYTE* p = (const BYTE*)REL_SITE;
+    if (memcmp(p, REL_STOLEN, sizeof(REL_STOLEN)) != 0 || memcmp((const BYTE*)REL_RESUME, REL_RESUMEB, sizeof(REL_RESUMEB)) != 0) {
+        Log("[WalkGuard] release guard bytes mismatch at 0x%08X (%02X %02X %02X %02X %02X %02X | %02X %02X %02X %02X) - skipped\n",
+            (unsigned)REL_SITE, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9]);
+        return;
+    }
+    const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)game;
+    const IMAGE_NT_HEADERS* nt = (const IMAGE_NT_HEADERS*)((const BYTE*)game + dos->e_lfanew);
+    g_imgLo = (uintptr_t)game; g_imgHi = g_imgLo + nt->OptionalHeader.SizeOfImage;
+    BYTE* g = (BYTE*)VirtualAlloc(nullptr, 0x40, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    for (size_t h = 0; g && !InRange(g, REL_SITE) && h < sizeof(CAVE_HINTS) / sizeof(CAVE_HINTS[0]); ++h) {
+        VirtualFree(g, 0, MEM_RELEASE);
+        g = (BYTE*)VirtualAlloc((LPVOID)CAVE_HINTS[h], 0x40, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    }
+    if (!g || !InRange(g, REL_SITE)) { Log("[WalkGuard] release guard FAILED: no cave in range\n"); return; }
+    size_t i = 0;
+    memcpy(g, REL_STOLEN, sizeof(REL_STOLEN)); i += sizeof(REL_STOLEN);              // 00 stolen prologue
+    g[i++] = 0x85; g[i++] = 0xF6;                                                   // 06 test esi,esi
+    g[i++] = 0x0F; g[i++] = 0x84; *reinterpret_cast<int32_t*>(g + i) = Rel32(g + i + 4, (const void*)REL_TAIL); i += 4;   // jz tail
+    g[i++] = 0x60;                                                                  // pushad
+    g[i++] = 0x56;                                                                  // push esi
+    g[i++] = 0xB8; *reinterpret_cast<uint32_t*>(g + i) = (uint32_t)(uintptr_t)&RelObjAlive; i += 4;   // mov eax,RelObjAlive
+    g[i++] = 0xFF; g[i++] = 0xD0;                                                   // call eax
+    g[i++] = 0x83; g[i++] = 0xC4; g[i++] = 0x04;                                   // add esp,4
+    g[i++] = 0x89; g[i++] = 0x44; g[i++] = 0x24; g[i++] = 0x1C;                    // mov [esp+1Ch],eax (saved EAX)
+    g[i++] = 0x61;                                                                  // popad
+    g[i++] = 0x85; g[i++] = 0xC0;                                                   // test eax,eax
+    g[i++] = 0x0F; g[i++] = 0x85; *reinterpret_cast<int32_t*>(g + i) = Rel32(g + i + 4, (const void*)REL_RESUME); i += 4; // jnz resume
+    g[i++] = 0xF0; g[i++] = 0xFF; g[i++] = 0x05; *reinterpret_cast<uint32_t*>(g + i) = (uint32_t)(uintptr_t)&g_hitsRel; i += 4; // lock inc [hits]
+    g[i++] = 0xE9; *reinterpret_cast<int32_t*>(g + i) = Rel32(g + i + 4, (const void*)REL_TAIL); i += 4;               // jmp tail
+    FlushInstructionCache(GetCurrentProcess(), g, 0x40);
+    if (!Hook::DetourFunc((BYTE*)REL_SITE, (DWORD)(uintptr_t)g, 6)) { Log("[WalkGuard] release guard FAILED: DetourFunc\n"); return; }
+    g_relInstalled = true;
+    Log("[WalkGuard] release guard installed 76E0F0 (dead object in the registry release -> skip destroy) cave=%p image=%08X..%08X\n",
+        g, (unsigned)g_imgLo, (unsigned)g_imgHi);
+}
+
 unsigned __stdcall ReporterThread(void*)
 {
     for (;;) {
         Sleep(1000);                                            // at most one line per second
-        if (!g_installed) continue;
+        if (!g_installed && !g_relInstalled) continue;
         __try {
+            static LONG s_relLogged = 0;
+            const LONG r = g_hitsRel;
+            if (r > s_relLogged) {
+                s_relLogged = r;
+                Log("[WalkGuard] release guard hit n=%ld: dead object %08X (vtable word %08X) - destroy skipped\n",
+                    (long)r, (unsigned)g_relLastObj, (unsigned)g_relLastVt);
+            }
             const LONG n = g_hitsF + g_hitsB + g_hitsD0 + g_hits210 + g_hits2E0;
             if (n <= g_lastLogged) continue;
             if (!g_firstHitTick) g_firstHitTick = GetTickCount64();
@@ -337,7 +414,8 @@ void WalkGuard::Init()
         if (!g_log) Paths::NoteOpenFailure(Paths::LogPath(leaf));
     }
 
-    if (!Install()) return;
+    if (GetPrivateProfileIntA("Coop", "ReleaseStaleGuard", 0, Paths::Ini()) != 0) InstallReleaseGuard(game);   // [Coop] ReleaseStaleGuard
+    if (!Install()) { if (g_relInstalled) _beginthreadex(nullptr, 0, ReporterThread, nullptr, 0, nullptr); return; }
     if (GetPrivateProfileIntA("Coop", "WalkNullGuardExt", 0, Paths::Ini()) != 0) InstallVecGuards();
 
     // _beginthreadex, not CreateThread: the reporter calls CRT functions (fputs/_vsnprintf_s) and
