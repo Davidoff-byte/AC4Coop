@@ -136,3 +136,21 @@ distance rounds. Pre-registered PASS: >= 90 % of host guards that have a key bou
 **Verdict: PASS for keyed guards (12/12, 0.0 m) - the same NPC from the same data, no nearest-body guess.** Coverage
 at Dry Tortuga is 12/32 host guards (38 %). The 20 unkeyed come from requests without a static key; ship-anchored crews
 (section 5) are the likely bulk - UNVERIFIED which. Next slice: ship-anchored keys (ship identity + local offset).
+
+## 8. Who the unkeyed guards are, and a ship key (2026-11-25, builds E99E075E / C8E6D21B, two copies, Dry Tortuga)
+Pre-registered: Q1 = the unkeyed host guards are ship crews if >= 70 % are anchored to an EntityGroup; Q2 = the ship's
+template builder ObjectID (HandleContainer at params+0x4C, id at hc+0x0C, `src/Scimitar/BaseTypes.h`) is a ship class
+key if authored (hi != 0) and the per-copy sets agree >= 90 %.
+
+| Question | Result |
+|---|---|
+| Q1 | **PASS: 20/20** unkeyed host guards have a request anchored to an EntityGroup (kind 4, vt 0x01E4A128) = ship crews |
+| Q2 | **FAIL**: 9 AI ships per copy, builder id **0:0** on all 9 (their params+0x4C is the shared invalid handle 0x04DD5F8C); only the player ship has an authored id (`3:BDBCBAD1`) |
+| Ship params content | the 9 AI SpawnShipParams (0x98 B) have identical non-pointer content within a copy and across copies: the params carry no per-ship class |
+
+**Consequence.** A crew member's key is (its ship, local offset); the local offsets already match (section 5). But a
+guest crew body bound to a host crew member would be driven to the host ship's position while its own ship is
+elsewhere (AI ships are placed at random, so they are not at the same point on the two copies). Crew keys therefore need the ships synced first: guest
+ship bound to host ship (class from the built ship, `ReadShipClass` phase1.cpp:1304; ShipBindProbe: a same-class local
+ship within 1000 m for 2-4 of 4 host records) and driven to the host's transform. Ship identity cannot come from the
+spawn data.

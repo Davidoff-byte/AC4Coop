@@ -141,6 +141,7 @@ extern "C" void __cdecl CensusDel(const uint32_t* esp)   // esp[1] = world, esp[
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
+static int DumpWords(char* out, size_t cap, uintptr_t base, int n);   // defined below
 int SpawnShareDecide(uintptr_t req);   // defined below ([Coop] SpawnShare)
 void SpawnKeyNoteReq(uintptr_t req);   // defined below ([Coop] SpawnKeyBind)
 extern "C" void __cdecl SpawnKeyNoteEnt(const uint32_t* esp);
@@ -162,6 +163,24 @@ uintptr_t __fastcall DetF(void* params, void*, int a2)
         const uint32_t pvt = *(const uint32_t*)params;
         if (e) { Made& m = g_made[(InterlockedIncrement(&g_madePos) - 1) & (kRing - 1)]; m.e = 0; m.pvt = pvt; m.e = e; }
         NoteF(pvt, *(const uint32_t*)fr, e != 0, e && IsHuman(e));
+        if (e && (pvt == 0x0270A538u || pvt == 0x026A20C8u)) {   // ship built: its template builder's ObjectID (HandleContainer at params+0x4C, id at hc+0x0C)
+            static LONG s_sk = 0;
+            if (InterlockedIncrement(&s_sk) <= 80) {
+                const uintptr_t hc = *(const uintptr_t*)((uintptr_t)params + 0x4C);
+                const uint32_t lo = hc ? *(const uint32_t*)(hc + 0x0C) : 0, hi = hc ? *(const uint32_t*)(hc + 0x10) : 0;
+                char line[180]; _snprintf_s(line, sizeof(line), _TRUNCATE, "[ShipKey] ship ent=%08X pvt=%08X params=%08X builder=%08X:%08X\n",
+                                            (unsigned)e, pvt, (unsigned)(uintptr_t)params, hi, lo);
+                Phase1_LogLine(line);
+                // AI ships: builder id 0 on both copies (run E99E075E). Dump the params (0x98 B, class map size) and the builder
+                // object for a cross-copy content key. Lock-free reads.
+                static char big[3000]; int k = _snprintf_s(big, sizeof(big), _TRUNCATE, "[ShipKD] n=%ld P:", s_sk);
+                if (k > 0) k += DumpWords(big + k, sizeof(big) - k, (uintptr_t)params, 38);
+                const uintptr_t bo = hc ? *(const uintptr_t*)hc : 0;
+                if (k > 0) k += _snprintf_s(big + k, sizeof(big) - k, _TRUNCATE, " | B:");
+                if (k > 0 && bo) k += DumpWords(big + k, sizeof(big) - k, bo, 24);
+                for (int off = 0, part = 0; off < k; off += 900, ++part) { char seg[1000]; _snprintf_s(seg, sizeof(seg), _TRUNCATE, "[ShipKD+] n=%ld p=%d %.900s\n", s_sk, part, big + off); Phase1_LogLine(seg); }
+            }
+        }
         if (g_watch > 0 && InterlockedDecrement(&g_watch) >= 0) { char line[160]; float p[3]; Pos(e, p); _snprintf_s(line, sizeof(line), _TRUNCATE, "[Replay] build after fire: params=%08X pvt=%08X -> ent=%08X human=%d\n", (unsigned)(uintptr_t)params, pvt, (unsigned)e, e && IsHuman(e) ? 1 : 0); Phase1_LogLine(line); }
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
     return e;
@@ -647,8 +666,8 @@ void SpawnShareTick()
 // its own entity built for the same key (phase1.cpp WideBindPrepass, key round before the distance rounds).
 // Static anchors only (ship-anchored crews and random traffic have no shared key yet). Lock-free reads only.
 namespace {
-struct RK { volatile uintptr_t req; uint64_t key; };
-struct EK { volatile uintptr_t ent; uint64_t key; };
+struct RK { volatile uintptr_t req; uint64_t key; int kind; uintptr_t anc; uint32_t avt; };   // kind: SpawnPoint frame (1 static, 0 none, 2 parent, 3 no anchor), 4 = frame 1 with a non-Entity anchor
+struct EK { volatile uintptr_t ent; uint64_t key; int kind; uintptr_t anc; uint32_t avt; };
 constexpr int kRK = 2048, kEK = 2048, kHK = 1024, kHP = 2048;
 RK g_rk[kRK]; volatile LONG g_rkPos = 0;
 EK g_ek[kEK]; volatile LONG g_ekPos = 0;
@@ -660,9 +679,11 @@ void SpawnKeyNoteReq(uintptr_t req)
 {
     if (!g_keyBind && !g_share) return;
     Cap c = {}; if (!CapFor(req, c) || !c.item) return;
-    uint64_t key = 0; float w[3];
-    if (!StaticKey(c.item, &key, w)) return;
-    RK& r = g_rk[(InterlockedIncrement(&g_rkPos) - 1) & (kRK - 1)]; r.req = 0; r.key = key; r.req = req;
+    uint64_t key = 0; float w[3], loc[3]; uintptr_t anc = 0;
+    int kind = SpawnPoint(c.item, w, loc, &anc);
+    const uint32_t avt = ReadVt(anc);
+    if (kind == 1 && avt == 0x01E4CE90u) key = KeyOf(w); else if (kind == 1) kind = 4;
+    RK& r = g_rk[(InterlockedIncrement(&g_rkPos) - 1) & (kRK - 1)]; r.req = 0; r.key = key; r.kind = kind; r.anc = anc; r.avt = avt; r.req = req;
     InterlockedIncrement(&k_req);
 }
 extern "C" void __cdecl SpawnKeyNoteEnt(const uint32_t* esp)   // esp[1] = request, esp[2] = entity
@@ -674,8 +695,8 @@ extern "C" void __cdecl SpawnKeyNoteEnt(const uint32_t* esp)   // esp[1] = reque
     for (int i = 0; i < kRK; ++i) {
         const RK& r = g_rk[(pos - 1 - i) & (kRK - 1)];
         if (r.req == req) {
-            EK& e = g_ek[(InterlockedIncrement(&g_ekPos) - 1) & (kEK - 1)]; e.ent = 0; e.key = r.key; e.ent = ent;
-            InterlockedIncrement(&k_ent); return;
+            EK& e = g_ek[(InterlockedIncrement(&g_ekPos) - 1) & (kEK - 1)]; e.ent = 0; e.key = r.key; e.kind = r.kind; e.anc = r.anc; e.avt = r.avt; e.ent = ent;
+            InterlockedIncrement(r.key ? &k_ent : &k_entNoKey); return;
         }
     }
     InterlockedIncrement(&k_entNoKey);
@@ -711,7 +732,19 @@ void SpawnKeyHostNote(uint64_t objId, uintptr_t ent)
     if (!g_keyBind || !objId || !Phase1_EntityHost() || !Net::IntentLaneOn()) return;
     for (int i = 0; i < g_hostPubN; ++i) if (g_hostPub[i] == objId) return;
     const uint64_t key = SpawnKeyOfEntity(ent);
-    if (!key) { InterlockedIncrement(&k_hostNoKey); if (g_hostPubN < kHP) g_hostPub[g_hostPubN++] = objId; return; }   // counted once per objId
+    if (!key) {   // counted once per objId; the first 40 are classified by their request's anchor (ship-crew check)
+        InterlockedIncrement(&k_hostNoKey); if (g_hostPubN < kHP) g_hostPub[g_hostPubN++] = objId;
+        int kind = -1; uintptr_t anc = 0; uint32_t avt = 0;
+        { const LONG pos = g_ekPos; for (int i = 0; i < kEK; ++i) { const EK& e = g_ek[(pos - 1 - i) & (kEK - 1)]; if (e.ent == ent) { kind = e.kind; anc = e.anc; avt = e.avt; break; } } }
+        static LONG s_un = 0;
+        if (InterlockedIncrement(&s_un) <= 40) {
+            float p[3]; Pos(ent, p); char line[200];
+            _snprintf_s(line, sizeof(line), _TRUNCATE, "[KeyBind] host unkeyed guard obj=%08X ent=%08X kind=%d anchor=%08X avt=%08X pos=(%.0f, %.0f, %.0f)\n",
+                        (unsigned)objId, (unsigned)ent, kind, (unsigned)anc, avt, p[0], p[1], p[2]);
+            Phase1_LogLine(line);
+        }
+        return;
+    }
     InterlockedIncrement(&k_hostKeyed);
     uint8_t pl[16] = { 2, 2 }; memcpy(pl + 8, &key, 8);
     if (Net::PublishIntent(0, objId, 15 /* IC_SPAWN */, 0, pl, (uint8_t)sizeof(pl))) {
