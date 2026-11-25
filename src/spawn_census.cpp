@@ -38,6 +38,8 @@ uintptr_t g_lo = 0, g_hi = 0;
 bool g_on = false;
 DWORD g_tF = 0, g_tR = 0, g_tA = 0, g_tD = 0;
 volatile LONG g_lock = 0, g_lines = 0, g_watch = 0;
+bool g_keyBind = false;    // [Coop] SpawnKeyBind (see the end of this file)
+DWORD g_tSet = 0;          // trampoline of sub_5BC470 (request <- built entity)
 bool g_share = false;      // [Coop] SpawnShare (see the SpawnShare section at the end of this file)
 float g_shareR = 150.f;    // [Coop] SpawnShareRadiusM
 
@@ -140,6 +142,8 @@ extern "C" void __cdecl CensusDel(const uint32_t* esp)   // esp[1] = world, esp[
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 int SpawnShareDecide(uintptr_t req);   // defined below ([Coop] SpawnShare)
+void SpawnKeyNoteReq(uintptr_t req);   // defined below ([Coop] SpawnKeyBind)
+extern "C" void __cdecl SpawnKeyNoteEnt(const uint32_t* esp);
 extern "C" void __cdecl CensusReq(uintptr_t req, const uint32_t* esp)
 {
     __try {
@@ -169,6 +173,7 @@ char __fastcall DetR(void* req, void*)
 {
     const uint32_t ret[1] = { *(const uint32_t*)_AddressOfReturnAddress() };
     CensusReq((uintptr_t)req, ret);
+    SpawnKeyNoteReq((uintptr_t)req);                          // [Coop] SpawnKeyBind: req -> spawn key
     if (SpawnShareDecide((uintptr_t)req) == 1) return 0;   // [Coop] SpawnShare: guest holds this request
     return ((SubmitFn)g_tR)(req);
 }
@@ -234,6 +239,17 @@ void __fastcall DetSrc(void* req, void*, uintptr_t owner, uint32_t lo, uint32_t 
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
+__declspec(naked) void DetSet()   // sub_5BC470 entry: [esp+4] = request, [esp+8] = built entity
+{
+    __asm { pushad
+            lea eax, [esp + 32]
+            push eax
+            call SpawnKeyNoteEnt
+            add esp, 4
+            popad
+            jmp dword ptr [g_tSet] }
+}
+
 bool Install(uintptr_t va, const BYTE* pro, int n, void* det, DWORD* slot, const char* name)
 {
     BYTE* site = (BYTE*)(GameModuleBase + (va - 0x00400000));
@@ -269,7 +285,10 @@ template <int N> void Dump(const char* tag, Table<N>& t, const char* k2name)
 
 void SpawnCensusInit()
 {
-    if (GetPrivateProfileIntA("Coop", "SpawnCensus", 0, Paths::Ini()) == 0) return;
+    const bool census = GetPrivateProfileIntA("Coop", "SpawnCensus", 0, Paths::Ini()) != 0;
+    g_keyBind = GetPrivateProfileIntA("Coop", "SpawnKeyBind", 0, Paths::Ini()) != 0;
+    const bool shareFlag = GetPrivateProfileIntA("Coop", "SpawnShare", 0, Paths::Ini()) != 0;
+    if (!census && !g_keyBind && !shareFlag) return;   // SpawnKeyBind / SpawnShare need the request hooks below
     const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)GameModuleBase;
     const IMAGE_NT_HEADERS32* nt = (const IMAGE_NT_HEADERS32*)(GameModuleBase + dos->e_lfanew);
     g_lo = GameModuleBase + nt->OptionalHeader.BaseOfCode;
@@ -279,19 +298,24 @@ void SpawnCensusInit()
     static const BYTE pA[6] = { 0x55, 0x8B, 0xEC, 0x8B, 0x45, 0x10 };
     static const BYTE pD[6] = { 0x55, 0x8B, 0xEC, 0x8B, 0x45, 0x0C };
     const bool spawnsOwned = GetPrivateProfileIntA("Coop", "DisableSpawns", 0, Paths::Ini()) || GetPrivateProfileIntA("Coop", "DisableCrowd", 0, Paths::Ini());
-    const bool f = Install(0x0046D8E0, pF, 6, (void*)&DetF, &g_tF, "SpawnEntityParamsSpawn");
+    const bool f = census && Install(0x0046D8E0, pF, 6, (void*)&DetF, &g_tF, "SpawnEntityParamsSpawn");
     const bool r = spawnsOwned ? false : Install(0x0079B8D0, pR, 5, (void*)&DetR, &g_tR, "SpawningRequestSpawn");
-    const bool a = Install(0x005A8A80, pA, 6, (void*)&DetA, &g_tA, "WorldAddCore");
-    const bool d = Install(0x005A8AC0, pD, 6, (void*)&DetD, &g_tD, "WorldRemoveCore");
+    const bool a = census && Install(0x005A8A80, pA, 6, (void*)&DetA, &g_tA, "WorldAddCore");
+    const bool d = census && Install(0x005A8AC0, pD, 6, (void*)&DetD, &g_tD, "WorldRemoveCore");
     static const BYTE pFac[6] = { 0x55, 0x8B, 0xEC, 0x8B, 0x45, 0x08 };
     static const BYTE pSrc[7] = { 0x55, 0x8B, 0xEC, 0x53, 0x8B, 0x5D, 0x10 };
     const bool fac = Install(0x00F72ED0, pFac, 6, (void*)&DetFac, &g_tFac, "RequestFactory");
     const bool src = Install(0x0079C6C0, pSrc, 7, (void*)&DetSrc, &g_tSrc, "RequestSetSource");
-    g_share = GetPrivateProfileIntA("Coop", "SpawnShare", 0, Paths::Ini()) != 0 && r && fac && src;   // the lane is checked at use: Net::Init runs after this init (run 2026-11-25 13:5x)
+    // sub_5BC470(client, req, entity), thiscall retn 8: the manager job stores the built entity into its request
+    // (0x005C57A9 in sub_5C5770; the job object IS the request: 0x79B8D0 sets req+0x20 = 1, sub_5C5770 sets +0x20 = 2).
+    static const BYTE pSet[7] = { 0x55, 0x8B, 0xEC, 0x53, 0x56, 0x8B, 0xF1 };
+    const bool set = (g_keyBind || shareFlag) && Install(0x005BC470, pSet, 7, (void*)&DetSet, &g_tSet, "RequestSetEntity");
+    g_keyBind = g_keyBind && r && fac && src && set;
+    g_share = shareFlag && r && fac && src;   // the lane is checked at use: Net::Init runs after this init (run 2026-11-25 13:5x)
     { char rb[32]; GetPrivateProfileStringA("Coop", "SpawnShareRadiusM", "150", rb, sizeof(rb), Paths::Ini()); g_shareR = (float)atof(rb); }
     g_on = f || r || a || d || fac || src;
     char line[128];
-    _snprintf_s(line, sizeof(line), _TRUNCATE, "[Census] SpawnCensus on: F=%d R=%d A=%d D=%d fac=%d src=%d | SpawnShare=%d radius=%.0f\n", f, r, a, d, fac, src, g_share ? 1 : 0, g_shareR);
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[Census] SpawnCensus on: F=%d R=%d A=%d D=%d fac=%d src=%d | SpawnShare=%d radius=%.0f SpawnKeyBind=%d\n", f, r, a, d, fac, src, g_share ? 1 : 0, g_shareR, g_keyBind ? 1 : 0);
     Phase1_LogLine(line);
 }
 
@@ -562,15 +586,17 @@ static bool TakeHeld(uint64_t key, Held* h)   // marks the key released; takes i
 }
 
 // Guest: one IC_SPAWN message (player thread, from FightIntentDrain).
-void SpawnShareRx(uint64_t key)
+void SpawnKeyRxBind(uint64_t hostObjId, uint64_t key);   // below
+void SpawnShareRx(uint64_t key, const uint8_t* payload, uint8_t len)
 {
+    if (len >= 16 && payload[0] == 2 && payload[1] == 2) { uint64_t k; memcpy(&k, payload + 8, 8); SpawnKeyRxBind(key, k); return; }
     if (!g_share) return;
     InterlockedIncrement(&c_rx);
     Held h = {};
     if (!TakeHeld(key, &h)) return;
     InterlockedIncrement(ReplayHeld(h) ? &c_relArr : &c_replayFail);
 }
-bool SpawnShareOn() { return g_share; }
+bool SpawnShareOn() { return g_share || g_keyBind; }   // keeps phase1's lane drain running for IC_SPAWN
 
 // Player thread: host publishes queued keys; guest expires held requests (60 s); stats every 10 s.
 void SpawnShareTick()
@@ -612,4 +638,90 @@ void SpawnShareTick()
                 Phase1_EntityHost() ? "host" : "guest", c_pub, c_pubDrop, c_rx, c_held, c_pending, g_nHeld, c_relArr, c_relReq, c_lateLocal,
                 c_fallback, c_stale, c_replayFail, c_passShip, c_passNone, c_passOut, c_passNoHost, g_nRel);
     Phase1_LogLine(line);
+}
+// ==== [Coop] SpawnKeyBind (default 0): bind host guards to guest bodies by spawn key ==================================
+// Evidence: docs/evidence/spawn-manager-2026-11-25.md sections 5-6. Both games spawn the same static-anchored NPC at the
+// same world point W (68/69) during loads; their ids are minted per process. Each side records, for every entity the
+// manager builds, the key of the request that built it (DetR: req -> key, DetSet/sub_5BC470: entity <- req). The host
+// publishes its guard's objId -> key once on IC_SPAWN (payload ver 2, kind 2, key at +8); the guest binds that objId to
+// its own entity built for the same key (phase1.cpp WideBindPrepass, key round before the distance rounds).
+// Static anchors only (ship-anchored crews and random traffic have no shared key yet). Lock-free reads only.
+namespace {
+struct RK { volatile uintptr_t req; uint64_t key; };
+struct EK { volatile uintptr_t ent; uint64_t key; };
+constexpr int kRK = 2048, kEK = 2048, kHK = 1024, kHP = 2048;
+RK g_rk[kRK]; volatile LONG g_rkPos = 0;
+EK g_ek[kEK]; volatile LONG g_ekPos = 0;
+struct HK { uint64_t obj, key; }; HK g_hk[kHK]; volatile LONG g_hkPos = 0;      // guest: host objId -> key
+uint64_t g_hostPub[kHP]; int g_hostPubN = 0;                                     // host: objIds already published
+volatile LONG k_req = 0, k_ent = 0, k_entNoKey = 0, k_pub = 0, k_rx = 0, k_hostNoKey = 0, k_hostKeyed = 0;
+}
+void SpawnKeyNoteReq(uintptr_t req)
+{
+    if (!g_keyBind && !g_share) return;
+    Cap c = {}; if (!CapFor(req, c) || !c.item) return;
+    uint64_t key = 0; float w[3];
+    if (!StaticKey(c.item, &key, w)) return;
+    RK& r = g_rk[(InterlockedIncrement(&g_rkPos) - 1) & (kRK - 1)]; r.req = 0; r.key = key; r.req = req;
+    InterlockedIncrement(&k_req);
+}
+extern "C" void __cdecl SpawnKeyNoteEnt(const uint32_t* esp)   // esp[1] = request, esp[2] = entity
+{
+    if (!g_keyBind) return;
+    const uintptr_t req = esp[1], ent = esp[2];
+    if (!req || !ent) return;
+    const LONG pos = g_rkPos;
+    for (int i = 0; i < kRK; ++i) {
+        const RK& r = g_rk[(pos - 1 - i) & (kRK - 1)];
+        if (r.req == req) {
+            EK& e = g_ek[(InterlockedIncrement(&g_ekPos) - 1) & (kEK - 1)]; e.ent = 0; e.key = r.key; e.ent = ent;
+            InterlockedIncrement(&k_ent); return;
+        }
+    }
+    InterlockedIncrement(&k_entNoKey);
+}
+bool SpawnKeyBindOn() { return g_keyBind; }
+uint64_t SpawnKeyOfEntity(uintptr_t ent)
+{
+    const LONG pos = g_ekPos;
+    for (int i = 0; i < kEK; ++i) { const EK& e = g_ek[(pos - 1 - i) & (kEK - 1)]; if (e.ent == ent) return e.key; }
+    return 0;
+}
+uintptr_t SpawnEntityOfKey(uint64_t key)
+{
+    const LONG pos = g_ekPos;
+    for (int i = 0; i < kEK; ++i) { const EK& e = g_ek[(pos - 1 - i) & (kEK - 1)]; if (e.ent && e.key == key) return e.ent; }
+    return 0;
+}
+uint64_t SpawnKeyForHostObj(uint64_t obj)
+{
+    const LONG pos = g_hkPos;
+    for (int i = 0; i < kHK; ++i) { const HK& h = g_hk[(pos - 1 - i) & (kHK - 1)]; if (h.obj == obj) return h.key; }
+    return 0;
+}
+void SpawnKeyRxBind(uint64_t hostObjId, uint64_t key)   // guest, player thread (lane drain)
+{
+    InterlockedIncrement(&k_rx);
+    for (int i = 0; i < kHK; ++i) if (g_hk[i].obj == hostObjId) { g_hk[i].key = key; return; }
+    HK& h = g_hk[(InterlockedIncrement(&g_hkPos) - 1) & (kHK - 1)]; h.obj = hostObjId; h.key = key;
+}
+// Host, from EmitGuardEntity (player thread): publish objId -> key once per objId.
+void SpawnKeyHostNote(uint64_t objId, uintptr_t ent)
+{
+    if (!g_keyBind || !objId || !Phase1_EntityHost() || !Net::IntentLaneOn()) return;
+    for (int i = 0; i < g_hostPubN; ++i) if (g_hostPub[i] == objId) return;
+    const uint64_t key = SpawnKeyOfEntity(ent);
+    if (!key) { InterlockedIncrement(&k_hostNoKey); if (g_hostPubN < kHP) g_hostPub[g_hostPubN++] = objId; return; }   // counted once per objId
+    InterlockedIncrement(&k_hostKeyed);
+    uint8_t pl[16] = { 2, 2 }; memcpy(pl + 8, &key, 8);
+    if (Net::PublishIntent(0, objId, 15 /* IC_SPAWN */, 0, pl, (uint8_t)sizeof(pl))) {
+        InterlockedIncrement(&k_pub);
+        if (g_hostPubN < kHP) g_hostPub[g_hostPubN++] = objId;
+    }
+}
+int SpawnKeyReport(char* out, int cap)
+{
+    if (!g_keyBind) return 0;
+    return _snprintf_s(out, cap, _TRUNCATE, "[KeyBind] reqKeys=%ld entKeys=%ld entNoKey=%ld | host guards keyed=%ld unkeyed=%ld published=%ld | guestReceived=%ld",
+                       k_req, k_ent, k_entNoKey, k_hostKeyed, k_hostNoKey, k_pub, k_rx);
 }

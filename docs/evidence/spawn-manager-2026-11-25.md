@@ -120,3 +120,19 @@ inside the radius and replays it through sub_569560 when the key arrives.
 the **binding**: guest entity <-> host entity by key (the entity spawned at W), replacing today's nearest-body binding.
 What genuinely diverges and needs the host: ship-anchored crews (ships placed at random) and position-less random
 traffic. SpawnShare stays default 0.
+
+## 7. [Coop] SpawnKeyBind: bind host guards to guest bodies by spawn key (2026-11-25, builds B64C5EF2 / 3BEA1836)
+Static: the manager job IS the request (`0x79B8D0` writes req+0x20 = 1, `sub_5C5770` writes +0x20 = 2 on the same
+object) and `sub_5BC470(client, req, entity)` (thiscall, retn 8; called at 0x005C57A9) stores the built entity into it.
+So request -> spec -> key -> entity is one chain. Each side records entity -> key; the host publishes its guard's
+objId -> key once on IC_SPAWN (payload ver 2, kind 2); the guest's WideBindPrepass runs a key round before the
+distance rounds. Pre-registered PASS: >= 90 % of host guards that have a key bound by key, median bind distance < 2 m.
+
+| Run (Dry Tortuga boot, two copies) | Result |
+|---|---|
+| B64C5EF2 | guest: **12 key binds, all d = 0.0 m**; other host guards bound by distance as before (exact/wide, 0.7-6.6 m) |
+| 3BEA1836 (counters) | host emitted 32 guards: **12 keyed, 20 without a key**; host requests with a static key 71, built entities linked to a key 43, built without one 29. Guest received 12, bound 12/12 by key, 12/12 within 0.4 m |
+
+**Verdict: PASS for keyed guards (12/12, 0.0 m) - the same NPC from the same data, no nearest-body guess.** Coverage
+at Dry Tortuga is 12/32 host guards (38 %). The 20 unkeyed come from requests without a static key; ship-anchored crews
+(section 5) are the likely bulk - UNVERIFIED which. Next slice: ship-anchored keys (ship identity + local offset).

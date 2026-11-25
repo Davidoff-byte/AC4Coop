@@ -6599,6 +6599,7 @@ static void EmitGuardEntity(EntityPacket& pkt, uint32_t& count, int idx, Entity*
     // A slot lives as long as the entity (10 s unseen tolerance, see SyncSlotSweep). The fallback to
     // `idx` only happens for objId==0 or a saturated table, both of which were already unmatchable.
     es.objId = hc->GetObjectID();
+    { void SpawnKeyHostNote(uint64_t, uintptr_t); SpawnKeyHostNote(es.objId, (uintptr_t)e); }   // [Coop] SpawnKeyBind: objId -> spawn key, once
     {
         const uint32_t slot = SyncSlotFor(es.objId, nowMs);
         es.key = (slot != SYNC_SLOT_NONE) ? slot : (uint32_t)idx;
@@ -7814,9 +7815,12 @@ static unsigned s_wbNeed = 0, s_wbExact = 0, s_wbWide = 0, s_wbNoArch = 0, s_wbF
 static float    s_wbFarMin = 1e9f;   // nearest same-archetype free body that was beyond the radius (m)
 static unsigned s_wbFarLinked = 0, s_wbBeyond[3] = {};   // round-3 links; beyond-R nearest in 12-20 / 20-40 / >=40 m
 
+bool SpawnKeyBindOn(); uint64_t SpawnKeyForHostObj(uint64_t); uintptr_t SpawnEntityOfKey(uint64_t);   // spawn_census.cpp
+static unsigned s_wbKey = 0, s_wbKeyNoLocal = 0, s_wbKeyNotFree = 0, s_wbKeyArchDiff = 0, s_wbKeyUnknown = 0;
+
 static void WideBindPrepass(const EntityPacket& pkt, World* world, Entity* player) {
     const float R = WideBindRadiusM();
-    if (R <= 1.5f) return;
+    if (R <= 1.5f && !SpawnKeyBindOn()) return;   // [Coop] SpawnKeyBind runs its key round even with the distance rounds off
     static uint64_t s_nextMs = 0;
     const uint64_t now = GetTickCount64();
     if (now < s_nextMs) return;          // 4 Hz is plenty: a binding, once made, is sticky
@@ -7880,7 +7884,28 @@ static void WideBindPrepass(const EntityPacket& pkt, World* world, Entity* playe
         const float x = p[0] - ppx, y = p[1] - ppy, z = p[2] - ppz;
         return x * x + y * y + z * z >= hide2;
     };
+    // [Coop] SpawnKeyBind: key round first. The host told us which spawn key built its guard (IC_SPAWN kind 2); the body
+    // our own manager built for the same key is the same NPC from the same data (spawn-manager-2026-11-25.md sections 5-6).
+    if (SpawnKeyBindOn()) {
+        for (int a = 0; a < nN; ++a) {
+            const uint64_t k = SpawnKeyForHostObj(need[a].objId);
+            if (!k) { ++s_wbKeyUnknown; continue; }
+            const uintptr_t le = SpawnEntityOfKey(k);
+            if (!le) { ++s_wbKeyNoLocal; continue; }
+            int hit = -1;
+            for (int b = 0; b < nC; ++b) if (!cand[b].taken && (uintptr_t)cand[b].e == le) { hit = b; break; }
+            if (hit < 0) { ++s_wbKeyNotFree; continue; }
+            if (cand[hit].arch != need[a].arch) ++s_wbKeyArchDiff;
+            const float dx = cand[hit].pos[0] - need[a].pos[0], dy = cand[hit].pos[1] - need[a].pos[1], dz = cand[hit].pos[2] - need[a].pos[2];
+            need[a].cand = hit; need[a].d2 = dx * dx + dy * dy + dz * dz; cand[hit].taken = true;
+            GuestObjAdd(need[a].objId, (unsigned int)cand[hit].e);
+            ++s_wbKey;
+            static unsigned s_kl = 0;
+            if (s_kl < 200) { ++s_kl; L("[WideBind] objId=%016llX key=%016llX -> ent=%08X d=%.1f m (key)\n", (unsigned long long)need[a].objId, (unsigned long long)k, (unsigned int)cand[hit].e, (double)sqrtf(need[a].d2)); }
+        }
+    }
     for (int round = 0; round < rounds; ++round) {
+        if (R <= 1.5f) break;
         for (;;) {
             int bn = -1, bc = -1; float bd = limits[round];
             for (int a = 0; a < nN; ++a) {
@@ -7930,6 +7955,10 @@ static void WideBindReport() {
       (double)WideBindRadiusM(), s_wbRuns, s_wbNeed, s_wbExact, s_wbWide, s_wbNoArch, s_wbFar,
       (double)(s_wbFarMin < 1e8f ? s_wbFarMin : -1.0f), (double)s_wbPool / (double)s_wbRuns);
     L("[WideBind] far linked=%u beyond nearest 12-20m=%u 20-40m=%u >=40m=%u\n", s_wbFarLinked, s_wbBeyond[0], s_wbBeyond[1], s_wbBeyond[2]);
+    if (SpawnKeyBindOn()) {
+        L("[WideBind] key bound=%u noKeyFromHost=%u noLocalForKey=%u localNotFree=%u archDiff=%u\n", s_wbKey, s_wbKeyUnknown, s_wbKeyNoLocal, s_wbKeyNotFree, s_wbKeyArchDiff);
+        s_wbKey = s_wbKeyUnknown = s_wbKeyNoLocal = s_wbKeyNotFree = s_wbKeyArchDiff = 0;
+    }
     s_wbNeed = s_wbExact = s_wbWide = s_wbNoArch = s_wbFar = s_wbPool = s_wbRuns = 0; s_wbFarMin = 1e9f;
     s_wbFarLinked = 0; s_wbBeyond[0] = s_wbBeyond[1] = s_wbBeyond[2] = 0;
 }
@@ -10378,7 +10407,7 @@ static void AttackForwardReport() {
       s_afSeen[0], s_afSeen[1], s_afTx[0], s_afTx[1], s_afDropped, s_afRx[0], s_afRx[1], s_afPost[0], s_afPost[1], s_afUnres, s_afFallback, s_afFail);
 }
 
-bool SpawnShareOn(); void SpawnShareRx(uint64_t key);   // spawn_census.cpp ([Coop] SpawnShare)
+bool SpawnShareOn(); void SpawnShareRx(uint64_t key, const uint8_t* payload, uint8_t len);   // spawn_census.cpp ([Coop] SpawnShare / SpawnKeyBind)
 // Receiver part 1, the local player's frame: drain the lane (the only consumer) and queue IC_FIGHT for the puppet.
 static void FightIntentDrain() {
     const bool fi = FightIntentsOn();
@@ -10393,7 +10422,7 @@ static void FightIntentDrain() {
         if (m.channel == IC_BRAIN) { Brain::OnIntent(m.wireId, m.seq, m.flags, m.payload, m.len); continue; }                 // [Coop] Brain
         if (m.channel == IC_ACTION) { GalGuestRx(m); continue; }                                                              // [Coop] GuardActionLane
         if (m.channel == IC_PCHAN) { PchanRx(m); continue; }
-        if (m.channel == IC_SPAWN) { SpawnShareRx(m.wireId); continue; }                                                     // [Coop] SpawnShare                                                                  // [Coop] PuppetChannels
+        if (m.channel == IC_SPAWN) { SpawnShareRx(m.wireId, m.payload, m.len); continue; }                                                     // [Coop] SpawnShare                                                                  // [Coop] PuppetChannels
         if (m.channel == IC_PDAMAGE && m.wireId == kPdrWire && m.len == sizeof(PdrPayload)) {   // [Coop] PlayerDamageRelay
             PdrPayload p; memcpy(&p, m.payload, sizeof(p));
             PlayerDamageOwnerApply(p, (m.flags & IF_BASE) != 0);
@@ -15657,7 +15686,7 @@ static void DumpConfigOnce()
         // The Tune* values are floats (read with strtod, see ShipTuningTick); the dump shows the integer part.
         { "Coop", "TuneConeAngle", 120 }, { "Coop", "TuneConeRange", 350 }, { "Coop", "TuneMaxTime", 30 },
         { "Coop", "TuneAggroTime", 30 }, { "Coop", "TuneHull", 0 },
-        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 }, { "Coop", "WeaponSync", 0 }, { "Coop", "ShipPeerZ", 0 }, { "Coop", "ShipBindProbe", 0 }, { "Coop", "ShipSpawnProbe", 0 }, { "Coop", "ShipSpawnFire", 0 }, { "Coop", "ShipSpawnFirePid", 0 }, { "Coop", "SpawnCensus", 0 }, { "Coop", "SpawnReplayFire", 0 }, { "Coop", "SpawnReplayFirePid", 0 }, { "Coop", "SpawnShare", 0 }, { "Coop", "SpawnShareRadiusM", 150 },{ "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 },
+        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 }, { "Coop", "WeaponSync", 0 }, { "Coop", "ShipPeerZ", 0 }, { "Coop", "ShipBindProbe", 0 }, { "Coop", "ShipSpawnProbe", 0 }, { "Coop", "ShipSpawnFire", 0 }, { "Coop", "ShipSpawnFirePid", 0 }, { "Coop", "SpawnCensus", 0 }, { "Coop", "SpawnReplayFire", 0 }, { "Coop", "SpawnReplayFirePid", 0 }, { "Coop", "SpawnShare", 0 }, { "Coop", "SpawnKeyBind", 0 }, { "Coop", "SpawnShareRadiusM", 150 },{ "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 },
         { "Coop", "CombatTest", 0 }, { "Coop", "CrashContext", 0 }, { "Coop", "CorpseKeepSec", 30 }, { "Coop", "CrowdProbeIntegrate", 1 },
         { "Coop", "CrowdProbeLiveKeys", 1 }, { "Coop", "DamageRelay", 0 }, { "Coop", "Diag", 0 },
         { "Coop", "DisableCrowd", 0 }, { "Coop", "DisablePuppetAI", 1 }, { "Coop", "DisableSpawns", 0 },
@@ -16084,6 +16113,7 @@ static void OnFrameInner(Human* updatedHuman) {
             { int TraversalProbeReport(char*, int); char trb[200]; if (TraversalProbeReport(trb, sizeof(trb)) > 0) L("%s\n", trb); }   // [Coop] TraversalProbe
             { int ShipSpawnProbeReport(char*, int); char ssb[160]; if (ShipSpawnProbeReport(ssb, sizeof(ssb)) > 0) L("%s\n", ssb); }   // [Coop] ShipSpawnProbe
             { int SpawnCensusReport(char*, int); char scb[200]; if (SpawnCensusReport(scb, sizeof(scb)) > 0) L("%s\n", scb); }   // [Coop] SpawnCensus
+            { int SpawnKeyReport(char*, int); char skb[240]; if (SpawnKeyReport(skb, sizeof(skb)) > 0) L("%s\n", skb); }   // [Coop] SpawnKeyBind
             char pdb[1100];
             if (PlayerDamageProbe::FormatReport(pdb, sizeof(pdb)) > 0) L("%s\n", pdb);   // [Coop] PlayerDamageProbe
             char rpb[256];
