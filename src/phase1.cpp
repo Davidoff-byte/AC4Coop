@@ -5409,6 +5409,47 @@ static void MirrorRetireStale() {
 // ship of the same vtable within SHIP_MATCH_TOL_M, (c) skip + count. The LOCAL ship (the Jackdaw), the
 // ghost and the player entity are never targets: driving the local hull with an NPC ship's transform is
 // what put the player's Jackdaw underwater.
+// [Coop] ShipBindProbe (default 0, read-only): can the guest's OWN ships stand in for the host's? Two games spawn their naval
+// traffic independently, so the 15 m position match above rarely fires and the rest become clones (no collision, no boarding,
+// and alive in every fast-travel crash, naval-s0-2026-11-25.md). Every 10 s: host records vs local ships (own ship, ghost and
+// proxies excluded) and, per host record, the nearest local ship of the same class (ReadShipClass) and of any class.
+static void ShipBindProbeTick(const EntityPacket& pkt, void* mgr, int n, Entity* localShip, Entity* player) {
+    static int s_on = -1;
+    if (s_on < 0) s_on = GetPrivateProfileIntA("Coop", "ShipBindProbe", 0, Paths::Ini()) != 0 ? 1 : 0;
+    if (!s_on) return;
+    static uint64_t s_next = 0; const uint64_t now = GetTickCount64();
+    if (now < s_next) return;
+    s_next = now + 10000;
+    Entity* loc[128]; unsigned locCls[128]; int ln = 0;
+    for (int s = 0; s < n && ln < 128; ++s) {
+        Entity* c = GetShipEntity(mgr, s);
+        if (!c || c == localShip || c == player || c == (Entity*)g_ghostShip || !readable(c, 0x60)) continue;
+        if (IsMirrorProxy(c) || *(uint32_t*)c != 0x01E4A128u) continue;
+        loc[ln] = c; locCls[ln] = (unsigned)ReadShipClass(c); ++ln;
+    }
+    int hostN = 0, w100 = 0, w300 = 0, w1000 = 0;
+    char line[700]; int o = 0; line[0] = 0;
+    for (uint32_t i = 0; i < pkt.count && i < (uint32_t)MAX_SYNC_ENTITIES; ++i) {
+        const EntityState& es = pkt.ents[i];
+        if (es.kind != 1) continue;
+        ++hostN;
+        float bestSame = 1e9f, bestAny = 1e9f;
+        for (int k = 0; k < ln; ++k) {
+            const float dx = loc[k]->m_GlobalMatrix.M41 - es.pos[0], dy = loc[k]->m_GlobalMatrix.M42 - es.pos[1];
+            const float d = sqrtf(dx * dx + dy * dy);
+            if (d < bestAny) bestAny = d;
+            if (locCls[k] == es.arch && d < bestSame) bestSame = d;
+        }
+        if (bestSame <= 100.0f) ++w100;
+        if (bestSame <= 300.0f) ++w300;
+        if (bestSame <= 1000.0f) ++w1000;
+        if (o < 640) o += _snprintf_s(line + o, sizeof(line) - o, _TRUNCATE, " [cls%u same=%.0f any=%.0f]", (unsigned)es.arch, bestSame, bestAny);
+    }
+    char cl[200]; int co = 0; cl[0] = 0;
+    for (int k = 0; k < ln && co < 180; ++k) co += _snprintf_s(cl + co, sizeof(cl) - co, _TRUNCATE, " %u", locCls[k]);
+    L("[ShipBind] host=%d local=%d sameClassWithin 100m=%d 300m=%d 1000m=%d | localCls:%s |%s\n", hostN, ln, w100, w300, w1000, cl, line);
+}
+
 static void ApplyShips(const EntityPacket& pkt) {
     if (!ShipSyncEnabled()) { g_syncCount = 0; return; }
     void* mgr = GetNavalManager();
@@ -5417,6 +5458,7 @@ static void ApplyShips(const EntityPacket& pkt) {
     World* world = World::GetCurrentWorld();
     Entity* player = world ? world->GetPlayer() : nullptr;
     Entity* localShip = GetLocalShip();
+    __try { ShipBindProbeTick(pkt, mgr, (int)n, localShip, player); } __except (EXCEPTION_EXECUTE_HANDLER) {}
     int count = 0;
     uint32_t nObj = 0, nNear = 0, nUnresolved = 0, nDup = 0;
     Entity* used[MAX_SYNC_ENTITIES];
@@ -15605,7 +15647,7 @@ static void DumpConfigOnce()
         // The Tune* values are floats (read with strtod, see ShipTuningTick); the dump shows the integer part.
         { "Coop", "TuneConeAngle", 120 }, { "Coop", "TuneConeRange", 350 }, { "Coop", "TuneMaxTime", 30 },
         { "Coop", "TuneAggroTime", 30 }, { "Coop", "TuneHull", 0 },
-        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 }, { "Coop", "WeaponSync", 0 }, { "Coop", "ShipPeerZ", 0 },{ "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 },
+        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 }, { "Coop", "WeaponSync", 0 }, { "Coop", "ShipPeerZ", 0 }, { "Coop", "ShipBindProbe", 0 },{ "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 },
         { "Coop", "CombatTest", 0 }, { "Coop", "CrashContext", 0 }, { "Coop", "CorpseKeepSec", 30 }, { "Coop", "CrowdProbeIntegrate", 1 },
         { "Coop", "CrowdProbeLiveKeys", 1 }, { "Coop", "DamageRelay", 0 }, { "Coop", "Diag", 0 },
         { "Coop", "DisableCrowd", 0 }, { "Coop", "DisablePuppetAI", 1 }, { "Coop", "DisableSpawns", 0 },

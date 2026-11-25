@@ -25,6 +25,10 @@ foreach ($p in $Pids) {
     } else {                                                                        # Havana: cursor at map ~(240,607)
         py -3.14 $pilot --pid $p stick -0.15 1 --sec 0.27 | Out-Null; Start-Sleep 0.5
         py -3.14 $pilot --pid $p stick -0.05 1 --sec 0.1 | Out-Null; Start-Sleep 1
+        $havanaEdge = $pos -and [math]::Abs($pos[0] - 104) -lt 30 -and [math]::Abs($pos[1] + 74) -lt 30
+        if ($havanaEdge) {                                                          # boot at (104,-74): cursor lands at ~(240,639)
+            py -3.14 $pilot --pid $p stick -0.4 0.9 --sec 0.12 | Out-Null; Start-Sleep 1
+        }
     }
     py -3.14 $pilot --pid $p frame --out (Join-Path $env:TEMP "sea_route_$p.png") | Out-Null
     py -3.14 $pilot --pid $p tap X --sec 0.15 | Out-Null; Start-Sleep 1.5           # "fast travel"
