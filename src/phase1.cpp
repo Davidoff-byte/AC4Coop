@@ -11240,15 +11240,25 @@ static void OwnDrain(Human* h) {
     HookMath::Transform m; HookMath::ToMatrix(&q, &m);
     m.M41 = pos[0]; m.M42 = pos[1]; m.M43 = pos[2];
     const int physMs = OwnPhysMs();
-    const bool phys = o.snap || (physMs > 0 && now - o.lastPhysUs >= (uint64_t)physMs * 1000ull);
+    // WR-9 / [Coop] OwnSnapAtTarget (default 0): with GuardInterpBuffer on, the frame after a > 5 m publish samples the
+    // ring INTERPOLATION-DELAY behind, so OwnRingSample still returns the pre-jump sample (it steps, never glides) and the
+    // one physics write (o.snap) placed the capsule at the OLD position; the render then stepped to the new one
+    // render-only. With the flag, the snap stays pending until the sample has crossed the jump (within 5 m of toPos).
+    static int s_osatOn = 0; static uint64_t s_osatNext = 0;
+    bool snapNow = o.snap;
+    if (snapNow && s_gibOn && OwnFlag("OwnSnapAtTarget", &s_osatOn, &s_osatNext)) {
+        const float jx = pos[0] - o.toPos[0], jy = pos[1] - o.toPos[1], jz = pos[2] - o.toPos[2];
+        if (jx * jx + jy * jy + jz * jz > 25.0f) snapNow = false;   // still before the jump: keep it pending
+    }
+    const bool phys = snapNow || (physMs > 0 && now - o.lastPhysUs >= (uint64_t)physMs * 1000ull);
     // 2026-11-25 (owner: guards' motion is jarring; per-frame mode measured 5-7 m "via=own" pops right after a link): the
     // per-frame writer jumped a newly linked body straight onto the host's position. It now closes the gap the way the
     // packet-rate writer does (BindApproachStep: from where the body is, at most 9 m/s, >= 30 m still snaps).
-    if (!o.snap) {
+    if (!snapNow) {
         float ap[3];
         if (BindApproachStep(o.ent, e->m_GlobalMatrix.M41, e->m_GlobalMatrix.M42, e->m_GlobalMatrix.M43, pos, ap)) { pos[0] = ap[0]; pos[1] = ap[1]; pos[2] = ap[2]; m.M41 = ap[0]; m.M42 = ap[1]; m.M43 = ap[2]; }
     }
-    if (!o.snap) BindNoteStep(e->m_GlobalMatrix.M41, e->m_GlobalMatrix.M42, e->m_GlobalMatrix.M43, pos, o.ent, "own", o.durUs > 300000 ? 1 : 0);   // per-frame pop metric
+    if (!snapNow) BindNoteStep(e->m_GlobalMatrix.M41, e->m_GlobalMatrix.M42, e->m_GlobalMatrix.M43, pos, o.ent, "own", o.durUs > 300000 ? 1 : 0);   // per-frame pop metric
     e->SetGlobalMatrixInternal(&m, phys);
     InterlockedIncrement(&s_gWrites);
     if (FloatProbeOn()) FloatProbe(e);
@@ -11262,7 +11272,7 @@ static void OwnDrain(Human* h) {
         // timers that must persist when GuardAnimFull is off (its block writes the whole o.ga back otherwise)
         s_own[j].ga.renderAlias = o.ga.renderAlias; s_own[j].ga.renderAliasUs = o.ga.renderAliasUs;
         s_own[j].ga.misSinceUs = o.ga.misSinceUs; s_own[j].ga.stuckLogUs = o.ga.stuckLogUs;
-        if (o.snap) s_own[j].snap = false;
+        if (snapNow) s_own[j].snap = false;
         if (phys) s_own[j].lastPhysUs = now;
     }
     ReleaseSRWLockExclusive(&s_ownLock);
@@ -15926,7 +15936,7 @@ static void DumpConfigOnce()
         // The Tune* values are floats (read with strtod, see ShipTuningTick); the dump shows the integer part.
         { "Coop", "TuneConeAngle", 120 }, { "Coop", "TuneConeRange", 350 }, { "Coop", "TuneMaxTime", 30 },
         { "Coop", "TuneAggroTime", 30 }, { "Coop", "TuneHull", 0 },
-        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 }, { "Coop", "WeaponSync", 0 }, { "Coop", "ShipPeerZ", 0 }, { "Coop", "ShipBindProbe", 0 }, { "Coop", "ShipSpawnProbe", 0 }, { "Coop", "ShipSpawnFire", 0 }, { "Coop", "ShipSpawnFirePid", 0 }, { "Coop", "SpawnCensus", 0 }, { "Coop", "SpawnReplayFire", 0 }, { "Coop", "SpawnReplayFirePid", 0 }, { "Coop", "SpawnShare", 0 }, { "Coop", "SpawnKeyBind", 0 }, { "Coop", "ShipClassBind", 0 }, { "Coop", "ShipClassBindSteal", 0 }, { "Coop", "SpawnShareRadiusM", 150 },{ "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "FastTravelCrashFix", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 },
+        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 }, { "Coop", "WeaponSync", 0 }, { "Coop", "ShipPeerZ", 0 }, { "Coop", "ShipBindProbe", 0 }, { "Coop", "ShipSpawnProbe", 0 }, { "Coop", "ShipSpawnFire", 0 }, { "Coop", "ShipSpawnFirePid", 0 }, { "Coop", "SpawnCensus", 0 }, { "Coop", "SpawnReplayFire", 0 }, { "Coop", "SpawnReplayFirePid", 0 }, { "Coop", "SpawnShare", 0 }, { "Coop", "SpawnKeyBind", 0 }, { "Coop", "ShipClassBind", 0 }, { "Coop", "ShipClassBindSteal", 0 }, { "Coop", "OwnSnapAtTarget", 0 }, { "Coop", "SpawnShareRadiusM", 150 },{ "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "FastTravelCrashFix", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 },
         { "Coop", "CombatTest", 0 }, { "Coop", "CrashContext", 0 }, { "Coop", "CorpseKeepSec", 30 }, { "Coop", "CrowdProbeIntegrate", 1 },
         { "Coop", "CrowdProbeLiveKeys", 1 }, { "Coop", "DamageRelay", 0 }, { "Coop", "Diag", 0 },
         { "Coop", "DisableCrowd", 0 }, { "Coop", "DisablePuppetAI", 1 }, { "Coop", "DisableSpawns", 0 },
