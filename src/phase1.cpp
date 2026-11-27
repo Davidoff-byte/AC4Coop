@@ -91,6 +91,7 @@ int    g_spawnCd = 0;        // net-mode spawn-retry cooldown (frames)
 uint64_t g_puppetWorldId = 0;// worldId the puppet was spawned in (informational)
 void*  g_puppetVtbl = nullptr;// vtable ptr captured at spawn; if it changes/unmaps the entity was freed
                              // (world change) -> drop the dangling ref. A pause leaves it intact.
+static void* s_puppetWorld = nullptr;   // WR-18: World::GetCurrentWorld() at spawn ([Coop] PuppetWorldDropRef)
 int    g_driveLoco = 0;      // [Coop] DriveLocomotion: replicate HumanGroundData player->puppet
 int    g_driveContext = 0;   // [Coop] DriveContext: replicate the active Human context (parkour/climb/swim)
 int    g_lastRemoteCtx = -1; // last remote contextId we drove onto the puppet (edge-trigger; -1 = fresh puppet)
@@ -15950,7 +15951,7 @@ static void DumpConfigOnce()
         // The Tune* values are floats (read with strtod, see ShipTuningTick); the dump shows the integer part.
         { "Coop", "TuneConeAngle", 120 }, { "Coop", "TuneConeRange", 350 }, { "Coop", "TuneMaxTime", 30 },
         { "Coop", "TuneAggroTime", 30 }, { "Coop", "TuneHull", 0 },
-        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 }, { "Coop", "WeaponSync", 0 }, { "Coop", "ShipPeerZ", 0 }, { "Coop", "ShipBindProbe", 0 }, { "Coop", "ShipSpawnProbe", 0 }, { "Coop", "ShipSpawnFire", 0 }, { "Coop", "ShipSpawnFirePid", 0 }, { "Coop", "SpawnCensus", 0 }, { "Coop", "SpawnReplayFire", 0 }, { "Coop", "SpawnReplayFirePid", 0 }, { "Coop", "SpawnShare", 0 }, { "Coop", "SpawnKeyBind", 0 }, { "Coop", "ShipClassBind", 0 }, { "Coop", "ShipClassBindSteal", 0 }, { "Coop", "OwnSnapAtTarget", 0 }, { "Coop", "SpawnShareRadiusM", 150 },{ "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "FastTravelCrashFix", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 },
+        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 }, { "Coop", "WeaponSync", 0 }, { "Coop", "ShipPeerZ", 0 }, { "Coop", "ShipBindProbe", 0 }, { "Coop", "ShipSpawnProbe", 0 }, { "Coop", "ShipSpawnFire", 0 }, { "Coop", "ShipSpawnFirePid", 0 }, { "Coop", "SpawnCensus", 0 }, { "Coop", "SpawnReplayFire", 0 }, { "Coop", "SpawnReplayFirePid", 0 }, { "Coop", "SpawnShare", 0 }, { "Coop", "SpawnKeyBind", 0 }, { "Coop", "ShipClassBind", 0 }, { "Coop", "ShipClassBindSteal", 0 }, { "Coop", "OwnSnapAtTarget", 0 }, { "Coop", "PuppetWorldDropRef", 0 }, { "Coop", "SpawnShareRadiusM", 150 },{ "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "FastTravelCrashFix", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 },
         { "Coop", "CombatTest", 0 }, { "Coop", "CrashContext", 0 }, { "Coop", "CorpseKeepSec", 30 }, { "Coop", "CrowdProbeIntegrate", 1 },
         { "Coop", "CrowdProbeLiveKeys", 1 }, { "Coop", "DamageRelay", 0 }, { "Coop", "Diag", 0 },
         { "Coop", "DisableCrowd", 0 }, { "Coop", "DisablePuppetAI", 1 }, { "Coop", "DisableSpawns", 0 },
@@ -16623,7 +16624,24 @@ static void OnFrameInner(Human* updatedHuman) {
                 L("[Net] puppet world changed (%08X%08X -> %08X%08X) -> despawn\n",
                   (uint32_t)(g_puppetWorldId >> 32), (uint32_t)g_puppetWorldId,
                   (uint32_t)(local.worldId >> 32), (uint32_t)local.worldId);
-                Phase1::DespawnPuppet();                 // the existing despawn path, never RemoveEntity here
+                // WR-18 / [Coop] PuppetWorldDropRef (default 0): liveness above is the vtable alone, so after a world
+                // change the old puppet's freed memory can hold ANOTHER entity of the same class and still pass; the
+                // despawn then RemoveEntity'd that innocent entity on the NEW world. With the flag, when the current
+                // World object is not the one the puppet was spawned in, the ref is dropped exactly as DespawnPuppet
+                // does but without RemoveEntity. Same World object (world id changed only) -> DespawnPuppet as before.
+                static int s_pwdOn = -1;
+                if (s_pwdOn < 0) s_pwdOn = GetPrivateProfileIntA("Coop", "PuppetWorldDropRef", 0, Paths::Ini()) != 0 ? 1 : 0;
+                void* curWorld = s_pwdOn ? (void*)World::GetCurrentWorld() : nullptr;
+                if (s_pwdOn && s_puppetWorld && curWorld != s_puppetWorld) {
+                    L("[Net] puppet's World %p is not the current %p -> drop ref, no RemoveEntity\n", s_puppetWorld, curWorld);
+                    g_puppet = nullptr; g_blockReg = nullptr;
+                    PuppetOwnClear();
+                    g_lastRemoteCtx = -1; g_lastActionAlias = 0xFFFFFFFF;
+                    g_bhvState = -1; g_switchCd = 0; g_casActivated = false;
+                } else {
+                    Phase1::DespawnPuppet();             // the existing despawn path, never RemoveEntity here
+                }
+                s_puppetWorld = nullptr;
                 g_puppetWorldId = 0; g_puppetVtbl = nullptr;
                 g_spawnTries = 0; g_spawnCd = 180;
                 g_snapCount = 0; g_snapHead = 0; g_haveSnapSeq = false;
@@ -16657,6 +16675,7 @@ static void OnFrameInner(Human* updatedHuman) {
                     Phase1::TrySpawnPuppet();
                     if (g_puppet) {                       // record identity for the liveness check
                         g_puppetWorldId = local.worldId;
+                        s_puppetWorld = (void*)World::GetCurrentWorld();   // WR-18: the World object it was spawned in
                         g_lastRemoteCtx = -1;             // drive the peer's current context onto the new puppet
                         g_lastActionAlias = 0xFFFFFFFF;   // and the peer's current action
                         g_bhvState = -1; g_switchCd = 0;  // re-establish the new puppet's behavior state
