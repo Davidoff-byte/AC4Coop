@@ -104,4 +104,15 @@ namespace Net {
         uint32_t outstanding, persisted, myInc, peerInc;   // current values, not counters
     };
     void GetIntentStats(IntentStats& out);
+
+    // ---- proto 17: pose lane ([Coop] PoseSync, default 0; docs/design/pose-sync-impl.md) ----
+    // Unreliable, newest seq wins, one datagram per frame (PoseWireHeader + records). With the flag off
+    // SendPose is a no-op and a received 'AC4P' datagram takes the pre-existing unknown-magic path (ignored).
+    bool PoseLaneOn();                                  // [Coop] PoseSync read at Init
+    void SendPose(const void* dgram, int len);          // caller-built datagram, len <= POSE_DGRAM_MAX
+    // Copy the newest accepted datagram if its seq differs from *lastSeq. Returns its length (0 = nothing
+    // new); *lastSeq is updated and *rxMs = GetTickCount64() at receive.
+    int  TakePose(uint8_t* out, int cap, uint32_t* lastSeq, uint64_t* rxMs);
+    struct PoseStats { uint32_t tx, rx, accepted, rejects, protoMismatch, stale; };
+    void GetPoseStats(PoseStats& out);
 }

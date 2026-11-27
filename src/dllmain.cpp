@@ -39,6 +39,7 @@
 #include "guard_poi.h"
 #include "fight_probe.h"
 #include "conflict_probe.h"
+#include "pose_sync.h"
 #include "puppet_listener.h"
 void Phase1_OwnerDamageInstall();   // phase1.cpp: [Coop] OwnerDamage SetLife detour (S9)
 #include "action_guard.h"
@@ -679,6 +680,9 @@ BOOL APIENTRY DllMain(HMODULE hMod, DWORD reason, LPVOID)
 
         // Which path removes the puppet's fighter record (sub_161F420). [Coop] FightProbe, default 0.
         FightProbe::Init();
+
+        // F3 pose parity: capture/apply at the compose call 0x45349C. [Coop] PoseSync / PoseSyncApply, default 0.
+        PoseSync::Init();
 
         // Who asks the FightManager to start a fight, player vs puppet (sub_1625330 / sub_1620140). [Coop] ConflictProbe, default 0.
         ConflictProbe::Init();
