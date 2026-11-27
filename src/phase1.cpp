@@ -201,8 +201,13 @@ void L(const char* fmt, ...) {
     printf("%s", buf);
     OutputDebugStringA(buf);
     // Also append to a per-process file, flushed each line, so the trail survives a crash.
-    static FILE* f = nullptr;
-    if (!f) {
+    static FILE* volatile f = nullptr;
+    // F18: first open is gated so two threads' first calls cannot both _fsopen(_SH_DENYWR) - the loser
+    // would fail, leak nothing useful and could null `f`. 0 = closed, 1 = opening, 2 = open.
+    static volatile LONG s_openState = 0;
+    if (!f && InterlockedCompareExchange(&s_openState, 1, 0) != 0) {
+        while (s_openState == 1) Sleep(0);   // another thread is opening: wait, then use its handle
+    } else if (!f) {
         char name[64];
         wsprintfA(name, "phase1_log_%u.txt", GetCurrentProcessId());
         const char* path = Paths::LogPath(name);
@@ -226,6 +231,7 @@ void L(const char* fmt, ...) {
                 fflush(f);
             }
         }
+        InterlockedExchange(&s_openState, f ? 2 : 0);   // a failed open may be retried, as before
     }
     if (f) { fputs(buf, f); fflush(f); }
 }
@@ -1243,9 +1249,8 @@ static void GhostTrack(void* ent) {
 // engine call at 0x01038330 (decomp unit "01038330"); null when the ship has no such object.
 // READ through the object's vtable slot 0x1B4 (float getter). Do NOT call slot 0x1B8: it takes an extra
 // argument and the wrong arity unbalances the stack.
-// WRITE through slot 0x12C, the __stdcall thunk to sub_1225A10 (a damage-aware setter: clamps, fires the
-// zero event, republishes the HUD fraction). __stdcall is the thunk's own convention (this on the stack),
-// which is also how the engine's virtual call site passes it.
+// WRITE through slot 0x12C, the thunk to sub_1225A10 (a damage-aware setter: clamps, fires the zero event,
+// republishes the HUD fraction). Calling convention: __thiscall - see WriteShipHullHP below (F14).
 // Evidence: ops/evidence/hull-hp-found.md.
 // Read once, cached (same idiom as PuppetPhysicsMode below).
 static int s_shipHPSync = -1;
@@ -1609,6 +1614,7 @@ static uint32_t g_capPlayerAlias = 0;
 
 // Read a player entity's full state (transform + locomotion) into a PlayerState.
 bool Phase1::CaptureLocalState(PlayerState& s) {
+    memset(&s, 0, sizeof(s));   // F15: no stack bytes on the wire (ctx/padding were left uninitialised outside swim)
     __try {
         World* world = World::GetCurrentWorld();
         if (!world)
@@ -5102,7 +5108,7 @@ static void CaptureShips(EntityPacket& pkt) {
         for (unsigned o = 0; o + 4 <= bytes; o += 4) {
             DWORD a = *(DWORD*)(s_prev[slot] + o), b = *(DWORD*)(cur + o);
             if (a == b) continue;
-            unsigned& h = *(unsigned*)&s_hits[slot][o >> 2];
+            unsigned char& h = s_hits[slot][o >> 2];   // F6: one byte per counter (was a 32-bit alias)
             if (h >= (unsigned)kPerOff) continue;
             ++h;
             L("[ShipDelta] t=%llu ship=%d crc=%u p=%08X off=0x%03X 0x%08X -> 0x%08X (i %d -> %d, f %.3f -> %.3f)\n",
@@ -6646,7 +6652,10 @@ static void StageLogEmit(const EntityState& es, float gx, float gy, float gz,
 // kept below one chunk:
 //   * age a corpse out of the PACKET after [Coop] CorpseKeepSec seconds (default 30, floor 0 =
 //     never age), and
-//   * cap corpse records per snapshot at CORPSE_BUDGET_MAX (24 < 26), oldest-first,
+//   * cap corpse records per snapshot at CORPSE_BUDGET_MAX (24 < 26), in emit order (nearest to the
+//     peer first - NOT oldest-first). F16: the 26/chunk figure assumes 52-byte records; a corpse that
+//     carries EF_ANIM is larger (net.cpp guard-anim wire), so 24 such corpses can still exceed a chunk
+//     (the cap is not sized from encoder bytes),
 // whichever binds first.  Ageing out means "stop including it in the packet" - the entity is not
 // deleted, es.dead is not touched, and the death lanes/tombstone/life-watch above all still run.
 // A corpse that is not packed keeps its first-seen stamp, so it cannot flap back in on the next
@@ -12284,7 +12293,7 @@ static void EntitySyncTick() {
         CaptureGuards(pkt);   // guards too: verify the mirror pipeline (capture -> drive) in one instance
         static int s_selfMax = -1;
         if (s_selfMax < 0) s_selfMax = GetPrivateProfileIntA("Coop", "EntitySelfTestMax", 1, Paths::Ini());
-        if ((int)pkt.count > s_selfMax) pkt.count = (uint32_t)s_selfMax;
+        if ((int)pkt.count > s_selfMax) pkt.count = (uint32_t)(s_selfMax < 0 ? 0 : s_selfMax);   // M-P1-2: negative max = 0, never 0xFFFFFFFF
         static float s_off = -1e9f;
         if (s_off == -1e9f) s_off = (float)GetPrivateProfileIntA("Coop", "EntitySelfTestOffset", 0, Paths::Ini());
         for (uint32_t i = 0; i < pkt.count; ++i) pkt.ents[i].pos[0] += s_off;
@@ -12790,7 +12799,7 @@ static int ScanNPCHealth(HealthEnt* out, int cap) {
             if (mbi.State == MEM_COMMIT && (mbi.Protect & PAGE_READWRITE) && !(mbi.Protect & PAGE_GUARD)) {
                 unsigned int* q = (unsigned int*)mbi.BaseAddress;
                 unsigned int* qe = (unsigned int*)((char*)mbi.BaseAddress + mbi.RegionSize);
-                for (; q + 1 < qe && n < cap; ++q) {
+                for (; (char*)q + 0x64 <= (char*)qe && n < cap; ++q) {   // M-P1-5: reads reach +0x63
                     if (*q != 0x02712F60u) continue;
                     unsigned char* o = (unsigned char*)q;
                     out[n].addr  = (unsigned int)o;
@@ -14272,7 +14281,7 @@ static void SimulatePeerKill() {
     ApplyPeerHealth(id, 0xFFFFu, x, y, z);
 }
 
-// ---- Die-clip watcher (always on, throttled) ---------------------------------------------------
+// ---- Die-clip watcher (throttled; NOT called - TickDieClipWatch/PollTrackedGuards are commented out in the frame tick, M-P2-5) ---------------------------------------------------
 // Functional death is solved (AI+0x8C=1 + health encoding), but the corpse animation comes from the
 // death state machine. To reproduce it we need the death clip's action alias. This samples the nearest
 // soldier's current action alias and, when its dead flag flips 0->1, dumps the alias window around the
@@ -14427,7 +14436,7 @@ static int ScanShipHealth(ShipHp* out, int cap) {
             if (mbi.State == MEM_COMMIT && (mbi.Protect & PAGE_READWRITE) && !(mbi.Protect & PAGE_GUARD)) {
                 unsigned int* q = (unsigned int*)mbi.BaseAddress;
                 unsigned int* qe = (unsigned int*)((char*)mbi.BaseAddress + mbi.RegionSize);
-                for (; q + 1 < qe && n < cap; ++q) {
+                for (; (char*)q + 0x64 <= (char*)qe && n < cap; ++q) {   // M-P1-5 (same overread, dead code)
                     unsigned int vt = *q;
                     if (vt != 0x02727088u && vt != 0x02712F60u) continue;
                     unsigned char* o = (unsigned char*)q;
@@ -15177,8 +15186,8 @@ void Phase1::TryShipProbe() {
         // with a2 == 0 it runs sub_525590(a1, ...) + a container walk, so a1 must be a collection
         // manager -- whether a ship Entity* is legal was never proven. The warm-up "flag on stack"
         // __thiscall attempt also puts a1 = 0, which is why the log always fell through.
-        // Nothing is lost: RequestShipProbe (phase1.cpp:6088) has no caller at HEAD, so g_shipReq
-        // (:6066) can never be set and this function is unreachable.
+        // Nothing is lost: Phase1::RequestShipProbe has no caller at HEAD, so g_shipReq (declared
+        // beside g_holdShipEnt) can never be set and this function is unreachable. (M-P3-3: cite by name)
 
         // Walk the ship entity's first 0x200 bytes for pointers to objects with a .rdata vtable
         // (its components). The ship HP (ShipHealthData / GcLNavalHealth) is behind one of these.
@@ -15896,7 +15905,7 @@ static void DumpConfigOnce()
         // The Tune* values are floats (read with strtod, see ShipTuningTick); the dump shows the integer part.
         { "Coop", "TuneConeAngle", 120 }, { "Coop", "TuneConeRange", 350 }, { "Coop", "TuneMaxTime", 30 },
         { "Coop", "TuneAggroTime", 30 }, { "Coop", "TuneHull", 0 },
-        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 }, { "Coop", "WeaponSync", 0 }, { "Coop", "ShipPeerZ", 0 }, { "Coop", "ShipBindProbe", 0 }, { "Coop", "ShipSpawnProbe", 0 }, { "Coop", "ShipSpawnFire", 0 }, { "Coop", "ShipSpawnFirePid", 0 }, { "Coop", "SpawnCensus", 0 }, { "Coop", "SpawnReplayFire", 0 }, { "Coop", "SpawnReplayFirePid", 0 }, { "Coop", "SpawnShare", 0 }, { "Coop", "SpawnKeyBind", 0 }, { "Coop", "ShipClassBind", 0 }, { "Coop", "ShipClassBindSteal", 0 }, { "Coop", "SpawnShareRadiusM", 150 },{ "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "FastTravelCrashFix", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 },
+        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 }, { "Coop", "WeaponSync", 0 }, { "Coop", "ShipPeerZ", 0 }, { "Coop", "ShipBindProbe", 0 }, { "Coop", "ShipSpawnProbe", 0 }, { "Coop", "ShipSpawnFire", 0 }, { "Coop", "ShipSpawnFirePid", 0 }, { "Coop", "SpawnCensus", 0 }, { "Coop", "SpawnReplayFire", 0 }, { "Coop", "SpawnReplayFirePid", 0 }, { "Coop", "SpawnShare", 0 }, { "Coop", "SpawnKeyBind", 0 }, { "Coop", "ShipClassBind", 0 }, { "Coop", "ShipClassBindSteal", 0 }, { "Coop", "SpawnShareRadiusM", 150 },{ "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "FastTravelCrashFix", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 },
         { "Coop", "CombatTest", 0 }, { "Coop", "CrashContext", 0 }, { "Coop", "CorpseKeepSec", 30 }, { "Coop", "CrowdProbeIntegrate", 1 },
         { "Coop", "CrowdProbeLiveKeys", 1 }, { "Coop", "DamageRelay", 0 }, { "Coop", "Diag", 0 },
         { "Coop", "DisableCrowd", 0 }, { "Coop", "DisablePuppetAI", 1 }, { "Coop", "DisableSpawns", 0 },
