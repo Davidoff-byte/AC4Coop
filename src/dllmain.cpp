@@ -615,7 +615,7 @@ BOOL APIENTRY DllMain(HMODULE hMod, DWORD reason, LPVOID)
         // (sub_968150). [Overlay] Probe / Enable, default 0 -> two GetPrivateProfileIntA, nothing patched.
         Overlay::InstallEarly();
 
-        // Phase 1: hook the per-frame Human update so spawns/drives run on the game's main thread.
+        // Phase 1: hook the per-frame Human update so spawns/drives run inside the game's Human update (M-P3-1: measured on worker threads, not the main thread - see the ApplyRemoteState note in phase1.cpp).
         if (HookGate("HookFrame")) Phase1::InstallFrameHook();
 
         // Guard the action/animation state gate (0x00679220) so a node with no bound target never

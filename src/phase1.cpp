@@ -3985,7 +3985,7 @@ static void GhostSuppressPlayerMarker(void* ghost)
 
 // Spawn a ghost ship = a FULL clone of the LOCAL ship (EntityGroup vtable[3] deep-copy + the 3 direct
 // component fields + physics disabled). Returns the ghost EntityGroup, or nullptr on failure.
-// Runs on the main thread (the frame hook). This is the ship-spawn primitive proven via F12.
+// Runs in the frame hook (the Human update - a game worker thread, M-P3-1). This is the ship-spawn primitive proven via F12.
 // Deep-copy a ship entity into a visual-only ghost: EntityGroup::Duplicate (vtable[3]) + component
 // deep-copy (+0x5C World shared, +0x78 rigging + +0xE8 AIComponent cloned) + disable physics/AI, then
 // AddEntity at the source ship's position. The render override drives it thereafter. Verified: works for
@@ -15109,7 +15109,7 @@ void Phase1::TrySceneProbe() {
 // F11 ship-spawn request (observation only). Asks the engine (FUN_01082810 @ VA 0x01082810) to spawn a
 // "ship-dude", then best-effort sets the type field at req+0xC to 0x13 so the USER can look at the game
 // and report what actually appears (the gate question for real ship sync). Does NOT touch the wire or any
-// co-op state. Runs on the main thread (via the frame hook), like the other probes.
+// co-op state. Runs in the frame hook (Human update, a game worker thread - M-P3-1), like the other probes.
 void Phase1::TryShipSpawn() {
     __try {
         L("[ShipSpawn] requesting ship-dude spawn (FUN_01082810)\n");
@@ -15276,7 +15276,7 @@ void Phase1::TryShipProbe() {
     }
 }
 
-// Runs on the main thread once per frame (only for the player's Human update).
+// Runs once per frame inside the player's Human update (a game worker thread, not the main thread - M-P3-1).
 // Identity probe: at every world load, dump the first entities with their handle objId, position,
 // archetype and index. Run this on BOTH machines and diff the two lists - if objIds match for the same
 // NPC, mirroring can bind by identity instead of by proximity, which removes the whole class of
