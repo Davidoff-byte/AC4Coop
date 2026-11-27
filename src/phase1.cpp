@@ -65,6 +65,15 @@ const int       MAIN_AI_TRACK       = 1;        // locomotion/parkour contexts l
 const int       CTX_GROUND          = 2;        // default context id (no explicit context active)
 const int       CTX_SWIM            = 10;       // Swim context: positions the character via its physics capsule
 const int       ACTLAYER_PRIMARY    = 0;        // main body-animation layer (action replication)
+// WR-12: channel/layer values received from the peer, checked before they reach an ActionComponent call. The engine
+// keys its controllers as channel | layer << 28 (sub_666BB0, IDA cc/g63 - see PuppetChannels), so only layers 0..15
+// are representable; the capture reads the channel as a u16 (Action+0x0C -> +8, 0xFFFF = unknown/any), so anything
+// wider never came from a real capture. Rejected pairs are skipped and counted, never clamped onto another controller.
+// UNVERIFIED: which in-range channel/layer values the engine actually has controllers for.
+static volatile LONG s_actKeyRejects = 0;
+static inline bool ActKeyValid(int channel, int layer) {
+    return layer >= 0 && layer <= 15 && channel >= 0 && channel <= 0xFFFF;
+}
 const int       ACTPERSIST_ALWAYS   = 4;        // ACTPersistType: keep a blend-factor slot across action/transition
                                                 // resets (default is transient) — makes our driven blend stick
 
@@ -82,6 +91,7 @@ int    g_spawnCd = 0;        // net-mode spawn-retry cooldown (frames)
 uint64_t g_puppetWorldId = 0;// worldId the puppet was spawned in (informational)
 void*  g_puppetVtbl = nullptr;// vtable ptr captured at spawn; if it changes/unmaps the entity was freed
                              // (world change) -> drop the dangling ref. A pause leaves it intact.
+static void* s_puppetWorld = nullptr;   // WR-18: World::GetCurrentWorld() at spawn ([Coop] PuppetWorldDropRef)
 int    g_driveLoco = 0;      // [Coop] DriveLocomotion: replicate HumanGroundData player->puppet
 int    g_driveContext = 0;   // [Coop] DriveContext: replicate the active Human context (parkour/climb/swim)
 int    g_lastRemoteCtx = -1; // last remote contextId we drove onto the puppet (edge-trigger; -1 = fresh puppet)
@@ -2760,6 +2770,7 @@ static void PchanApply(Human* h, uint32_t primaryAlias) {   // the puppet's own 
     ReleaseSRWLockExclusive(&s_pchLock);
     for (int j = 0; j < nt; ++j) {
         const int ch = (int)(todo[j].key & 0x0FFFFFFFu), ly = (int)(todo[j].key >> 28);
+        if (!ActKeyValid(ch, ly)) { InterlockedIncrement(&s_actKeyRejects); continue; }   // WR-12: peer key, channel wider than u16
         unsigned char mir = 0; void* cur = ac->GetCurrentAction(&mir, ch, ly);
         const uint32_t curAlias = readable(cur, 0x0C) ? *(uint32_t*)((char*)cur + 8) : 0;
         uint32_t want = todo[j].alias;
@@ -3021,7 +3032,9 @@ static void PuppetActionBlock(Human* h, const PlayerState& s, bool writeActions)
         if (writeActions && s.actionAlias != 0 && (s.actionAlias != g_lastActionAlias || reassertDue)) {
             if (reassertDue) s_pupIssueMs = GetTickCount64();
             ActionComponent* ac = h->GetActionComponent();
-            if (readable(ac, 0x40)) {
+            if (readable(ac, 0x40) && !ActKeyValid((int)s.actionChannel, (int)s.actionLayer)) {
+                InterlockedIncrement(&s_actKeyRejects);   // WR-12: peer channel/layer out of range - skip, never clamp
+            } else if (readable(ac, 0x40)) {
                 unsigned char mir = 0;
                 void* cur = ac->GetCurrentAction(&mir, 0, s.actionLayer);
                 uint32_t curAlias = readable(cur, 0x0C) ? *(uint32_t*)((char*)cur + 8) : 0;
@@ -4479,12 +4492,30 @@ struct SyncTarget {
     float    pos[3];
     float    quat[4];
 };
-static SyncTarget g_syncTargets[MAX_SYNC_ENTITIES];
-static int        g_syncCount = 0;
+// WR-6: double-buffered. ApplyShips used to rewrite the one table in place while the SGM hook (any thread,
+// and re-entrantly from ApplyShips' own SetGlobalMatrixInternal call) scanned it, so the hook could read a
+// half-written entry or a count that did not match the entries. The writer fills the back buffer and
+// publishes its index; the hook reads the published buffer and drops the override if that buffer's
+// generation changed (odd = being written) while it copied the entry - it never spins.
+struct SyncTargetBuf {
+    volatile LONG gen;           // even = stable, odd = being written
+    int           count;
+    SyncTarget    t[MAX_SYNC_ENTITIES];
+};
+static SyncTargetBuf g_syncBuf[2];
+static volatile LONG g_syncFront = 0;   // index of the published buffer
+static void SyncTargetsPublishEmpty() {
+    const LONG back = 1 - g_syncFront;
+    SyncTargetBuf& b = g_syncBuf[back];
+    _InterlockedIncrement(&b.gen);
+    b.count = 0;
+    _InterlockedIncrement(&b.gen);
+    _InterlockedExchange(&g_syncFront, back);
+}
 
 // [Coop] ShipSync (default 1): master kill switch for the whole NPC-ship lane — capture AND apply.
 // Read once, so a live run cannot flip it mid-session. When 0 the host sends no ship entries and the
-// peer's ApplyShips empties g_syncCount, which also clears any stale render override.
+// peer's ApplyShips publishes an empty sync-target buffer, which also clears any stale render override.
 static int s_shipSync = -1;
 static bool ShipSyncEnabled() {
     if (s_shipSync < 0) s_shipSync = GetPrivateProfileIntA("Coop", "ShipSync", 1, Paths::Ini());
@@ -5604,7 +5635,7 @@ static Entity* ShipClassBindFor(const EntityState& es, Entity* const* live, cons
     return nullptr;
 }
 static void ApplyShips(const EntityPacket& pkt) {
-    if (!ShipSyncEnabled()) { g_syncCount = 0; return; }
+    if (!ShipSyncEnabled()) { SyncTargetsPublishEmpty(); return; }
     void* mgr = GetNavalManager();
     if (!mgr || !readable((char*)mgr + 0x3E8, 8)) return;
     unsigned short n = *(unsigned short*)((char*)mgr + 0x3EE);
@@ -5613,6 +5644,9 @@ static void ApplyShips(const EntityPacket& pkt) {
     Entity* localShip = GetLocalShip();
     __try { ShipBindProbeTick(pkt, mgr, (int)n, localShip, player); } __except (EXCEPTION_EXECUTE_HANDLER) {}
     int count = 0;
+    const LONG syncBack = 1 - g_syncFront;                    // WR-6: fill the back buffer, publish at the end
+    SyncTargetBuf& syncBuf = g_syncBuf[syncBack];
+    _InterlockedIncrement(&syncBuf.gen);                      // odd: being written
     uint32_t nObj = 0, nNear = 0, nUnresolved = 0, nDup = 0;
     Entity* used[MAX_SYNC_ENTITIES];
     int usedN = 0;
@@ -5708,7 +5742,7 @@ static void ApplyShips(const EntityPacket& pkt) {
             if (dup) { ++nDup; continue; }
             if (usedN < MAX_SYNC_ENTITIES) used[usedN++] = ent;
 
-            SyncTarget& t = g_syncTargets[count];
+            SyncTarget& t = syncBuf.t[count];
             t.ent = (uint32_t)ent;
             t.pos[0] = es.pos[0]; t.pos[1] = es.pos[1]; t.pos[2] = es.pos[2];
             t.quat[0] = es.quat[0]; t.quat[1] = es.quat[1]; t.quat[2] = es.quat[2]; t.quat[3] = es.quat[3];
@@ -5725,7 +5759,9 @@ static void ApplyShips(const EntityPacket& pkt) {
             }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    g_syncCount = count;
+    syncBuf.count = count;
+    _InterlockedIncrement(&syncBuf.gen);                      // even: stable
+    _InterlockedExchange(&g_syncFront, syncBack);             // publish
     if (mirror) {
         MirrorRetireStale();
         const uint64_t now = GetTickCount64();
@@ -7626,16 +7662,21 @@ static int   s_mirroredN = 0;
 struct MirrorAction { unsigned int ent; unsigned int alias; };
 static MirrorAction s_mirrorAct[MIRROR_TABLE];
 static int s_mirrorActN = 0;
+// WR-2: eviction cursors. Once a table is full the next write replaces the OLDEST entry (FIFO), not
+// slot ptr % 512 - that hashed eviction could overwrite an entry recorded a moment ago (two pointers
+// with the same residue) while stale ones lived on, so a fresh body re-ran its first-sight path.
+static int s_mirroredNext = 0;
+static int s_mirrorActNext = 0;
 
-static void MirrorTablePut(void** table, int& n, void* e) {
+static void MirrorTablePut(void** table, int& n, int& next, void* e) {
     if (n < MIRROR_TABLE) { table[n++] = e; return; }
-    int slot = (int)((unsigned int)e % (unsigned int)MIRROR_TABLE);   // deterministic eviction
-    table[slot] = e;
+    table[next] = e;                                                    // evict the oldest
+    next = (next + 1) % MIRROR_TABLE;
 }
 
 static bool MirrorFirstSight(void* e) {
     for (int i = 0; i < s_mirroredN; ++i) if (s_mirroredEnt[i] == e) return false;
-    MirrorTablePut(s_mirroredEnt, s_mirroredN, e);
+    MirrorTablePut(s_mirroredEnt, s_mirroredN, s_mirroredNext, e);
     return true;
 }
 
@@ -7646,7 +7687,8 @@ static void MirrorAliasRemember(void* e, unsigned int alias) {
         ++s_mirrorActN;
         return;
     }
-    int slot = (int)((unsigned int)e % (unsigned int)MIRROR_TABLE);
+    const int slot = s_mirrorActNext;                                   // WR-2: evict the oldest
+    s_mirrorActNext = (s_mirrorActNext + 1) % MIRROR_TABLE;
     s_mirrorAct[slot].ent = (unsigned int)e;
     s_mirrorAct[slot].alias = alias;
 }
@@ -7667,6 +7709,7 @@ static bool MirrorAliasChanged(void* e, unsigned int alias) {
 // corpse's transform/clip from the host snapshot and it would stand back up or slide around.
 static void* s_mirrorDeadLocal[MIRROR_TABLE];
 static int   s_mirrorDeadLocalN = 0;
+static int   s_mirrorDeadLocalNext = 0;   // WR-2: FIFO eviction cursor
 
 static bool MirrorKilledLocally(void* e) {
     for (int i = 0; i < s_mirrorDeadLocalN; ++i) if (s_mirrorDeadLocal[i] == e) return true;
@@ -7674,7 +7717,7 @@ static bool MirrorKilledLocally(void* e) {
 }
 static void MarkMirrorKilledLocally(void* e) {
     if (MirrorKilledLocally(e)) return;
-    MirrorTablePut(s_mirrorDeadLocal, s_mirrorDeadLocalN, e);
+    MirrorTablePut(s_mirrorDeadLocal, s_mirrorDeadLocalN, s_mirrorDeadLocalNext, e);
 }
 
 // Reverse lookup: which host objId is this local body already playing? Used to stop one body being
@@ -8888,11 +8931,13 @@ static void GuardAnimApply(Human* h, OwnBody& o, uint64_t now, volatile int* ste
     GaState& st = o.ga;
     ++st.frameN;
     unsigned char mir = 0;
-    void* cur = ac->GetCurrentAction(&mir, 0, g.layer);
+    const bool keyOk = ActKeyValid((int)g.channel, (int)g.layer);   // WR-12: host values, checked before the engine sees them
+    if (!keyOk) InterlockedIncrement(&s_actKeyRejects);
+    void* cur = keyOk ? ac->GetCurrentAction(&mir, 0, g.layer) : nullptr;
     const uint32_t curAlias = readable(cur, 0x0C) ? *(uint32_t*)((char*)cur + 8) : 0;
     const float hostRatio = g.ratioQ / 65535.0f;
     // ---- action switch ----
-    if (o.alias && curAlias != o.alias) {
+    if (o.alias && keyOk && curAlias != o.alias) {
         const bool newTarget = st.issuedAlias != o.alias;
         if (newTarget || now - st.issuedUs > 250000) {
             *step = 2;
@@ -11244,15 +11289,25 @@ static void OwnDrain(Human* h) {
     HookMath::Transform m; HookMath::ToMatrix(&q, &m);
     m.M41 = pos[0]; m.M42 = pos[1]; m.M43 = pos[2];
     const int physMs = OwnPhysMs();
-    const bool phys = o.snap || (physMs > 0 && now - o.lastPhysUs >= (uint64_t)physMs * 1000ull);
+    // WR-9 / [Coop] OwnSnapAtTarget (default 0): with GuardInterpBuffer on, the frame after a > 5 m publish samples the
+    // ring INTERPOLATION-DELAY behind, so OwnRingSample still returns the pre-jump sample (it steps, never glides) and the
+    // one physics write (o.snap) placed the capsule at the OLD position; the render then stepped to the new one
+    // render-only. With the flag, the snap stays pending until the sample has crossed the jump (within 5 m of toPos).
+    static int s_osatOn = 0; static uint64_t s_osatNext = 0;
+    bool snapNow = o.snap;
+    if (snapNow && s_gibOn && OwnFlag("OwnSnapAtTarget", &s_osatOn, &s_osatNext)) {
+        const float jx = pos[0] - o.toPos[0], jy = pos[1] - o.toPos[1], jz = pos[2] - o.toPos[2];
+        if (jx * jx + jy * jy + jz * jz > 25.0f) snapNow = false;   // still before the jump: keep it pending
+    }
+    const bool phys = snapNow || (physMs > 0 && now - o.lastPhysUs >= (uint64_t)physMs * 1000ull);
     // 2026-11-25 (owner: guards' motion is jarring; per-frame mode measured 5-7 m "via=own" pops right after a link): the
     // per-frame writer jumped a newly linked body straight onto the host's position. It now closes the gap the way the
     // packet-rate writer does (BindApproachStep: from where the body is, at most 9 m/s, >= 30 m still snaps).
-    if (!o.snap) {
+    if (!snapNow) {
         float ap[3];
         if (BindApproachStep(o.ent, e->m_GlobalMatrix.M41, e->m_GlobalMatrix.M42, e->m_GlobalMatrix.M43, pos, ap)) { pos[0] = ap[0]; pos[1] = ap[1]; pos[2] = ap[2]; m.M41 = ap[0]; m.M42 = ap[1]; m.M43 = ap[2]; }
     }
-    if (!o.snap) BindNoteStep(e->m_GlobalMatrix.M41, e->m_GlobalMatrix.M42, e->m_GlobalMatrix.M43, pos, o.ent, "own", o.durUs > 300000 ? 1 : 0);   // per-frame pop metric
+    if (!snapNow) BindNoteStep(e->m_GlobalMatrix.M41, e->m_GlobalMatrix.M42, e->m_GlobalMatrix.M43, pos, o.ent, "own", o.durUs > 300000 ? 1 : 0);   // per-frame pop metric
     e->SetGlobalMatrixInternal(&m, phys);
     InterlockedIncrement(&s_gWrites);
     if (FloatProbeOn()) FloatProbe(e);
@@ -11266,7 +11321,7 @@ static void OwnDrain(Human* h) {
         // timers that must persist when GuardAnimFull is off (its block writes the whole o.ga back otherwise)
         s_own[j].ga.renderAlias = o.ga.renderAlias; s_own[j].ga.renderAliasUs = o.ga.renderAliasUs;
         s_own[j].ga.misSinceUs = o.ga.misSinceUs; s_own[j].ga.stuckLogUs = o.ga.stuckLogUs;
-        if (o.snap) s_own[j].snap = false;
+        if (snapNow) s_own[j].snap = false;
         if (phys) s_own[j].lastPhysUs = now;
     }
     ReleaseSRWLockExclusive(&s_ownLock);
@@ -15964,7 +16019,7 @@ static void DumpConfigOnce()
         // The Tune* values are floats (read with strtod, see ShipTuningTick); the dump shows the integer part.
         { "Coop", "TuneConeAngle", 120 }, { "Coop", "TuneConeRange", 350 }, { "Coop", "TuneMaxTime", 30 },
         { "Coop", "TuneAggroTime", 30 }, { "Coop", "TuneHull", 0 },
-        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 }, { "Coop", "WeaponSync", 0 }, { "Coop", "ShipPeerZ", 0 }, { "Coop", "ShipBindProbe", 0 }, { "Coop", "ShipSpawnProbe", 0 }, { "Coop", "ShipSpawnFire", 0 }, { "Coop", "ShipSpawnFirePid", 0 }, { "Coop", "SpawnCensus", 0 }, { "Coop", "SpawnReplayFire", 0 }, { "Coop", "SpawnReplayFirePid", 0 }, { "Coop", "SpawnShare", 0 }, { "Coop", "SpawnKeyBind", 0 }, { "Coop", "ShipClassBind", 0 }, { "Coop", "ShipClassBindSteal", 0 }, { "Coop", "SpawnShareRadiusM", 150 },{ "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "TableEvict", 0 }, { "Coop", "UsedEntAllPaths", 0 }, { "Coop", "PuppetSeqResync", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "FastTravelCrashFix", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 }, { "Coop", "PuppetListener", 0 }, { "Coop", "PuppetListenerAttach", 0 }, { "Coop", "PuppetMaxLife", 0 }, { "Coop", "ConflictProbe", 0 },
+        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 }, { "Coop", "WeaponSync", 0 }, { "Coop", "ShipPeerZ", 0 }, { "Coop", "ShipBindProbe", 0 }, { "Coop", "ShipSpawnProbe", 0 }, { "Coop", "ShipSpawnFire", 0 }, { "Coop", "ShipSpawnFirePid", 0 }, { "Coop", "SpawnCensus", 0 }, { "Coop", "SpawnReplayFire", 0 }, { "Coop", "SpawnReplayFirePid", 0 }, { "Coop", "SpawnShare", 0 }, { "Coop", "SpawnKeyBind", 0 }, { "Coop", "ShipClassBind", 0 }, { "Coop", "ShipClassBindSteal", 0 }, { "Coop", "SpawnShareRadiusM", 150 }, { "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "TableEvict", 0 }, { "Coop", "UsedEntAllPaths", 0 }, { "Coop", "PuppetSeqResync", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "FastTravelCrashFix", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 }, { "Coop", "PuppetListener", 0 }, { "Coop", "PuppetListenerAttach", 0 }, { "Coop", "PuppetMaxLife", 0 }, { "Coop", "ConflictProbe", 0 }, { "Coop", "OwnSnapAtTarget", 0 }, { "Coop", "PuppetWorldDropRef", 0 }, { "Coop", "PadIdPreferOffered", 0 },
         { "Coop", "CombatTest", 0 }, { "Coop", "CrashContext", 0 }, { "Coop", "CorpseKeepSec", 30 }, { "Coop", "CrowdProbeIntegrate", 1 },
         { "Coop", "CrowdProbeLiveKeys", 1 }, { "Coop", "DamageRelay", 0 }, { "Coop", "Diag", 0 },
         { "Coop", "DisableCrowd", 0 }, { "Coop", "DisablePuppetAI", 1 }, { "Coop", "DisableSpawns", 0 },
@@ -16637,7 +16692,24 @@ static void OnFrameInner(Human* updatedHuman) {
                 L("[Net] puppet world changed (%08X%08X -> %08X%08X) -> despawn\n",
                   (uint32_t)(g_puppetWorldId >> 32), (uint32_t)g_puppetWorldId,
                   (uint32_t)(local.worldId >> 32), (uint32_t)local.worldId);
-                Phase1::DespawnPuppet();                 // the existing despawn path, never RemoveEntity here
+                // WR-18 / [Coop] PuppetWorldDropRef (default 0): liveness above is the vtable alone, so after a world
+                // change the old puppet's freed memory can hold ANOTHER entity of the same class and still pass; the
+                // despawn then RemoveEntity'd that innocent entity on the NEW world. With the flag, when the current
+                // World object is not the one the puppet was spawned in, the ref is dropped exactly as DespawnPuppet
+                // does but without RemoveEntity. Same World object (world id changed only) -> DespawnPuppet as before.
+                static int s_pwdOn = -1;
+                if (s_pwdOn < 0) s_pwdOn = GetPrivateProfileIntA("Coop", "PuppetWorldDropRef", 0, Paths::Ini()) != 0 ? 1 : 0;
+                void* curWorld = s_pwdOn ? (void*)World::GetCurrentWorld() : nullptr;
+                if (s_pwdOn && s_puppetWorld && curWorld != s_puppetWorld) {
+                    L("[Net] puppet's World %p is not the current %p -> drop ref, no RemoveEntity\n", s_puppetWorld, curWorld);
+                    g_puppet = nullptr; g_blockReg = nullptr;
+                    PuppetOwnClear();
+                    g_lastRemoteCtx = -1; g_lastActionAlias = 0xFFFFFFFF;
+                    g_bhvState = -1; g_switchCd = 0; g_casActivated = false;
+                } else {
+                    Phase1::DespawnPuppet();             // the existing despawn path, never RemoveEntity here
+                }
+                s_puppetWorld = nullptr;
                 g_puppetWorldId = 0; g_puppetVtbl = nullptr;
                 g_spawnTries = 0; g_spawnCd = 180;
                 g_snapCount = 0; g_snapHead = 0; g_haveSnapSeq = false;
@@ -16671,6 +16743,7 @@ static void OnFrameInner(Human* updatedHuman) {
                     Phase1::TrySpawnPuppet();
                     if (g_puppet) {                       // record identity for the liveness check
                         g_puppetWorldId = local.worldId;
+                        s_puppetWorld = (void*)World::GetCurrentWorld();   // WR-18: the World object it was spawned in
                         g_lastRemoteCtx = -1;             // drive the peer's current context onto the new puppet
                         g_lastActionAlias = 0xFFFFFFFF;   // and the peer's current action
                         g_bhvState = -1; g_switchCd = 0;  // re-establish the new puppet's behavior state
@@ -16975,19 +17048,25 @@ static void LogSetGlobalMatrixBody(uint32_t thisEnt, uint32_t sgmMatrix, uint32_
     // Entity sync (NPCs + ships): override the RENDER for each synced entity, and clear `updatePhysics`
     // so the override does NOT feed back into the entity's own physics (UNVERIFIED-EVIDENCE per decomp/units.json, M-P3-2: SetGlobalMatrixInternal
     // 0x00528200 always writes the matrix, then only updates physics components when updatePhysics!=0).
-    for (int i = 0; i < g_syncCount; ++i) {
-        if (g_syncTargets[i].ent != thisEnt) continue;
+    const SyncTargetBuf& sb = g_syncBuf[g_syncFront & 1];     // WR-6: published buffer, generation-checked copy
+    const LONG sbGen = sb.gen;
+    const int sbCount = (sbGen & 1) ? 0 : sb.count;
+    for (int i = 0; i < sbCount && i < MAX_SYNC_ENTITIES; ++i) {
+        if (sb.t[i].ent != thisEnt) continue;
+        const SyncTarget tgt = sb.t[i];
+        _ReadWriteBarrier();
+        if (sb.gen != sbGen) break;                           // rewritten while copying: skip the override this call
         if (sgmPhysPtr) *(uint32_t*)sgmPhysPtr = (ShipClassBindMode() == 2 && *(uint32_t*)thisEnt == 0x01E4A128u) ? 1u : 0u;   // render-only, or [Coop] ShipClassBind=2: the hull moves too
         float* m = (float*)sgmMatrix;
         // ToMatrix, never hand-build: the hand-built off-diagonals were transposed and only appeared
         // correct while FromMatrix returned the conjugate (audit 2026-11-20).
-        HookMath::Quaternion q; q.x = g_syncTargets[i].quat[0]; q.y = g_syncTargets[i].quat[1];
-                                q.z = g_syncTargets[i].quat[2]; q.w = g_syncTargets[i].quat[3];
+        HookMath::Quaternion q; q.x = tgt.quat[0]; q.y = tgt.quat[1];
+                                q.z = tgt.quat[2]; q.w = tgt.quat[3];
         HookMath::Transform tm; HookMath::ToMatrix(&q, &tm);
         m[0] = tm.M11;  m[1] = tm.M12;  m[2]  = tm.M13;
         m[4] = tm.M21;  m[5] = tm.M22;  m[6]  = tm.M23;
         m[8] = tm.M31;  m[9] = tm.M32;  m[10] = tm.M33;
-        m[12] = g_syncTargets[i].pos[0]; m[13] = g_syncTargets[i].pos[1]; m[14] = g_syncTargets[i].pos[2];
+        m[12] = tgt.pos[0]; m[13] = tgt.pos[1]; m[14] = tgt.pos[2];
         return;
     }
 
@@ -17055,7 +17134,18 @@ static void* buildTrampoline(uintptr_t target, size_t stolenLen) {
 typedef char (__fastcall *GetUnusedPad_t)(void* padMgr, void* edx, uint8_t* out);
 static GetUnusedPad_t g_origGetUnusedPad = nullptr;
 
+// WR-20 / [Coop] PadIdPreferOffered (default 0, read once at install): the forced scan below takes the first null slot of
+// 0..7, but the engine only offers the ids of its ordered candidate list (sub_A0A790; decomp/candidates/00744CF0.cpp
+// tests this[id] for each listed id). With the flag the original runs first and its answer - an offered AND empty slot,
+// per its contract - is used; the forced scan remains only for "no offered slot free" (returning 0 there makes the
+// caller use slot 0 = the player's pad). NEED RE for a full fix: what the candidate list holds when it has no free id.
+static int s_padPreferOffered = 0;
 static char __fastcall MyGetUnusedPadID(void* padMgr, void* edx, uint8_t* out) {
+    if (g_blockReg && s_padPreferOffered && g_origGetUnusedPad(padMgr, edx, out)) {
+        char msg[64]; wsprintfA(msg, "[Phase1] GetUnusedPadID -> offered pad %d\n", (int)*out);
+        OutputDebugStringA(msg);
+        return 1;
+    }
     if (g_blockReg) {                                  // a puppet exists -> give it its own slot
         for (int i = 0; i < 8; ++i) {
             if (((void**)padMgr)[i] == nullptr) {
@@ -17071,6 +17161,7 @@ static char __fastcall MyGetUnusedPadID(void* padMgr, void* edx, uint8_t* out) {
 
 static void InstallGetUnusedPadHook() {
     uintptr_t fn = base() + 0x344CF0;                  // PlayerPadManager::GetUnusedPadID
+    s_padPreferOffered = GetPrivateProfileIntA("Coop", "PadIdPreferOffered", 0, Paths::Ini()) != 0 ? 1 : 0;   // WR-20
     g_origGetUnusedPad = (GetUnusedPad_t)buildTrampoline(fn, 6);
     patchJmp(fn, (void*)&MyGetUnusedPadID, 6);
     OutputDebugStringA("[Phase1] GetUnusedPadID hook installed\n");
