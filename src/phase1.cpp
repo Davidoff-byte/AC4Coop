@@ -14620,6 +14620,7 @@ static void ApplyPeerHealth(uint64_t objId, unsigned short life, float x, float 
             // GuestKillMirrorEntity); MirrorVisualDeath stays first so the "[Mirror] dead ..." line is
             // still emitted exactly as before.
             bool applied = false;
+            const char* latch = "kill-refused";   // C2 latch-reason line (diagnostic only): why applied=0 below
             if (g_entHost == 1) {
                 // WR-14 (W-P2-2): the host path had neither gate the guest path has. A guard the host already
                 // killed (Life == 0xFFFF, the value SetLife(-1) lands) must not get SetLife(-1) again - that is
@@ -14633,21 +14634,25 @@ static void ApplyPeerHealth(uint64_t objId, unsigned short life, float x, float 
                 if (hostDead || DeathAppliedRecently(ent)) {
                     L("[Kill] peer DEATH objId=%llu ent=%08X skipped reason=%s\n", (unsigned long long)objId, ent,
                       hostDead ? "already-dead" : "duplicate");
+                    latch = hostDead ? "host-already-dead" : "host-duplicate-window";
                 } else {
                     applied = KillGuardEntity((Entity*)ent);
                     if (applied) MarkDeathApplied(ent);   // only a settled kill closes the window; a refusal may retry
+                    else latch = "host-kill-refused";
                 }
             }
             else if (!DeathAppliedRecently(ent)) {
                 MarkDeathApplied(ent);
                 MirrorVisualDeath((Entity*)ent);
                 applied = GuestKillMirrorEntity(objId, ent, viaGuestObj);
+                if (!applied) latch = "guest-mirror-refused (see [Mirror] reason=)";
             }
+            else latch = "guest-duplicate-window";
             if (KtOn(KT_RECV))
-                L("[KT] death recv objId=%llu -> ent=%08X ok=1 applied=%d\n",
-                  (unsigned long long)objId, ent, applied ? 1 : 0);
+                L("[KT] death recv objId=%llu -> ent=%08X ok=1 applied=%d%s%s\n",
+                  (unsigned long long)objId, ent, applied ? 1 : 0, applied ? "" : " latch=", applied ? "" : latch);
         } else if (KtOn(KT_RECV)) {
-            L("[KT] death recv objId=%llu -> ent=%08X ok=0 applied=0\n", (unsigned long long)objId, ent);
+            L("[KT] death recv objId=%llu -> ent=%08X ok=0 applied=0 latch=unresolved-ent\n", (unsigned long long)objId, ent);
         }
         return;
     }

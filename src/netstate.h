@@ -220,6 +220,9 @@ enum EntityKind : uint8_t {
     EK_SHIP      = 1,   // ship        -> phase1.cpp ApplyShips
     EK_GUARD     = 2,   // guard NPC   -> phase1.cpp ApplyGuards
     EK_KILL      = 3,   // one-shot death event -> ProcessKillEvents / Net::GetKillEntities
+    EK_RESERVED_4 = 4,  // NEVER PUBLISH. PROTOCOL-LEDGER A9.1 "kind-4 hole": 4 is unallocated and rejected on receive
+                        // (net.cpp DEC_KIND) for no wire reason; named so it does not read as an oversight. C2 proposes
+                        // KIND_VANISH = 5. Same precedent as the retired EF_HULLHP bit.
 };
 
 #pragma pack(push, 1)
