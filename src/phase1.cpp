@@ -8523,6 +8523,12 @@ static int OwnFlag(const char* key, int* cache, uint64_t* next);
 static bool GuardInterpBufferOn() { return OwnFlag("GuardInterpBuffer", &s_gibOn, &s_gibNext) != 0; }
 static int64_t OwnHostUs(uint32_t hostMs) {
     if (!s_hostBaseSet) { s_hostBaseMs = hostMs; s_hostBaseSet = true; }
+    // WR-11: host change -> host clock restarts; drop retained offset + base so old host clock doesn't linger
+    static uint32_t s_lastHostMs = 0;
+    if (s_hostBaseSet && (int32_t)(hostMs - s_lastHostMs) < -10000) {
+        s_hostBaseMs = hostMs; s_offCur = INT64_MAX; s_offPrev = INT64_MAX; s_offWinUs = 0;
+    }
+    s_lastHostMs = hostMs;
     return (int64_t)(int32_t)(hostMs - s_hostBaseMs) * 1000;
 }
 static void OwnOffsetNote(int64_t hostUs, uint64_t rxUs) {   // under s_ownLock (exclusive)
