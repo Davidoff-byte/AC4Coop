@@ -399,7 +399,10 @@ struct IntentCoordValue {
     uint8_t field;      // CoordField: 1 = hullCurrent (GcLShip+0xD0), 2 = sailState (GcLShip+0xCC),
                         // 9 = helm (GcLShip+0x39A, [Coop] HelmSync)
     uint8_t rsv[3];     // 0, except field 9: rsv[0] = holderIsLocal (1 = the publishing machine natively
-                        // owns this object). Every other field keeps all three bytes 0.
+                        // owns this object), and field 21 (CF_TRIGGER, [Coop] CoordTriggerRelay): rsv[0..1] =
+                        // host trigger index u16 LE, rsv[2] = class tag, value = trigger hash as raw bits.
+                        // Every other field keeps all three bytes 0. Same 8-byte layout: no protocol bump (an
+                        // older receiver counts fields 19/21 as bad and applies nothing).
     float   value;      // the value to publish / apply
 };
 #pragma pack(pop)

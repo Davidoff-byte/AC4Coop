@@ -1,5 +1,14 @@
 {
  "units": {
+  "0040D0C0": {
+   "addr": "0040D0C0",
+   "claimed_at": null,
+   "name": "TimeOfDayManager_SetCurrentTime",
+   "owner": null,
+   "receipts": [],
+   "size": 202,
+   "status": "unknown"
+  },
   "004212A0": {
    "addr": "004212A0",
    "claimed_at": null,

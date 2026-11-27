@@ -30,6 +30,7 @@
 #include "action_writer.h"
 #include "guard_sight.h"
 #include "event_probe.h"
+#include "world_sync.h"
 #include "combat_timing.h"
 #include "player_damage_probe.h"
 #include "puppet_stim.h"
@@ -660,6 +661,7 @@ BOOL APIENTRY DllMain(HMODULE hMod, DWORD reason, LPVOID)
 
         // Event probe on sub_64A020 (observation only): which events shooting / attacking posts. [Coop] EventProbe, default 0.
         EventProbe::Init();
+        WorldSync::Init();           // [Coop] TimeOfDaySync / CollectableProbe / CoordTriggerRelay (default 0; detour 0x00A014A0 only when CoordTriggerRelay != 0)
         PlayerDamageProbe::Init();   // [Coop] PlayerDamageProbe (default 0) / PlayerDamageRelay (default follows FightIntents)
         PuppetListener::Init();      // [Coop] PuppetListener / PuppetListenerAttach / PuppetMaxLife (code default 0; harvested from re/conflict-gate-probe b9cd5ab)
         CombatTiming::Init();        // [Coop] CombatTimingProbe (default 0): read-only attack timing lines

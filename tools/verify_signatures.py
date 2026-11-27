@@ -119,6 +119,9 @@ IAT_SITES = [
 CALL_SITES = [
     ("CreateSwapChain call", 0x0094A1D7, bytes.fromhex("8B 52 28 57 51 50 FF D2"), "mov edx,[edx+28h]; push edi,ecx,eax; call edx"),
     ("factory thunk", 0x00976220, bytes.fromhex("FF 25 18 A6 E3 01"), "jmp [0x01E3A618]"),
+    # src/world_sync.cpp ([Coop] TimeOfDaySync): the guest calls 0x0040D0C0 only when TimeOfDayManager vtable slot
+    # +0x6C (cell 0x01E3F8E4) holds it; the plugin re-reads the cell live before every call.
+    ("ToD setter vt cell", 0x01E3F8E4, bytes.fromhex("C0 D0 40 00"), "TimeOfDayManager vt+0x6C = 0x0040D0C0"),
 ]
 
 

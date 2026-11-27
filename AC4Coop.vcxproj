@@ -164,6 +164,7 @@
     <ClCompile Include="src\fort_probe.cpp" />
     <ClCompile Include="src\coord_enum.cpp" />
     <ClCompile Include="src\coord_sync.cpp" />
+    <ClCompile Include="src\world_sync.cpp" />
     <ClCompile Include="src\fort_damage.cpp" />
     <ClCompile Include="src\guard_sight.cpp" />
     <ClCompile Include="src\build_gate.cpp" />
@@ -175,6 +176,7 @@
   <ItemGroup>
     <ClInclude Include="src\coord_enum.h" />
     <ClInclude Include="src\coord_sync.h" />
+    <ClInclude Include="src\world_sync.h" />
     <ClInclude Include="src\fort_damage.h" />
     <ClInclude Include="src\Hook.h" />
     <ClInclude Include="src\HookMath.h" />
