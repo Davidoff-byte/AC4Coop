@@ -51,9 +51,11 @@ common base `b95b7a5`; it is the branch that carries every feature described bel
 - spawn: AI ship spawn data has no per-ship identity (builder id 0, identical SpawnShipParams on both copies).
 - The repo's shipped `AC4Coop.ini` has `IntentLane=0` and `DisableSpawns=1`: every lane feature (Brain set, OwnerDamage, SailSync, SpawnKeyBind) is inert in a kit built from it, and SpawnKeyBind is also off under DisableSpawns. Owner sessions ran on the install ini (IntentLane=1, DisableSpawns=0). The 2026-11-25 test kit ships its own ini.
 - Fast-travel guest crash (`sub_76E0F0` release during the sea -> Havana unload) needs ship clones alive: 5/5;
-  `ReleaseStaleGuard` only moves it. OPEN; mitigation ShipMirror/ShipGhost=0.
+  `ReleaseStaleGuard` only moves it. INTERIM FIX in place: `MirrorRetireAll()` retires all proxies before
+  world change (gated by `[Coop] FastTravelCrashFix`, default 1). Complete fix needs sub-entity independence
+  (audit sub_52A980). Mitigation ShipMirror/ShipGhost=0 still safest. UNVERIFIED.
 ## Built but not verified live
-- 2026-11-25 crash-class: CR-2 `reloadBuilder` gives the async loader a static slot (path not reached in any run); CR-3 `WbTrap` tolerates a guard re-applied after a disarm (debug trap, default 0). CR-6/CR-7 closed by disassembly with no change; CR-5 (guards written from the player thread) open - `OwnUpdateGuards=1` scored worse.
+- 2026-11-25 crash-class: CR-2 `reloadBuilder` gives the async loader a static slot (path not reached in any run); CR-3 `WbTrap` tolerates a guard re-applied after a disarm (debug trap, default 0). CR-6/CR-7 closed by disassembly with no change; CR-5 (guards written from the player thread) PARTIALLY ADDRESSED: legacy direct-write fallback on starved guards now skipped when OwnGuardsOn() is true (hypothesized cause of worse score). Full fix needs game-run verification.
 - Guest combat, built after the owner fight (default 0, NOT yet run in the game): the 16-byte alignment fix for the forwarded
   attack event (968 of 1086 warning re-posts faulted at `0x018BD72D`); `[Coop] RespawnHitGraceMs` (hits forwarded while the
   guest reloads were applied 2.6-4.5 s late to the respawned player); `[Coop] GuardStageApply` (the guard's Fight stage
