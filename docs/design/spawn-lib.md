@@ -38,8 +38,12 @@ lines list them; their callbacks are unread — NPC spawns still use the engine 
   key, else SpawnLib follow builds one; guard lanes mirror it.
 
 ## Not done / unverified
-- Ships under the private owner get no owner AI setup (sub_196E910 also sets navigation); whether host-spawned ships
-  still sail is measured per run.
-- NPC owner classes: not read; adoption 1:1 risk unmeasured for NPCs.
-- Nothing despawns our private-owner ships before world unload.
-- World-unload behaviour with SpawnLib ships alive: untested.
+- Ships under the private owner skip the owner's adoption (vt[4] `sub_196E610` per build); they still get their crew
+  spawns (7 per hull). Whether they sail/fight like engine ships: not measured.
+- NPC owner class 0x026BDE50: callbacks forward to global functions (read), real owner kept; 28 host NPC spawns + 27
+  guest follow spawns in T8 without a crash. No 1:1 adoption study beyond that.
+- Crews of spawned ships never enter the host guard lane → no crew keys → no crew sync (evidence s11).
+- Requests that never build stay queued (their slot borrow is given back after 3 s); such a ship can appear later.
+- Nothing despawns our private-owner ships before world unload; world-unload behaviour with them alive: untested.
+- `ShipClassBindSteal=1` + SpawnLib: one guest AV 0xF1813C right after a steal (T6), cause unknown; tests since run
+  with steal off.
