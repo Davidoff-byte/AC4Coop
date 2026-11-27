@@ -4682,6 +4682,20 @@ static const char* BoardBitStr(int v, char* buf, size_t n) {
     return buf;
 }
 
+// [Coop] BoardStartGuest (default 0, read once): BoardProbe's S2 and BoardingForce no longer write bit 95 raw /
+// call the setter alone. They queue the ship's GcLShip and BoardStartGuestFire (OnFrame, after the OnFrameInner __try)
+// enters state 95 the engine's way: sub_1207960(obj,1) then sub_A014A0(obj, *(u16*)0x4DEAD5C, 0), only while the copy is
+// in state 91 (the event's only transition, 0x11F372A). The raw OR set the bit without the state instance (0x9F9EA0),
+// without 95's handler, and left 91 active so its regen kept healing (evidence naval-boarding-noclass-sink s1c).
+static int BoardStartGuestOn() {
+    static int s = -1;
+    if (s < 0) s = GetPrivateProfileIntA("Coop", "BoardStartGuest", 0, Paths::Ini()) != 0 ? 1 : 0;
+    return s;
+}
+static void* volatile s_bsgObj = nullptr;        // queued GcLShip (player-work thread writes and reads)
+static const char*    s_bsgFrom = "";
+static void BoardStartGuestQueue(void* obj, const char* from) { s_bsgFrom = from; s_bsgObj = obj; }
+
 // mode 0 = [Coop] BoardableTest: one-shot, verbose BEFORE/AFTER + both predicates (unchanged behaviour).
 // mode 1 = [Coop] BoardingForce (ported from 4093cb3's branch, b4d1692): repeats on the same 2 s cadence,
 //          compact one-line log, never touches s_done (the one-shot test's state must survive the other mode).
@@ -4713,6 +4727,11 @@ static void BoardableTestTick(int mode) {
             const unsigned char p408a = ((Pred)vt[408 / 4])(obj), p368a = ((Pred)vt[368 / 4])(obj);
             L("[Board] BEFORE ship=%p obj=%p dist=%.1f +0x3A9=%u +0x540=%u pred408=%u pred368=%u\n",
               best, obj, sqrtf(bestD2), b0, m0, p408a, p368a);
+        }
+        if (mode == 1 && BoardStartGuestOn()) {   // [Coop] BoardStartGuest: setter + 4DEAD5C from OnFrame instead
+            BoardStartGuestQueue(obj, "force");
+            L("[Board] ent=%p obj=%p was=%d engine entry queued (BoardStartGuest)\n", best, obj, (int)b0);
+            return;
         }
         CallSetBoardable(obj, 1);                                                        // SetBoardable(obj, 1)
         const unsigned char b1 = *((unsigned char*)obj + 0x3A9), m1 = *((unsigned char*)obj + 0x540);
@@ -5026,6 +5045,11 @@ static void BoardProbeTick() {
             __try { p408 = ((Pred)vt[408 / 4])(obj); p368 = ((Pred)vt[368 / 4])(obj); }
             __except (EXCEPTION_EXECUTE_HANDLER) { L("[Board] EXCEPTION 0x%08X at S1(predicates)\n", GetExceptionCode()); }
             L("[Board] S1 pred408=%u pred368=%u\n", (unsigned)p408, (unsigned)p368);
+        }
+        if (BoardStartGuestOn()) {   // [Coop] BoardStartGuest: S2 = the engine's own entry, fired from OnFrame (S2e lines)
+            BoardStartGuestQueue(obj, "probe");
+            L("[Board] S2 engine entry queued obj=%p gcl=%p objEqGcl=%d (no raw bit-95 write)\n", obj, gcl, obj == gcl ? 1 : 0);
+            return;
         }
         // S2 - add bit 95 to the mask. Expect bit95=1 and the hull unchanged: the condition must now be true.
         const bool wrote = SetBoardBit95(maskp);
@@ -6348,6 +6372,44 @@ static void NavStateFire() {
     L("[ShipSt] stats rows=%d post95=%ld postSink=%ld pass=%ld fail=%ld unsanctioned=%ld drive=%ld noThr=%ld bad=%ld noAutoSink skip=%ld pass=%ld evt5C=%u evtE0=%u\n",
       rn, c_navPost95, c_navPostSink, c_navPass, c_navFail, c_navUnsanc, c_navDrive, c_navNoThr, c_navBad, c_nasSkip, c_nasPass,
       (unsigned)NavEvt(0x04DEAD5Cu), (unsigned)NavEvt(0x04DEADE0u));
+}
+
+// [Coop] BoardStartGuest fire (OnFrame, player-work thread, no __try around the engine calls). One queued ship per
+// call; a 5 s re-read afterwards answers "did regen stop" (state 91's handler is the regen, s0a).
+static void BoardStartGuestFire() {
+    if (!BoardStartGuestOn()) return;
+    static void* s_chkObj = nullptr; static DWORD s_chkTick = 0; static float s_chkHull = 0.0f;
+    const DWORD now = GetTickCount();
+    char b0[24], b1[24];
+    if (s_chkObj && now - s_chkTick >= 5000) {
+        NavLocal L5;
+        if (NavRead(s_chkObj, &L5)) {
+            const int stopped = s_chkHull < L5.max ? (L5.hull <= s_chkHull + 0.5f ? 1 : 0) : -1;
+            L("[Board] S2e+5s obj=%p hull=%.1f->%.1f max=%.1f regenStopped=%d state=%s\n",
+              s_chkObj, s_chkHull, L5.hull, L5.max, stopped, ShipHBitsStr(L5.bits, b0, sizeof(b0)));
+        } else L("[Board] S2e+5s obj=%p unreadable\n", s_chkObj);
+        s_chkObj = nullptr;
+    }
+    void* obj = s_bsgObj;
+    if (!obj) return;
+    s_bsgObj = nullptr;
+    NavLocal L0;
+    if (!NavRead(obj, &L0)) { L("[Board] S2e obj=%p from=%s not a readable GcLShip - skipped\n", obj, s_bsgFrom); return; }
+    if (ShipHStateOf(L0.bits) != 91) {
+        L("[Board] S2e obj=%p from=%s state=%s - not 91, nothing posted\n", obj, s_bsgFrom, ShipHBitsStr(L0.bits, b0, sizeof(b0)));
+        return;
+    }
+    NavEnter95(obj, true);                       // sub_1207960(obj,1) then post 4DEAD5C - outside any __try
+    NavLocal L1; L1.bits = -1; L1.hull = 0.0f; L1.max = 0.0f; L1.a540 = 0;
+    NavRead(obj, &L1);
+    unsigned char p408 = 0xFF, p368 = 0xFF;      // the BoardingCondition predicates, called as BoardProbe calls them
+    __try { void** vt = *(void***)obj; p408 = ((unsigned char (__thiscall*)(void*))vt[408 / 4])(obj); p368 = ((unsigned char (__thiscall*)(void*))vt[368 / 4])(obj); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+    L("[Board] S2e obj=%p from=%s evt=%u before=%s after=%s bit91=%d bit95=%d a540=%u hull=%.1f max=%.1f pred408=%u pred368=%u\n",
+      obj, s_bsgFrom, (unsigned)NavEvt(0x04DEAD5Cu), ShipHBitsStr(L0.bits, b0, sizeof(b0)), ShipHBitsStr(L1.bits, b1, sizeof(b1)),
+      L1.bits >= 0 ? (L1.bits & 1) : -1, L1.bits >= 0 ? ((L1.bits >> 4) & 1) : -1, (unsigned)L1.a540, L1.hull, L1.max,
+      (unsigned)p408, (unsigned)p368);
+    s_chkObj = obj; s_chkTick = now; s_chkHull = L1.hull;
 }
 
 // [Coop] ShipNoAutoSink: the redirected `call sub_A014A0` at 0x01205379 (sub_1205280 = state 95's handler; ecx = the
@@ -16720,6 +16782,7 @@ static void __cdecl OnFrame(Human* updatedHuman) {
     if ((DWORD)s_playerWorkTid == GetCurrentThreadId()) ShipSpawnReplayFire();
     // [Coop] ShipStateSync: the guest's statechart posts / hull setter calls, same thread and same no-__try rule.
     if ((DWORD)s_playerWorkTid == GetCurrentThreadId()) NavStateFire();
+    if ((DWORD)s_playerWorkTid == GetCurrentThreadId()) BoardStartGuestFire();   // [Coop] BoardStartGuest
     InterlockedCompareExchange(&s_playerWorkTid, 0, (LONG)GetCurrentThreadId());   // player work over (if it was ours)
 }
 
@@ -16753,7 +16816,7 @@ static void DumpConfigOnce()
         // The Tune* values are floats (read with strtod, see ShipTuningTick); the dump shows the integer part.
         { "Coop", "TuneConeAngle", 120 }, { "Coop", "TuneConeRange", 350 }, { "Coop", "TuneMaxTime", 30 },
         { "Coop", "TuneAggroTime", 30 }, { "Coop", "TuneHull", 0 },
-        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 }, { "Coop", "WeaponSync", 0 }, { "Coop", "ShipPeerZ", 0 }, { "Coop", "ShipBindProbe", 0 }, { "Coop", "ShipSpawnProbe", 0 }, { "Coop", "ShipSpawnFire", 0 }, { "Coop", "ShipSpawnFirePid", 0 }, { "Coop", "SpawnCensus", 0 }, { "Coop", "SpawnReplayFire", 0 }, { "Coop", "SpawnReplayFirePid", 0 }, { "Coop", "SpawnShare", 0 }, { "Coop", "SpawnKeyBind", 0 }, { "Coop", "ShipClassBind", 0 }, { "Coop", "ShipClassBindSteal", 0 }, { "Coop", "ShipClassFix", 0 }, { "Coop", "ShipClassProbe", 0 }, { "Coop", "ShipStateSync", 0 }, { "Coop", "ShipNoAutoSink", 0 }, { "Coop", "SpawnShareRadiusM", 150 }, { "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "TableEvict", 0 }, { "Coop", "UsedEntAllPaths", 0 }, { "Coop", "PuppetSeqResync", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "FastTravelCrashFix", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 }, { "Coop", "PuppetListener", 0 }, { "Coop", "PuppetListenerAttach", 0 }, { "Coop", "PuppetMaxLife", 0 }, { "Coop", "ConflictProbe", 0 }, { "Coop", "OwnSnapAtTarget", 0 }, { "Coop", "PuppetWorldDropRef", 0 }, { "Coop", "PadIdPreferOffered", 0 }, { "Coop", "GuardPerceivePuppet", 0 },
+        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 }, { "Coop", "WeaponSync", 0 }, { "Coop", "ShipPeerZ", 0 }, { "Coop", "ShipBindProbe", 0 }, { "Coop", "ShipSpawnProbe", 0 }, { "Coop", "ShipSpawnFire", 0 }, { "Coop", "ShipSpawnFirePid", 0 }, { "Coop", "SpawnCensus", 0 }, { "Coop", "SpawnReplayFire", 0 }, { "Coop", "SpawnReplayFirePid", 0 }, { "Coop", "SpawnShare", 0 }, { "Coop", "SpawnKeyBind", 0 }, { "Coop", "ShipClassBind", 0 }, { "Coop", "ShipClassBindSteal", 0 }, { "Coop", "ShipClassFix", 0 }, { "Coop", "ShipClassProbe", 0 }, { "Coop", "ShipStateSync", 0 }, { "Coop", "ShipNoAutoSink", 0 }, { "Coop", "BoardStartGuest", 0 }, { "Coop", "SpawnShareRadiusM", 150 }, { "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "TableEvict", 0 }, { "Coop", "UsedEntAllPaths", 0 }, { "Coop", "PuppetSeqResync", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "FastTravelCrashFix", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 }, { "Coop", "PuppetListener", 0 }, { "Coop", "PuppetListenerAttach", 0 }, { "Coop", "PuppetMaxLife", 0 }, { "Coop", "ConflictProbe", 0 }, { "Coop", "OwnSnapAtTarget", 0 }, { "Coop", "PuppetWorldDropRef", 0 }, { "Coop", "PadIdPreferOffered", 0 }, { "Coop", "GuardPerceivePuppet", 0 },
         { "Coop", "ShipSpawnReplay", 0 },
         { "Coop", "ShipFields", 0 }, { "Coop", "HelmBoth", 0 }, { "Coop", "BoardingForce", 0 }, { "Coop", "PlayerFrameFallback", 0 },
         { "Coop", "CombatTest", 0 }, { "Coop", "CrashContext", 0 }, { "Coop", "CorpseKeepSec", 30 }, { "Coop", "CrowdProbeIntegrate", 1 },
