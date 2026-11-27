@@ -8453,8 +8453,8 @@ static unsigned s_wbNeed = 0, s_wbExact = 0, s_wbWide = 0, s_wbNoArch = 0, s_wbF
 static float    s_wbFarMin = 1e9f;   // nearest same-archetype free body that was beyond the radius (m)
 static unsigned s_wbFarLinked = 0, s_wbBeyond[3] = {};   // round-3 links; beyond-R nearest in 12-20 / 20-40 / >=40 m
 
-bool SpawnKeyBindOn(); uint64_t SpawnKeyForHostObj(uint64_t); uintptr_t SpawnEntityOfKey(uint64_t); void SpawnLibWantKey(uint64_t, uint64_t);   // spawn_census.cpp
-static unsigned s_wbKey = 0, s_wbKeyNoLocal = 0, s_wbKeyNotFree = 0, s_wbKeyArchDiff = 0, s_wbKeyUnknown = 0;
+bool SpawnKeyBindOn(); uint64_t SpawnKeyForHostObj(uint64_t); uintptr_t SpawnEntityOfKey(uint64_t); void SpawnLibWantKey(uint64_t, uint64_t); bool SpawnLibPendingFor(uint64_t);   // spawn_census.cpp / spawn_lib.cpp
+static unsigned s_wbKey = 0, s_wbKeyNoLocal = 0, s_wbKeyNotFree = 0, s_wbKeyArchDiff = 0, s_wbKeyUnknown = 0, s_wbKeyPend = 0;
 
 static void WideBindPrepass(const EntityPacket& pkt, World* world, Entity* player) {
     const float R = WideBindRadiusM();
@@ -8524,15 +8524,19 @@ static void WideBindPrepass(const EntityPacket& pkt, World* world, Entity* playe
     };
     // [Coop] SpawnKeyBind: key round first. The host told us which spawn key built its guard (IC_SPAWN kind 2); the body
     // our own manager built for the same key is the same NPC from the same data (spawn-manager-2026-11-25.md sections 5-6).
+    // pend[a]: a SpawnLib follow spawn for need[a] is queued/in flight/just built -> the distance rounds leave it alone, so
+    // the key round binds the new body next run (run 2026-11-28: a distance round took a body 6.9 m away first).
+    static bool pend[MAX_SYNC_ENTITIES];
+    for (int a = 0; a < nN; ++a) pend[a] = false;
     if (SpawnKeyBindOn()) {
         for (int a = 0; a < nN; ++a) {
             const uint64_t k = SpawnKeyForHostObj(need[a].objId);
             if (!k) { ++s_wbKeyUnknown; continue; }
             const uintptr_t le = SpawnEntityOfKey(k);
-            if (!le) { ++s_wbKeyNoLocal; SpawnLibWantKey(k, need[a].objId); continue; }   // [Coop] SpawnLib follow: replay our spec for k
+            if (!le) { ++s_wbKeyNoLocal; SpawnLibWantKey(k, need[a].objId); if ((pend[a] = SpawnLibPendingFor(need[a].objId))) ++s_wbKeyPend; continue; }   // [Coop] SpawnLib follow: replay our spec for k
             int hit = -1;
             for (int b = 0; b < nC; ++b) if (!cand[b].taken && (uintptr_t)cand[b].e == le) { hit = b; break; }
-            if (hit < 0) { ++s_wbKeyNotFree; SpawnLibWantKey(k, need[a].objId); continue; }   // body taken/gone: one more of the same
+            if (hit < 0) { ++s_wbKeyNotFree; SpawnLibWantKey(k, need[a].objId); if ((pend[a] = SpawnLibPendingFor(need[a].objId))) ++s_wbKeyPend; continue; }   // body taken/gone: one more of the same
             if (cand[hit].arch != need[a].arch) ++s_wbKeyArchDiff;
             const float dx = cand[hit].pos[0] - need[a].pos[0], dy = cand[hit].pos[1] - need[a].pos[1], dz = cand[hit].pos[2] - need[a].pos[2];
             need[a].cand = hit; need[a].d2 = dx * dx + dy * dy + dz * dz; cand[hit].taken = true;
@@ -8547,7 +8551,7 @@ static void WideBindPrepass(const EntityPacket& pkt, World* world, Entity* playe
         for (;;) {
             int bn = -1, bc = -1; float bd = limits[round];
             for (int a = 0; a < nN; ++a) {
-                if (need[a].cand >= 0) continue;
+                if (need[a].cand >= 0 || pend[a]) continue;
                 if (round == 2 && !farFromPlayer(need[a].pos)) continue;
                 for (int b = 0; b < nC; ++b) {
                     if (cand[b].taken || cand[b].arch != need[a].arch) continue;
@@ -8572,7 +8576,7 @@ static void WideBindPrepass(const EntityPacket& pkt, World* world, Entity* playe
     }
     // What was left without a body, and why: no free body of that archetype at all, or the nearest is beyond R.
     for (int a = 0; a < nN; ++a) {
-        if (need[a].cand >= 0) continue;
+        if (need[a].cand >= 0 || pend[a]) continue;
         float md = 1e30f;
         for (int b = 0; b < nC; ++b) {
             if (cand[b].taken || cand[b].arch != need[a].arch) continue;
@@ -8594,8 +8598,8 @@ static void WideBindReport() {
       (double)(s_wbFarMin < 1e8f ? s_wbFarMin : -1.0f), (double)s_wbPool / (double)s_wbRuns);
     L("[WideBind] far linked=%u beyond nearest 12-20m=%u 20-40m=%u >=40m=%u\n", s_wbFarLinked, s_wbBeyond[0], s_wbBeyond[1], s_wbBeyond[2]);
     if (SpawnKeyBindOn()) {
-        L("[WideBind] key bound=%u noKeyFromHost=%u noLocalForKey=%u localNotFree=%u archDiff=%u\n", s_wbKey, s_wbKeyUnknown, s_wbKeyNoLocal, s_wbKeyNotFree, s_wbKeyArchDiff);
-        s_wbKey = s_wbKeyUnknown = s_wbKeyNoLocal = s_wbKeyNotFree = s_wbKeyArchDiff = 0;
+        L("[WideBind] key bound=%u noKeyFromHost=%u noLocalForKey=%u localNotFree=%u archDiff=%u pendingFollow=%u\n", s_wbKey, s_wbKeyUnknown, s_wbKeyNoLocal, s_wbKeyNotFree, s_wbKeyArchDiff, s_wbKeyPend);
+        s_wbKey = s_wbKeyUnknown = s_wbKeyNoLocal = s_wbKeyNotFree = s_wbKeyArchDiff = s_wbKeyPend = 0;
     }
     s_wbNeed = s_wbExact = s_wbWide = s_wbNoArch = s_wbFar = s_wbPool = s_wbRuns = 0; s_wbFarMin = 1e9f;
     s_wbFarLinked = 0; s_wbBeyond[0] = s_wbBeyond[1] = s_wbBeyond[2] = 0;

@@ -283,7 +283,7 @@ void ShipSpawnReplayFire()
     SpawnShareReplayTag(0); t_tag = 0;
     const uintptr_t req = g_ourReq; g_ourReq = 0;
     int restored = 0;
-    if (req) {   // addendum 1: give the spec its own request back (only if the slot still holds ours)
+    if (req && old && Readable(old, 0x14) && *(const uint32_t*)old == 0x01E6D77Cu && *(const uintptr_t*)(old + 0x10) == s.spec) {   // addendum 1, but ONLY when the old request is still a live request of this spec (2026-11-28: a blind restore re-installed a freed request -> 0x1C27B13 executed heap)
         restored = (uintptr_t)InterlockedCompareExchange((volatile LONG*)(s.spec + 0x3C), (LONG)old, (LONG)req) == req ? 1 : 0;
         if (restored) ++c_restored;
     }

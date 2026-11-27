@@ -103,10 +103,10 @@ bool SpecValid(const LibE& e)
 }
 // Newest valid entry of a kind; key != 0 -> that key only; cls != 0 -> that learned ship class only. Invalid entries met on
 // the way are marked bad (never submitted again).
-bool Pick(int kind, uint64_t key, uint32_t cls, LibE* out)
+bool Pick(int kind, uint64_t key, uint32_t cls, LibE* out, bool keyedOnly = false)
 {
     LibE cand[kLib]; int n = 0;
-    { Spin s; for (int i = 0; i < g_libN; ++i) { const LibE& e = g_lib[i]; if (!e.bad && e.kind == kind && (!key || e.key == key) && (!cls || e.cls == cls)) cand[n++] = e; } }
+    { Spin s; for (int i = 0; i < g_libN; ++i) { const LibE& e = g_lib[i]; if (!e.bad && e.kind == kind && (!key || e.key == key) && (!cls || e.cls == cls) && (!keyedOnly || e.key)) cand[n++] = e; } }
     for (int pass = 0; pass < n; ++pass) {
         int best = -1;
         for (int i = 0; i < n; ++i) if (cand[i].spec && (best < 0 || cand[i].t > cand[best].t)) best = i;
@@ -225,6 +225,17 @@ void SpawnLibWantKey(uint64_t key, uint64_t hostObjId)
     ++c_want; ++c_follow;
 }
 
+// phase1.cpp WideBindPrepass distance rounds: a follow spawn for this host guard is queued, in flight or was built
+// < 4 s ago -> do not bind it by distance meanwhile (run 2026-11-28: the distance round took another guest body 6.9 m
+// away first and the follow-built body was left unbound).
+bool SpawnLibPendingFor(uint64_t hostObjId)
+{
+    if (!hostObjId || !g_installed || !g_follow) return false;
+    for (int i = 0; i < g_qN; ++i) if (g_q[i].purpose == P_FOLLOW && g_q[i].host == hostObjId) return true;
+    if (g_fly.w.purpose == P_FOLLOW && g_fly.w.host == hostObjId && (g_fly.active || (g_fly.tBuilt && GetTickCount64() - g_fly.tBuilt < 4000))) return true;
+    return false;
+}
+
 // ---- player thread, OnFrame, outside every __try ---------------------------------------------------------------------
 void SpawnLibFire()
 {
@@ -295,7 +306,7 @@ void SpawnLibFire()
     bool have = false;
     if (w.kind == K_SHIP) have = (w.cls && Pick(K_SHIP, 0, w.cls, &e)) || Pick(K_SHIP, 0, 0, &e);
     else if (w.key) have = Pick(K_NPC, w.key, 0, &e);
-    else { have = Pick(K_NPC, 0, 0, &e); }
+    else { have = Pick(K_NPC, 0, 0, &e, true) || Pick(K_NPC, 0, 0, &e); }   // prefer a keyed spec: the guest can follow it by key
     if (!have) { ++c_noSpec; Log("[SpawnLib] no valid spec kind=%d cls=%u key=%016llX purpose=%d\n", w.kind, w.cls, (unsigned long long)w.key, w.purpose); return; }
     if (w.purpose == P_FOLLOW) TryCount(w.host);
     const uintptr_t old = *(const uintptr_t*)(e.spec + 0x3C);   // spec validated in Pick (Readable 0x40)
@@ -304,7 +315,11 @@ void SpawnLibFire()
     SpawnShareReplayTag(0); t_tag = 0;
     const uintptr_t req = g_ourReq; g_ourReq = 0;
     int restored = 0;
-    if (req) restored = (uintptr_t)InterlockedCompareExchange((volatile LONG*)(e.spec + 0x3C), (LONG)old, (LONG)req) == req ? 1 : 0;
+    // Restore the spec's previous request ONLY if it is still a live request of this spec (vt 0x01E6D77C, +0x10 == spec).
+    // Run 2026-11-28 (guest 17552): a blind restore re-installed a FREED request; sub_1C27A90 (0x1C27B13) then called its
+    // vt[2] and executed heap memory. If the old one is gone, our request stays (its dtor clears the slot, 0x79C65B).
+    if (req && old && Readable(old, 0x14) && *(const uint32_t*)old == 0x01E6D77Cu && *(const uintptr_t*)(old + 0x10) == e.spec)
+        restored = (uintptr_t)InterlockedCompareExchange((volatile LONG*)(e.spec + 0x3C), (LONG)old, (LONG)req) == req ? 1 : 0;
     ++c_fired;
     Log("[SpawnLib] req kind=%d purpose=%d spec=%08X owner=%08X ctx=%08X key=%016llX cls=%u(lib %u) host=%016llX -> submitted=%d req=%08X restored=%d\n",
         w.kind, w.purpose, (unsigned)e.spec, (unsigned)e.owner, (unsigned)e.ctx, (unsigned long long)e.key, w.cls, e.cls, (unsigned long long)w.host,
