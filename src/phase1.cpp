@@ -5509,6 +5509,10 @@ static void ShipBindProbeTick(const EntityPacket& pkt, void* mgr, int n, Entity*
     L("[ShipBind] host=%d local=%d sameClassWithin 100m=%d 300m=%d 1000m=%d | localCls:%s |%s\n", hostN, ln, w100, w300, w1000, cl, line);
 }
 
+// [Coop] ShipSpawnReplay (ship_spawn_replay.cpp; default 0): engine-spawned ships for host records with no free hull.
+bool ShipSpawnReplayOn(); void ShipSpawnReplayWant(uint64_t host, uint32_t cls); uintptr_t ShipSpawnReplayReservedFor(uint64_t host, uint32_t cls);
+bool ShipSpawnReplayReservedOther(uintptr_t ent, uint64_t host); void ShipSpawnReplayNoteBound(uint64_t host);
+void ShipSpawnReplayFrame(void* const* live, const uint32_t* liveCls, int liveN, int scbN); void ShipSpawnReplayFire(); void ShipSpawnReplayWorldChange();
 struct ShipCB { uint64_t hostId; Entity* ent; uint32_t cls; uint64_t lastMs; };
 static ShipCB s_scb[64]; static int s_scbN = 0;
 static LONG s_scbNew = 0, s_scbNoCls = 0, s_scbNoShip = 0, s_scbLost = 0, s_scbHost = 0, s_scbBound = 0, s_scbStolen = 0;
@@ -5546,12 +5550,30 @@ static Entity* ShipClassBindFor(const EntityState& es, Entity* const* live, cons
     }
     if (!es.arch) { ++s_scbNoCls; return nullptr; }
     if (es.arch == 7) { ++s_scbNoCls; return nullptr; }   // class 7 = Jackdaw, a player's own ship (run 2026-11-25: two docked Jackdaws bound 0 m apart)
+    const bool ssr = ShipSpawnReplayOn();   // [Coop] ShipSpawnReplay (ship_spawn_replay.cpp)
+    if (ssr) {   // the hull our own SpawningManager built for this host record (class verified when it was built)
+        if (Entity* r = (Entity*)ShipSpawnReplayReservedFor(es.objId, es.arch)) {
+            for (int k = 0; k < liveN; ++k) {
+                if (live[k] != r || liveCls[k] != es.arch) continue;
+                bool taken = false;
+                for (int i = 0; i < s_scbN; ++i) if (s_scb[i].ent == r) { taken = true; break; }
+                if (taken || s_scbN >= 64) break;
+                s_scb[s_scbN++] = { es.objId, r, liveCls[k], now };
+                ++s_scbNew; ++s_scbBound;
+                const float dx = r->m_GlobalMatrix.M41 - es.pos[0], dy = r->m_GlobalMatrix.M42 - es.pos[1], dz = r->m_GlobalMatrix.M43 - es.pos[2];
+                L("[ShipSpawnReplay] bind host=%016llX ent=%08X err=%.1f\n", (unsigned long long)es.objId, (unsigned)(uintptr_t)r, sqrtf(dx * dx + dy * dy + dz * dz));
+                ShipSpawnReplayNoteBound(es.objId);
+                return r;
+            }
+        }
+    }
     int best = -1; float bd = 3000.0f * 3000.0f;
     for (int k = 0; k < liveN; ++k) {
         if (liveCls[k] != es.arch) continue;
         bool taken = false;
         for (int i = 0; i < s_scbN; ++i) if (s_scb[i].ent == live[k]) { taken = true; break; }
         if (taken) continue;
+        if (ssr && ShipSpawnReplayReservedOther((uintptr_t)live[k], es.objId)) continue;   // reserved replay hull of another host
         const float dx = live[k]->m_GlobalMatrix.M41 - es.pos[0], dy = live[k]->m_GlobalMatrix.M42 - es.pos[1];
         const float d2 = dx * dx + dy * dy;
         if (d2 < bd) { bd = d2; best = k; }
@@ -5569,6 +5591,7 @@ static Entity* ShipClassBindFor(const EntityState& es, Entity* const* live, cons
             for (int i = 0; i < s_scbN; ++i) {
                 if (s_scb[i].cls != es.arch) continue;        // same class only
                 Entity* h = s_scb[i].ent;
+                if (ssr && ShipSpawnReplayReservedOther((uintptr_t)h, es.objId)) continue;   // [Coop] ShipSpawnReplay: never steal a replay hull
                 if (!h || !readable((const char*)h + 0x40, 12)) continue;   // BaseEntity::m_GlobalMatrix.M41 (Entity.h:26)
                 float dp2 = 0.0f;
                 __try {
@@ -5587,7 +5610,9 @@ static Entity* ShipClassBindFor(const EntityState& es, Entity* const* live, cons
                 return hull;
             }
         }
-        ++s_scbNoShip; return nullptr;
+        ++s_scbNoShip;
+        if (ssr) ShipSpawnReplayWant(es.objId, es.arch);   // [Coop] ShipSpawnReplay: queue only (the engine call is in OnFrame)
+        return nullptr;
     }
     if (s_scbN < 64) {
         s_scb[s_scbN++] = { es.objId, live[best], liveCls[best], now };
@@ -5632,6 +5657,7 @@ static void ApplyShips(const EntityPacket& pkt) {
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) { scbLiveN = 0; }
         for (int i = 0; i < s_scbN; ) if (scbNow - s_scb[i].lastMs > 10000) s_scb[i] = s_scb[--s_scbN]; else ++i;   // host ship gone 10 s
+        __try { ShipSpawnReplayFrame((void* const*)scbLive, scbLiveCls, scbLiveN, s_scbN); } __except (EXCEPTION_EXECUTE_HANDLER) {}   // [Coop] ShipSpawnReplay: no engine calls
         static uint64_t s_scbLog = 0;
         if (scbNow >= s_scbLog) {
             s_scbLog = scbNow + 5000;
@@ -15863,6 +15889,9 @@ static void __cdecl OnFrame(Human* updatedHuman) {
         static int s_n = 0;
         if (s_n < 20) { ++s_n; L("[Frame] EXCEPTION 0x%08X in on-frame work (skipped)\n", GetExceptionCode()); }
     }
+    // [Coop] ShipSpawnReplay: the one engine submit (sub_569560) runs HERE, on the player-update thread and outside every
+    // __try (it reaches EnterCriticalSection(client+4) at 0x5BCAE0; a swallowed fault would leave the lock held).
+    if ((DWORD)s_playerWorkTid == GetCurrentThreadId()) ShipSpawnReplayFire();
     InterlockedCompareExchange(&s_playerWorkTid, 0, (LONG)GetCurrentThreadId());   // player work over (if it was ours)
 }
 
@@ -15896,7 +15925,7 @@ static void DumpConfigOnce()
         // The Tune* values are floats (read with strtod, see ShipTuningTick); the dump shows the integer part.
         { "Coop", "TuneConeAngle", 120 }, { "Coop", "TuneConeRange", 350 }, { "Coop", "TuneMaxTime", 30 },
         { "Coop", "TuneAggroTime", 30 }, { "Coop", "TuneHull", 0 },
-        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 }, { "Coop", "WeaponSync", 0 }, { "Coop", "ShipPeerZ", 0 }, { "Coop", "ShipBindProbe", 0 }, { "Coop", "ShipSpawnProbe", 0 }, { "Coop", "ShipSpawnFire", 0 }, { "Coop", "ShipSpawnFirePid", 0 }, { "Coop", "SpawnCensus", 0 }, { "Coop", "SpawnReplayFire", 0 }, { "Coop", "SpawnReplayFirePid", 0 }, { "Coop", "SpawnShare", 0 }, { "Coop", "SpawnKeyBind", 0 }, { "Coop", "ShipClassBind", 0 }, { "Coop", "ShipClassBindSteal", 0 }, { "Coop", "SpawnShareRadiusM", 150 },{ "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "FastTravelCrashFix", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 },
+        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 }, { "Coop", "WeaponSync", 0 }, { "Coop", "ShipPeerZ", 0 }, { "Coop", "ShipBindProbe", 0 }, { "Coop", "ShipSpawnProbe", 0 }, { "Coop", "ShipSpawnFire", 0 }, { "Coop", "ShipSpawnFirePid", 0 }, { "Coop", "SpawnCensus", 0 }, { "Coop", "SpawnReplayFire", 0 }, { "Coop", "SpawnReplayFirePid", 0 }, { "Coop", "SpawnShare", 0 }, { "Coop", "SpawnKeyBind", 0 }, { "Coop", "ShipClassBind", 0 }, { "Coop", "ShipClassBindSteal", 0 }, { "Coop", "ShipSpawnReplay", 0 }, { "Coop", "SpawnShareRadiusM", 150 },{ "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "FastTravelCrashFix", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 },
         { "Coop", "CombatTest", 0 }, { "Coop", "CrashContext", 0 }, { "Coop", "CorpseKeepSec", 30 }, { "Coop", "CrowdProbeIntegrate", 1 },
         { "Coop", "CrowdProbeLiveKeys", 1 }, { "Coop", "DamageRelay", 0 }, { "Coop", "Diag", 0 },
         { "Coop", "DisableCrowd", 0 }, { "Coop", "DisablePuppetAI", 1 }, { "Coop", "DisableSpawns", 0 },
@@ -16523,6 +16552,7 @@ static void OnFrameInner(Human* updatedHuman) {
                         L("[E] ev=world-change world=%08X->%08X localKey=%08X\n",
                           lastWorldId, curWorld, localShow);
                         MirrorRetireAll("world-change");   // [Coop] FastTravelCrashFix: retire proxies before unload
+                        ShipSpawnReplayWorldChange();      // [Coop] ShipSpawnReplay: captured spec pointers die on travel
                     } else {
                         L("[E] ev=scene-change localKey=%08X world=%08X\n",
                           localShow, curWorld);
