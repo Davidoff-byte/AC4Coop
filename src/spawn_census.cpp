@@ -781,9 +781,13 @@ uintptr_t SpawnEntityOfKey(uint64_t key)
             if ((uint32_t)Phase1_ScbHostOf(e.anc) == shipLo) { InterlockedIncrement(&k_crewResolved); return e.ent; }
         }
         InterlockedIncrement(&k_crewNoShip);
-        {   // diagnostics (first 40): is the host ship bound, and which crew offsets does our bound ship have?
-            static LONG s_cd = 0;
-            if (InterlockedIncrement(&s_cd) <= 40) {
+        {   // diagnostics: is the host ship bound, and which crew offsets does our bound ship have? Up to 4 lines per host
+            // ship, 24 ships (run T8: the old global cap of 40 lines was spent on one docked ship that was never bound).
+            static struct { uint32_t ship; LONG n; } s_cs[24]; static LONG s_csN = 0;
+            int ci = -1;
+            for (int i = 0; i < s_csN && i < 24; ++i) if (s_cs[i].ship == shipLo) { ci = i; break; }
+            if (ci < 0 && s_csN < 24) { ci = InterlockedIncrement(&s_csN) - 1; if (ci < 24) { s_cs[ci].ship = shipLo; s_cs[ci].n = 0; } else ci = -1; }
+            if (ci >= 0 && InterlockedIncrement(&s_cs[ci].n) <= 4) {
                 const uintptr_t gs = Phase1_ScbGuestOfLo(shipLo);
                 int nOn = 0; char qs[160]; int k = 0; qs[0] = 0;
                 if (gs) for (int i = 0; i < kEK; ++i) { const EK& e = g_ek[(pos - 1 - i) & (kEK - 1)]; if (e.ent && e.anc == gs) { ++nOn; if (k < 140) k += _snprintf_s(qs + k, sizeof(qs) - k, _TRUNCATE, " %08X/k%d", CrewQ(e.loc), e.kind); } }
@@ -826,6 +830,13 @@ void SpawnKeyHostNote(uint64_t objId, uintptr_t ent)
             if (Net::PublishIntent(0, objId, 15 /* IC_SPAWN */, 0, pl, (uint8_t)sizeof(pl))) {
                 InterlockedIncrement(&k_pub); InterlockedIncrement(&k_hostCrew);
                 if (g_hostPubN < kHP) g_hostPub[g_hostPubN++] = objId;
+                static uint32_t s_ships[32]; static int s_shipsN = 0; bool seen = false;   // one line per crew-carrying host ship
+                for (int i = 0; i < s_shipsN; ++i) if (s_ships[i] == (uint32_t)sid) { seen = true; break; }
+                if (!seen && s_shipsN < 32) {
+                    s_ships[s_shipsN++] = (uint32_t)sid; char line[160];
+                    _snprintf_s(line, sizeof(line), _TRUNCATE, "[KeyBind] host crew ship=%08X shipEnt=%08X first crew obj=%08X q=%08X\n", (unsigned)sid, (unsigned)anc, (unsigned)objId, CrewQ(loc));
+                    Phase1_LogLine(line);
+                }
             }
             return;
         }
