@@ -202,12 +202,18 @@
   },
   "00569560": {
    "addr": "00569560",
-   "claimed_at": null,
+   "claimed_at": "2026-11-27T14:10:57Z",
    "name": "SpawnSubmitRequest",
-   "owner": null,
-   "receipts": [],
+   "owner": "ship-spawn",
+   "receipts": [
+    {
+     "arm": "probe",
+     "at": "2026-11-27T14:10:58Z",
+     "verdict": "UNVERIFIED-EVIDENCE"
+    }
+   ],
    "size": 65,
-   "status": "unknown"
+   "status": "claimed"
   },
   "0059AA90": {
    "addr": "0059AA90",

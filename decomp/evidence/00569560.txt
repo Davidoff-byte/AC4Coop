@@ -1,0 +1,19 @@
+SpawnSubmitRequest @ 0x569560  (size 65)   -- probe receipt, no cl 16.00.40219.01 on this machine
+measured 2026-11-27 (ship-spawn slice 1) against the pinned binary; IDA session on D:\AC4-RE\ida\AC4BFSP.exe.i64
+
+claim
+    cdecl (item=spec, owner, ctx, id_lo, id_hi); plain `retn` at 0x5695A0 (caller cleans).
+    req = (*dword_2AC1E88)->vt[0x84/4](ctx, item)   (thiscall, factory sub_F72ED0)      0x56956E..0x56957A
+    if req: sub_79C6C0(req; owner, id_lo, id_hi) (thiscall, ecx=req)                    0x569582..0x569590
+            tail-jump sub_79B8D0(req) (submit)                                           0x569595..0x569599
+    returns char: 0 if the factory returned 0, else sub_79B8D0's AL. It does NOT return the request:
+    callers that need it must take the factory's return (spawn_census.cpp DetFac, thread-tagged).
+
+use in the plugin
+    src/ship_spawn_replay.cpp ShipSpawnReplayFire: player-update thread, OUTSIDE every __try (0x5BCAE0, reached
+    through sub_79B8D0 -> client->vt[0x88], takes EnterCriticalSection(client+4) on the caller's thread), after
+    VirtualQuery checks of spec / owner / params. Earlier use: SpawnReplayTick / ReplayHeld (NPC replay, n=1 PASS
+    L-prior, spawn-manager s4 R).
+
+limit of this receipt
+    proves bytes + body only. Live behaviour of ship replays (O1-O5, docs/design/ship-spawn-replay.md) is UNVERIFIED.

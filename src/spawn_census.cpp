@@ -242,6 +242,7 @@ uintptr_t __fastcall DetFac(void* self, void*, uintptr_t ctx, uintptr_t item)
             c.req = 0; c.ctx = ctx; c.item = item; c.itemVt = item ? *(const uintptr_t*)item : 0; c.owner = 0;
             c.idLo = c.idHi = 0; c.t = GetTickCount64(); c.printed = 0; c.req = req;
         }
+        { void ShipReplayNoteFac(uintptr_t); ShipReplayNoteFac(req); }   // [Coop] ShipSpawnReplay: our own submit's request (tagged thread)
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
     return req;
 }
@@ -307,7 +308,9 @@ void SpawnCensusInit()
     const bool census = GetPrivateProfileIntA("Coop", "SpawnCensus", 0, Paths::Ini()) != 0;
     g_keyBind = GetPrivateProfileIntA("Coop", "SpawnKeyBind", 0, Paths::Ini()) != 0;
     const bool shareFlag = GetPrivateProfileIntA("Coop", "SpawnShare", 0, Paths::Ini()) != 0;
-    if (!census && !g_keyBind && !shareFlag) return;   // SpawnKeyBind / SpawnShare need the request hooks below
+    int ShipSpawnReplayInitFlag(); void ShipSpawnReplaySetHooked(bool);
+    const bool ssr = ShipSpawnReplayInitFlag() != 0;   // [Coop] ShipSpawnReplay needs DetFac + DetSrc + DetSet
+    if (!census && !g_keyBind && !shareFlag && !ssr) return;   // SpawnKeyBind / SpawnShare need the request hooks below
     const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)GameModuleBase;
     const IMAGE_NT_HEADERS32* nt = (const IMAGE_NT_HEADERS32*)(GameModuleBase + dos->e_lfanew);
     g_lo = GameModuleBase + nt->OptionalHeader.BaseOfCode;
@@ -328,7 +331,8 @@ void SpawnCensusInit()
     // sub_5BC470(client, req, entity), thiscall retn 8: the manager job stores the built entity into its request
     // (0x005C57A9 in sub_5C5770; the job object IS the request: 0x79B8D0 sets req+0x20 = 1, sub_5C5770 sets +0x20 = 2).
     static const BYTE pSet[7] = { 0x55, 0x8B, 0xEC, 0x53, 0x56, 0x8B, 0xF1 };
-    const bool set = (g_keyBind || shareFlag) && Install(0x005BC470, pSet, 7, (void*)&DetSet, &g_tSet, "RequestSetEntity");
+    const bool set = (g_keyBind || shareFlag || ssr) && Install(0x005BC470, pSet, 7, (void*)&DetSet, &g_tSet, "RequestSetEntity");
+    if (ssr) ShipSpawnReplaySetHooked(fac && src && set);
     g_keyBind = g_keyBind && r && fac && src && set;
     g_share = shareFlag && r && fac && src;   // the lane is checked at use: Net::Init runs after this init (run 2026-11-25 13:5x)
     { char rb[32]; GetPrivateProfileStringA("Coop", "SpawnShareRadiusM", "150", rb, sizeof(rb), Paths::Ini()); g_shareR = (float)atof(rb); }
@@ -356,6 +360,12 @@ int SpawnCensusReport(char* out, int cap)
 }
 
 static unsigned ReadVt(uintptr_t p) { __try { return p ? *(const unsigned*)p : 0u; } __except (EXCEPTION_EXECUTE_HANDLER) { return 0u; } }
+// vtable of a spec's FIRST SpawnParams (sub_4F33C0: u16 spec+0x32 count, params = **(spec+0x2C)); 0 if none / unreadable.
+static unsigned FirstParamsVt(uintptr_t spec)
+{
+    __try { if (!spec || !*(const uint16_t*)(spec + 0x32)) return 0u; const uintptr_t a = *(const uintptr_t*)(spec + 0x2C); const uintptr_t p = a ? *(const uintptr_t*)a : 0; return p ? *(const unsigned*)p : 0u; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0u; }
+}
 
 // One dword per word; a value that is a readable address whose first dword lies in the image is printed as value@vt.
 static int DumpWords(char* out, size_t cap, uintptr_t base, int n)
@@ -465,7 +475,9 @@ void SpawnReplayTick()
     Cap pick = {}; bool have = false;
     for (int i = 0; i < kCap && !have; ++i) {
         const Cap& c = g_cap[(pos - 1 - i) & (kCap - 1)];
-        if (c.req && c.owner && (!want || c.itemVt == want)) { pick.ctx = c.ctx; pick.item = c.item; pick.itemVt = c.itemVt; pick.owner = c.owner; pick.idLo = c.idLo; pick.idHi = c.idHi; pick.t = c.t; have = true; }
+        // mode 1: the factory's item is the SPEC (vt 0x01E4A278), so a ship request is recognised by its first params'
+        // vtable (design 2026-11-27 s2.1), not by the item's own vtable (the old test never matched).
+        if (c.req && c.owner && (!want || (mode == 1 ? FirstParamsVt(c.item) == want : c.itemVt == want))) { pick.ctx = c.ctx; pick.item = c.item; pick.itemVt = c.itemVt; pick.owner = c.owner; pick.idLo = c.idLo; pick.idHi = c.idHi; pick.t = c.t; have = true; }
     }
     if (!have) { Phase1_LogLine("[Replay] fire: no captured request of that kind\n"); return; }
     char ok = 0; DWORD code = 0;
@@ -540,6 +552,14 @@ int StaticKey(uintptr_t item, uint64_t* key, float* w)
 }
 }  // namespace
 
+void SpawnShareReplayTag(int v) { t_replay = v; }   // [Coop] ShipSpawnReplay: our submit passes SpawnShareDecide
+// [Coop] ShipSpawnReplay: the ctx argument DetFac recorded for this request (whole 1024 ring, newest first).
+bool SpawnCensusCtxOf(uintptr_t req, uintptr_t* ctx)
+{
+    const LONG pos = g_capPos;
+    for (int i = 0; i < kCap; ++i) { const Cap& c = g_cap[(pos - 1 - i) & (kCap - 1)]; if (c.req == req) { *ctx = c.ctx; return true; } }
+    return false;
+}
 // Called from DetR (any game thread) for every request submitted. 1 = hold (decline), 0 = let it through.
 int SpawnShareDecide(uintptr_t req)
 {
@@ -688,6 +708,7 @@ void SpawnKeyNoteReq(uintptr_t req)
 }
 extern "C" void __cdecl SpawnKeyNoteEnt(const uint32_t* esp)   // esp[1] = request, esp[2] = entity
 {
+    { void ShipReplayNoteEnt(uintptr_t, uintptr_t); ShipReplayNoteEnt(esp[1], esp[2]); }   // [Coop] ShipSpawnReplay capture (lock-free)
     if (!g_keyBind) return;
     const uintptr_t req = esp[1], ent = esp[2];
     if (!req || !ent) return;
