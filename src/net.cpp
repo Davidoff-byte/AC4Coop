@@ -1217,6 +1217,31 @@ namespace {
     CRITICAL_SECTION g_intentLock;
     uint8_t          g_intentTx[INTENT_PUMP_DGRAMS][INTENT_DGRAM_MAX];   // game thread only (PumpIntents)
 
+    // ---- proto 17 pose lane ([Coop] PoseSync) ----
+    bool             g_poseOn = false;
+    CRITICAL_SECTION g_poseLock;                 // guards g_poseBuf/g_poseLen/g_poseSeq/g_poseRxMs
+    uint8_t          g_poseBuf[POSE_DGRAM_MAX];
+    int              g_poseLen = 0;
+    uint32_t         g_poseSeq = 0;              // seq of g_poseBuf (0 = none yet)
+    uint64_t         g_poseRxMs = 0;
+    volatile LONG    g_poseTx = 0, g_poseRx = 0, g_poseAccepted = 0, g_poseRejects = 0, g_poseProto = 0, g_poseStale = 0;
+
+    // 0 = ok; 1 short, 2 proto, 3 kind/reserved, 4 count/length, 5 record reserved bits.
+    int CheckPoseDatagram(const uint8_t* b, int n, uint32_t* seq) {
+        if (n < (int)sizeof(PoseWireHeader)) return 1;
+        PoseWireHeader h; std::memcpy(&h, b, sizeof(h));
+        if (h.protoVer != NET_PROTO_VER) return 2;
+        if (h.kind != POSE_KIND_FRAME || h.reserved != 0) return 3;
+        if (h.count == 0 || h.count > POSE_RECORDS_MAX ||
+            n != (int)sizeof(PoseWireHeader) + (int)h.count * (int)sizeof(PoseWireRecord)) return 4;
+        for (int i = 0; i < h.count; ++i) {
+            PoseWireRecord r; std::memcpy(&r, b + sizeof(h) + (size_t)i * sizeof(r), sizeof(r));
+            if ((r.flags & ~POSE_RF_TRANS) != 0 || r.rsv != 0 || (r.q48[5] & 0x80) != 0) return 5;
+        }
+        *seq = h.seq;
+        return 0;
+    }
+
     uint32_t MakeIntentIncarnation() {
         LARGE_INTEGER q; QueryPerformanceCounter(&q);
         uint64_t x = (uint64_t)q.QuadPart ^ ((uint64_t)GetCurrentProcessId() << 32) ^ GetTickCount64();
@@ -1255,10 +1280,10 @@ namespace {
         Net::IntentMsg q{};
         static uint8_t d1[INTENT_DGRAM_MAX], d2[INTENT_DGRAM_MAX];
 
-        // (0) golden vector: the byte layout tools/lobby_peer.py packs (INTENT_GOLDEN_HEX there). Proto 15.
-        static_assert(NET_PROTO_VER == 16, "re-derive the intent golden vector (and lobby_peer.py) for the new protoVer");
+        // (0) golden vector: the byte layout tools/lobby_peer.py packs (INTENT_GOLDEN_HEX there). Proto 15 layout, protoVer byte = 17 (POSE BUMP).
+        static_assert(NET_PROTO_VER == 17, "re-derive the intent golden vector (and lobby_peer.py) for the new protoVer");
         static const uint8_t kGolden[64] = {
-            0x41,0x43,0x34,0x49, 0x10,0x00,0x00,0x00, 0x44,0x33,0x22,0x11, 0x88,0x77,0x66,0x55,
+            0x41,0x43,0x34,0x49, 0x11,0x00,0x00,0x00, 0x44,0x33,0x22,0x11, 0x88,0x77,0x66,0x55,
             0x04,0x03,0x02,0x01, 0x07,0x00,0x00,0x00, 0x01, 0x01, 0x00,0x00,
             0x09,0x00,0x00,0x00, 0x02,0x00,
             0x05,0x00,0x00,0x00, 0x03,0x00,0x00,0x00, 0x08,0x07,0x06,0x05,0x04,0x03,0x02,0x01,
@@ -2161,6 +2186,35 @@ namespace {
                     if (rn > 0) SendRaw(&reply, rn, peer, peerSlot);
                     continue;
                 }
+                // proto 17 pose lane ([Coop] PoseSync): only when the flag is on. Off, an 'AC4P' datagram falls through
+                // to the unknown-magic path below exactly as before this lane existed. Never refreshes g_lastRecvMs.
+                if (magic == NET_POSE_MAGIC && g_poseOn) {
+                    if (g_strictPeer && from.sin_addr.s_addr != peer.sin_addr.s_addr) continue;
+                    InterlockedIncrement(&g_rxPackets);
+                    InterlockedAdd(&g_rxBytes, (LONG)n);
+                    InterlockedIncrement(&g_poseRx);
+                    uint32_t pseq = 0;
+                    const int pc = CheckPoseDatagram((const uint8_t*)buf, n, &pseq);
+                    if (pc != 0) {
+                        if (pc == 2) { InterlockedIncrement(&g_poseProto); InterlockedIncrement(&g_rxProtoMismatch); }
+                        InterlockedIncrement(&g_poseRejects);
+                        const LONG rejects = InterlockedIncrement(&g_rxRejects);
+                        if (rejects == 1 || (rejects % 256) == 0) LogRejectSummary(rejects);
+                        continue;
+                    }
+                    EnterCriticalSection(&g_poseLock);
+                    // newest wins; a seq far behind the stored one is a restarted sender, accepted
+                    const int32_t d = (int32_t)(pseq - g_poseSeq);
+                    if (g_poseSeq == 0 || d > 0 || d < -1000) {
+                        std::memcpy(g_poseBuf, buf, (size_t)n); g_poseLen = n; g_poseSeq = pseq;
+                        g_poseRxMs = GetTickCount64();
+                        InterlockedIncrement(&g_poseAccepted);
+                    } else {
+                        InterlockedIncrement(&g_poseStale);
+                    }
+                    LeaveCriticalSection(&g_poseLock);
+                    continue;
+                }
                 // proto 15 intention lane: its own datagram type, same source gate as the other game lanes.
                 // It never refreshes g_lastRecvMs (liveness stays defined by the player/entity lanes).
                 if (magic == NET_INTENT_MAGIC) {
@@ -2660,6 +2714,9 @@ bool Init() {
     InitializeCriticalSection(&g_intentLock);
     g_intentOn = GetPrivateProfileIntA("Coop", "IntentLane", 0, Paths::Ini()) != 0;
     g_intent.Init(MakeIntentIncarnation());
+    InitializeCriticalSection(&g_poseLock);
+    g_poseOn = GetPrivateProfileIntA("Coop", "PoseSync", 0, Paths::Ini()) != 0;   // proto 17 pose lane, default 0
+    if (g_poseOn) dbg("[Net] pose lane ON\n");
     { char m[96]; wsprintfA(m, "[Net] intent lane %s (proto %u, inc=%08x)\n", g_intentOn ? "ON" : "off",
                             (unsigned)NET_PROTO_VER, (unsigned)g_intent.myInc); dbg(m); }
 
@@ -3033,6 +3090,38 @@ void GetIntentStats(IntentStats& out) {
     EnterCriticalSection(&g_intentLock);
     g_intent.Stats(out);
     LeaveCriticalSection(&g_intentLock);
+}
+
+// ---- proto 17 pose lane ----
+bool PoseLaneOn() { return g_enabled && g_poseOn; }
+
+void SendPose(const void* dgram, int len) {
+    if (!PoseLaneOn() || !dgram || len <= 0 || len > POSE_DGRAM_MAX) return;
+    if (InterlockedCompareExchange(&g_peerReady, 0, 0) == 0) return;   // lobby: no peer yet
+    uint16_t slot = 0;
+    const sockaddr_in peer = PeerCopy(&slot);
+    SendRaw(dgram, len, peer, slot);
+    InterlockedIncrement(&g_txPackets);
+    InterlockedAdd(&g_txBytes, (LONG)len);
+    InterlockedIncrement(&g_poseTx);
+}
+
+int TakePose(uint8_t* out, int cap, uint32_t* lastSeq, uint64_t* rxMs) {
+    if (!PoseLaneOn() || !out || !lastSeq) return 0;
+    int n = 0;
+    EnterCriticalSection(&g_poseLock);
+    if (g_poseSeq != 0 && g_poseSeq != *lastSeq && g_poseLen <= cap) {
+        std::memcpy(out, g_poseBuf, (size_t)g_poseLen);
+        n = g_poseLen; *lastSeq = g_poseSeq;
+        if (rxMs) *rxMs = g_poseRxMs;
+    }
+    LeaveCriticalSection(&g_poseLock);
+    return n;
+}
+
+void GetPoseStats(PoseStats& o) {
+    o.tx = (uint32_t)g_poseTx; o.rx = (uint32_t)g_poseRx; o.accepted = (uint32_t)g_poseAccepted;
+    o.rejects = (uint32_t)g_poseRejects; o.protoMismatch = (uint32_t)g_poseProto; o.stale = (uint32_t)g_poseStale;
 }
 
 } // namespace Net

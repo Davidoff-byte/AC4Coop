@@ -158,7 +158,10 @@ static_assert(sizeof(PlayerState) == 576, "PlayerState wire size changed - updat
 static const uint32_t NET_MAGIC = 0x43344341; // 'AC4C'
 // Wire/struct-layout version. PlayerState is #pragma pack(1): adding a field shifts every following
 // offset, so both peers MUST run the same build. Bump this whenever the layout changes.
-static const uint32_t NET_PROTO_VER = 16;  // 16: datagram budget 1400 -> 1170 B (EOS P2P max) on both the entity lane (chunk
+static const uint32_t NET_PROTO_VER = 17;  // 17: POSE BUMP (feat/pose-parity, base 16; a parallel branch also takes 17 -
+                                           //     the integrator renumbers): pose lane, a new datagram type ('AC4P',
+                                           //     PoseWireHeader below). PlayerState, entity, intent and lobby unchanged
+                                           // 16: datagram budget 1400 -> 1170 B (EOS P2P max) on both the entity lane (chunk
                                            //     stride 1368 -> 1134 B, part of the wire format) and the intent lane
                                            // 15: intention lane, a new datagram type ('AC4I', IntentWireHeader below).
                                            //     PlayerState, the entity header/records and LobbyPacket are unchanged
@@ -418,3 +421,37 @@ struct IntentWireHeader {
 };
 #pragma pack(pop)
 static_assert(sizeof(IntentWireHeader) == 28, "IntentWireHeader is a wire layout (tools/lobby_peer.py INTENT_HDR_FMT)");
+
+// ---- proto 17 pose lane ([Coop] PoseSync, default 0; docs/design/pose-sync-impl.md) ------------------
+// One unreliable datagram per pose frame (sender rate [Coop] PoseSyncHz, default 10), newest seq wins.
+// Datagram = PoseWireHeader (20 B) + count x PoseWireRecord (18 B). All little-endian, no padding.
+// A bone is named by crc32(HumanIK name) and resolved on the receiver's own rig (sub_44DB80), never by
+// index. q48 = smallest-three: bits 0..1 = index of the dropped (largest) component, then three 15-bit
+// fields (bits 2..16, 17..31, 32..46) = the other components in x,y,z,w order mapped from [-1/sqrt2,
+// +1/sqrt2] to 0..32767; the dropped one is made positive. t = the bone's LOCAL translation x 2048
+// (the engine's own packed scale, sub_759250), valid only when flags & POSE_RF_TRANS.
+static const uint32_t NET_POSE_MAGIC   = 0x50344341; // 'AC4P'
+static const uint8_t  POSE_KIND_FRAME  = 1;
+static const uint8_t  POSE_RF_TRANS    = 1u << 0;    // record flag: t[] carries the bone's LOCAL translation
+static const int      POSE_DGRAM_MAX   = 1170;       // same UDP / EOS P2P budget as the other lanes (proto 16)
+#pragma pack(push, 1)
+struct PoseWireHeader {
+    uint32_t magic;       // NET_POSE_MAGIC
+    uint32_t protoVer;    // NET_PROTO_VER
+    uint32_t seq;         // sender pose-frame counter, starts at 1, +1 per sent frame
+    uint32_t hostMs;      // sender capture time, QPC ms (same clock as PlayerState::hostTimeMs)
+    uint8_t  kind;        // POSE_KIND_FRAME; anything else is rejected
+    uint8_t  count;       // records that follow (1..POSE_RECORDS_MAX)
+    uint16_t reserved;    // 0, rejected otherwise
+};
+struct PoseWireRecord {
+    uint32_t hash;        // crc32(HumanIK bone name)
+    uint8_t  flags;       // POSE_RF_TRANS; other bits reserved = 0 (rejected)
+    uint8_t  rsv;         // 0
+    uint8_t  q48[6];      // smallest-three rotation, see above
+    int16_t  t[3];        // LOCAL translation x 2048 (0 when !POSE_RF_TRANS)
+};
+#pragma pack(pop)
+static_assert(sizeof(PoseWireHeader) == 20, "PoseWireHeader is a wire layout");
+static_assert(sizeof(PoseWireRecord) == 18, "PoseWireRecord is a wire layout");
+static const int POSE_RECORDS_MAX = (POSE_DGRAM_MAX - (int)sizeof(PoseWireHeader)) / (int)sizeof(PoseWireRecord);   // 63
