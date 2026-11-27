@@ -7254,6 +7254,17 @@ static void CaptureGuards(EntityPacket& pkt) {
         }
 
         if (!HostHpSvcValid(w.hpSvc)) { w.hpSvc = 0; continue; }   // stale: drop it, change nothing
+        // WR-4 (F9): HostHpSvcValid proves only vtable + plausible Max, so a service freed with the vanished
+        // entity and re-allocated to ANOTHER guard passes it - and that guard's death (or 0xFFFF) was then
+        // reported as this objId's. A service that a different, still-live watch claimed in THIS capture is
+        // recycled by construction: drop it, change nothing (the same silence as the stale case above).
+        {
+            bool recycled = false;
+            for (int j = 0; j < s_hostLifeN && !recycled; ++j)
+                if (j != i && s_hostLife[j].gen == s_hostLifeGen && s_hostLife[j].hpSvc == w.hpSvc
+                    && s_hostLife[j].objId != w.objId) recycled = true;
+            if (recycled) { w.hpSvc = 0; continue; }
+        }
         bool dead = false;
         unsigned short life = w.life;
         bool readOk = true;
@@ -12098,6 +12109,15 @@ static void GuestDeathScan() {
         GuestLifeWatch& w = s_gktWatch[q];
         if (w.gen == s_gktGen || w.tombstoned || !w.hpSvc) continue;
         if (!HostHpSvcValid(w.hpSvc)) { w.hpSvc = 0; continue; }
+        // WR-4 (F9): same recycled-service gate as the host vanish lane - a service a different, still-live
+        // watch claimed in THIS scan belongs to that body now, not to the one that vanished.
+        {
+            bool recycled = false;
+            for (int j = 0; j < s_gktWatchN && !recycled; ++j)
+                if (j != q && s_gktWatch[j].gen == s_gktGen && s_gktWatch[j].hpSvc == w.hpSvc
+                    && s_gktWatch[j].ent != w.ent) recycled = true;
+            if (recycled) { w.hpSvc = 0; continue; }
+        }
         bool dead = false; unsigned short life = w.lastLife; bool ok = true;
         __try {
             dead = (*(unsigned int*)(w.hpSvc + 0x60) & 0x01000000u) != 0;
