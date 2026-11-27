@@ -132,6 +132,7 @@
     <ClCompile Include="src\ui_probe.cpp" />
     <ClCompile Include="src\overlay.cpp" />
     <ClCompile Include="src\overlay_ui.cpp"><LanguageStandard>stdcpp17</LanguageStandard></ClCompile>
+    <ClCompile Include="src\overlay_ui_imgui.cpp" />
     <ClCompile Include="src\video_hook.cpp" />
     <ClCompile Include="src\menu_probe.cpp" />
     <ClCompile Include="src\auto_continue.cpp" />
@@ -235,17 +236,40 @@
   <ItemGroup>
     <None Include="AC4Coop.ini" />
   </ItemGroup>
-  <!-- In-game overlay (src\overlay_ui.cpp): RmlUi + FreeType static x86 libraries built by third_party\rmlui\build_rmlui.cmd
-       into the ignored local\rmlui-x86. Without them the overlay compiles as a stub (AC4COOP_OVERLAY 0) and the ASI
-       builds exactly as before. d3dcompiler_47 and imm32 are delay-loaded so the ASI's load-time imports do not grow. -->
-  <PropertyGroup Condition="Exists('$(ProjectDir)local\rmlui-x86\lib\rmlui.lib')">
+  <!-- In-game overlay UI (src\overlay_ui.h). Default: Dear ImGui (third_party\imgui, vendored v1.91.5) in
+       src\overlay_ui_imgui.cpp -> AC4COOP_OVERLAY=1. Opt-in alternative: RmlUi, only with /p:Ac4UiRmlUi=1 AND the
+       RmlUi + FreeType static x86 libraries built by third_party\rmlui\build_rmlui.cmd into the ignored
+       local\rmlui-x86 -> AC4COOP_OVERLAY=1 + AC4COOP_UI_RMLUI=1. With neither, overlay_ui.cpp is the stub.
+       d3dcompiler_47 and imm32 are delay-loaded so the ASI's load-time imports do not grow. -->
+  <PropertyGroup Condition="Exists('$(ProjectDir)third_party\imgui\imgui.cpp')">
+    <Ac4Imgui>1</Ac4Imgui>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Ac4UiRmlUi)'=='1' And Exists('$(ProjectDir)local\rmlui-x86\lib\rmlui.lib')">
     <Ac4Overlay>1</Ac4Overlay>
+    <Ac4Imgui>0</Ac4Imgui>
     <Ac4RmlInc>$(ProjectDir)local\rmlui-x86\include;$(ProjectDir)local\vendor\rmlui\Backends</Ac4RmlInc>
   </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Ac4Imgui)'=='1'">
+    <ClCompile>
+      <AdditionalIncludeDirectories>$(ProjectDir)third_party\imgui;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>AC4COOP_OVERLAY=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <Link>
+      <AdditionalDependencies>d3dcompiler.lib;imm32.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <DelayLoadDLLs>d3dcompiler_47.dll;imm32.dll;%(DelayLoadDLLs)</DelayLoadDLLs>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup Condition="'$(Ac4Imgui)'=='1'">
+    <ClCompile Include="third_party\imgui\imgui.cpp"><WarningLevel>TurnOffAllWarnings</WarningLevel></ClCompile>
+    <ClCompile Include="third_party\imgui\imgui_draw.cpp"><WarningLevel>TurnOffAllWarnings</WarningLevel></ClCompile>
+    <ClCompile Include="third_party\imgui\imgui_tables.cpp"><WarningLevel>TurnOffAllWarnings</WarningLevel></ClCompile>
+    <ClCompile Include="third_party\imgui\imgui_widgets.cpp"><WarningLevel>TurnOffAllWarnings</WarningLevel></ClCompile>
+    <ClCompile Include="third_party\imgui\backends\imgui_impl_dx11.cpp"><WarningLevel>TurnOffAllWarnings</WarningLevel></ClCompile>
+  </ItemGroup>
   <ItemDefinitionGroup Condition="'$(Ac4Overlay)'=='1'">
     <ClCompile>
       <AdditionalIncludeDirectories>$(Ac4RmlInc);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>AC4COOP_OVERLAY=1;RMLUI_STATIC_LIB;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>AC4COOP_OVERLAY=1;AC4COOP_UI_RMLUI=1;RMLUI_STATIC_LIB;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
       <AdditionalLibraryDirectories>$(ProjectDir)local\rmlui-x86\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>

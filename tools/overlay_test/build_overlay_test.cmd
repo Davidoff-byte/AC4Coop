@@ -8,7 +8,7 @@ set "RML=%ROOT%\local\rmlui-x86"
 set "BK=%ROOT%\local\vendor\rmlui\Backends"
 set "OUT=%ROOT%\local\overlay-test"
 if not exist "%OUT%" mkdir "%OUT%"
-cl /nologo /std:c++17 /EHsc /O2 /MT /W3 /DAC4COOP_OVERLAY=1 /DRMLUI_STATIC_LIB /I"%RML%\include" /I"%BK%" ^
+cl /nologo /std:c++17 /EHsc /O2 /MT /W3 /DAC4COOP_OVERLAY=1 /DAC4COOP_UI_RMLUI=1 /DRMLUI_STATIC_LIB /I"%RML%\include" /I"%BK%" ^
    "%~dp0main.cpp" "%ROOT%\src\overlay_ui.cpp" "%BK%\RmlUi_Renderer_DX11.cpp" "%BK%\RmlUi_Platform_Win32.cpp" ^
    /Fo"%OUT%\\" /Fe"%OUT%\overlay_test.exe" ^
    /link /LIBPATH:"%RML%\lib" rmlui.lib freetype.lib d3d11.lib d3dcompiler.lib user32.lib imm32.lib || exit /b 1
