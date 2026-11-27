@@ -42,7 +42,9 @@ lines list them; their callbacks are unread — NPC spawns still use the engine 
   spawns (7 per hull). Whether they sail/fight like engine ships: not measured.
 - NPC owner class 0x026BDE50: callbacks forward to global functions (read), real owner kept; 28 host NPC spawns + 27
   guest follow spawns in T8 without a crash. No 1:1 adoption study beyond that.
-- Crews of spawned ships never enter the host guard lane → no crew keys → no crew sync (evidence s11).
+- Crews of spawned ships are deck actors (NPC vt 0x01E4CE90, no BhvGenericNPC/AI/health): never in the guard lane;
+  the guest's replay hull spawns the same layout (7/7 offsets, n = 1) and carries them (evidence s12). AI crews on AI
+  ships (crew-key path) untested; the host's Jackdaw crew is no longer published (class 7, never bindable).
 - Requests that never build stay queued (their slot borrow is given back after 3 s); such a ship can appear later.
 - Nothing despawns our private-owner ships before world unload; world-unload behaviour with them alive: untested.
 - `ShipClassBindSteal=1` + SpawnLib: one guest AV 0xF1813C right after a steal (T6), cause unknown; tests since run

@@ -185,6 +185,7 @@ void ShipSpawnReplayFrame(void* const* live, const uint32_t* liveCls, int liveN,
             _snprintf_s(line, sizeof(line), _TRUNCATE, "[ShipSpawnReplay] built host=%016llX want=%u got=%u ent=%08X req=%08X clsAtSet=%u dt=%llums\n",
                         (unsigned long long)g_fly.host, g_fly.cls, got, (unsigned)c.ent, (unsigned)c.req, c.clsSet, now - g_fly.t);
             Phase1_LogLine(line);
+            { void SpawnLibNoteOurShip(uintptr_t); SpawnLibNoteOurShip(c.ent); }   // spawn_lib.cpp crew diagnostics
             uint64_t host = 0;
             if (got == g_fly.cls) { ++c_classOk; host = g_fly.host; }
             else {   // class not fixed per spec (addendum): give it to a pending host record of the class built, if any

@@ -39,6 +39,7 @@
 void Phase1_LogLine(const char* s);
 bool Phase1_InSave();
 void SpawnShareReplayTag(int v);   // spawn_census.cpp: SpawnShareDecide passes our own submit
+int SpawnCrewOfShip(uintptr_t ship, uintptr_t* out, int* kinds, float* loc3, int cap);   // spawn_census.cpp
 
 namespace {
 constexpr uint32_t kSpecVt = 0x01E4A278u, kShipParamsVt = 0x0270A538u, kNpcParamsVt = 0x026FD610u, kCharParamsVt = 0x026FD4F0u;
@@ -185,6 +186,7 @@ struct Inf { volatile uintptr_t req; volatile uintptr_t spec; int kind; uint32_t
 constexpr int kInf = 256;   // no expiry: run T7 host 28300 - our request FC21EF40 stayed queued > 12 s, its entry had expired, the
                             // spec was freed later and the manager built it -> AV 0x69D0A5. Entries leave at build or when dead.
 Inf g_inf[kInf] = {}; volatile LONG g_infNext = 0;
+uintptr_t g_ourShips[64] = {}; int g_ourShipsN = 0;   // our built ships (player thread), crew diagnostics
 uintptr_t g_pendAny = 0; int g_pendKind = 0; uint32_t g_pendCls = 0;   // set around our submit (player thread)
 volatile LONG c_dying = 0, c_redir = 0, c_redirFail = 0; LONG c_bwEarly = 0, c_infDead = 0;
 constexpr ULONGLONG kBorrowEarlyMs = 3000;
@@ -373,6 +375,8 @@ extern "C" void SpawnLibSpecDying(uintptr_t spec)
     }
 }
 
+void SpawnLibNoteOurShip(uintptr_t ent) { if (ent && g_ourShipsN < 64) g_ourShips[g_ourShipsN++] = ent; }   // ship_spawn_replay.cpp: crew diagnostics
+
 // ---- ship spec supply for ship_spawn_replay.cpp (player thread) ------------------------------------------------------
 bool SpawnLibPickShip(uint32_t cls, uintptr_t* spec, uintptr_t* specVt, uintptr_t* owner, uintptr_t* ownerVt, uintptr_t* ctx, uint32_t* gotCls)
 {
@@ -449,6 +453,7 @@ void SpawnLibFire()
                 ++c_built;
                 Log("[SpawnLib] built kind=%d purpose=%d ent=%08X evt=%08X cls=%u key=%016llX host=%016llX dt=%llums\n", g_fly.w.kind, g_fly.w.purpose,
                     (unsigned)ent, evt, cls, (unsigned long long)g_fly.w.key, (unsigned long long)g_fly.w.host, now - g_fly.t);
+                if (evt == kShipVt && g_ourShipsN < 64) g_ourShips[g_ourShipsN++] = ent;   // crew diagnostics
                 if (g_fly.w.hasPlace && (evt == kShipVt || evt == kNpcVt)) {
                     HookMath::Transform m = ((Entity*)ent)->m_GlobalMatrix;
                     m.M41 = g_fly.w.place[0]; m.M42 = g_fly.w.place[1]; m.M43 = g_fly.w.place[2];
@@ -473,6 +478,40 @@ void SpawnLibFire()
         for (int i = 0; i < kInf; ++i) {
             Inf& f = g_inf[i]; const uintptr_t r = f.req;
             if (r && now - f.t > 15000 && !(Readable(r, 0x14) && *(const uint32_t*)r == 0x01E6D77Cu && *(const uintptr_t*)(r + 0x10) == f.spec)) { f.req = 0; ++c_infDead; }
+        }
+    }
+    // 2c. crew diagnostics (every 10 s): component vtables of every built entity anchored on one of our ships, once each.
+    // Run T10/T11: crews of our ships never became guard-lane candidates (skeleton + BhvGenericNPC 0x026E34D8 + AI/health).
+    static ULONGLONG s_crewDiag = 0;
+    if (now >= s_crewDiag && g_ourShipsN) {
+        s_crewDiag = now + 10000;
+        static uintptr_t s_logged[512]; static int s_loggedN = 0;
+        for (int si = 0; si < g_ourShipsN; ++si) {
+            const uintptr_t ship = g_ourShips[si];
+            if (!Readable(ship, 0xA0) || *(const uint32_t*)ship != kShipVt) continue;
+            uintptr_t crew[48]; int kinds[48]; float loc[48 * 3]; const int nc = SpawnCrewOfShip(ship, crew, kinds, loc, 48);
+            int nNew = 0;
+            for (int c = 0; c < nc; ++c) {
+                bool seen = false; for (int j = 0; j < s_loggedN; ++j) if (s_logged[j] == crew[c]) { seen = true; break; }
+                if (seen || s_loggedN >= 512) continue;
+                s_logged[s_loggedN++] = crew[c]; ++nNew;
+                const uintptr_t e = crew[c];
+                char comps[400]; int k = 0; comps[0] = 0; int ncomp = 0; uint32_t evt = 0; float pos[3] = {};
+                if (Readable(e, 0x68)) {
+                    evt = *(const uint32_t*)e;
+                    ncomp = *(const uint16_t*)(e + 0x66);
+                    const uintptr_t data = *(const uintptr_t*)(e + 0x60);
+                    if (ncomp > 0 && ncomp <= 96 && Readable(data, (size_t)ncomp * 4))
+                        for (int q = 0; q < ncomp && k < 380; ++q) {
+                            const uintptr_t cp = ((const uintptr_t*)data)[q];
+                            k += _snprintf_s(comps + k, sizeof(comps) - k, _TRUNCATE, " %08X", (cp && Readable(cp, 4)) ? *(const uint32_t*)cp : 0u);
+                        }
+                    if (evt == kNpcVt || evt == kShipVt) { const HookMath::Vector4 p = ((Entity*)e)->GetPosition(); pos[0] = p.x; pos[1] = p.y; pos[2] = p.z; }
+                }
+                Log("[CrewDiag] ship=%08X crew=%08X kind=%d local=(%.2f, %.2f, %.2f) evt=%08X comps=%d pos=(%.1f, %.1f, %.1f):%s\n", (unsigned)ship, (unsigned)e, kinds[c],
+                    loc[3 * c], loc[3 * c + 1], loc[3 * c + 2], evt, ncomp, pos[0], pos[1], pos[2], comps);
+            }
+            if (nNew || nc == 0) Log("[CrewDiag] ship=%08X built entities anchored on it: %d (new %d)\n", (unsigned)ship, nc, nNew);
         }
     }
     // 3. stats every 10 s

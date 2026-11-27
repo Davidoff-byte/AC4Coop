@@ -715,7 +715,7 @@ RK g_rk[kRK]; volatile LONG g_rkPos = 0;
 EK g_ek[kEK]; volatile LONG g_ekPos = 0;
 struct HK { uint64_t obj, key; }; HK g_hk[kHK]; volatile LONG g_hkPos = 0;      // guest: host objId -> key
 uint64_t g_hostPub[kHP]; int g_hostPubN = 0;                                     // host: objIds already published
-volatile LONG k_req = 0, k_ent = 0, k_entNoKey = 0, k_pub = 0, k_rx = 0, k_hostNoKey = 0, k_hostKeyed = 0, k_hostCrew = 0, k_crewResolved = 0, k_crewNoShip = 0;
+volatile LONG k_req = 0, k_ent = 0, k_entNoKey = 0, k_pub = 0, k_rx = 0, k_hostNoKey = 0, k_hostKeyed = 0, k_hostCrew = 0, k_crewResolved = 0, k_crewNoShip = 0, k_hostJackdawCrew = 0;
 }
 void SpawnKeyNoteReq(uintptr_t req)
 {
@@ -759,6 +759,12 @@ static uint32_t CrewQ(const float* loc)
     const int32_t qx = (int32_t)floorf(loc[0] * 10.f + 0.5f), qy = (int32_t)floorf(loc[1] * 10.f + 0.5f), qz = (int32_t)floorf(loc[2] * 10.f + 0.5f);
     return ((uint32_t)(qx & 0x7FF) << 21) | ((uint32_t)(qy & 0x7FF) << 10) | (uint32_t)(qz & 0x3FF);
 }
+// Ship class as ShipClassBind/ReadShipClass decode entity+0x9C (class 7 = Jackdaw); 0 = not a ship class word.
+static uint32_t ShipClassOf(uintptr_t ship)
+{
+    __try { const uint32_t f = *(const uint32_t*)(ship + 0x9C); return ((f & 7u) == 3u && (f & 0x1F8u) == 0xE8u) ? (f >> 9) & 0x3Fu : 0u; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
 static uint64_t ShipIdOf(uintptr_t ship)
 {
     __try { const uintptr_t hc = *(const uintptr_t*)(ship + 0xC8); return hc ? *(const uint64_t*)(hc + 0x0C) : 0; }
@@ -800,6 +806,18 @@ uintptr_t SpawnEntityOfKey(uint64_t key)
     for (int i = 0; i < kEK; ++i) { const EK& e = g_ek[(pos - 1 - i) & (kEK - 1)]; if (e.ent && e.key == key) return e.ent; }
     return 0;
 }
+// spawn_lib.cpp crew diagnostics: built entities whose spawn anchor is this ship (EK ring, newest first, de-duplicated).
+int SpawnCrewOfShip(uintptr_t ship, uintptr_t* out, int* kinds, float* loc3, int cap)
+{
+    const LONG pos = g_ekPos; int n = 0;
+    for (int i = 0; i < kEK && n < cap; ++i) {
+        const EK& e = g_ek[(pos - 1 - i) & (kEK - 1)];
+        if (!e.ent || e.anc != ship) continue;
+        bool dup = false; for (int j = 0; j < n; ++j) if (out[j] == e.ent) { dup = true; break; }
+        if (!dup) { out[n] = e.ent; kinds[n] = e.kind; loc3[3 * n] = e.loc[0]; loc3[3 * n + 1] = e.loc[1]; loc3[3 * n + 2] = e.loc[2]; ++n; }
+    }
+    return n;
+}
 uint64_t SpawnKeyForHostObj(uint64_t obj)
 {
     const LONG pos = g_hkPos;
@@ -824,6 +842,10 @@ void SpawnKeyHostNote(uint64_t objId, uintptr_t ent)
         // kind 2 = the anchor ship has a parent (*(e+8) != 0; run 2026-11-25: the other 20/20 unkeyed host guards): the local
         // offset and the ship are still known, so they get a crew key too.
         const uint64_t sid = ((kind == 4 || kind == 2) && avt == 0x01E4A128u) ? ShipIdOf(anc) : 0;
+        // A Jackdaw's crew (ship class 7, entity+0x9C as ShipClassBind reads it) can never resolve on the guest: Jackdaws
+        // are excluded from ShipClassBind (each player keeps their own). Runs T9-T12 2026-11-28: the only published crew
+        // keys were the host Jackdaw's 20 (ship[0], 15 m from the player), all crewNoShip on the guest.
+        if (sid && ShipClassOf(anc) == 7) { InterlockedIncrement(&k_hostJackdawCrew); if (g_hostPubN < kHP) g_hostPub[g_hostPubN++] = objId; return; }
         if (sid &&(sid >> 32) == 0 && ((uint32_t)sid >> 28) == 0xF) {   // minted ship id (the player's own ship has an authored id: skipped)
             const uint64_t ck = ((uint64_t)(uint32_t)sid << 32) | CrewQ(loc);
             uint8_t pl[16] = { 2, 2 }; memcpy(pl + 8, &ck, 8);
@@ -860,6 +882,6 @@ void SpawnKeyHostNote(uint64_t objId, uintptr_t ent)
 int SpawnKeyReport(char* out, int cap)
 {
     if (!g_keyBind) return 0;
-    return _snprintf_s(out, cap, _TRUNCATE, "[KeyBind] reqKeys=%ld entKeys=%ld entNoKey=%ld | host guards keyed=%ld crew=%ld unkeyed=%ld published=%ld | guestReceived=%ld crewResolved=%ld crewNoShip=%ld",
-                       k_req, k_ent, k_entNoKey, k_hostKeyed, k_hostCrew, k_hostNoKey, k_pub, k_rx, k_crewResolved, k_crewNoShip);
+    return _snprintf_s(out, cap, _TRUNCATE, "[KeyBind] reqKeys=%ld entKeys=%ld entNoKey=%ld | host guards keyed=%ld crew=%ld jackdawCrewSkipped=%ld unkeyed=%ld published=%ld | guestReceived=%ld crewResolved=%ld crewNoShip=%ld",
+                       k_req, k_ent, k_entNoKey, k_hostKeyed, k_hostCrew, k_hostJackdawCrew, k_hostNoKey, k_pub, k_rx, k_crewResolved, k_crewNoShip);
 }
