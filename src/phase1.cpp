@@ -8653,6 +8653,15 @@ static void OwnPublish(Human* h, Entity* e, const float* pos, const float* quat,
             InterlockedIncrement(&s_plReseeds);
         }
     }
+    if (i < 0 && s_ownN >= OWN_MAX) {
+        // WR-7: table full; evict the stalest entry (smallest lastPubUs) so new guards aren't frozen out.
+        int evict = 0;
+        for (int k = 1; k < s_ownN; ++k) if (s_own[k].lastPubUs < s_own[evict].lastPubUs) evict = k;
+        s_own[evict] = s_own[s_ownN - 1];   // move last into evict slot
+        InterlockedDecrement(&s_ownN);       // free a slot
+        // retry lookup on the freed slot count
+        i = -1;
+    }
     if (i < 0 && s_ownN < OWN_MAX) {
         i = s_ownN; OwnBody& n = s_own[i];
         std::memset(&n, 0, sizeof(n));
