@@ -158,7 +158,10 @@ static_assert(sizeof(PlayerState) == 576, "PlayerState wire size changed - updat
 static const uint32_t NET_MAGIC = 0x43344341; // 'AC4C'
 // Wire/struct-layout version. PlayerState is #pragma pack(1): adding a field shifts every following
 // offset, so both peers MUST run the same build. Bump this whenever the layout changes.
-static const uint32_t NET_PROTO_VER = 16;  // 16: datagram budget 1400 -> 1170 B (EOS P2P max) on both the entity lane (chunk
+static const uint32_t NET_PROTO_VER = 17;  // 17: IC_ACTION (GuardActionLane) payload may be 18 B: + u8 perception stage,
+                                           //     u8 targetIsPuppet ([Coop] GuardPerceivePuppet, phase1.cpp GalPayloadP);
+                                           //     the 16 B payload is still sent with the flag off and still accepted
+                                           // 16: datagram budget 1400 -> 1170 B (EOS P2P max) on both the entity lane (chunk
                                            //     stride 1368 -> 1134 B, part of the wire format) and the intent lane
                                            // 15: intention lane, a new datagram type ('AC4I', IntentWireHeader below).
                                            //     PlayerState, the entity header/records and LobbyPacket are unchanged

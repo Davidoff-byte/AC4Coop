@@ -10234,7 +10234,14 @@ static void FightIntentSend(Human* player) {
 struct GalPayload { uint32_t alias; uint16_t channel; int16_t layer; uint16_t ratioQ; uint8_t stage, tgt; uint32_t hostQpcMs; };
 #pragma pack(pop)
 static_assert(sizeof(GalPayload) == 16, "IC_ACTION payload is a wire layout");
-struct GalHostEnt { unsigned int human, ent; uint64_t objId; uint32_t alias; uint8_t stage, tgt; uint64_t seenMs; };
+// Proto 17, [Coop] GuardPerceivePuppet=1 on the host: GalPayload + 2 bytes = the guard's perception (guard_sight.cpp
+// GuardSight::PerceiveFor): stage 0 none, 1 sight visible, 2 detection start; targetIsPuppet 1 = the host's puppet = the
+// receiver's own player, 0 = the host player. With the flag off the 16-byte payload is sent; the receiver takes both.
+#pragma pack(push, 1)
+struct GalPayloadP { GalPayload a; uint8_t perStage, targetIsPuppet; };
+#pragma pack(pop)
+static_assert(sizeof(GalPayloadP) == 18, "IC_ACTION payload with perception is a wire layout");
+struct GalHostEnt { unsigned int human, ent; uint64_t objId; uint32_t alias; uint8_t stage, tgt; uint64_t seenMs; uint8_t pst, ptg; };
 static GalHostEnt s_galH[64]; static volatile LONG s_galHN = 0; static SRWLOCK s_galLock = SRWLOCK_INIT;
 static volatile LONG s_galTx = 0, s_galTxFail = 0, s_galRx = 0, s_galQueued = 0, s_galNoBody = 0, s_galSnapSkipped = 0, s_galRebind = 0;
 
@@ -10247,7 +10254,7 @@ static void GalHostScope(Human* h, Entity* e, uint64_t objId) {
     for (int i = 0; i < s_galHN; ++i) if (s_galH[i].human == (unsigned int)h) { k = i; break; }
     if (k < 0 && s_galHN < 64) { k = s_galHN; s_galH[k].human = (unsigned int)h; s_galH[k].alias = 0; InterlockedIncrement(&s_galHN); }
     if (k >= 0) {
-        if (s_galH[k].objId != objId) { s_galH[k].alias = 0; s_galH[k].stage = 0; s_galH[k].tgt = 0; }   // another guard now
+        if (s_galH[k].objId != objId) { s_galH[k].alias = 0; s_galH[k].stage = 0; s_galH[k].tgt = 0; s_galH[k].pst = 0; s_galH[k].ptg = 0; }   // another guard now
         s_galH[k].objId = objId; s_galH[k].ent = (unsigned int)e; s_galH[k].seenMs = now;
     }
     ReleaseSRWLockExclusive(&s_galLock);
@@ -10312,20 +10319,22 @@ static uint8_t HumanStage1(Human* h) {   // HumanGroundStage + 1, 0 = unreadable
 }
 static void GalHostOwnUpdate(Human* h) {
     if (!s_galHN) return;
-    uint64_t objId = 0; uint32_t last = 0; unsigned int ent = 0; uint8_t lastSt = 0, lastTg = 0;
+    uint64_t objId = 0; uint32_t last = 0; unsigned int ent = 0; uint8_t lastSt = 0, lastTg = 0, lastPs = 0, lastPt = 0;
     AcquireSRWLockShared(&s_galLock);
     for (int i = 0; i < s_galHN; ++i)
-        if (s_galH[i].human == (unsigned int)h) { objId = s_galH[i].objId; last = s_galH[i].alias; ent = s_galH[i].ent; lastSt = s_galH[i].stage; lastTg = s_galH[i].tgt; break; }
+        if (s_galH[i].human == (unsigned int)h) { objId = s_galH[i].objId; last = s_galH[i].alias; ent = s_galH[i].ent; lastSt = s_galH[i].stage; lastTg = s_galH[i].tgt; lastPs = s_galH[i].pst; lastPt = s_galH[i].ptg; break; }
     ReleaseSRWLockShared(&s_galLock);
     if (!objId || !readable(h, 4)) return;
     const uint8_t st = HumanStage1(h), tg = ent ? GuardTargetClass((Entity*)ent) : 0;
+    uint8_t pst = 0, ptg = 0;   // [Coop] GuardPerceivePuppet: false (and 0/0) with the flag off
+    const bool perc = ent && GuardSight::PerceiveFor((const void*)(uintptr_t)ent, &pst, &ptg);
     ActionComponent* ac = h->GetActionComponent();
     if (!ac || !readable(ac, 0x40)) return;
     unsigned char mir = 0;
     void* act = ac->GetCurrentAction(&mir, 0, ACTLAYER_PRIMARY);
     if (!act || !readable(act, 0x14)) return;
     const uint32_t alias = *(uint32_t*)((char*)act + 8);
-    if (!alias || (alias == last && st == lastSt && tg == lastTg)) return;
+    if (!alias || (alias == last && st == lastSt && tg == lastTg && pst == lastPs && ptg == lastPt)) return;
     GalPayload p = {};
     p.alias = alias; p.channel = 0xFFFF; p.stage = st; p.tgt = tg;
     void* bpc = *(void**)((char*)act + 0x0C);
@@ -10336,11 +10345,13 @@ static void GalHostOwnUpdate(Human* h) {
     if (r > 1.0f) r = 1.0f;
     p.ratioQ = (uint16_t)(r * 65535.0f + 0.5f);
     p.hostQpcMs = (uint32_t)(OwnNowUs() / 1000);
-    const bool ok = Net::PublishIntent(0, objId, IC_ACTION, p.hostQpcMs, &p, (uint8_t)sizeof(p));
+    GalPayloadP pp; pp.a = p; pp.perStage = pst; pp.targetIsPuppet = ptg;
+    const bool ok = perc ? Net::PublishIntent(0, objId, IC_ACTION, p.hostQpcMs, &pp, (uint8_t)sizeof(pp))
+                         : Net::PublishIntent(0, objId, IC_ACTION, p.hostQpcMs, &p, (uint8_t)sizeof(p));
     InterlockedIncrement(ok ? &s_galTx : &s_galTxFail);
     AcquireSRWLockExclusive(&s_galLock);
     for (int i = 0; i < s_galHN; ++i)
-        if (s_galH[i].human == (unsigned int)h && s_galH[i].objId == objId) { s_galH[i].alias = alias; s_galH[i].stage = st; s_galH[i].tgt = tg; break; }
+        if (s_galH[i].human == (unsigned int)h && s_galH[i].objId == objId) { s_galH[i].alias = alias; s_galH[i].stage = st; s_galH[i].tgt = tg; s_galH[i].pst = pst; s_galH[i].ptg = ptg; break; }
     ReleaseSRWLockExclusive(&s_galLock);
 }
 static void GalHostOwnUpdateGuarded(Human* h) {
@@ -10348,7 +10359,8 @@ static void GalHostOwnUpdateGuarded(Human* h) {
 }
 
 // Guest (player update only): the lane's current action per guard.
-struct GalGuestEnt { uint64_t objId; uint32_t alias; unsigned int ent; uint64_t rxMs; uint8_t stage, tgt; };
+struct GalGuestEnt { uint64_t objId; uint32_t alias; unsigned int ent; uint64_t rxMs; uint8_t stage, tgt, pst, ptg; };
+static volatile LONG s_galPerRx = 0, s_galPerLines = 0;   // [Coop] GuardPerceivePuppet: 18-byte payloads received
 static void GsaNote(Entity* e, uint64_t objId, uint8_t stage, uint8_t tgt);   // [Coop] GuardStageApply, below
 static GalGuestEnt s_galG[128];
 static GalGuestEnt* GalGuestFind(uint64_t id, bool create) {
@@ -10357,7 +10369,7 @@ static GalGuestEnt* GalGuestFind(uint64_t id, bool create) {
     int k = s_galGN;
     if (k >= 128) { k = 0; for (int i = 1; i < 128; ++i) if (s_galG[i].rxMs < s_galG[k].rxMs) k = i; }   // oldest
     else ++s_galGN;
-    s_galG[k].objId = id; s_galG[k].alias = 0; s_galG[k].ent = 0; s_galG[k].rxMs = 0; s_galG[k].stage = 0; s_galG[k].tgt = 0;
+    s_galG[k].objId = id; s_galG[k].alias = 0; s_galG[k].ent = 0; s_galG[k].rxMs = 0; s_galG[k].stage = 0; s_galG[k].tgt = 0; s_galG[k].pst = 0; s_galG[k].ptg = 0;
     return &s_galG[k];
 }
 static void GalGuestIssue(GalGuestEnt* g, Entity* e) {
@@ -10368,12 +10380,19 @@ static void GalGuestIssue(GalGuestEnt* g, Entity* e) {
     InterlockedIncrement(&s_galQueued);
 }
 static void GalGuestRx(const Net::IntentMsg& m) {
-    if (!g_guardActLane || g_entHost == 1 || m.len != sizeof(GalPayload)) return;
+    if (!g_guardActLane || g_entHost == 1 || (m.len != sizeof(GalPayload) && m.len != sizeof(GalPayloadP))) return;
     GalPayload p; memcpy(&p, m.payload, sizeof(p));
     InterlockedIncrement(&s_galRx);
     GalGuestEnt* g = GalGuestFind(m.wireId, true);
     const bool newAlias = g->alias != p.alias;
     g->alias = p.alias; g->rxMs = GetTickCount64(); g->stage = p.stage; g->tgt = p.tgt;
+    if (m.len == sizeof(GalPayloadP)) {   // proto 17 perception bytes ([Coop] GuardPerceivePuppet on the host); recorded + logged only
+        const uint8_t ps = m.payload[sizeof(GalPayload)], pt = m.payload[sizeof(GalPayload) + 1];
+        InterlockedIncrement(&s_galPerRx);
+        if ((ps != g->pst || pt != g->ptg) && InterlockedIncrement(&s_galPerLines) <= 200)
+            L("[Perceive] guest guard=%016llX stage=%u local=%u\n", (unsigned long long)m.wireId, (unsigned)ps, (unsigned)pt);
+        g->pst = ps; g->ptg = pt;
+    }
     Entity* e = (Entity*)GuestObjFind(m.wireId);                // the linked copy only
     if (!e || !readable(e, 0xCC) || *(uint32_t*)e != 0x01E4CE90u || MirrorKilledLocally(e)) { g->ent = 0; InterlockedIncrement(&s_galNoBody); return; }
     GsaNote(e, m.wireId, p.stage, p.tgt);
@@ -10395,6 +10414,7 @@ static void GalReport() {
     if (!g_guardActLane) return;
     L("[GAL] GuardActionLane=1 host: scoped=%ld tx=%ld txFail=%ld | guest: rx=%ld queued=%ld noBody=%ld rebind=%ld snapshotAliasSkipped=%ld tracked=%d\n",
       s_galHN, s_galTx, s_galTxFail, s_galRx, s_galQueued, s_galNoBody, s_galRebind, s_galSnapSkipped, s_galGN);
+    if (s_galPerRx) L("[GAL] perception rx=%ld\n", s_galPerRx);   // [Coop] GuardPerceivePuppet (proto 17 payloads)
 }
 
 // ---- [Coop] PlayerDamageRelay (default follows FightIntents, read once at load in player_damage_probe.cpp) ------------
@@ -16019,7 +16039,7 @@ static void DumpConfigOnce()
         // The Tune* values are floats (read with strtod, see ShipTuningTick); the dump shows the integer part.
         { "Coop", "TuneConeAngle", 120 }, { "Coop", "TuneConeRange", 350 }, { "Coop", "TuneMaxTime", 30 },
         { "Coop", "TuneAggroTime", 30 }, { "Coop", "TuneHull", 0 },
-        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 }, { "Coop", "WeaponSync", 0 }, { "Coop", "ShipPeerZ", 0 }, { "Coop", "ShipBindProbe", 0 }, { "Coop", "ShipSpawnProbe", 0 }, { "Coop", "ShipSpawnFire", 0 }, { "Coop", "ShipSpawnFirePid", 0 }, { "Coop", "SpawnCensus", 0 }, { "Coop", "SpawnReplayFire", 0 }, { "Coop", "SpawnReplayFirePid", 0 }, { "Coop", "SpawnShare", 0 }, { "Coop", "SpawnKeyBind", 0 }, { "Coop", "ShipClassBind", 0 }, { "Coop", "ShipClassBindSteal", 0 }, { "Coop", "SpawnShareRadiusM", 150 }, { "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "TableEvict", 0 }, { "Coop", "UsedEntAllPaths", 0 }, { "Coop", "PuppetSeqResync", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "FastTravelCrashFix", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 }, { "Coop", "PuppetListener", 0 }, { "Coop", "PuppetListenerAttach", 0 }, { "Coop", "PuppetMaxLife", 0 }, { "Coop", "ConflictProbe", 0 }, { "Coop", "OwnSnapAtTarget", 0 }, { "Coop", "PuppetWorldDropRef", 0 }, { "Coop", "PadIdPreferOffered", 0 },
+        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 }, { "Coop", "WeaponSync", 0 }, { "Coop", "ShipPeerZ", 0 }, { "Coop", "ShipBindProbe", 0 }, { "Coop", "ShipSpawnProbe", 0 }, { "Coop", "ShipSpawnFire", 0 }, { "Coop", "ShipSpawnFirePid", 0 }, { "Coop", "SpawnCensus", 0 }, { "Coop", "SpawnReplayFire", 0 }, { "Coop", "SpawnReplayFirePid", 0 }, { "Coop", "SpawnShare", 0 }, { "Coop", "SpawnKeyBind", 0 }, { "Coop", "ShipClassBind", 0 }, { "Coop", "ShipClassBindSteal", 0 }, { "Coop", "SpawnShareRadiusM", 150 }, { "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "TableEvict", 0 }, { "Coop", "UsedEntAllPaths", 0 }, { "Coop", "PuppetSeqResync", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "FastTravelCrashFix", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 }, { "Coop", "PuppetListener", 0 }, { "Coop", "PuppetListenerAttach", 0 }, { "Coop", "PuppetMaxLife", 0 }, { "Coop", "ConflictProbe", 0 }, { "Coop", "OwnSnapAtTarget", 0 }, { "Coop", "PuppetWorldDropRef", 0 }, { "Coop", "PadIdPreferOffered", 0 }, { "Coop", "GuardPerceivePuppet", 0 },
         { "Coop", "CombatTest", 0 }, { "Coop", "CrashContext", 0 }, { "Coop", "CorpseKeepSec", 30 }, { "Coop", "CrowdProbeIntegrate", 1 },
         { "Coop", "CrowdProbeLiveKeys", 1 }, { "Coop", "DamageRelay", 0 }, { "Coop", "Diag", 0 },
         { "Coop", "DisableCrowd", 0 }, { "Coop", "DisablePuppetAI", 1 }, { "Coop", "DisableSpawns", 0 },
@@ -16438,6 +16458,7 @@ static void OnFrameInner(Human* updatedHuman) {
             s_sightNext = hbNow + 5000;
             char sb[1024];   // the SightProbe tail needs ~450 more bytes; FormatReport only appends it when 200+ remain
             if (GuardSight::FormatReport(sb, sizeof(sb)) > 0) L("%s\n", sb);
+            if (GuardSight::FormatPerceiveReport(sb, sizeof(sb)) > 0) L("%s\n", sb);   // [Coop] GuardPerceivePuppet
             char stb[160];
             if (StateProbeHb(stb, sizeof(stb)) > 0) L("%s", stb);   // [Coop] StateProbe counters (both roles)
             char evb[512];
