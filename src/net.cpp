@@ -22,16 +22,12 @@ namespace {
     bool               g_secondInstance = false;   // LocalPort taken -> this is the same-PC 2nd instance
     int                g_instanceSlot = 1;         // multi-guest S1: same-PC instance slot 1..4 (NOT the player slot)
     SOCKET             g_sock = INVALID_SOCKET;
-    sockaddr_in        g_peer{};
     CRITICAL_SECTION   g_lock;
-    PlayerState        g_remote{};
-    bool               g_haveRemote = false;
     EntityPacket       g_remoteEntities{};
     bool               g_haveEntities = false;
     uint64_t           g_entitiesMs = 0;      // GetTickCount64() of the last write to g_remoteEntities
     const uint64_t     NET_ENTITIES_TTL_MS = 3000;   // a snapshot older than this is from a dead peer
     bool               g_strictPeer = true;   // reject datagrams from any source but the configured peer
-    uint64_t           g_lastRecvMs = 0;      // GetTickCount64() of the last ACCEPTED packet (0 = none yet)
 
     // ---- lobby mode (slice 3, docs/design/lobby-code.md) -------------------------------------------
     // Manual mode: g_peer comes from PeerIP and g_peerReady is 1 from the start (today's behaviour).
@@ -46,13 +42,10 @@ namespace {
     enum LobbyMode { LM_MANUAL = 0, LM_HOST = 1, LM_JOIN = 2, LM_LOBBY = 3 };
     volatile LobbyMode g_mode = LM_MANUAL;
     SRWLOCK            g_peerLock = SRWLOCK_INIT;
-    volatile LONG      g_peerReady = 1;
     uint32_t           g_joinNonce = 0;       // join: this attempt's nonce (WELCOME must echo it)
     uint32_t           g_joinCheck = 0;       // join: check of the typed code (sent in HELLO, logged by the host)
     volatile LONG      g_joinState = 0;       // join: 0 idle, 1 sending HELLO, 2 welcomed, 3 rejected, 4 timed out
     volatile LONG      g_joinGen = 0;         // join attempt generation (F8 restarts)
-    uint32_t           g_lockedNonce = 0;     // host: nonce of the HELLO that locked the current guest (recv thread)
-    uint64_t           g_lockedMs = 0;        // host: GetTickCount64() of that lock (WR-22; recv thread)
     char               g_joinCodeText[16] = {0};   // the code of the current attempt, for the status line
     // [Net] MaxPeers (multi-guest S0, ops/design-multi-guest-2026-11-27.md): players in the session including the host,
     // clamped 1..4. 1 (default) = the 1+1 link exactly as before.
@@ -84,11 +77,9 @@ namespace {
     sockaddr_in        g_relaySrv{};             // resolved off the game thread (RelayResolve); 0 until then
     volatile LONG      g_relayResolved = 0;      // 1 ok, -1 failed
     int                g_relayForce = 0;         // [Net] RelayForce=1: skip the direct attempt
-    uint16_t           g_peerSlot = 0;           // slot of g_peer on the relay (meaningful when g_peer == g_relaySrv)
     volatile LONG64    g_relayRoom = 0;          // host: from REGISTERED; guest: from the room code
     uint32_t           g_relayNonce = 0;         // REGISTER / JOIN nonce
     volatile LONG      g_relayRegistered = 0;    // host: REGISTERED seen
-    volatile LONG      g_linkVia = 0;            // 0 none, 1 direct, 2 relay
     volatile LONG      g_relayErr = 0;           // last relay ERR code (guest status line)
     // guest: the host's endpoints from PEER (written by the recv thread before g_hostInfo = 1)
     sockaddr_in        g_hostPub{}, g_hostLan{};
@@ -119,9 +110,28 @@ namespace {
     // which starves the interpolation buffer exactly when the frame rate dips. This ring keeps them
     // all, in arrival order. g_remote/g_haveRemote are still maintained so other callers see no change.
     #define NET_RXQ 16
-    PlayerState        g_rxq[NET_RXQ];
-    int                g_rxqHead = 0;    // next write slot
-    int                g_rxqCount = 0;   // filled entries (<= NET_RXQ); full -> the OLDEST is overwritten
+
+    // ---- multi-guest S2: the peer table (ops/design-multi-guest-2026-11-27.md 1.1 #1-11) ----------------
+    // Everything that described "the one remote endpoint" lives in one Peer. Star topology: on the host the entries
+    // are its guests, on a guest (and in manual mode) only entry 0 is used. Field locking is as it was for the old
+    // globals: addr/relaySlot under g_peerLock; ready/linkVia/lastRecvMs interlocked; lockedNonce/lockedMs recv
+    // thread only; remote/haveRemote/rxq under g_lock.
+    static const int NET_MAX_PEERS = 3;   // remote peers at most: [Net] MaxPeers 4 = host + 3 guests
+    struct Peer {
+        sockaddr_in   addr;          // was g_peer: the endpoint (the relay server's, for a relayed peer)
+        uint16_t      relaySlot;     // was g_peerSlot: its slot on the relay (meaningful when addr == g_relaySrv)
+        volatile LONG ready;         // was g_peerReady: 0 = no peer (lobby: before HELLO/WELCOME), game lanes off
+        uint64_t      lastRecvMs;    // was g_lastRecvMs: GetTickCount64() of the last ACCEPTED packet (0 = none yet)
+        uint32_t      lockedNonce;   // was g_lockedNonce: host, nonce of the HELLO that locked this guest
+        uint64_t      lockedMs;      // was g_lockedMs: host, GetTickCount64() of that lock (WR-22)
+        volatile LONG linkVia;       // was g_linkVia: 0 none, 1 direct, 2 relay
+        PlayerState   remote;        // was g_remote: newest player packet
+        bool          haveRemote;    // was g_haveRemote
+        PlayerState   rxq[NET_RXQ];  // was g_rxq: every queued player packet, arrival order
+        int           rxqHead;       // next write slot
+        int           rxqCount;      // filled entries (<= NET_RXQ); full -> the OLDEST is overwritten
+    };
+    Peer g_peers[NET_MAX_PEERS] = { { {}, 0, 1 } };   // entry 0 ready = 1 like the old g_peerReady; the rest zero
 
     int DetectInstanceSlot();   // below; never logs (dbg calls it to pick the file)
     void dbg(const char* s) {
@@ -1557,17 +1567,18 @@ namespace {
     }
 
     // ---- lobby helpers (slice 3) ------------------------------------------------------------------
-    sockaddr_in PeerCopy(uint16_t* slot = nullptr) {
+    // Peer i's endpoint (+ relay slot). i = 0 is the only peer unless [Net] MaxPeers > 1 on a host.
+    sockaddr_in PeerCopy(uint16_t* slot = nullptr, int i = 0) {
         AcquireSRWLockShared(&g_peerLock);
-        sockaddr_in p = g_peer;
-        if (slot) *slot = g_peerSlot;
+        sockaddr_in p = g_peers[i].addr;
+        if (slot) *slot = g_peers[i].relaySlot;
         ReleaseSRWLockShared(&g_peerLock);
         return p;
     }
-    void PeerSet(const sockaddr_in& p, uint16_t slot = Relay::kHostSlot) {
+    void PeerSet(const sockaddr_in& p, uint16_t slot = Relay::kHostSlot, int i = 0) {
         AcquireSRWLockExclusive(&g_peerLock);
-        g_peer = p;
-        g_peerSlot = slot;
+        g_peers[i].addr = p;
+        g_peers[i].relaySlot = slot;
         ReleaseSRWLockExclusive(&g_peerLock);
     }
     bool SameAddr(const sockaddr_in& a, const sockaddr_in& b) {
@@ -1627,7 +1638,7 @@ namespace {
             }
             uint16_t curSlot = 0;
             const sockaddr_in cur = PeerCopy(&curSlot);
-            const bool ready = InterlockedCompareExchange(&g_peerReady, 0, 0) != 0;
+            const bool ready = InterlockedCompareExchange(&g_peers[0].ready, 0, 0) != 0;
             const bool sameGuest = SameAddr(cur, from) && (!viaRelay || curSlot == slot);
             if (ready && sameGuest) {   // a retry that crossed our WELCOME: answer again, no log
                 SendLobby(LOBBY_WELCOME, p.nonce, 0, from, slot);
@@ -1642,15 +1653,15 @@ namespace {
             // current guest has been silent for 10 s. Through the relay every guest shares the server's
             // address, so "same machine" does not apply there: only silence frees the slot.
             const uint64_t now = GetTickCount64();
-            const bool silent = g_lastRecvMs == 0 || now - g_lastRecvMs > 10000;
+            const bool silent = g_peers[0].lastRecvMs == 0 || now - g_peers[0].lastRecvMs > 10000;
             // WR-22 (N4): the same-nonce rule above used to hold FOREVER, so when the locked path died (e.g. the
             // LAN endpoint the guest reached first stops delivering) the same join attempt could never move to its
             // other path. It now yields once the locked path has been silent for 10 s, measured from the last
             // accepted packet or, if none arrived yet, from the lock itself (g_lastRecvMs is reset to 0 on lock,
             // so `silent` alone would re-open the X1 crossing-HELLO race).
-            const uint64_t heardMs = g_lastRecvMs ? g_lastRecvMs : g_lockedMs;
+            const uint64_t heardMs = g_peers[0].lastRecvMs ? g_peers[0].lastRecvMs : g_peers[0].lockedMs;
             const bool lockedPathSilent = now - heardMs > 10000;
-            if (ready && p.nonce == g_lockedNonce && !lockedPathSilent) return;
+            if (ready && p.nonce == g_peers[0].lockedNonce && !lockedPathSilent) return;
             const bool sameMachine = !viaRelay && !IsRelay(cur) && cur.sin_addr.s_addr == from.sin_addr.s_addr;
             if (ready && !sameMachine && !silent) {
                 static int s_full = 0;
@@ -1661,13 +1672,13 @@ namespace {
                 }
                 return;
             }
-            InterlockedExchange(&g_peerReady, 0);
+            InterlockedExchange(&g_peers[0].ready, 0);
             PeerSet(from, slot);
-            g_lockedNonce = p.nonce;
-            g_lockedMs = now;   // WR-22
-            InterlockedExchange64((volatile LONGLONG*)&g_lastRecvMs, 0);   // N5: 64-bit store, never torn on x86
-            InterlockedExchange(&g_linkVia, viaRelay ? 2 : 1);
-            InterlockedExchange(&g_peerReady, 1);
+            g_peers[0].lockedNonce = p.nonce;
+            g_peers[0].lockedMs = now;   // WR-22
+            InterlockedExchange64((volatile LONGLONG*)&g_peers[0].lastRecvMs, 0);   // N5: 64-bit store, never torn on x86
+            InterlockedExchange(&g_peers[0].linkVia, viaRelay ? 2 : 1);
+            InterlockedExchange(&g_peers[0].ready, 1);
             SendLobby(LOBBY_WELCOME, p.nonce, 0, from, slot);
             _snprintf(m, sizeof(m), "[Lobby] guest joined %s (nonce=%08x codeCheck=%03x%s)\n", fa,
                       (unsigned)p.nonce, (unsigned)(p.codeCheck & 0xFFF), ready ? " re-lock" : "");
@@ -1688,8 +1699,8 @@ namespace {
             if (p.type == LOBBY_WELCOME) {
                 if (InterlockedCompareExchange(&g_joinState, 2, 1) != 1) return;
                 PeerSet(from, Relay::kHostSlot);   // lock onto the path that answered
-                InterlockedExchange(&g_linkVia, viaRelay ? 2 : 1);
-                InterlockedExchange(&g_peerReady, 1);
+                InterlockedExchange(&g_peers[0].linkVia, viaRelay ? 2 : 1);
+                InterlockedExchange(&g_peers[0].ready, 1);
                 _snprintf(m, sizeof(m), "[Lobby] joined host %s\n", fa);
                 m[sizeof(m) - 1] = 0; dbg(m);
                 { char e[160]; _snprintf(e, sizeof(e), "[E] ev=lobby-joined host=%s\n", fa); e[sizeof(e) - 1] = 0; dbg(e); }
@@ -1739,10 +1750,10 @@ namespace {
     // change; state 1 last publishes the new attempt.
     void StartJoin(uint32_t ipHost, uint16_t port, const char* codeText) {
         InterlockedExchange(&g_joinState, 0);
-        InterlockedExchange(&g_peerReady, 0);
+        InterlockedExchange(&g_peers[0].ready, 0);
         InterlockedExchange64(&g_relayRoom, 0);   // a direct code: not a relay join
         InterlockedExchange(&g_hostInfo, 0);
-        InterlockedExchange(&g_linkVia, 0);
+        InterlockedExchange(&g_peers[0].linkVia, 0);
         sockaddr_in peer{}; peer.sin_family = AF_INET; peer.sin_port = htons(port); peer.sin_addr.s_addr = htonl(ipHost);
         PeerSet(peer);
         LARGE_INTEGER qpc; QueryPerformanceCounter(&qpc);
@@ -1825,7 +1836,7 @@ namespace {
     struct PunchArgs { sockaddr_in pub, lan; uint32_t nonce; };
     unsigned __stdcall PunchThread(void* arg) {
         PunchArgs* a = (PunchArgs*)arg;
-        for (int i = 0; i < 12 && InterlockedCompareExchange(&g_peerReady, 0, 0) == 0; ++i) {
+        for (int i = 0; i < 12 && InterlockedCompareExchange(&g_peers[0].ready, 0, 0) == 0; ++i) {
             SendLobby(LOBBY_PUNCH, a->nonce, 0, a->pub);
             if (a->lan.sin_addr.s_addr && a->lan.sin_port && !SameAddr(a->lan, a->pub)) SendLobby(LOBBY_PUNCH, a->nonce, 0, a->lan);
             Sleep(250);
@@ -1936,7 +1947,7 @@ namespace {
         // overwritten by an unconditional PeerSet(relay) (dead link: both ends drop each other). Switch to the relay only
         // while the join is still undecided, under the peer lock the WELCOME handler's PeerSet also takes.
         AcquireSRWLockExclusive(&g_peerLock);
-        if (alive()) { g_peer = g_relaySrv; g_peerSlot = Relay::kHostSlot; }
+        if (alive()) { g_peers[0].addr = g_relaySrv; g_peers[0].relaySlot = Relay::kHostSlot; }
         ReleaseSRWLockExclusive(&g_peerLock);
         if (!alive()) return 0;   // WELCOMEd in the gap: keep the path that answered
         t0 = GetTickCount64();
@@ -1961,10 +1972,10 @@ namespace {
 
     void StartRelayJoin(uint64_t room, const char* codeText) {
         InterlockedExchange(&g_joinState, 0);
-        InterlockedExchange(&g_peerReady, 0);
+        InterlockedExchange(&g_peers[0].ready, 0);
         InterlockedExchange(&g_hostInfo, 0);
         InterlockedExchange(&g_relayErr, 0);
-        InterlockedExchange(&g_linkVia, 0);
+        InterlockedExchange(&g_peers[0].linkVia, 0);
         InterlockedExchange(&g_roomMissingLogged, 0);
         InterlockedExchange64(&g_relayRoom, (LONG64)room);
         g_relayNonce = NewNonce();
@@ -2119,7 +2130,7 @@ namespace {
                 const uint64_t cur = (uint64_t)InterlockedCompareExchange64(&g_relayRoom, 0, 0);
                 RelayHello(Relay::T_REGISTER, cur ? cur : g_relayRoomCfg);
             }
-            if (haveSrv && InterlockedCompareExchange(&g_peerReady, 0, 0) == 0 && now - lastStun >= 25000) {
+            if (haveSrv && InterlockedCompareExchange(&g_peers[0].ready, 0, 0) == 0 && now - lastStun >= 25000) {
                 lastStun = now;
                 if (StunOnce(srv, 1000) && (g_stunIp != prevIp || g_stunPort != prevPort)) {
                     FmtIp(prevIp, a, sizeof(a)); FmtIp(g_stunIp, b, sizeof(b));
@@ -2205,7 +2216,7 @@ namespace {
                     continue;
                 }
                 // Before the handshake there is no peer: drop game packets unseen (lobby modes only).
-                if (InterlockedCompareExchange(&g_peerReady, 0, 0) == 0) continue;
+                if (InterlockedCompareExchange(&g_peers[0].ready, 0, 0) == 0) continue;
                 uint16_t peerSlot = 0;
                 const sockaddr_in peer = PeerCopy(&peerSlot);   // one consistent copy per datagram (g_peerLock)
                 // Relayed peer: other members of the room arrive from the same server endpoint; only the
@@ -2324,15 +2335,15 @@ namespace {
                         }
                         EnterCriticalSection(&g_lock);
                         if (playerOk) {
-                            std::memcpy(&g_remote, buf, sizeof(g_remote));   // not *(PlayerState*)buf: buf is not 16-byte aligned
+                            std::memcpy(&g_peers[0].remote, buf, sizeof(g_peers[0].remote));   // not *(PlayerState*)buf: buf is not 16-byte aligned
                             // blendCount indexes blendFactors[BLEND_MAX] in lerpState/apply; a wire value above it is an OOB write.
-                            if (g_remote.blendCount > BLEND_MAX) g_remote.blendCount = BLEND_MAX;
-                            g_haveRemote = true;
+                            if (g_peers[0].remote.blendCount > BLEND_MAX) g_peers[0].remote.blendCount = BLEND_MAX;
+                            g_peers[0].haveRemote = true;
                             // Queue it too (overwrites the OLDEST when the ring is full), so a frame
                             // that drains several packets feeds the interpolator all of them.
-                            g_rxq[g_rxqHead] = g_remote;
-                            g_rxqHead = (g_rxqHead + 1) % NET_RXQ;
-                            if (g_rxqCount < NET_RXQ) ++g_rxqCount;
+                            g_peers[0].rxq[g_peers[0].rxqHead] = g_peers[0].remote;
+                            g_peers[0].rxqHead = (g_peers[0].rxqHead + 1) % NET_RXQ;
+                            if (g_peers[0].rxqCount < NET_RXQ) ++g_peers[0].rxqCount;
                         }
                         else if (entityPkt && entityOk) {
                             // B-4: pull the death entries out into their own ring first. A packet made
@@ -2365,7 +2376,7 @@ namespace {
                         // g_rxRejects is the subset that produced no state, EXCLUDING the chunks that
                         // were merely deferred (DEC_PENDING) or superseded (DEC_STALE).
                         const bool heartbeatOnly = accepted && entityPkt && decoded.count == 0;
-                        if (accepted && !heartbeatOnly) InterlockedExchange64((volatile LONGLONG*)&g_lastRecvMs, (LONGLONG)GetTickCount64());   // N5
+                        if (accepted && !heartbeatOnly) InterlockedExchange64((volatile LONGLONG*)&g_peers[0].lastRecvMs, (LONGLONG)GetTickCount64());   // N5
                         InterlockedIncrement(&g_rxPackets);
                         InterlockedAdd(&g_rxBytes, (LONG)n);
                         LeaveCriticalSection(&g_lock);
@@ -2781,9 +2792,9 @@ bool Init() {
     if (g_mode == LM_MANUAL) {
         peer.sin_port = htons((u_short)sendPort);
         inet_pton(AF_INET, peerIp, &peer.sin_addr);
-        g_peerReady = 1;
+        g_peers[0].ready = 1;
     } else {   // host: no peer until the first HELLO; join: no peer until StartJoin below / F8
-        g_peerReady = 0;
+        g_peers[0].ready = 0;
     }
     PeerSet(peer);
 
@@ -2797,7 +2808,7 @@ bool Init() {
                             (unsigned)NET_PROTO_VER, (unsigned)g_intent.myInc); dbg(m); }
 
     g_enabled = true;
-    g_lastRecvMs = 0;   // no packet accepted yet
+    g_peers[0].lastRecvMs = 0;   // no packet accepted yet
     SelfTestWire();     // [Phase 2] prove the compact codec round-trips before any traffic
     { char lm[192]; LobbyCode::SelfTest(lm, sizeof(lm)); dbg(lm); }   // lobby-code format (slice 2): log only, no behaviour
     if (g_mode != LM_MANUAL) SelfTestLobby();
@@ -2908,8 +2919,8 @@ void LobbyStatus(char* out, size_t n) {
     AcquireSRWLockShared(&g_codeLock);
     lstrcpynA(code, g_mode == LM_HOST ? g_hostCode : g_joinCodeText, sizeof(code));
     ReleaseSRWLockShared(&g_codeLock);
-    const bool ready = InterlockedCompareExchange(&g_peerReady, 0, 0) != 0;
-    const LONG via = InterlockedCompareExchange(&g_linkVia, 0, 0);
+    const bool ready = InterlockedCompareExchange(&g_peers[0].ready, 0, 0) != 0;
+    const LONG via = InterlockedCompareExchange(&g_peers[0].linkVia, 0, 0);
     const char* viaTxt = via == 2 ? " (relay)" : via == 1 ? " (direct)" : "";
     if (g_mode == LM_HOST) {
         const char* note = (const char*)InterlockedCompareExchangePointer((PVOID volatile*)&g_hostNote, nullptr, nullptr);
@@ -2939,7 +2950,7 @@ int MaxPeers() { return g_maxPeers; }
 int InstanceSlot() { return g_instanceSlot; }
 
 void Send(const PlayerState& s) {
-    if (!g_enabled || InterlockedCompareExchange(&g_peerReady, 0, 0) == 0) return;   // lobby: no peer yet
+    if (!g_enabled || InterlockedCompareExchange(&g_peers[0].ready, 0, 0) == 0) return;   // lobby: no peer yet
     uint16_t slot = 0;
     const sockaddr_in peer = PeerCopy(&slot);
     SendRaw(&s, (int)sizeof(s), peer, slot);   // direct, or DATA through the relay
@@ -2954,8 +2965,8 @@ bool GetRemote(PlayerState& out) {
     if (!g_enabled) return false;
     bool have;
     EnterCriticalSection(&g_lock);
-    have = g_haveRemote;
-    if (have) out = g_remote;
+    have = g_peers[0].haveRemote;
+    if (have) out = g_peers[0].remote;
     LeaveCriticalSection(&g_lock);
     return have;
 }
@@ -2966,10 +2977,10 @@ int DrainRemote(PlayerState* out, int max) {
     if (!g_enabled || !out || max <= 0) return 0;
     int n = 0;
     EnterCriticalSection(&g_lock);
-    while (n < max && g_rxqCount > 0) {
-        int idx = (g_rxqHead - g_rxqCount + NET_RXQ) % NET_RXQ;   // oldest entry in the ring
-        out[n++] = g_rxq[idx];
-        --g_rxqCount;
+    while (n < max && g_peers[0].rxqCount > 0) {
+        int idx = (g_peers[0].rxqHead - g_peers[0].rxqCount + NET_RXQ) % NET_RXQ;   // oldest entry in the ring
+        out[n++] = g_peers[0].rxq[idx];
+        --g_peers[0].rxqCount;
     }
     LeaveCriticalSection(&g_lock);
     return n;
@@ -2977,7 +2988,7 @@ int DrainRemote(PlayerState* out, int max) {
 
 void SendEntities(const EntityPacket& p) {
     // Lobby: no peer yet -> send nothing, and do not encode either (the encoder advances the delta shadow).
-    if (!g_enabled || InterlockedCompareExchange(&g_peerReady, 0, 0) == 0) return;
+    if (!g_enabled || InterlockedCompareExchange(&g_peers[0].ready, 0, 0) == 0) return;
     uint16_t slot = 0;
     const sockaddr_in peer = PeerCopy(&slot);
     const size_t n = EncodeEntityPacket(p, g_txBuf, sizeof(g_txBuf));   // [header][records]
@@ -3077,13 +3088,13 @@ void SetLocalWorldId(uint64_t id) {
 
 uint64_t LastRecvMs() {
     if (!g_enabled) return 0;
-    uint64_t t = (uint64_t)InterlockedCompareExchange64((volatile LONGLONG*)&g_lastRecvMs, 0, 0);   // N5: atomic 64-bit read
+    uint64_t t = (uint64_t)InterlockedCompareExchange64((volatile LONGLONG*)&g_peers[0].lastRecvMs, 0, 0);   // N5: atomic 64-bit read
     return t;
 }
 
 uint32_t MillisSinceRecv() {
     if (!g_enabled) return 0xFFFFFFFFu;
-    uint64_t t = (uint64_t)InterlockedCompareExchange64((volatile LONGLONG*)&g_lastRecvMs, 0, 0);   // N5: atomic 64-bit read
+    uint64_t t = (uint64_t)InterlockedCompareExchange64((volatile LONGLONG*)&g_peers[0].lastRecvMs, 0, 0);   // N5: atomic 64-bit read
     if (t == 0) return 0xFFFFFFFFu;               // nothing received yet
     return (uint32_t)(GetTickCount64() - t);       // 64-bit delta, narrowed after the subtraction
 }
@@ -3140,7 +3151,7 @@ void ForgetIntents(uint32_t slot, uint64_t wireId) {
 }
 
 void PumpIntents() {
-    if (!IntentLaneOn() || InterlockedCompareExchange(&g_peerReady, 0, 0) == 0) return;
+    if (!IntentLaneOn() || InterlockedCompareExchange(&g_peers[0].ready, 0, 0) == 0) return;
     size_t len[INTENT_PUMP_DGRAMS] = {0};
     int n = 0;
     const uint64_t now = GetTickCount64();
