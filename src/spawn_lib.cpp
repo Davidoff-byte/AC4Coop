@@ -176,17 +176,20 @@ uintptr_t PrivateOwnerFor(uintptr_t real)   // player thread; real validated by 
 }
 bool IsPrivateOwner(uintptr_t o) { return o == (uintptr_t)(g_foObj + 8); }
 uintptr_t g_pendSpec = 0, g_pendOld = 0;   // set around our submit (player thread), consumed in SpawnLibNoteFac (same thread)
-struct Borrow { volatile uintptr_t req; uintptr_t spec, old; };
+struct Borrow { volatile uintptr_t req; uintptr_t spec, old; ULONGLONG t; };
 Borrow g_bw[32] = {}; volatile LONG g_bwNext = 0;
 // Our submitted, not yet built requests (any owner). A spec can be freed while one of them is queued (run T5 guest 29392:
 // spec FC63CA20 freed with our request FC124C40 still queued -> sub_199D1F0 read its position params, AV 0x69D0A5).
 // The spec dtor sub_501DF0 (detoured in spawn_census.cpp) never touches the request in +0x3C, so we redirect.
 struct Inf { volatile uintptr_t req; volatile uintptr_t spec; int kind; uint32_t cls; ULONGLONG t; };
-Inf g_inf[64] = {}; volatile LONG g_infNext = 0;
+constexpr int kInf = 256;   // no expiry: run T7 host 28300 - our request FC21EF40 stayed queued > 12 s, its entry had expired, the
+                            // spec was freed later and the manager built it -> AV 0x69D0A5. Entries leave at build or when dead.
+Inf g_inf[kInf] = {}; volatile LONG g_infNext = 0;
 uintptr_t g_pendAny = 0; int g_pendKind = 0; uint32_t g_pendCls = 0;   // set around our submit (player thread)
-volatile LONG c_dying = 0, c_redir = 0, c_redirFail = 0;
-constexpr ULONGLONG kInfMaxMs = 12000;   // > kBuildTimeoutMs: an older unbuilt entry is treated as gone (never written)
-void BorrowRestore(uintptr_t req)   // DetSet, manager job thread
+volatile LONG c_dying = 0, c_redir = 0, c_redirFail = 0; LONG c_bwEarly = 0, c_infDead = 0;
+constexpr ULONGLONG kBorrowEarlyMs = 3000;
+int InfCount() { int n = 0; for (int i = 0; i < kInf; ++i) n += g_inf[i].req != 0; return n; }   // unbuilt after 3 s: give the slot back now (the private owner cannot pair it)
+void BorrowRestore(uintptr_t req)   // DetSet (manager job thread) at build, or SpawnLibFire (player thread) 3 s after submit
 {
     for (int i = 0; i < 32; ++i) {
         Borrow& b = g_bw[i];
@@ -307,8 +310,8 @@ void SpawnLibNoteFac(uintptr_t req)
 {
     if (!t_tag || !req) return;
     g_ourReq = req;
-    if (g_pendSpec) { Borrow& b = g_bw[(InterlockedIncrement(&g_bwNext) - 1) & 31]; b.spec = g_pendSpec; b.old = g_pendOld; MemoryBarrier(); b.req = req; g_pendSpec = 0; }
-    if (g_pendAny) { Inf& f = g_inf[(InterlockedIncrement(&g_infNext) - 1) & 63]; f.spec = g_pendAny; f.kind = g_pendKind; f.cls = g_pendCls; f.t = GetTickCount64(); MemoryBarrier(); f.req = req; g_pendAny = 0; }
+    if (g_pendSpec) { Borrow& b = g_bw[(InterlockedIncrement(&g_bwNext) - 1) & 31]; b.spec = g_pendSpec; b.old = g_pendOld; b.t = GetTickCount64(); MemoryBarrier(); b.req = req; g_pendSpec = 0; }
+    if (g_pendAny) { Inf& f = g_inf[(InterlockedIncrement(&g_infNext) - 1) & (kInf - 1)]; f.spec = g_pendAny; f.kind = g_pendKind; f.cls = g_pendCls; f.t = GetTickCount64(); MemoryBarrier(); f.req = req; g_pendAny = 0; }
 }
 // SpawnKeyNoteReq (submit, game threads): one submitted request with its factory args; key = static spawn key or 0.
 void SpawnLibNoteSubmit(uintptr_t item, uintptr_t owner, uintptr_t ctx, uint64_t key)
@@ -337,7 +340,7 @@ extern "C" void SpawnLibNoteBuilt(uintptr_t req, uintptr_t ent)   // C linkage: 
 {
     if (!g_installed || !req || !ent) return;
     BorrowRestore(req);
-    for (int i = 0; i < 64; ++i) if (g_inf[i].req == req) g_inf[i].req = 0;   // built: never redirected afterwards
+    for (int i = 0; i < kInf; ++i) if (g_inf[i].req == req) g_inf[i].req = 0;   // built: never redirected afterwards
     if (g_fly.active && req == g_fly.req) { g_fly.ent = ent; g_fly.tBuilt = GetTickCount64(); }
     uint32_t cls = 0; uintptr_t spec = 0;
     if (!ReadBuiltShip(req, ent, &cls, &spec) || !cls || !spec) return;
@@ -356,11 +359,10 @@ extern "C" void SpawnLibSpecDying(uintptr_t spec)
 {
     if (!g_installed || !spec) return;
     { Spin s; for (int i = 0; i < g_libN; ++i) if (g_lib[i].spec == spec) g_lib[i].bad = 1; }
-    const ULONGLONG now = GetTickCount64();
-    for (int i = 0; i < 64; ++i) {
+    for (int i = 0; i < kInf; ++i) {
         Inf& f = g_inf[i];
         const uintptr_t req = f.req;
-        if (!req || f.spec != spec || now - f.t > kInfMaxMs) continue;
+        if (!req || f.spec != spec) continue;
         InterlockedIncrement(&c_dying);
         for (int j = 0; j < 32; ++j) if (g_bw[j].req == req) g_bw[j].req = 0;
         LibE e;
@@ -463,6 +465,16 @@ void SpawnLibFire()
             g_fly.active = 0;
         }
     }
+    // 2b. our queued requests: give the borrowed slot back after 3 s; drop table entries whose request is dead (vt gone)
+    static ULONGLONG s_maint = 0;
+    if (now >= s_maint) {
+        s_maint = now + 1000;
+        for (int i = 0; i < 32; ++i) { Borrow& b = g_bw[i]; const uintptr_t r = b.req; if (r && now - b.t >= kBorrowEarlyMs) { BorrowRestore(r); ++c_bwEarly; } }
+        for (int i = 0; i < kInf; ++i) {
+            Inf& f = g_inf[i]; const uintptr_t r = f.req;
+            if (r && now - f.t > 15000 && !(Readable(r, 0x14) && *(const uint32_t*)r == 0x01E6D77Cu && *(const uintptr_t*)(r + 0x10) == f.spec)) { f.req = 0; ++c_infDead; }
+        }
+    }
     // 3. stats every 10 s
     static ULONGLONG s_stats = 0;
     if (now >= s_stats) {
@@ -470,8 +482,8 @@ void SpawnLibFire()
         int ships = 0, npcs = 0, keyed = 0, learned = 0, idleS = 0, idleN = 0, armS = 0, armN = 0;
         { Spin s; for (int i = 0; i < g_libN; ++i) { if (g_lib[i].bad) continue; const bool rd = Readable(g_lib[i].spec, 0x40); const int idle = rd && *(const uintptr_t*)(g_lib[i].spec + 0x3C) == 0; const int arm = rd && SpecArmed(g_lib[i].spec);
             if (g_lib[i].kind == K_SHIP) { ++ships; learned += g_lib[i].cls != 0; idleS += idle; armS += arm; } else { ++npcs; keyed += g_lib[i].key != 0; idleN += idle; armN += arm; } } }
-        Log("[SpawnLib] stats lib ships=%d (classKnown %d idle %d armed %d) npcs=%d (keyed %d idle %d armed %d) | want=%ld cmd=%ld follow=%ld fired=%ld submit0=%ld built=%ld placed=%ld noSpec=%ld failed=%ld badSpec=%ld busySkip=%ld unarmedSkip=%ld busyState(1/2/4/6/9/other/bad)=%ld/%ld/%ld/%ld/%ld/%ld/%ld pol=%ld queue=%d | owner priv=%ld real=%ld slot restored=%ld kept=%ld | specDying=%ld redirected=%ld redirectFail=%ld | privCalls(4/5/6/7/8/10/11/17)=%ld/%ld/%ld/%ld/%ld/%ld/%ld/%ld\n",
-            ships, learned, idleS, armS, npcs, keyed, idleN, armN, c_want, c_cmd, c_follow, c_fired, c_submit0, c_built, c_placed, c_noSpec, c_failed, c_badSpec, c_busy, c_unarmed, c_st[0], c_st[1], c_st[2], c_st[3], c_st[4], c_st[5], c_st[6], g_busyPol, g_qN, c_foUsed, c_realOwner, c_bwRestored, c_bwKept, c_dying, c_redir, c_redirFail, c_fo[4], c_fo[5], c_fo[6], c_fo[7], c_fo[8], c_fo[10], c_fo[11], c_fo[17]);
+        Log("[SpawnLib] stats lib ships=%d (classKnown %d idle %d armed %d) npcs=%d (keyed %d idle %d armed %d) | want=%ld cmd=%ld follow=%ld fired=%ld submit0=%ld built=%ld placed=%ld noSpec=%ld failed=%ld badSpec=%ld busySkip=%ld unarmedSkip=%ld busyState(1/2/4/6/9/other/bad)=%ld/%ld/%ld/%ld/%ld/%ld/%ld pol=%ld queue=%d | owner priv=%ld real=%ld slot restored=%ld kept=%ld | early=%ld | queued=%d dead=%ld specDying=%ld redirected=%ld redirectFail=%ld | privCalls(4/5/6/7/8/10/11/17)=%ld/%ld/%ld/%ld/%ld/%ld/%ld/%ld\n",
+            ships, learned, idleS, armS, npcs, keyed, idleN, armN, c_want, c_cmd, c_follow, c_fired, c_submit0, c_built, c_placed, c_noSpec, c_failed, c_badSpec, c_busy, c_unarmed, c_st[0], c_st[1], c_st[2], c_st[3], c_st[4], c_st[5], c_st[6], g_busyPol, g_qN, c_foUsed, c_realOwner, c_bwRestored, c_bwKept, c_bwEarly, InfCount(), c_infDead, c_dying, c_redir, c_redirFail, c_fo[4], c_fo[5], c_fo[6], c_fo[7], c_fo[8], c_fo[10], c_fo[11], c_fo[17]);
     }
     // 4. fire at most one request
     if (g_fly.active || g_qN == 0 || now - g_lastFire < kGapMs) return;

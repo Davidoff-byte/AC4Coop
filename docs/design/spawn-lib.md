@@ -21,6 +21,9 @@ Evidence: `docs/evidence/spawn-lib-2026-11-28.md` (runs, four crash root causes,
 | spec must be **armed**: `spec+0x1C` object with a vtable in .rdata and vt[2] in .text | C (host 25716 + guest 24228): `sub_46D6F0 → sub_6B3CE0(spec)` on an un-armed spec, AV 0x6B3CE3 |
 | busy spec only if its current request is not in flight (`SpawnLibBusy=1`; 0 idle only, 2 any) | idle specs did not build (4/4 timeouts); in-flight is where B's pairing came from |
 | naval submits use the **private owner** (no adoption) + slot borrow restored at build | D (T3, both copies): owner adoption is 1:1 per spec; it freed a spec another record still used, AV 0x1C27B25 |
+| a spec dying under one of our queued requests → request re-pointed to a live substitute (detour `sub_501DF0`) | E (T5 guest): encounter freed the spec while our request was queued, AV 0x69D0A5 |
+| ship specs only from the naval owner class 0x02708E80 | ship specs of class 0x026BDE50 never built (11/11 in T5+T6) |
+| `SpawnCmdSeq` acts on a value read twice in a row (1 s apart), sentinel defaults on every re-read | a key caught mid-write reads as 0: 39 / 19 phantom commands in T5 / T6 |
 
 Private owner: one static zeroed object; its vtables point at a copy of the owner interface 0x02708E80 with the
 adoption / entity-removed / dtor slots ([4]–[8], [10], [11], [17]) replaced by counting no-ops; the other slots are the
