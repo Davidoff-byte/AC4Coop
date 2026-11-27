@@ -16075,6 +16075,38 @@ static void __cdecl OnFrame(Human* updatedHuman) {
         static int s_n = 0;
         if (s_n < 20) { ++s_n; L("[Frame] EXCEPTION 0x%08X in on-frame work (skipped)\n", GetExceptionCode()); }
     }
+    // [Coop] PlayerFrameFallback (default 0; ported from b52ce83, archive/feat-ship-coop, where it defaulted to
+    // [Coop] ShipCoop which is not on this base). b52ce83 records (live 2026-11-16) that at the ship wheel
+    // (ContextID 25) the PLAYER's Human update stops reaching this hook, so the copy at the helm stopped sending.
+    // Other Humans are still updated on this thread: when the player has had no frame for > 100 ms, run the
+    // player-frame work from the next other Human's update, at most once per 15 ms. A player frame turns it off.
+    // UNVERIFIED: the fallback itself was never observed live (b52ce83: "built, not yet live-verified").
+    {
+        static int s_fbOn = -1; static ULONGLONG s_lastPlayerMs = 0, s_lastFbMs = 0; static bool s_fbActive = false;
+        if (s_fbOn < 0) s_fbOn = GetPrivateProfileIntA("Coop", "PlayerFrameFallback", 0, Paths::Ini()) != 0 ? 1 : 0;
+        if (s_fbOn == 1) {
+            const ULONGLONG now = GetTickCount64();
+            if (isPlayerUpdate(base(), updatedHuman)) {
+                s_lastPlayerMs = now;
+                if (s_fbActive) { s_fbActive = false; L("[Frame] player update resumed -> fallback off\n"); }
+            } else if (s_lastPlayerMs && now - s_lastPlayerMs > 100 && now - s_lastFbMs >= 15) {
+                Human* ph = nullptr;
+                __try {
+                    World* w = World::GetCurrentWorld(); Entity* pl = w ? w->GetPlayer() : nullptr;
+                    ph = pl ? AIEntityHelper::GetHuman(pl) : nullptr;
+                } __except (EXCEPTION_EXECUTE_HANDLER) { ph = nullptr; }
+                if (ph) {
+                    s_lastFbMs = now;
+                    if (!s_fbActive) { s_fbActive = true; L("[Frame] no player update for %llu ms -> player work runs from other Humans' updates\n", now - s_lastPlayerMs); }
+                    __try { OnFrameInner(ph); }
+                    __except (EXCEPTION_EXECUTE_HANDLER) {
+                        static int s_fe = 0;
+                        if (s_fe < 20) { ++s_fe; L("[Frame] EXCEPTION 0x%08X in fallback player work (skipped)\n", GetExceptionCode()); }
+                    }
+                }
+            }
+        }
+    }
     InterlockedCompareExchange(&s_playerWorkTid, 0, (LONG)GetCurrentThreadId());   // player work over (if it was ours)
 }
 
@@ -16108,7 +16140,7 @@ static void DumpConfigOnce()
         // The Tune* values are floats (read with strtod, see ShipTuningTick); the dump shows the integer part.
         { "Coop", "TuneConeAngle", 120 }, { "Coop", "TuneConeRange", 350 }, { "Coop", "TuneMaxTime", 30 },
         { "Coop", "TuneAggroTime", 30 }, { "Coop", "TuneHull", 0 },
-        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 }, { "Coop", "WeaponSync", 0 }, { "Coop", "ShipPeerZ", 0 }, { "Coop", "ShipBindProbe", 0 }, { "Coop", "ShipSpawnProbe", 0 }, { "Coop", "ShipSpawnFire", 0 }, { "Coop", "ShipSpawnFirePid", 0 }, { "Coop", "SpawnCensus", 0 }, { "Coop", "SpawnReplayFire", 0 }, { "Coop", "SpawnReplayFirePid", 0 }, { "Coop", "SpawnShare", 0 }, { "Coop", "SpawnKeyBind", 0 }, { "Coop", "ShipClassBind", 0 }, { "Coop", "ShipClassBindSteal", 0 }, { "Coop", "ShipFields", 0 }, { "Coop", "HelmBoth", 0 }, { "Coop", "BoardingForce", 0 }, { "Coop", "SpawnShareRadiusM", 150 },{ "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "FastTravelCrashFix", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 }, { "Coop", "PuppetListener", 0 }, { "Coop", "PuppetListenerAttach", 0 }, { "Coop", "PuppetMaxLife", 0 }, { "Coop", "ConflictProbe", 0 },
+        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 }, { "Coop", "WeaponSync", 0 }, { "Coop", "ShipPeerZ", 0 }, { "Coop", "ShipBindProbe", 0 }, { "Coop", "ShipSpawnProbe", 0 }, { "Coop", "ShipSpawnFire", 0 }, { "Coop", "ShipSpawnFirePid", 0 }, { "Coop", "SpawnCensus", 0 }, { "Coop", "SpawnReplayFire", 0 }, { "Coop", "SpawnReplayFirePid", 0 }, { "Coop", "SpawnShare", 0 }, { "Coop", "SpawnKeyBind", 0 }, { "Coop", "ShipClassBind", 0 }, { "Coop", "ShipClassBindSteal", 0 }, { "Coop", "ShipFields", 0 }, { "Coop", "HelmBoth", 0 }, { "Coop", "BoardingForce", 0 }, { "Coop", "PlayerFrameFallback", 0 }, { "Coop", "SpawnShareRadiusM", 150 },{ "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "FastTravelCrashFix", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 }, { "Coop", "PuppetListener", 0 }, { "Coop", "PuppetListenerAttach", 0 }, { "Coop", "PuppetMaxLife", 0 }, { "Coop", "ConflictProbe", 0 },
         { "Coop", "CombatTest", 0 }, { "Coop", "CrashContext", 0 }, { "Coop", "CorpseKeepSec", 30 }, { "Coop", "CrowdProbeIntegrate", 1 },
         { "Coop", "CrowdProbeLiveKeys", 1 }, { "Coop", "DamageRelay", 0 }, { "Coop", "Diag", 0 },
         { "Coop", "DisableCrowd", 0 }, { "Coop", "DisablePuppetAI", 1 }, { "Coop", "DisableSpawns", 0 },
