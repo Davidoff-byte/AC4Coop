@@ -19,6 +19,8 @@
 // nearer and the current choice is at least 2 s old; read by the other two sites (create: decide once if unknown).
 // Not covered (S3 3.2 / 7.2 / 7.3): the target gate 0x101CAA0 for the puppet, the escalation receiver, and the
 // helpers 0x6F6010 / 0x65A660 / 0x1B06D30 (not patched: they still read the local player).
+// [Coop] GuardPerceivePuppet=1 replaces this choice rule (visibility-sticky G1, G3 keeps the stimulus target): see
+// ChoosePerceive. With the flag at 0 the rule above runs unchanged.
 #include "guard_sight.h"
 #include "Hook.h"
 #include "paths.h"
@@ -31,6 +33,7 @@
 
 void* Phase1_PuppetEntity();
 bool  Phase1_IsEntityHost();
+void  Phase1_LogLine(const char* s);
 
 namespace {
 
@@ -44,16 +47,21 @@ bool g_installed = false;
 int  g_on = 0; ULONGLONG g_nextMs = 0;
 
 const int SLOTS = 256;
-struct Choice { uintptr_t obs; int puppet; ULONGLONG sinceMs; ULONGLONG seenMs; };   // seenMs: last Choose for obs
+// seenMs: last Choose for obs. commit .. detMs are used only with [Coop] GuardPerceivePuppet=1 (ChoosePerceive):
+// commit = body last seen (0 player, 1 puppet), visMs[body] = last tick its request had VISIBLE (bit 2),
+// det = detection target at G3 (0 none, 1 player, 2 puppet), detMs = when G3 set it.
+struct Choice { uintptr_t obs; int puppet; ULONGLONG sinceMs; ULONGLONG seenMs; int commit; ULONGLONG visMs[2]; int det; ULONGLONG detMs; };
 Choice  g_tab[SLOTS];
 SRWLOCK g_lock = SRWLOCK_INIT;
 volatile LONG g_calls[3] = {}, g_puppetPicks = 0, g_switches = 0;
+int g_perc = 0;   // [Coop] GuardPerceivePuppet (default 0), read with GuardSeesPuppet
 
 bool On(ULONGLONG nowMs)
 {
     if (nowMs >= g_nextMs) {
         g_nextMs = nowMs + 2000;
         g_on = GetPrivateProfileIntA("Coop", "GuardSeesPuppet", 0, Paths::Ini()) != 0;
+        g_perc = GetPrivateProfileIntA("Coop", "GuardPerceivePuppet", 0, Paths::Ini()) != 0;
     }
     return g_on != 0;
 }
@@ -135,6 +143,118 @@ void SightProbe(void* los, void* G, void* P, void* player)
     }
 }
 
+// ---- [Coop] GuardPerceivePuppet (default 0; needs GuardSeesPuppet; read live with it every 2 s) --------------------
+// Design: ops/evidence/guard-perceive-puppet-design-2026-11-27.md section 3.1 (faults F1, F3, F4 of the rules above).
+// Only the decision changes; sites, stubs and byte checks are the ones above. No engine call on this path (SightProbe's
+// faction getters are not called with the flag on): GetTickCount64, g_lock and field reads under __try only.
+//   G1 retarget (mode 1): req = *(los+0xF8); u16 req+0x10 bit 2 = VISIBLE, the result for the body the previous call
+//      returned (S3 A8.3). Visible -> keep it. Not visible -> hold the body last seen until T_LOSE without seeing it,
+//      then alternate the two bodies, each staying in the slot at least T_PROBE.
+//   G1 create (mode 0): unchanged rule (the nearer body, decided once).
+//   G3 detection start (mode 2): esi = CRLDetect; +0x74 already holds the stimulus target (CreateReaction 0x1055D12).
+//      Return that body when it is the player or the puppet; otherwise the real GetPlayer (SP). Recorded as det.
+//   G4 (guard_poi.cpp PoiFor): DetectsPuppet() - lend the puppet only while this guard's detection target is the puppet.
+// Not implemented: design 3.1 (b) "the other body is within the guard's sight range" needs sub_18779F0 (an engine call,
+// lock behaviour unread) - the alternation probes the other body instead.
+const ULONGLONG T_LOSE = 1500, T_PROBE = 500, T_DET = 3000;
+volatile LONG g_pcG1 = 0, g_pcPickPup = 0, g_pcPickPl = 0, g_pcKeepVis = 0, g_pcHold = 0, g_pcProbe = 0,
+              g_pcG3 = 0, g_pcTgtPup = 0, g_pcTgtPl = 0, g_pcTgtOther = 0, g_pcLend = 0, g_pcEv1 = 0, g_pcEv3 = 0;
+
+// caller holds g_lock exclusive. A slot is free when unused or not seen by any gate for 60 s.
+int FindSlotP(uintptr_t obs, ULONGLONG nowMs, bool create)
+{
+    int freeSlot = -1;
+    for (int i = 0; i < SLOTS; ++i) {
+        if (g_tab[i].obs == obs) return i;
+        if (freeSlot < 0 && (g_tab[i].obs == 0 || nowMs - g_tab[i].seenMs > 60000)) freeSlot = i;
+    }
+    if (!create || freeSlot < 0) return -1;
+    g_tab[freeSlot] = Choice{};
+    g_tab[freeSlot].obs = obs; g_tab[freeSlot].sinceMs = nowMs; g_tab[freeSlot].seenMs = nowMs;
+    return freeSlot;
+}
+
+void* ChoosePerceive(void* obs, void* player, void* pup, int mode, void* los, ULONGLONG nowMs)
+{
+    char line[160]; line[0] = 0;
+    if (mode == 2) {
+        InterlockedIncrement(&g_pcG3);
+        const void* e = nullptr;
+        if (los) {
+            __try {
+                const int* h = *(const int* const*)((const char*)los + 0x74);
+                e = h ? (const void*)(uintptr_t)((h[2] >> 31) & h[0]) : nullptr;
+            } __except (EXCEPTION_EXECUTE_HANDLER) { e = nullptr; }
+        }
+        // +0x74 = puppet -> puppet; = player -> player; anything else -> the real GetPlayer, so the detection then
+        // targets the player and is recorded as such (no lend).
+        const int det = e == pup ? 2 : 1;
+        InterlockedIncrement(e == pup ? &g_pcTgtPup : e == player ? &g_pcTgtPl : &g_pcTgtOther);
+        AcquireSRWLockExclusive(&g_lock);
+        const int s = FindSlotP((uintptr_t)obs, nowMs, true);
+        if (s >= 0) { g_tab[s].det = det; g_tab[s].detMs = nowMs; g_tab[s].seenMs = nowMs; }
+        ReleaseSRWLockExclusive(&g_lock);
+        if (InterlockedIncrement(&g_pcEv3) <= 20)
+            _snprintf_s(line, sizeof(line), _TRUNCATE, "[Perceive] gate=3 guard=%p target=%s src=%s\n", obs,
+                        det == 2 ? "puppet" : "player", (e == pup || e == player) ? "stim74" : "getplayer");
+        if (line[0]) Phase1_LogLine(line);
+        if (det == 2) { InterlockedIncrement(&g_puppetPicks); return pup; }
+        return player;
+    }
+
+    InterlockedIncrement(&g_pcG1);
+    unsigned flags = 0;
+    if (mode == 1 && los) {
+        __try {
+            const char* req = *(const char* const*)((const char*)los + 0xF8);
+            flags = req ? *(const uint16_t*)(req + 0x10) : 0;
+        } __except (EXCEPTION_EXECUTE_HANDLER) { flags = 0; }
+    }
+    float po[3], pp[3], pq[3];
+    const bool havePos = Pos(obs, po) && Pos(player, pp) && Pos(pup, pq);
+    AcquireSRWLockExclusive(&g_lock);
+    int s = FindSlotP((uintptr_t)obs, nowMs, false);
+    if (s < 0) {   // first sight of this guard: the create rule (nearer body)
+        if (!havePos) { ReleaseSRWLockExclusive(&g_lock); InterlockedIncrement(&g_pcPickPl); return player; }
+        s = FindSlotP((uintptr_t)obs, nowMs, true);
+        const int first = D2(po, pq) < D2(po, pp) ? 1 : 0;
+        if (s >= 0) { g_tab[s].puppet = first; g_tab[s].commit = first; }
+        else {
+            ReleaseSRWLockExclusive(&g_lock);
+            InterlockedIncrement(first ? &g_pcPickPup : &g_pcPickPl);
+            if (first) { InterlockedIncrement(&g_puppetPicks); return pup; }
+            return player;
+        }
+    }
+    Choice& c = g_tab[s];
+    const int prev = c.puppet ? 1 : 0;
+    int pick = prev;
+    if (mode == 1) {
+        if (flags & 0x002) {   // the body in the slot is visible: keep it
+            const bool reacquired = c.visMs[prev] == 0 || nowMs - c.visMs[prev] >= T_LOSE;
+            c.visMs[prev] = nowMs;
+            c.commit = prev;
+            InterlockedIncrement(&g_pcKeepVis);
+            if (reacquired && InterlockedIncrement(&g_pcEv1) <= 40)
+                _snprintf_s(line, sizeof(line), _TRUNCATE, "[Perceive] gate=1 guard=%p vis=%s after=%llums\n", obs,
+                            prev ? "pup" : "pl", (unsigned long long)(nowMs - c.sinceMs));
+        } else if (c.visMs[c.commit ? 1 : 0] && nowMs - c.visMs[c.commit ? 1 : 0] < T_LOSE) {
+            pick = c.commit ? 1 : 0;   // seen less than T_LOSE ago: hold it
+            InterlockedIncrement(&g_pcHold);
+        } else if (nowMs - c.sinceMs >= T_PROBE) {
+            pick = prev ^ 1;           // lost: alternate, each body at least T_PROBE in the slot
+            InterlockedIncrement(&g_pcProbe);
+        }
+        if (pick != prev) { c.puppet = pick; c.sinceMs = nowMs; InterlockedIncrement(&g_switches); }
+    }
+    c.seenMs = nowMs;
+    ReleaseSRWLockExclusive(&g_lock);
+    if (line[0]) Phase1_LogLine(line);
+    InterlockedIncrement(pick ? &g_pcPickPup : &g_pcPickPl);
+    if (pick) { InterlockedIncrement(&g_puppetPicks); return pup; }
+    return player;
+}
+
 int g_dktOn = 0; ULONGLONG g_dktNext = 0; volatile LONG g_dktKept = 0;
 // mode 0 = request create, 1 = per-update retarget (decides), 2 = detection start (reads)
 void* __cdecl Choose(void* obs, void* player, int mode, void* los)
@@ -144,6 +264,7 @@ void* __cdecl Choose(void* obs, void* player, int mode, void* los)
     if (!On(nowMs) || !Phase1_IsEntityHost() || !obs || !player) return player;
     void* pup = Phase1_PuppetEntity();
     if (!pup || pup == obs || World(pup) != World(player)) return player;
+    if (g_perc) return ChoosePerceive(obs, player, pup, mode, los, nowMs);   // [Coop] GuardPerceivePuppet
     // [Coop] DetectKeepTarget (live, default 0). At 0x131EFD5 `los` is the CRLDetect (esi). CreateReaction
     // (0x1055CB0) set CRLDetect+0x74 to the stimulus's handle (S3 evidence section 8); the start function then
     // overwrites +0x74 with this call's result. When the reaction was created FOR the puppet, keep the puppet, so
@@ -286,6 +407,54 @@ bool GuardSight::TracksPuppet(const void* guard)
         if (g_tab[i].obs == (uintptr_t)guard) { r = g_tab[i].puppet && nowMs - g_tab[i].seenMs < 3000; break; }
     ReleaseSRWLockShared(&g_lock);
     return r;
+}
+
+bool GuardSight::PerceiveOn() { return g_installed && g_on && g_perc; }
+
+// G4 with GuardPerceivePuppet=1: this guard's detection target (G3) is the puppet and was set less than T_DET ago.
+bool GuardSight::DetectsPuppet(const void* guard)
+{
+    if (!PerceiveOn() || !guard) return false;
+    const ULONGLONG nowMs = GetTickCount64();
+    bool r = false;
+    AcquireSRWLockShared(&g_lock);
+    for (int i = 0; i < SLOTS; ++i)
+        if (g_tab[i].obs == (uintptr_t)guard) { r = g_tab[i].det == 2 && nowMs - g_tab[i].detMs < T_DET; break; }
+    ReleaseSRWLockShared(&g_lock);
+    if (r) InterlockedIncrement(&g_pcLend);
+    return r;
+}
+
+// Guest lane ([Coop] GuardActionLane): false with the flag off (nothing appended). stage 2 = detection start less than
+// T_DET ago (target = det), 1 = the committed sight body was visible less than T_LOSE ago, 0 = none.
+bool GuardSight::PerceiveFor(const void* guard, unsigned char* stage, unsigned char* targetIsPuppet)
+{
+    if (!PerceiveOn() || !guard || !stage || !targetIsPuppet) return false;
+    *stage = 0; *targetIsPuppet = 0;
+    const ULONGLONG nowMs = GetTickCount64();
+    AcquireSRWLockShared(&g_lock);
+    for (int i = 0; i < SLOTS; ++i) {
+        if (g_tab[i].obs != (uintptr_t)guard) continue;
+        const Choice& c = g_tab[i];
+        const int b = c.commit ? 1 : 0;
+        if (c.det && nowMs - c.detMs < T_DET) { *stage = 2; *targetIsPuppet = c.det == 2 ? 1 : 0; }
+        else if (c.visMs[b] && nowMs - c.visMs[b] < T_LOSE) { *stage = 1; *targetIsPuppet = (unsigned char)b; }
+        break;
+    }
+    ReleaseSRWLockShared(&g_lock);
+    return true;
+}
+
+int GuardSight::FormatPerceiveReport(char* out, int cap)
+{
+    if (!g_installed || !g_perc || cap < 64) return 0;
+    const int n = _snprintf_s(out, cap, _TRUNCATE,
+        "[Perceive] on=%d g1 calls=%ld pickPup=%ld pickPl=%ld keepVis=%ld hold=%ld probeSwitch=%ld | g3 calls=%ld tgt pup=%ld pl=%ld other=%ld | g4 lend=%ld",
+        g_on && g_perc ? 1 : 0, InterlockedExchange(&g_pcG1, 0), InterlockedExchange(&g_pcPickPup, 0),
+        InterlockedExchange(&g_pcPickPl, 0), InterlockedExchange(&g_pcKeepVis, 0), InterlockedExchange(&g_pcHold, 0),
+        InterlockedExchange(&g_pcProbe, 0), InterlockedExchange(&g_pcG3, 0), InterlockedExchange(&g_pcTgtPup, 0),
+        InterlockedExchange(&g_pcTgtPl, 0), InterlockedExchange(&g_pcTgtOther, 0), InterlockedExchange(&g_pcLend, 0));
+    return n > 0 ? n : 0;
 }
 
 int GuardSight::FormatReport(char* out, int cap)

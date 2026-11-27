@@ -113,7 +113,9 @@ void* __cdecl PoiFor(void* e)
         if (!g_on || !e || !Phase1_IsEntityHost()) return nullptr;
         void* pup = Phase1_PuppetEntity();
         if (!pup || e == pup) return nullptr;
-        if (!GuardSight::TracksPuppet(e)) {
+        // [Coop] GuardPerceivePuppet: key on the guard's detection target, not on what its sensor is probing (F4)
+        const bool tracks = GuardSight::PerceiveOn() ? GuardSight::DetectsPuppet(e) : GuardSight::TracksPuppet(e);
+        if (!tracks) {
             if (!g_ftOn || !FightTargetIs(e, pup)) return nullptr;
             InterlockedIncrement(&g_lentFight);
         }
