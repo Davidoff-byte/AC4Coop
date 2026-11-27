@@ -120,7 +120,6 @@ void Poll()
         cnt = ai ? *(const unsigned short*)((char*)ai + 0x76) : 0;
         rec98 = ai ? *(void**)((char*)ai + 0x98) : 0;   // the entity fight record; null = no fight data at all
         team = *(unsigned*)((char*)pup + 0x10);            // entity+0x10 = the word sub_15DABC0 matches against fm+0x30C
-        fac = ((FacFn)VA_FACTION)(pup);                    // ResolveFaction (0x133A4C0) - the hostility input, NOT the team
         tgate = ai ? ((AiTypeFn)VA_AITYPE)(ai) : 0;        // 1 = the faction field is used, 0 = handle fallback
         svc = FindHealth(ai);
         if (svc) {
@@ -128,6 +127,10 @@ void Poll()
             flags = *(const unsigned short*)((const char*)svc + 0x5E);
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+    // Lock rule (ops/evidence/guard-perceive-puppet-design-2026-11-27.md, Addendum A3): ResolveFaction 0x133A4C0 can
+    // enter the global handle CS [0x4DD5FA0+0x7C] (refcount-zero path, 0x133A51A / 0x133A530). It runs OUTSIDE any
+    // __try, after the pup fields (+0x5C, +0xE8, +0x10) were read above. Poll runs on its own thread (no outer __try).
+    fac = ((FacFn)VA_FACTION)(pup);                        // ResolveFaction (0x133A4C0) - the hostility input, NOT the team
 
     // Differential control: the local player through the identical chain.
     int plLife = -1, plFlags = -1;
@@ -135,6 +138,7 @@ void Poll()
     void* plSvc = 0;
     void* plRec98 = 0;
     unsigned pteam = 0, pfac = 0, ptgate = 0;
+    void* plForFac = 0;   // set once the player's +0xE8/+0x10 fields read cleanly; ResolveFaction runs after the __try
     __try {
         World* w = World::GetCurrentWorld();
         void* pl = w ? w->GetPlayer() : 0;
@@ -143,7 +147,7 @@ void Poll()
             plAI = aic ? *(void**)((char*)aic + 0x1C) : 0;
             pteam = *(unsigned*)((char*)pl + 0x10);
             plRec98 = plAI ? *(void**)((char*)plAI + 0x98) : 0;
-            pfac = ((FacFn)VA_FACTION)(pl);
+            plForFac = pl;
             ptgate = plAI ? ((AiTypeFn)VA_AITYPE)(plAI) : 0;
             plSvc = FindHealth(plAI);
             if (plSvc) {
@@ -152,6 +156,7 @@ void Poll()
             }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    if (plForFac) pfac = ((FacFn)VA_FACTION)(plForFac);   // 0x133A4C0 outside any __try (lock rule above)
 
     // [Coop] PuppetMaxLife: the replica spawns with its own stat block (max 10 vs the player's 125), so a single
     // guard hit kills it. Copy the player's max once and refill. Cosmetic; the guest still owns the outcome.

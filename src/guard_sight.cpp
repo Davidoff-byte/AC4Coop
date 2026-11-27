@@ -103,10 +103,15 @@ void SightProbe(void* los, void* G, void* P, void* player)
     const ULONGLONG nowMs = GetTickCount64();
     if (nowMs >= g_spNext) { g_spNext = nowMs + 2000; g_spOn = GetPrivateProfileIntA("Coop", "SightProbe", 0, Paths::Ini()) != 0; }
     if (!g_spOn || !los) return;
+    // Lock rule (ops/evidence/guard-perceive-puppet-design-2026-11-27.md, Addendum A3): 0x17114C0 always enters the
+    // global handle-table CS [0x4DD5FA0+0x7C] (0xA0BE15), 0x133A4C0 enters it on the refcount-zero path (0x133A530).
+    // A fault swallowed by __except while that CS is owned deadlocks every other thread, so those calls run below,
+    // OUTSIDE any __try, only after every input was read here. Choose (the caller) holds no __try around this call.
+    SpSample s = {};
+    bool callFac = false;
     __try {
         const char* req = *(const char* const*)((const char*)los + 0xF8);
         if (!req) return;
-        SpSample s = {};
         s.flags = *(const uint16_t*)(req + 0x10);
         InterlockedIncrement(&g_spN);
         if (s.flags & 0x001) InterlockedIncrement(&g_spCone);
@@ -130,17 +135,27 @@ void SightProbe(void* los, void* G, void* P, void* player)
         float pg[3], pp[3];
         if (Pos(G, pg) && Pos(P, pp)) s.dist = sqrtf(D2(pg, pp));
         if (s.flags & 0x002) {
-            typedef void* (__cdecl* FacFn)(void*);
-            typedef BOOL (__cdecl* HostFn)(void*, void*);
-            s.facP  = (unsigned)(uintptr_t)((FacFn)0x0133A4C0)(P);
-            s.facPl = (unsigned)(uintptr_t)((FacFn)0x0133A4C0)(player);
-            if (s.facP && s.facP == s.facPl) InterlockedIncrement(&g_spSameFac);
-            if (((HostFn)0x017114C0)(G, P)) InterlockedIncrement(&g_spHostP);
-            if (((HostFn)0x017114C0)(G, player)) InterlockedIncrement(&g_spHostPl);
+            // Validate the getter inputs here (inside __try): the same fields already read from P, read from the
+            // player too; G was read above (+0x5C, Pos). A fault here leaves the getters uncalled.
+            if (!player) return;
+            volatile uint32_t k2 = *(const uint32_t*)((const char*)player + 0x9C); (void)k2;
+            volatile const void* h2 = *(const void* const*)((const char*)player + 0xE8); (void)h2;
+            volatile const void* w2 = *(const void* const*)((const char*)player + 0x5C); (void)w2;
+            callFac = true;
         }
-        g_spLast = s;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return;
     }
+    if (callFac) {   // engine calls that may take the global CS: no __try on this path (see above)
+        typedef void* (__cdecl* FacFn)(void*);
+        typedef BOOL (__cdecl* HostFn)(void*, void*);
+        s.facP  = (unsigned)(uintptr_t)((FacFn)0x0133A4C0)(P);
+        s.facPl = (unsigned)(uintptr_t)((FacFn)0x0133A4C0)(player);
+        if (s.facP && s.facP == s.facPl) InterlockedIncrement(&g_spSameFac);
+        if (((HostFn)0x017114C0)(G, P)) InterlockedIncrement(&g_spHostP);
+        if (((HostFn)0x017114C0)(G, player)) InterlockedIncrement(&g_spHostPl);
+    }
+    g_spLast = s;
 }
 
 // ---- [Coop] GuardPerceivePuppet (default 0; needs GuardSeesPuppet; read live with it every 2 s) --------------------

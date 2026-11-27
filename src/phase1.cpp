@@ -3698,6 +3698,32 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
     }
 }
 
+// [Coop] DespawnLeaveFight: puppet queued by DespawnPuppet for RemoveFighter + RemoveEntity outside any __try.
+// Main thread only (set in OnFrameInner, drained in OnFrame).
+static Entity* s_pendingDespawn = nullptr;
+
+// Called from OnFrame AFTER the OnFrameInner __try. RemoveFighter runs with no __try on the call path; World lookup
+// and RemoveEntity keep the __try they had in DespawnPuppet.
+static void DespawnPuppetDeferred() {
+    Entity* dead = s_pendingDespawn;
+    if (!dead) return;
+    s_pendingDespawn = nullptr;
+    World* world = nullptr;
+    __try { world = World::GetCurrentWorld(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        L("[Net] DespawnPuppet EXCEPTION (code=0x%08X)\n", GetExceptionCode());
+        return;
+    }
+    if (!world) return;
+    GuardPoi::LeaveFightBeforeDespawn(dead);   // validates under its own __try, calls sub_161F420 outside it
+    __try {
+        world->RemoveEntity(dead);
+        L("[Net] puppet despawned (%p)\n", dead);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        L("[Net] DespawnPuppet EXCEPTION (code=0x%08X)\n", GetExceptionCode());
+    }
+}
+
 // Remove the puppet from the world when the peer leaves our world or disconnects. World::RemoveEntity
 // is the deferred counterpart to World::AddEntity (processes next frame). Clears g_puppet immediately
 // so nothing drives the entity after we've asked for its removal. Main-thread only (like spawn).
@@ -3712,12 +3738,20 @@ void Phase1::DespawnPuppet() {
     g_bhvState = -1;                 // re-establish the next puppet's behavior state (toggle from unknown)
     g_switchCd = 0;
     g_casActivated = false;          // re-activate its CharacterActionSet
+    // [Coop] DespawnLeaveFight (default 0): RemoveFighter (sub_161F420) takes the FightManager CS and the global
+    // handle CS (design-2026-11-27 Addendum A3), and DespawnPuppet runs inside OnFrameInner, i.e. inside OnFrame's
+    // __try. Lock rule: never call a lock-taking engine function under __try. With the flag on, the whole
+    // RemoveFighter -> RemoveEntity sequence (same order) is deferred to DespawnPuppetDeferred, which OnFrame runs
+    // after the OnFrameInner __try has closed. Flag off: unchanged below.
+    if (GetPrivateProfileIntA("Coop", "DespawnLeaveFight", 0, Paths::Ini()) != 0) {
+        s_pendingDespawn = dead;
+        return;
+    }
     __try {
         World* world = World::GetCurrentWorld();
         if (!world)
             return;
 
-        GuardPoi::LeaveFightBeforeDespawn(dead);   // [Coop] DespawnLeaveFight (default 0)
         world->RemoveEntity(dead);
 
         L("[Net] puppet despawned (%p)\n", dead);
@@ -6540,20 +6574,91 @@ enum Hostility {
     HOST_NO      = 1,
     HOST_YES     = 2
 };
+// Lock rule (ops/evidence/guard-perceive-puppet-design-2026-11-27.md, Addendum A3): 0x17114C0 always enters the
+// global handle-table CS [0x4DD5FA0+0x7C] (sub_19017C0 -> sub_A0BDE0, 0xA0BE15), 0x133A4C0 on its refcount-zero
+// path (0x133A51A / 0x133A530). A fault swallowed by an __except while that CS is owned deadlocks every other
+// thread. So this has NO __try and must only be reached with no __try on the call path: its one caller is
+// HostilityRefreshDeferred (from OnFrame, after the OnFrameInner __try). Same calls, same order as before.
 static Hostility HostilityToPlayer(const void* player, const void* e) {
     if (!player || !e) return HOST_UNKNOWN;
-    __try {
-        // Fast path: 0x17114C0 returns 1 only when it resolved BOTH factions itself, so a 1 here
-        // is YES with no extra engine calls.  Subject first: (player, e).
-        if (((BOOL(__cdecl*)(void*, void*))0x017114C0)((void*)player, (void*)e)) return HOST_YES;
-        // Slow path: 0 is ambiguous ("not enemy" vs "could not resolve"); resolve to separate them.
-        // These are the only reason the two extra calls exist -- the predicate resolves both anyway.
-        if (!((int(__cdecl*)(void*))0x0133A4C0)((void*)player)) return HOST_UNKNOWN;
-        if (!((int(__cdecl*)(void*))0x0133A4C0)((void*)e))      return HOST_UNKNOWN;
-        return HOST_NO;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return HOST_UNKNOWN;
+    // Fast path: 0x17114C0 returns 1 only when it resolved BOTH factions itself, so a 1 here
+    // is YES with no extra engine calls.  Subject first: (player, e).
+    if (((BOOL(__cdecl*)(void*, void*))0x017114C0)((void*)player, (void*)e)) return HOST_YES;
+    // Slow path: 0 is ambiguous ("not enemy" vs "could not resolve"); resolve to separate them.
+    // These are the only reason the two extra calls exist -- the predicate resolves both anyway.
+    if (!((int(__cdecl*)(void*))0x0133A4C0)((void*)player)) return HOST_UNKNOWN;
+    if (!((int(__cdecl*)(void*))0x0133A4C0)((void*)e))      return HOST_UNKNOWN;
+    return HOST_NO;
+}
+
+// ---- deferred hostility (lock rule above) ---------------------------------------------------------
+// CaptureGuards runs inside two __try levels (its entity loop, and OnFrame's __try{OnFrameInner}), so it only
+// LOOKS UP a cached result here and queues misses. HostilityRefreshDeferred computes them from OnFrame after the
+// OnFrameInner __try, on the same thread: the producer (CaptureGuards, reached only from EntitySyncTick in
+// OnFrameInner after the isPlayerUpdate gate) and the consumer are both the player-work thread, which OnFrame
+// checks through s_playerWorkTid before draining. Plain arrays, no lock.
+// Key: entity pointer + its vtable + its HandleContainer (m_Object == e) objId (an inline field read,
+// BaseTypes.h), so a freed-and-reused address does not inherit another body's result.
+// Miss / identity mismatch -> HOST_UNKNOWN for this snapshot and queued. Entry older than HOST_TTL_MS -> the
+// cached value is still returned and the entity is re-queued (refresh without an "unknown" gap).
+struct HostCacheEnt { const void* e; uint32_t vt; uint64_t objId; uint64_t ms; uint8_t host; };
+struct HostQEnt { const void* e; HandleContainer* hc; uint32_t vt; uint64_t objId; };
+static const int HOST_CACHE_N = 256, HOST_Q_N = 64, HOST_PER_FRAME = 16;
+static const uint64_t HOST_TTL_MS = 500;
+static HostCacheEnt s_hostCache[HOST_CACHE_N];
+static HostQEnt s_hostQ[HOST_Q_N];
+static int s_hostQN = 0;
+static const void* s_hostPlayer = nullptr;   // the cache is relative to this player body; flushed on change
+
+static int HostSlot(const void* e) { return (int)(((uintptr_t)e >> 4) * 2654435761u >> 24) & (HOST_CACHE_N - 1); }
+
+static void HostQueue(const void* e, HandleContainer* hc, uint32_t vt, uint64_t objId) {
+    for (int i = 0; i < s_hostQN; ++i) if (s_hostQ[i].e == e) return;
+    if (s_hostQN >= HOST_Q_N) return;   // full: stays unknown/stale until a later snapshot
+    s_hostQ[s_hostQN++] = HostQEnt{ e, hc, vt, objId };
+}
+
+// Called from CaptureGuards' loop. Caller has already checked readable(e,4) and readable(hc,4), hc->m_Object == e.
+static Hostility HostilityLookup(const void* player, const void* e, HandleContainer* hc, uint64_t nowMs) {
+    if (!player || !e || !hc) return HOST_UNKNOWN;
+    if (player != s_hostPlayer) {
+        std::memset(s_hostCache, 0, sizeof(s_hostCache));
+        s_hostQN = 0;
+        s_hostPlayer = player;
     }
+    const uint32_t vt = *(const uint32_t*)e;
+    const uint64_t objId = hc->GetObjectID();
+    const HostCacheEnt& c = s_hostCache[HostSlot(e)];
+    if (c.e != e || c.vt != vt || c.objId != objId) { HostQueue(e, hc, vt, objId); return HOST_UNKNOWN; }
+    if (nowMs - c.ms >= HOST_TTL_MS) HostQueue(e, hc, vt, objId);
+    return (Hostility)c.host;
+}
+
+// Validation reads only; no engine call. 1 = the queued identity still holds.
+static int HostValidate(const HostQEnt& q, const void* player) {
+    __try {
+        if (!readable(q.e, 4) || !readable(q.hc, sizeof(HandleContainer)) || !readable(player, 4)) return 0;
+        if (*(const uint32_t*)q.e != q.vt) return 0;
+        if ((const void*)q.hc->m_Object != q.e || q.hc->GetObjectID() != q.objId) return 0;
+        return 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+// From OnFrame after the OnFrameInner __try, on the player-work thread only. At most HOST_PER_FRAME entities.
+static void HostilityRefreshDeferred() {
+    if (s_hostQN <= 0) return;
+    const void* player = s_hostPlayer;
+    const uint64_t nowMs = GetTickCount64();
+    const int n = s_hostQN < HOST_PER_FRAME ? s_hostQN : HOST_PER_FRAME;
+    for (int i = 0; i < n; ++i) {
+        const HostQEnt q = s_hostQ[i];
+        if (!player || !HostValidate(q, player)) continue;   // gone / reused: dropped, re-queued if seen again
+        const Hostility h = HostilityToPlayer(player, q.e);  // engine calls, NO __try on this path
+        HostCacheEnt& c = s_hostCache[HostSlot(q.e)];
+        c.e = q.e; c.vt = q.vt; c.objId = q.objId; c.ms = nowMs; c.host = (uint8_t)h;
+    }
+    for (int i = n; i < s_hostQN; ++i) s_hostQ[i - n] = s_hostQ[i];
+    s_hostQN -= n;
 }
 
 // ---- sync scope (TASK: proximity to the PEER) ------------------------------------------------
@@ -7426,7 +7531,9 @@ static void CaptureGuards(EntityPacket& pkt) {
             // A28: ONE classification per candidate, before the gate, so the counters describe the
             // population and not just the survivors.  Counted hostile -> unknown -> candidate.
             // Default-off gate means nothing is rejected (identical to before) but it is measured.
-            const int hostile = (int)HostilityToPlayer(player, e);
+            // Lock rule: no faction engine call here (inside this loop's __try and OnFrameInner's). Cached result
+            // computed by HostilityRefreshDeferred; a miss reads HOST_UNKNOWN for this snapshot.
+            const int hostile = (int)HostilityLookup(player, e, hc, nowMs);
             if (hostile == HOST_YES)     ++s_scopeHostile;
             if (hostile == HOST_UNKNOWN) ++s_scopeUnknown;
             ++s_scopeCand;
@@ -16354,9 +16461,16 @@ static void __cdecl OnFrame(Human* updatedHuman) {
             }
         }
     }
-    // [Coop] ShipSpawnReplay: the one engine submit (sub_569560) runs HERE, on the player-update thread and outside every
-    // __try (it reaches EnterCriticalSection(client+4) at 0x5BCAE0; a swallowed fault would leave the lock held).
-    if ((DWORD)s_playerWorkTid == GetCurrentThreadId()) ShipSpawnReplayFire();
+    // Deferred lock-taking engine work, outside every __try. Only on the thread that just did the player work
+    // (OnFrameInner sets s_playerWorkTid after its isPlayerUpdate gate; cleared below): OnFrame runs for every
+    // Human, and the queues are filled on the player-work thread only.
+    // [Coop] ShipSpawnReplay: the one engine submit (sub_569560) also runs here, on the player-update thread and outside
+    // every __try (it reaches EnterCriticalSection(client+4) at 0x5BCAE0; a swallowed fault would leave the lock held).
+    if (s_playerWorkTid == (LONG)GetCurrentThreadId()) {
+        DespawnPuppetDeferred();      // [Coop] DespawnLeaveFight: RemoveFighter (no-op unless queued)
+        HostilityRefreshDeferred();   // CaptureGuards' hostility cache (no-op unless queued)
+        ShipSpawnReplayFire();        // [Coop] ShipSpawnReplay (no-op unless queued)
+    }
     InterlockedCompareExchange(&s_playerWorkTid, 0, (LONG)GetCurrentThreadId());   // player work over (if it was ours)
 }
 
