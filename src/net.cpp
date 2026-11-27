@@ -2497,9 +2497,55 @@ namespace {
     int  EosBridgePort() { return GetPrivateProfileIntA("Net", "EosBridgePort", 47900, Paths::Ini()); }
 }
 
+#include <tlhelp32.h>   // PreflightLog: modules of this process
+
 namespace Net {
 
 bool BeginJoin(uint32_t ip, uint16_t port, char* err, size_t errN);   // below Init
+
+// [Preflight] (backlog I-801/I-802, ops/PREFLIGHT-TWO-MACHINE-2026-11-09.md B1-B4): one explicit line per known
+// two-machine blocker that otherwise fails silently. Read-only - nothing here changes what Init does.
+// B1 (stale ASI) is not checkable here: the ASI carries no pinned hash; the launcher compares deployed vs its build.
+static void PreflightLog(bool eos, int mode, const char* peerIp, int localPort, int peerPort) {
+    int fails = 0; char m[320];
+    {   // ASI2: two co-op ASIs loaded into this process both hook the game
+        int n = 0; char names[160] = {0};
+        HANDLE s = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+        if (s != INVALID_HANDLE_VALUE) {
+            MODULEENTRY32W e; e.dwSize = sizeof(e);
+            for (BOOL ok = Module32FirstW(s, &e); ok; ok = Module32NextW(s, &e)) {
+                char nm[MAX_MODULE_NAME32 + 1] = {0};
+                WideCharToMultiByte(CP_ACP, 0, e.szModule, -1, nm, sizeof(nm), nullptr, nullptr);
+                char lo[MAX_MODULE_NAME32 + 1]; lstrcpynA(lo, nm, sizeof(lo)); CharLowerA(lo);
+                const size_t L = strlen(lo);
+                if (L > 4 && strcmp(lo + L - 4, ".asi") == 0 && strstr(lo, "coop")) {
+                    ++n;
+                    if (strlen(names) + L + 2 < sizeof(names)) { if (names[0]) lstrcatA(names, ","); lstrcatA(names, nm); }
+                }
+            }
+            CloseHandle(s);
+        }
+        if (n > 1) { _snprintf(m, sizeof(m), "[Preflight] FAIL ASI2 %d co-op ASIs loaded (%s) - keep only AC4Coop.asi\n", n, names); m[sizeof(m) - 1] = 0; dbg(m); ++fails; }
+    }
+    // PeerIP / ports are used only in manual mode over UDP (Transport=eos forces the bridge; host/join/lobby take the
+    // peer from HELLO / the code).
+    const bool manual = !eos && mode == LM_MANUAL;
+    in_addr pa{}; const bool loop = inet_pton(AF_INET, peerIp, &pa) == 1 && (ntohl(pa.s_addr) >> 24) == 127;
+    const int strict = GetPrivateProfileIntA("Coop", "NetStrictPeer", 1, Paths::Ini());   // phase1.cpp default
+    if (manual && loop && strict) {
+        _snprintf(m, sizeof(m), "[Preflight] FAIL B2 PeerIP=%s with NetStrictPeer=1: datagrams from another PC are dropped "
+                  "(expected only on a same-PC two-instance test)\n", peerIp); m[sizeof(m) - 1] = 0; dbg(m); ++fails;
+    }
+    if (manual && !loop && localPort != peerPort) {
+        _snprintf(m, sizeof(m), "[Preflight] FAIL B3 LocalPort=%d != PeerPort=%d with remote PeerIP=%s: the same ini on both PCs "
+                  "gives a one-way link\n", localPort, peerPort, peerIp); m[sizeof(m) - 1] = 0; dbg(m); ++fails;
+    }
+    if (GetPrivateProfileIntA("Coop", "HostileOnly", 0, Paths::Ini())) {   // phase1.cpp default 0
+        dbg("[Preflight] FAIL B4 [Coop] HostileOnly=1 gates sync on a predicate never observed in game\n"); ++fails;
+    }
+    _snprintf(m, sizeof(m), "[Preflight] %s: %d fail(s) of ASI2 B2 B3 B4 (B1 = launcher hash check)\n", fails ? "DONE" : "OK", fails);
+    m[sizeof(m) - 1] = 0; dbg(m);
+}
 
 bool Init() {
     if (GetPrivateProfileIntA("Net", "Enabled", 0, Paths::Ini()) == 0) return false;
@@ -2533,6 +2579,7 @@ bool Init() {
             char m[128]; wsprintfA(m, "[EOS] Transport=eos: manual mode, peer = bridge 127.0.0.1:%d\n", peerPort); dbg(m);
         }
     }
+    PreflightLog(g_eos, (int)g_mode, peerIp, localPort, peerPort);
     // Host mode only: [Net] Upnp=1 (default) and [Net] StunServer=stun.l.google.com:19302 (default; empty = off).
     g_upnpEnabled = GetPrivateProfileIntA("Net", "Upnp", 1, Paths::Ini());
     GetPrivateProfileStringA("Net", "StunServer", "stun.l.google.com:19302", g_stunServer, sizeof(g_stunServer), Paths::Ini());
