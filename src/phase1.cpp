@@ -3393,7 +3393,14 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
         //   other contexts  -> WE own actions: behavior DISABLED + action replication (parkour/climb/etc.).
         // HybridLoco=0 restores the old global-flag behavior for A/B.
         bool hybrid     = (g_hybridLoco != 0);
-        bool peerGround = (s.contextId == CTX_GROUND);
+        // [Coop] HybridLocoCtx4 (default 0): the live sender's ground context is 4, not CTX_GROUND (2) - see kCtxGroundLive
+        // and docs/evidence/native-replica-2026-11-15.md ("PlayerState+134 = 4 with ground stage 1 in 36530 of 36573 packets";
+        // "[Net] puppet behavior disabled (ctx=4)"), so with real packets this ground branch never ran. 1 = accept 4 as ground
+        // too (2 stays accepted: BuildState's fallback writes CTX_GROUND). 0 = the old test. UNVERIFIED live: the toggle
+        // crash history of the ground/off-ground switch (same evidence file, crash 29404) has never been run on this branch.
+        static int s_hlCtx4 = -1;
+        if (s_hlCtx4 < 0) { s_hlCtx4 = GetPrivateProfileIntA("Coop", "HybridLocoCtx4", 0, Paths::Ini()) != 0 ? 1 : 0; L("[Coop] HybridLocoCtx4=%d\n", s_hlCtx4); }
+        bool peerGround = (s.contextId == CTX_GROUND) || (s_hlCtx4 && s.contextId == kCtxGroundLive);
         bool aiOff   = hybrid ? !peerGround : (g_disablePuppetAI != 0);   // disable the puppet's behavior?
         bool actNow  = hybrid ? !peerGround : (g_driveActions   != 0);    // run our action replication?
         bool locoNow = hybrid ?  peerGround : (g_driveLoco       != 0);   // feed HumanGroundData (FSM anim)?
@@ -16402,7 +16409,7 @@ static void DumpConfigOnce()
         { "Coop", "ForceUnknownBuild", 0 }, { "Coop", "GhostMarkerSuppress", 1 }, { "Coop", "GhostProxy", 0 },
         { "Coop", "GuardNullActionTarget", 0 }, { "Coop", "GuardNullTarget", 1 }, { "Coop", "GuardAnimFull", 0 }, { "Coop", "GuardBlendFix", 0 }, { "Coop", "GuardStaleReturn", 0 }, { "Coop", "GuardStaleTarget", 1 },
         { "Coop", "GuestKillMirror", 0 }, { "Coop", "HelmSync", 0 }, { "Coop", "HookSgm", 1 }, { "Coop", "HostileOnly", 0 },
-        { "Coop", "HybridLoco", 1 }, { "Coop", "IdentityBand", 0 }, { "Coop", "IdResolver", 1 },
+        { "Coop", "HybridLoco", 1 }, { "Coop", "HybridLocoCtx4", 0 }, { "Coop", "IdentityBand", 0 }, { "Coop", "IdResolver", 1 },
         { "Coop", "InstallHooks", 1 }, { "Coop", "IntegratePuppet", 0 }, { "Coop", "KillTrace", 1 },
         { "Coop", "KrLog", 0 }, { "Coop", "LegacyPadIdHook", 1 }, { "Coop", "MirrorActions", 1 }, { "Coop", "MirrorActionsDeferred", 1 }, { "Coop", "OwnPhysicsMs", 0 }, { "Coop", "OwnUpdateGuards", 0 }, { "Coop", "OwnUpdatePuppet", 0 }, { "Coop", "MinBlendInMs", 100 },
         { "Coop", "NetStrictPeer", 1 }, { "Coop", "NullReturnObserver", 1 }, { "Coop", "Probe", 0 },
