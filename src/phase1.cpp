@@ -201,8 +201,13 @@ void L(const char* fmt, ...) {
     printf("%s", buf);
     OutputDebugStringA(buf);
     // Also append to a per-process file, flushed each line, so the trail survives a crash.
-    static FILE* f = nullptr;
-    if (!f) {
+    static FILE* volatile f = nullptr;
+    // F18: first open is gated so two threads' first calls cannot both _fsopen(_SH_DENYWR) - the loser
+    // would fail, leak nothing useful and could null `f`. 0 = closed, 1 = opening, 2 = open.
+    static volatile LONG s_openState = 0;
+    if (!f && InterlockedCompareExchange(&s_openState, 1, 0) != 0) {
+        while (s_openState == 1) Sleep(0);   // another thread is opening: wait, then use its handle
+    } else if (!f) {
         char name[64];
         wsprintfA(name, "phase1_log_%u.txt", GetCurrentProcessId());
         const char* path = Paths::LogPath(name);
@@ -226,6 +231,7 @@ void L(const char* fmt, ...) {
                 fflush(f);
             }
         }
+        InterlockedExchange(&s_openState, f ? 2 : 0);   // a failed open may be retried, as before
     }
     if (f) { fputs(buf, f); fflush(f); }
 }
@@ -1243,9 +1249,8 @@ static void GhostTrack(void* ent) {
 // engine call at 0x01038330 (decomp unit "01038330"); null when the ship has no such object.
 // READ through the object's vtable slot 0x1B4 (float getter). Do NOT call slot 0x1B8: it takes an extra
 // argument and the wrong arity unbalances the stack.
-// WRITE through slot 0x12C, the __stdcall thunk to sub_1225A10 (a damage-aware setter: clamps, fires the
-// zero event, republishes the HUD fraction). __stdcall is the thunk's own convention (this on the stack),
-// which is also how the engine's virtual call site passes it.
+// WRITE through slot 0x12C, the thunk to sub_1225A10 (a damage-aware setter: clamps, fires the zero event,
+// republishes the HUD fraction). Calling convention: __thiscall - see WriteShipHullHP below (F14).
 // Evidence: ops/evidence/hull-hp-found.md.
 // Read once, cached (same idiom as PuppetPhysicsMode below).
 static int s_shipHPSync = -1;
@@ -1387,17 +1392,17 @@ static inline int GhostProxyEnabled() {
 // Oldest-overwrite ring: insertion never fails, and exclusion is always a finite set of <= 8 pairs,
 // so no code path can leave selection impossible. An eviction only lets the evicted source be
 // duplicated once more - bounded, never a disablement.
-struct ProxySrcPair { uint32_t srcId; uint32_t ghostId; };
+struct ProxySrcPair { uint64_t srcId; uint64_t ghostId; };   // F12: full 64-bit ids (ResolveEntityById compares 64-bit)
 static ProxySrcPair g_proxySrcRing[8];
 static int g_proxySrcCount = 0;    // live pairs, <= 8 - diagnostic only, never gates selection
 static int g_proxySrcNext  = 0;    // next write slot
 // Every duplicate id we have ever created. DespawnGhostShip hides a ghost instead of destroying it
 // (SHIP-RE C11), so its id can stay live forever; this keeps such a ghost out of the candidate set.
-static uint32_t g_proxyGhostIds[8];
+static uint64_t g_proxyGhostIds[8];
 static int      g_proxyGhostCount = 0, g_proxyGhostNext = 0;
 
 // What the selector reports. A pure-query result: the selector records nothing.
-struct ProxyPick { uint32_t srcId; int idx; float srcMax; float tierDelta; uint32_t hint; uint32_t cls; int classMiss; const char* camSrc; };
+struct ProxyPick { uint64_t srcId; int idx; float srcMax; float tierDelta; uint32_t hint; uint32_t cls; int classMiss; const char* camSrc; };
 
 static void PuppetOwnNote(Human* h, Entity* e, const HookMath::Transform& m);   // own-update block, before ApplyGuards
 bool FightIntentOwnsPuppet();   // [Coop] FightIntents (S7 slice 1), defined with OwnDrain
@@ -1482,7 +1487,7 @@ static void PuppetOwnClear();
 static Entity* ResolveEntityById(uint64_t id);   // engine registry, defined with the ApplyGuards
 static void ProxySrcClearAll();
 
-static void ProxySrcRemember(uint32_t srcId, uint32_t ghostId) {
+static void ProxySrcRemember(uint64_t srcId, uint64_t ghostId) {
     g_proxySrcRing[g_proxySrcNext].srcId   = srcId;
     g_proxySrcRing[g_proxySrcNext].ghostId = ghostId;
     g_proxySrcNext = (g_proxySrcNext + 1) % 8;
@@ -1492,12 +1497,12 @@ static void ProxySrcRemember(uint32_t srcId, uint32_t ghostId) {
     if (g_proxySrcCount   < 8) ++g_proxySrcCount;
     if (g_proxyGhostCount < 8) ++g_proxyGhostCount;
 }
-static bool ProxySrcUsed(uint32_t srcId) {
+static bool ProxySrcUsed(uint64_t srcId) {
     if (!srcId) return false;
     for (int k = 0; k < 8; ++k) if (g_proxySrcRing[k].srcId == srcId) return true;
     return false;
 }
-static bool ProxyGhostIdKnown(uint32_t ghostId) {
+static bool ProxyGhostIdKnown(uint64_t ghostId) {
     if (!ghostId) return false;
     for (int k = 0; k < 8; ++k) if (g_proxyGhostIds[k] == ghostId) return true;
     return false;
@@ -1609,6 +1614,7 @@ static uint32_t g_capPlayerAlias = 0;
 
 // Read a player entity's full state (transform + locomotion) into a PlayerState.
 bool Phase1::CaptureLocalState(PlayerState& s) {
+    memset(&s, 0, sizeof(s));   // F15: no stack bytes on the wire (ctx/padding were left uninitialised outside swim)
     __try {
         World* world = World::GetCurrentWorld();
         if (!world)
@@ -3316,7 +3322,7 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
     __try {
         // Position + orientation of the entity. SetGlobalMatrixInternal writes the entity matrix and updates
         // the graphic node/skeleton unconditionally; only the physics components are touched when
-        // updatePhysics!=0 (verified at the 0x00528200 detour, and relied on by the entity-sync override
+        // updatePhysics!=0 (observed at the 0x00528200 detour - decomp/units.json receipt is UNVERIFIED-EVIDENCE, M-P3-2 - and relied on by the entity-sync override
         // which clears that same bool). PuppetPhysics=1 therefore keeps today's physics warp
         // (updatePhysics=true); PuppetPhysics=0 writes the matrix with updatePhysics=false -> render-only,
         // no capsule push, no physics invalidation. s.matrix is pack(1)/const, so copy to an aligned local.
@@ -3979,7 +3985,7 @@ static void GhostSuppressPlayerMarker(void* ghost)
 
 // Spawn a ghost ship = a FULL clone of the LOCAL ship (EntityGroup vtable[3] deep-copy + the 3 direct
 // component fields + physics disabled). Returns the ghost EntityGroup, or nullptr on failure.
-// Runs on the main thread (the frame hook). This is the ship-spawn primitive proven via F12.
+// Runs in the frame hook (the Human update - a game worker thread, M-P3-1). This is the ship-spawn primitive proven via F12.
 // Deep-copy a ship entity into a visual-only ghost: EntityGroup::Duplicate (vtable[3]) + component
 // deep-copy (+0x5C World shared, +0x78 rigging + +0xE8 AIComponent cloned) + disable physics/AI, then
 // AddEntity at the source ship's position. The render override drives it thereafter. Verified: works for
@@ -4101,7 +4107,7 @@ static void* SpawnGhostShip() {
             static unsigned s_proxyDupFails     = 0;   // saturated at 8: only the shift (clamped to 4)
                                                        // and the [GhostProxy] log field consume it
             static uint64_t s_proxyLogLast      = 0;   // wall-clock throttle, 1 s
-            static uint32_t s_pickLastSrcId     = 0;   // PX-m5: last pick line's source id
+            static uint64_t s_pickLastSrcId     = 0;   // PX-m5: last pick line's source id
             static int      s_pickSpawn         = 0;   // PX-m5: pick count (first spawn always logs)
             const uint64_t nowMs = GetTickCount64();
             ProxySrcWorldCheck();
@@ -4130,8 +4136,8 @@ static void* SpawnGhostShip() {
                     ++s_pickSpawn;
                     void* dup = DuplicateShip(chosen);
                     if (dup) {
-                        uint32_t ghostId = 0;
-                        __try { ghostId = (uint32_t)((ManagedObject*)dup)->GetObjectID(); }
+                        uint64_t ghostId = 0;
+                        __try { ghostId = (uint64_t)((ManagedObject*)dup)->GetObjectID(); }
                         __except (EXCEPTION_EXECUTE_HANDLER) { ghostId = 0; }
                         if (GhostSetHullIdentity(dup, g_ghostPeerMaxHP)) {
                             // The pair is recorded only now - after the duplicate exists. On any
@@ -4799,7 +4805,7 @@ static Entity* SelectProxySource(float peerMax, uint32_t peerClass, ProxyPick* o
             }
         }
         Entity* localShip = GetLocalShip();
-        const uint32_t curGhostId = (uint32_t)g_ghostObjId;
+        const uint64_t curGhostId = (uint64_t)g_ghostObjId;
 
         // Camera-focus proxy: the local ship's position (the naval camera orbits it). When the local
         // ship cannot be read the tie-break silently degrades to "distance from world origin", so the
@@ -4815,7 +4821,7 @@ static Entity* SelectProxySource(float peerMax, uint32_t peerClass, ProxyPick* o
         Entity* best = nullptr;
         float bestTier = 0.0f, bestDist = -1.0f, bestMax = 0.0f;
         float bestTieDelta = 0.0f;
-        uint32_t bestId = 0;
+        uint64_t bestId = 0;
         int bestIdx = -1, bestHint = 0;
         bool bestHintOk = false;
         uint32_t bestCls = 0;
@@ -4832,8 +4838,8 @@ static Entity* SelectProxySource(float peerMax, uint32_t peerClass, ProxyPick* o
             if (se == (Entity*)g_ghostShip) { ghostInList = true; continue; }
             void* hc = GetShipHandle(mgr, i);
             if (!hc || !readable(hc, 0x14)) continue;
-            uint32_t candId = 0;
-            __try { candId = (uint32_t)(*(uint64_t*)((char*)hc + 0x0C)); }
+            uint64_t candId = 0;
+            __try { candId = *(uint64_t*)((char*)hc + 0x0C); }
             __except (EXCEPTION_EXECUTE_HANDLER) { candId = 0; }
             if (!candId) continue;                        // no identity -> cannot be tracked/pruned
             if (candId == curGhostId) { ghostInList = true; continue; }
@@ -5102,7 +5108,7 @@ static void CaptureShips(EntityPacket& pkt) {
         for (unsigned o = 0; o + 4 <= bytes; o += 4) {
             DWORD a = *(DWORD*)(s_prev[slot] + o), b = *(DWORD*)(cur + o);
             if (a == b) continue;
-            unsigned& h = *(unsigned*)&s_hits[slot][o >> 2];
+            unsigned char& h = s_hits[slot][o >> 2];   // F6: one byte per counter (was a 32-bit alias)
             if (h >= (unsigned)kPerOff) continue;
             ++h;
             L("[ShipDelta] t=%llu ship=%d crc=%u p=%08X off=0x%03X 0x%08X -> 0x%08X (i %d -> %d, f %.3f -> %.3f)\n",
@@ -5916,10 +5922,27 @@ static uint32_t AdAliasGet(uint64_t objId) {
     return 0;
 }
 
+// [Coop] TableEvict (default 0): saturating per-scene tables (F10 host life watch, F17 mirror-death relay
+// watch, M-P1-3 mirror last-transform cache, M-P2-1 pushed-death tombstone) recycle an entry instead of
+// silently refusing every new body once full. 0 = the old refuse-when-full behaviour.
+static int s_tableEvict = -1;
+static bool TableEvictOn() {
+    if (s_tableEvict < 0) s_tableEvict = GetPrivateProfileIntA("Coop", "TableEvict", 0, Paths::Ini()) != 0 ? 1 : 0;
+    return s_tableEvict != 0;
+}
+
 static HostLifeWatch* HostLifeFor(uint64_t objId) {
     for (int i = 0; i < s_hostLifeN; ++i) if (s_hostLife[i].objId == objId) return &s_hostLife[i];
-    if (s_hostLifeN >= 256) return nullptr;
-    HostLifeWatch* w = &s_hostLife[s_hostLifeN++];
+    HostLifeWatch* w = nullptr;
+    if (s_hostLifeN >= 256) {
+        static int s_fullLines = 0;   // F10: a full table used to refuse with no trace
+        if (s_fullLines < 3) { ++s_fullLines; L("[KT] host life-watch table full (256) objId=%llu TableEvict=%d\n", (unsigned long long)objId, TableEvictOn() ? 1 : 0); }
+        if (!TableEvictOn()) return nullptr;
+        for (int i = 0; i < s_hostLifeN && !w; ++i) if (s_hostLife[i].tombstoned) w = &s_hostLife[i];   // only a finished watch is recycled
+        if (!w) return nullptr;
+    } else {
+        w = &s_hostLife[s_hostLifeN++];
+    }
     w->objId = objId; w->life = 0; w->hpSvc = 0; w->gen = 0; w->vanishedLogged = false;
     w->lastLife = 0; w->seen = false; w->tombstoned = false;
     w->lastX = 0; w->lastY = 0; w->lastZ = 0; w->lastDist = 0; w->lastEnt = 0; w->adEmitted = false;
@@ -6646,7 +6669,10 @@ static void StageLogEmit(const EntityState& es, float gx, float gy, float gz,
 // kept below one chunk:
 //   * age a corpse out of the PACKET after [Coop] CorpseKeepSec seconds (default 30, floor 0 =
 //     never age), and
-//   * cap corpse records per snapshot at CORPSE_BUDGET_MAX (24 < 26), oldest-first,
+//   * cap corpse records per snapshot at CORPSE_BUDGET_MAX (24 < 26), in emit order (nearest to the
+//     peer first - NOT oldest-first). F16: the 26/chunk figure assumes 52-byte records; a corpse that
+//     carries EF_ANIM is larger (net.cpp guard-anim wire), so 24 such corpses can still exceed a chunk
+//     (the cap is not sized from encoder bytes),
 // whichever binds first.  Ageing out means "stop including it in the packet" - the entity is not
 // deleted, es.dead is not touched, and the death lanes/tombstone/life-watch above all still run.
 // A corpse that is not packed keeps its first-seen stamp, so it cannot flap back in on the next
@@ -7545,8 +7571,10 @@ static void TrackMirrorDeathForRelay(Entity* e, const EntityState& es) {
         if (s_mirrLifeN >= 64) {
             // A full table used to mean "this body is never watched" with no trace at all.
             GktSkip(es.objId, (unsigned int)e, "mirror-watch-table-full");
-            return;
-        }
+            if (!TableEvictOn()) return;
+            static unsigned s_mirrLifeRing = 0;   // F17: [Coop] TableEvict - recycle round-robin as a new baseline
+            slot = (int)(s_mirrLifeRing++ % 64u);
+        } else
         slot = s_mirrLifeN++;
         s_mirrLife[slot].ent = (unsigned int)e;
         s_mirrLife[slot].life = life;
@@ -8570,17 +8598,23 @@ static int64_t OwnHostUs(uint32_t hostMs) {
     // WR-11: host change -> host clock restarts; drop retained offset + base so old host clock doesn't linger
     static uint32_t s_lastHostMs = 0;
     if (s_hostBaseSet && (int32_t)(hostMs - s_lastHostMs) < -10000) {
-        s_hostBaseMs = hostMs; s_offCur = INT64_MAX; s_offPrev = INT64_MAX; s_offWinUs = 0;
+        s_hostBaseMs = hostMs; InterlockedExchange64((volatile LONGLONG*)&s_offCur, INT64_MAX); InterlockedExchange64((volatile LONGLONG*)&s_offPrev, INT64_MAX); s_offWinUs = 0;   // M-P1-1
     }
     s_lastHostMs = hostMs;
     return (int64_t)(int32_t)(hostMs - s_hostBaseMs) * 1000;
 }
 static void OwnOffsetNote(int64_t hostUs, uint64_t rxUs) {   // under s_ownLock (exclusive)
-    if (rxUs - s_offWinUs > 2000000) { s_offPrev = s_offCur; s_offCur = INT64_MAX; s_offWinUs = rxUs; }
+    // M-P1-1: 64-bit stores are interlocked so the lock-free reader in OwnOffset never sees a torn value.
+    if (rxUs - s_offWinUs > 2000000) { InterlockedExchange64((volatile LONGLONG*)&s_offPrev, s_offCur); InterlockedExchange64((volatile LONGLONG*)&s_offCur, INT64_MAX); s_offWinUs = rxUs; }
     const int64_t off = (int64_t)rxUs - hostUs;
-    if (off < s_offCur) s_offCur = off;
+    if (off < s_offCur) InterlockedExchange64((volatile LONGLONG*)&s_offCur, off);
 }
-static int64_t OwnOffset() { return s_offCur < s_offPrev ? s_offCur : s_offPrev; }
+// M-P1-1: callers read this after s_ownLock is released, so each int64 is read atomically (no torn half on x86).
+static int64_t OwnOffset() {
+    const int64_t c = (int64_t)InterlockedCompareExchange64((volatile LONGLONG*)&s_offCur, 0, 0);
+    const int64_t p = (int64_t)InterlockedCompareExchange64((volatile LONGLONG*)&s_offPrev, 0, 0);
+    return c < p ? c : p;
+}
 static float OwnLerpRatio(float a, float b, float f, bool* wrapped) {
     *wrapped = b < a;                     // the clip looped between the two samples
     if (*wrapped) b += 1.0f;
@@ -11702,6 +11736,15 @@ static void ApplyGuards(const EntityPacket& pkt) {
                     continue;
                 }
             }
+            // M-P1-4: [Coop] UsedEntAllPaths (default 0) - the one-body-per-record check also covers the sticky and
+            // resolver picks (and objId==0 records), which skip the scan's usedEnt test above.
+            static int s_usedEntAll = -1;
+            if (s_usedEntAll < 0) s_usedEntAll = GetPrivateProfileIntA("Coop", "UsedEntAllPaths", 0, Paths::Ini()) != 0 ? 1 : 0;
+            if (s_usedEntAll) {
+                bool taken = false;
+                for (int u = 0; u < usedN; ++u) if (usedEnt[u] == (unsigned int)best) { taken = true; break; }
+                if (taken) { ++s_covStolen; continue; }
+            }
             if (usedN < MAX_SYNC_ENTITIES) usedEnt[usedN++] = (unsigned int)best;
             ++s_covMatched;
             if (plBand >= 0) ++s_plBandLinked[plBand];
@@ -11857,6 +11900,10 @@ static void ApplyGuards(const EntityPacket& pkt) {
                 int slot = -1;
                 for (int k = 0; k < s_lastN; ++k) if (s_last[k].ent == (unsigned int)best) { slot = k; break; }
                 if (slot < 0 && s_lastN < MIRROR_TABLE) { slot = s_lastN++; s_last[slot].ent = (unsigned int)best; s_last[slot].pos[0] = 1e30f; }
+                else if (slot < 0 && TableEvictOn()) {   // M-P1-3: [Coop] TableEvict - recycle round-robin instead of dp=1e30 forever
+                    static unsigned s_lastRing = 0;
+                    slot = (int)(s_lastRing++ % (unsigned)MIRROR_TABLE); s_last[slot].ent = (unsigned int)best; s_last[slot].pos[0] = 1e30f;
+                }
                 bool moved = true;
                 float dp = 1e30f;
                 if (slot >= 0) {
@@ -12284,7 +12331,7 @@ static void EntitySyncTick() {
         CaptureGuards(pkt);   // guards too: verify the mirror pipeline (capture -> drive) in one instance
         static int s_selfMax = -1;
         if (s_selfMax < 0) s_selfMax = GetPrivateProfileIntA("Coop", "EntitySelfTestMax", 1, Paths::Ini());
-        if ((int)pkt.count > s_selfMax) pkt.count = (uint32_t)s_selfMax;
+        if ((int)pkt.count > s_selfMax) pkt.count = (uint32_t)(s_selfMax < 0 ? 0 : s_selfMax);   // M-P1-2: negative max = 0, never 0xFFFFFFFF
         static float s_off = -1e9f;
         if (s_off == -1e9f) s_off = (float)GetPrivateProfileIntA("Coop", "EntitySelfTestOffset", 0, Paths::Ini());
         for (uint32_t i = 0; i < pkt.count; ++i) pkt.ents[i].pos[0] += s_off;
@@ -12790,7 +12837,7 @@ static int ScanNPCHealth(HealthEnt* out, int cap) {
             if (mbi.State == MEM_COMMIT && (mbi.Protect & PAGE_READWRITE) && !(mbi.Protect & PAGE_GUARD)) {
                 unsigned int* q = (unsigned int*)mbi.BaseAddress;
                 unsigned int* qe = (unsigned int*)((char*)mbi.BaseAddress + mbi.RegionSize);
-                for (; q + 1 < qe && n < cap; ++q) {
+                for (; (char*)q + 0x64 <= (char*)qe && n < cap; ++q) {   // M-P1-5: reads reach +0x63
                     if (*q != 0x02712F60u) continue;
                     unsigned char* o = (unsigned char*)q;
                     out[n].addr  = (unsigned int)o;
@@ -13019,7 +13066,7 @@ static unsigned int FindHealthInAI(unsigned int ai) {
     if (!ai || !readable((void*)ai, 0x78)) return 0;
     unsigned int arr = *(unsigned int*)(ai + 0x70);
     unsigned int n   = *(unsigned short*)(ai + 0x76);
-    if (!arr || !readable((void*)arr, 4) || n == 0 || n > 64) return 0;
+    if (!arr || n == 0 || n > 64 || !readable((void*)arr, n * 4)) return 0;   // M-P2-3: prove the whole n*4 array, not 4 bytes
     for (unsigned int k = 0; k < n; ++k) {
         unsigned int svc = *(unsigned int*)(arr + k * 4);
         if (!svc || !readable((void*)svc, 0x70)) continue;
@@ -13709,6 +13756,7 @@ static void SendHealthEvent(uint64_t objId, unsigned short life, float x, float 
                 return;
             }
         if (s_pushedDeathN < 256) s_pushedDeathIds[s_pushedDeathN++] = objId;
+        else if (TableEvictOn()) { static unsigned s_pushedDeathRing = 0; s_pushedDeathIds[s_pushedDeathRing++ % 256u] = objId; }   // M-P2-1: ring when full
     }
     static EntityPacket out;   // static: ~16 KB at proto 13 (player-update thread only)
     memset(&out, 0, sizeof(out));
@@ -13917,17 +13965,24 @@ static int GuestKillMirrorEnabled() {
 // existing per-tick generation counter (s_gktGen, phase1.cpp:3681) - no threads, no timers - and the
 // write set is exactly the tick's (:3494 behaviour disable, :3499 drive-flag clear), so a latched body
 // ends in the same state as every other playback dummy.
-struct CorpseLatch { unsigned int ent; unsigned int bornGen; Component* bhv; };
+struct CorpseLatch { unsigned int ent; unsigned int bornGen; Component* bhv; unsigned int bhvVt; };   // M-P2-2: bhvVt = vtable seen at arm time
 static CorpseLatch s_corpseLatch[64];
 static int s_corpseLatchN = 0;
 static const unsigned int CORPSE_LATCH_TICKS = 8;     // ~0.4 s at SnapshotHz: enough for the fall to start
 
+// M-P2-2: first dword of the behaviour component (its vtable) at arm time; 0 = unreadable. Re-checked before the
+// latch writes, so a component freed and reused for another object within the latch window is not written.
+static unsigned int CorpseLatchVt(Component* bhv) {
+    if (!bhv || !readable(bhv, 4)) return 0;
+    __try { return *(unsigned int*)bhv; } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
 static void CorpseLatchArm(unsigned int ent, Component* bhv) {
     if (!ent) return;
     for (int i = 0; i < s_corpseLatchN; ++i)
         if (s_corpseLatch[i].ent == ent) {
             s_corpseLatch[i].bornGen = s_gktGen;
             s_corpseLatch[i].bhv = bhv;
+            s_corpseLatch[i].bhvVt = CorpseLatchVt(bhv);
             return;
         }
     int slot = s_corpseLatchN;
@@ -13936,6 +13991,7 @@ static void CorpseLatchArm(unsigned int ent, Component* bhv) {
     s_corpseLatch[slot].ent = ent;
     s_corpseLatch[slot].bornGen = s_gktGen;
     s_corpseLatch[slot].bhv = bhv;
+    s_corpseLatch[slot].bhvVt = CorpseLatchVt(bhv);
     static int s_latchLines = 0;
     if (s_latchLines < 10) {
         ++s_latchLines;
@@ -13952,7 +14008,7 @@ static void CorpseLatchTick() {
         if ((unsigned int)(s_gktGen - c.bornGen) < CORPSE_LATCH_TICKS) { ++i; continue; }
         int ok = 0;
         __try {
-            if (c.bhv && readable(c.bhv, 0x40)) {
+            if (c.bhv && readable(c.bhv, 0x40) && c.bhvVt && *(unsigned int*)c.bhv == c.bhvVt) {   // M-P2-2
                 ((Component*)c.bhv)->SetEnabled(false);
                 ok = 1;
             }
@@ -14272,7 +14328,7 @@ static void SimulatePeerKill() {
     ApplyPeerHealth(id, 0xFFFFu, x, y, z);
 }
 
-// ---- Die-clip watcher (always on, throttled) ---------------------------------------------------
+// ---- Die-clip watcher (throttled; NOT called - TickDieClipWatch/PollTrackedGuards are commented out in the frame tick, M-P2-5) ---------------------------------------------------
 // Functional death is solved (AI+0x8C=1 + health encoding), but the corpse animation comes from the
 // death state machine. To reproduce it we need the death clip's action alias. This samples the nearest
 // soldier's current action alias and, when its dead flag flips 0->1, dumps the alias window around the
@@ -14427,7 +14483,7 @@ static int ScanShipHealth(ShipHp* out, int cap) {
             if (mbi.State == MEM_COMMIT && (mbi.Protect & PAGE_READWRITE) && !(mbi.Protect & PAGE_GUARD)) {
                 unsigned int* q = (unsigned int*)mbi.BaseAddress;
                 unsigned int* qe = (unsigned int*)((char*)mbi.BaseAddress + mbi.RegionSize);
-                for (; q + 1 < qe && n < cap; ++q) {
+                for (; (char*)q + 0x64 <= (char*)qe && n < cap; ++q) {   // M-P1-5 (same overread, dead code)
                     unsigned int vt = *q;
                     if (vt != 0x02727088u && vt != 0x02712F60u) continue;
                     unsigned char* o = (unsigned char*)q;
@@ -14882,6 +14938,7 @@ static uint64_t PuppetStampUs(const PlayerState& s, uint64_t nowUs) {
     const int64_t t = hostUs + best;
     return t > 0 ? (uint64_t)t : nowUs;
 }
+static uint32_t s_consecReorder = 0;   // M-P2-4: consecutive reorder drops (PuppetSeqResync)
 static uint32_t s_sameStamp = 0;   // [Coop] CaptureAtWrite + PuppetHostTime: packets merged into the newest (no new engine write)
 static void PushSnapshot(const PlayerState& s, uint64_t nowUs) {
     nowUs = PuppetStampUs(s, nowUs);
@@ -14898,11 +14955,22 @@ static void PushSnapshot(const PlayerState& s, uint64_t nowUs) {
                 g_snapCount = 0; g_snapHead = 0;
                 ++s_wipeCount;
             } else {
-                ++s_reorderDrops;                      // late/reordered packet: drop it, keep the buffer
-                return;
+                // M-P2-4: [Coop] PuppetSeqResync (default 0) - a peer restart with an old seq <= 1000 used to drop every
+                // new packet as a reorder until the new seq overtook the old one (frozen puppet). 30 consecutive
+                // "reorders" are treated as a restart instead.
+                static int s_seqResync = -1;
+                if (s_seqResync < 0) s_seqResync = GetPrivateProfileIntA("Coop", "PuppetSeqResync", 0, Paths::Ini()) != 0 ? 1 : 0;
+                if (s_seqResync && ++s_consecReorder >= 30) {
+                    g_snapCount = 0; g_snapHead = 0; s_consecReorder = 0;
+                    ++s_wipeCount;
+                } else {
+                    ++s_reorderDrops;                      // late/reordered packet: drop it, keep the buffer
+                    return;
+                }
             }
         }
     }
+    s_consecReorder = 0;
     g_snaps[g_snapHead].st = s;
     g_snaps[g_snapHead].t  = nowUs;
     g_snapHead = (g_snapHead + 1) % SNAP_MAX;
@@ -14979,7 +15047,7 @@ static bool ComputeInterpolated(uint64_t nowUs, PlayerState& out) {
             return true;
         }
     }
-    out = g_snaps[newestIdx].st; return true;         // shouldn't reach; be safe
+    out = g_snaps[newestIdx].st; return true;         // M-P3-7: reachable when PuppetHostTime=1 stamps step backwards - snaps to the newest sample
 }
 
 // True while the engine is streaming/loading a world. Guards puppet construction so we never build an
@@ -15041,7 +15109,7 @@ void Phase1::TrySceneProbe() {
 // F11 ship-spawn request (observation only). Asks the engine (FUN_01082810 @ VA 0x01082810) to spawn a
 // "ship-dude", then best-effort sets the type field at req+0xC to 0x13 so the USER can look at the game
 // and report what actually appears (the gate question for real ship sync). Does NOT touch the wire or any
-// co-op state. Runs on the main thread (via the frame hook), like the other probes.
+// co-op state. Runs in the frame hook (Human update, a game worker thread - M-P3-1), like the other probes.
 void Phase1::TryShipSpawn() {
     __try {
         L("[ShipSpawn] requesting ship-dude spawn (FUN_01082810)\n");
@@ -15177,8 +15245,8 @@ void Phase1::TryShipProbe() {
         // with a2 == 0 it runs sub_525590(a1, ...) + a container walk, so a1 must be a collection
         // manager -- whether a ship Entity* is legal was never proven. The warm-up "flag on stack"
         // __thiscall attempt also puts a1 = 0, which is why the log always fell through.
-        // Nothing is lost: RequestShipProbe (phase1.cpp:6088) has no caller at HEAD, so g_shipReq
-        // (:6066) can never be set and this function is unreachable.
+        // Nothing is lost: Phase1::RequestShipProbe has no caller at HEAD, so g_shipReq (declared
+        // beside g_holdShipEnt) can never be set and this function is unreachable. (M-P3-3: cite by name)
 
         // Walk the ship entity's first 0x200 bytes for pointers to objects with a .rdata vtable
         // (its components). The ship HP (ShipHealthData / GcLNavalHealth) is behind one of these.
@@ -15208,7 +15276,7 @@ void Phase1::TryShipProbe() {
     }
 }
 
-// Runs on the main thread once per frame (only for the player's Human update).
+// Runs once per frame inside the player's Human update (a game worker thread, not the main thread - M-P3-1).
 // Identity probe: at every world load, dump the first entities with their handle objId, position,
 // archetype and index. Run this on BOTH machines and diff the two lists - if objIds match for the same
 // NPC, mirroring can bind by identity instead of by proximity, which removes the whole class of
@@ -15287,7 +15355,7 @@ static void ProbeIdentityOnce() {
 // never the process. Nothing below is even reached unless [Coop] TransformProbe=1.
 // ============================================================================================
 const uintptr_t TP_PTR_LO      = 0x00010000u;   // user-space floor: never a valid object
-const uintptr_t TP_PTR_HI      = 0x7F000000u;   // ceiling we accept for object pointers
+const uintptr_t TP_PTR_HI      = 0xFFFF0000u;   // M-P3-5: top of 32-bit user space; readable() has no 2 GB cap (see its comment) - 0x7F000000 rejected valid >2 GB pointers
 const uintptr_t TP_CC_EXTENT   = 0x600;         // == the readable(cc, 0x600) probe already in this file
 const uintptr_t TP_CC_OFF_A    = 0x1A0;         // documented CC translation lane
 const uintptr_t TP_CC_OFF_B    = 0x1C0;         // documented CC basis/quaternion lane
@@ -15896,7 +15964,7 @@ static void DumpConfigOnce()
         // The Tune* values are floats (read with strtod, see ShipTuningTick); the dump shows the integer part.
         { "Coop", "TuneConeAngle", 120 }, { "Coop", "TuneConeRange", 350 }, { "Coop", "TuneMaxTime", 30 },
         { "Coop", "TuneAggroTime", 30 }, { "Coop", "TuneHull", 0 },
-        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 }, { "Coop", "WeaponSync", 0 }, { "Coop", "ShipPeerZ", 0 }, { "Coop", "ShipBindProbe", 0 }, { "Coop", "ShipSpawnProbe", 0 }, { "Coop", "ShipSpawnFire", 0 }, { "Coop", "ShipSpawnFirePid", 0 }, { "Coop", "SpawnCensus", 0 }, { "Coop", "SpawnReplayFire", 0 }, { "Coop", "SpawnReplayFirePid", 0 }, { "Coop", "SpawnShare", 0 }, { "Coop", "SpawnKeyBind", 0 }, { "Coop", "ShipClassBind", 0 }, { "Coop", "ShipClassBindSteal", 0 }, { "Coop", "SpawnShareRadiusM", 150 },{ "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "FastTravelCrashFix", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 }, { "Coop", "PuppetListener", 0 }, { "Coop", "PuppetListenerAttach", 0 }, { "Coop", "PuppetMaxLife", 0 }, { "Coop", "ConflictProbe", 0 },
+        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 }, { "Coop", "WeaponSync", 0 }, { "Coop", "ShipPeerZ", 0 }, { "Coop", "ShipBindProbe", 0 }, { "Coop", "ShipSpawnProbe", 0 }, { "Coop", "ShipSpawnFire", 0 }, { "Coop", "ShipSpawnFirePid", 0 }, { "Coop", "SpawnCensus", 0 }, { "Coop", "SpawnReplayFire", 0 }, { "Coop", "SpawnReplayFirePid", 0 }, { "Coop", "SpawnShare", 0 }, { "Coop", "SpawnKeyBind", 0 }, { "Coop", "ShipClassBind", 0 }, { "Coop", "ShipClassBindSteal", 0 }, { "Coop", "SpawnShareRadiusM", 150 },{ "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "TableEvict", 0 }, { "Coop", "UsedEntAllPaths", 0 }, { "Coop", "PuppetSeqResync", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "FastTravelCrashFix", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 }, { "Coop", "PuppetListener", 0 }, { "Coop", "PuppetListenerAttach", 0 }, { "Coop", "PuppetMaxLife", 0 }, { "Coop", "ConflictProbe", 0 },
         { "Coop", "CombatTest", 0 }, { "Coop", "CrashContext", 0 }, { "Coop", "CorpseKeepSec", 30 }, { "Coop", "CrowdProbeIntegrate", 1 },
         { "Coop", "CrowdProbeLiveKeys", 1 }, { "Coop", "DamageRelay", 0 }, { "Coop", "Diag", 0 },
         { "Coop", "DisableCrowd", 0 }, { "Coop", "DisablePuppetAI", 1 }, { "Coop", "DisableSpawns", 0 },
@@ -16905,7 +16973,7 @@ static void LogSetGlobalMatrixBody(uint32_t thisEnt, uint32_t sgmMatrix, uint32_
     }
 
     // Entity sync (NPCs + ships): override the RENDER for each synced entity, and clear `updatePhysics`
-    // so the override does NOT feed back into the entity's own physics (verified: SetGlobalMatrixInternal
+    // so the override does NOT feed back into the entity's own physics (UNVERIFIED-EVIDENCE per decomp/units.json, M-P3-2: SetGlobalMatrixInternal
     // 0x00528200 always writes the matrix, then only updates physics components when updatePhysics!=0).
     for (int i = 0; i < g_syncCount; ++i) {
         if (g_syncTargets[i].ent != thisEnt) continue;

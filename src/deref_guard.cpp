@@ -129,6 +129,8 @@ volatile LONG  g_noNulls       = 0;   // every null return, beyond the cap too
 volatile LONG  g_noCapLogged   = 0;
 volatile LONG  g_noTableFull   = 0;
 DWORD          g_noTramp       = 0;   // read by NullObsDetour's inline asm
+volatile DWORD g_nrCaveRa      = 0;   // D3: Part C cave return address (cave+5), 0 = not installed
+volatile DWORD g_nrSiteRa      = 0;   // D3: the original site's return address it stands for (0x006817FF rebased)
 bool           g_noInstalled   = false;
 
 // A rel32 patch reaches +-2 GB. Require a comfortable margin so the boundary itself is never used.
@@ -442,7 +444,9 @@ void BuildStub(BYTE* stub, BYTE* shim, DWORD fieldOff, uintptr_t cont, uintptr_t
     stub[35] = 0x83;
     *reinterpret_cast<int32_t*>(stub + 36) = Rel32(stub + 40, reject);
 
-    // 28  8B 01           mov eax,[ecx]    -- the vtable pointer; ecx is a readable object by now
+    // 28  8B 01           mov eax,[ecx]    -- the vtable pointer. D2: the range test above does NOT prove
+    //                                         the page is mapped; a freed+decommitted target faults HERE,
+    //                                         inside the stub (no SEH), so a crash EIP in a cave = this load.
     stub[40] = 0x8B;
     stub[41] = 0x01;
 
@@ -878,6 +882,10 @@ static bool InstallNullReturnFix(uintptr_t moduleBase)
     }
 
     BYTE* t = cave;
+    // D3: both trampolines re-issue the call at t+0, so the observer sees RA = cave+5; LogNullReturn
+    // maps it back to the original site's RA (site+5) for the caller table.
+    g_nrCaveRa = (DWORD)(uintptr_t)(t + 5);
+    g_nrSiteRa = (DWORD)(site + 5);
     if (staleReturn) {
         BuildStaleReturnTramp(t, callee, cont, epilogue);
         FlushInstructionCache(GetCurrentProcess(), cave, NR2_TRAMP_SIZE);
@@ -984,9 +992,11 @@ void __cdecl LogNullReturn(DWORD caller)
         return;
     }
 
+    if (g_nrCaveRa && caller == g_nrCaveRa) caller = g_nrSiteRa;   // D3: report the site, not the heap cave
+
     const LONG used = g_noCallersUsed;
     for (LONG i = 0; i < used && i < (LONG)NO_MAX_CALLERS; ++i) {
-        if (g_noCallers[i].ra == caller) {
+        if ((DWORD)InterlockedCompareExchange((volatile LONG*)&g_noCallers[i].ra, 0, 0) == caller) {
             const LONG c = InterlockedIncrement(&g_noCallers[i].count);
             Log("[NO] null return -> caller 0x%08X (n=%u)\n", (unsigned)caller, (unsigned)c);
             return;
@@ -995,8 +1005,10 @@ void __cdecl LogNullReturn(DWORD caller)
 
     const LONG slot = InterlockedIncrement(&g_noCallersUsed) - 1;
     if (slot < (LONG)NO_MAX_CALLERS) {
-        g_noCallers[slot].ra    = caller;
+        // D4: a reader scanning `i < used` may see this row before `ra` lands and claim a second row for
+        // the same caller (diagnostic split only). Count first, then publish `ra` with a full barrier.
         g_noCallers[slot].count = 1;
+        InterlockedExchange((volatile LONG*)&g_noCallers[slot].ra, (LONG)caller);
         Log("[NO] null return -> caller 0x%08X (n=%u)\n", (unsigned)caller, 1u);
     } else if (InterlockedExchange(&g_noTableFull, 1) == 0) {
         Log("[NO] caller table full\n");                // counts only from here on
