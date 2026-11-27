@@ -191,6 +191,14 @@ namespace {
     bool       g_rxHaveDone = false;
     static const uint32_t EPOCH_PACKETS = 64;    // both sides drop their shadow this often; also the
                                                  // self-heal bound after a lost delta packet (~3 s)
+    // WR-21 (N1): the receiver zeroes its shadow on the FIRST packet it sees of a new epoch. If the
+    // epoch-start packet was lost, the next one was a delta against the sender's base (the lost packet)
+    // and was rebuilt on the receiver from zeros (unchanged hp/arch/pos read as 0) until the next epoch.
+    // The first EPOCH_FULL_PACKETS packets of every epoch therefore carry every record with every field
+    // (the same full mask as the saturated-table path), so any one of them re-bases a receiver that
+    // missed the others. Wire layout unchanged (frequency only), so NET_PROTO_VER is not bumped.
+    static const uint32_t EPOCH_FULL_PACKETS = 3;
+    uint32_t   g_txFullLeft = EPOCH_FULL_PACKETS;   // full packets still owed in the current epoch
     uint32_t   g_wireFullRecs = 0;               // instrumentation: records that carried every field
     uint32_t   g_wireRecs = 0;                   // instrumentation: records in the last packet
 
@@ -303,7 +311,10 @@ namespace {
             std::memset(g_txShadow, 0, sizeof(g_txShadow));
             g_txSinceReset = 0;
             ++g_txEpoch;
+            g_txFullLeft = EPOCH_FULL_PACKETS;   // WR-21
         }
+        const bool fullPacket = g_txFullLeft != 0;
+        if (fullPacket) --g_txFullLeft;
         EntityWireHeader h{};
         h.magic = p.magic; h.protoVer = p.protoVer; h.seq = p.seq; h.epoch = g_txEpoch; h.hostMs = p.hostMs;
         h.worldId = ReadLocalWorldId();      // X5: sender's world id rides the header
@@ -317,8 +328,9 @@ namespace {
             const uint64_t id = ShadowId(e.kind, e.key, e.objId);
             ShadowSlot* sh = ShadowFind(g_txShadow, id, true);
             uint16_t mask = 0;
-            if (!sh) {
-                mask = (uint16_t)(EF_ALL & ~EF_OBJID);   // table saturated: send everything
+            if (!sh || fullPacket) {
+                // table saturated, or WR-21 epoch-start window: send everything
+                mask = (uint16_t)(EF_ALL & ~EF_OBJID);
                 if (!e.anim.valid) mask &= (uint16_t)~EF_ANIM;
             } else {
                 // Quantised delta: position/quaternion only go on the wire when they moved enough to be
@@ -482,7 +494,7 @@ namespace {
         }
         std::memset(g_txShadow, 0, sizeof(g_txShadow));
         std::memset(g_rxShadow, 0, sizeof(g_rxShadow));
-        g_txEpoch = g_rxEpoch = 1; g_txSinceReset = 0;
+        g_txEpoch = g_rxEpoch = 1; g_txSinceReset = 0; g_txFullLeft = 0;   // steady-state fixtures (WR-21 window off)
         uint8_t buf[16384];
         const size_t n1 = EncodeEntityPacket(a, buf, sizeof(buf));
         bool ok = n1 > 0 && DecodeEntityPacket(buf, n1, b) && b.count == 3;
@@ -582,7 +594,7 @@ namespace {
         {
             std::memset(g_txShadow, 0, sizeof(g_txShadow));
             std::memset(g_rxShadow, 0, sizeof(g_rxShadow));
-            g_txEpoch = g_rxEpoch = 1; g_txSinceReset = 0; g_rxHaveDone = false; g_rxDoneSeq = 0;
+            g_txEpoch = g_rxEpoch = 1; g_txSinceReset = 0; g_txFullLeft = 0; g_rxHaveDone = false; g_rxDoneSeq = 0;
             std::memset(&d, 0, sizeof(d));
             d.magic = NET_ENTITY_MAGIC; d.protoVer = NET_PROTO_VER; d.seq = 7000; d.count = 120;
             for (int i = 0; i < 120; ++i) {
@@ -609,10 +621,29 @@ namespace {
             okC = okC && f.count == 120 && SameEntity(d.ents[0], f.ents[0]) && SameEntity(d.ents[119], f.ents[119]);
             g_rxHaveDone = false; g_rxDoneSeq = 0;
         }
+        // WR-21: the epoch-start packet is lost; the next packet of the same epoch must still rebuild every
+        // record exactly (it is a full packet). Pre-fix it was a delta decoded onto a zeroed shadow.
+        bool okL = false;
+        {
+            static EntityPacket l;
+            std::memset(g_txShadow, 0, sizeof(g_txShadow));
+            std::memset(g_rxShadow, 0, sizeof(g_rxShadow));
+            g_txEpoch = g_rxEpoch = 1; g_txSinceReset = 0; g_txFullLeft = 0;
+            const size_t b0 = EncodeEntityPacket(a, buf, sizeof(buf));           // epoch 1 base, delivered
+            okL = b0 > 0 && DecodeEntityPacket(buf, b0, l);
+            g_txSinceReset = EPOCH_PACKETS;                                     // next encode starts epoch 2
+            okL = okL && EncodeEntityPacket(a, buf, sizeof(buf)) > 0;           // epoch-start packet: LOST
+            const size_t b2 = EncodeEntityPacket(a, buf, sizeof(buf));           // 2nd packet of epoch 2
+            okL = okL && b2 > 0 && DecodeEntityPacket(buf, b2, l) && l.count == 3 && g_rxEpoch == g_txEpoch;
+            if (okL) for (int i = 0; i < 3; ++i) okL = okL && SameEntity(a.ents[i], l.ents[i]);
+            char ml[128];
+            wsprintfA(ml, "[Net] wire epoch-loss selftest (WR-21): %s\n", okL ? "PASS" : "FAIL");
+            dbg(ml);
+        }
         // Both peers must start from an empty shadow.
         std::memset(g_txShadow, 0, sizeof(g_txShadow));
         std::memset(g_rxShadow, 0, sizeof(g_rxShadow));
-        g_txEpoch = g_rxEpoch = 1; g_txSinceReset = 0;
+        g_txEpoch = g_rxEpoch = 1; g_txSinceReset = 0; g_txFullLeft = EPOCH_FULL_PACKETS;
         {
             char mc[128];
             wsprintfA(mc, "[Net] wire chunk selftest (proto %u, <= %d B/datagram): %s (chunks=%u, decoded in reverse)\n",
@@ -627,7 +658,7 @@ namespace {
                   (unsigned)n1, (unsigned)nr, (unsigned)n2, (unsigned)n3, (unsigned)n4, (unsigned)n5, (unsigned)n6);
         dbg(m);
         const bool okI = SelfTestIntent();   // proto 15: golden, parse, ack, dedup, reorder, 30% loss, rejoin replay
-        return ok && okR && ok2 && ok3 && ok4 && ok5 && ok6 && okS && okT && okC && okI;
+        return ok && okR && ok2 && ok3 && ok4 && ok5 && ok6 && okS && okT && okC && okI && okL;
     }
 
     bool DecodeEntityPacket(const uint8_t* in, size_t len, EntityPacket& out, DecodeReason* why) {
