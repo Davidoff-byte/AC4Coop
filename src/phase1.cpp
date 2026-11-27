@@ -65,6 +65,15 @@ const int       MAIN_AI_TRACK       = 1;        // locomotion/parkour contexts l
 const int       CTX_GROUND          = 2;        // default context id (no explicit context active)
 const int       CTX_SWIM            = 10;       // Swim context: positions the character via its physics capsule
 const int       ACTLAYER_PRIMARY    = 0;        // main body-animation layer (action replication)
+// WR-12: channel/layer values received from the peer, checked before they reach an ActionComponent call. The engine
+// keys its controllers as channel | layer << 28 (sub_666BB0, IDA cc/g63 - see PuppetChannels), so only layers 0..15
+// are representable; the capture reads the channel as a u16 (Action+0x0C -> +8, 0xFFFF = unknown/any), so anything
+// wider never came from a real capture. Rejected pairs are skipped and counted, never clamped onto another controller.
+// UNVERIFIED: which in-range channel/layer values the engine actually has controllers for.
+static volatile LONG s_actKeyRejects = 0;
+static inline bool ActKeyValid(int channel, int layer) {
+    return layer >= 0 && layer <= 15 && channel >= 0 && channel <= 0xFFFF;
+}
 const int       ACTPERSIST_ALWAYS   = 4;        // ACTPersistType: keep a blend-factor slot across action/transition
                                                 // resets (default is transient) — makes our driven blend stick
 
@@ -2754,6 +2763,7 @@ static void PchanApply(Human* h, uint32_t primaryAlias) {   // the puppet's own 
     ReleaseSRWLockExclusive(&s_pchLock);
     for (int j = 0; j < nt; ++j) {
         const int ch = (int)(todo[j].key & 0x0FFFFFFFu), ly = (int)(todo[j].key >> 28);
+        if (!ActKeyValid(ch, ly)) { InterlockedIncrement(&s_actKeyRejects); continue; }   // WR-12: peer key, channel wider than u16
         unsigned char mir = 0; void* cur = ac->GetCurrentAction(&mir, ch, ly);
         const uint32_t curAlias = readable(cur, 0x0C) ? *(uint32_t*)((char*)cur + 8) : 0;
         uint32_t want = todo[j].alias;
@@ -3015,7 +3025,9 @@ static void PuppetActionBlock(Human* h, const PlayerState& s, bool writeActions)
         if (writeActions && s.actionAlias != 0 && (s.actionAlias != g_lastActionAlias || reassertDue)) {
             if (reassertDue) s_pupIssueMs = GetTickCount64();
             ActionComponent* ac = h->GetActionComponent();
-            if (readable(ac, 0x40)) {
+            if (readable(ac, 0x40) && !ActKeyValid((int)s.actionChannel, (int)s.actionLayer)) {
+                InterlockedIncrement(&s_actKeyRejects);   // WR-12: peer channel/layer out of range - skip, never clamp
+            } else if (readable(ac, 0x40)) {
                 unsigned char mir = 0;
                 void* cur = ac->GetCurrentAction(&mir, 0, s.actionLayer);
                 uint32_t curAlias = readable(cur, 0x0C) ? *(uint32_t*)((char*)cur + 8) : 0;
@@ -8884,11 +8896,13 @@ static void GuardAnimApply(Human* h, OwnBody& o, uint64_t now, volatile int* ste
     GaState& st = o.ga;
     ++st.frameN;
     unsigned char mir = 0;
-    void* cur = ac->GetCurrentAction(&mir, 0, g.layer);
+    const bool keyOk = ActKeyValid((int)g.channel, (int)g.layer);   // WR-12: host values, checked before the engine sees them
+    if (!keyOk) InterlockedIncrement(&s_actKeyRejects);
+    void* cur = keyOk ? ac->GetCurrentAction(&mir, 0, g.layer) : nullptr;
     const uint32_t curAlias = readable(cur, 0x0C) ? *(uint32_t*)((char*)cur + 8) : 0;
     const float hostRatio = g.ratioQ / 65535.0f;
     // ---- action switch ----
-    if (o.alias && curAlias != o.alias) {
+    if (o.alias && keyOk && curAlias != o.alias) {
         const bool newTarget = st.issuedAlias != o.alias;
         if (newTarget || now - st.issuedUs > 250000) {
             *step = 2;
