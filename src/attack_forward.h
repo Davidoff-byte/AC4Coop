@@ -25,7 +25,10 @@ struct AtkFields {
 bool AttackForward_On();                               // [Coop] AttackForward as read at load
 void AttackForward_Capture(const void* fde, AtkFields& out);   // fill from a posted FightDamageEvent
 // Post a native FightDamageEvent built from `a` (attacker = the owner's copy, victim = the owner's player). Game thread.
-bool AttackForward_Post(void* victim, void* attacker, const AtkFields& a);
+// [Coop] CounterProbe/CounterSync/CounterGuestVeto: outFde (optional) receives the posted event. Dispatch is synchronous
+// (sub_64D8C0 -> sub_423C10 -> sub_796470), so on return its FightDamageResponse (+0x70, type +0x90) holds the victim's
+// decision; the caller reads it at once on the same thread (sub_18DA720 reads +0x90 the same way at 0x18DA72F).
+bool AttackForward_Post(void* victim, void* attacker, const AtkFields& a, void** outFde = nullptr);
 // [Coop] BrainReact: build the same event without posting it (the caller gives it to a reaction Can/Do pair). Game thread.
 void* AttackForward_Build(void* attacker, const AtkFields& a);
 
