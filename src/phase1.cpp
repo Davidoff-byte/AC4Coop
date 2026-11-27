@@ -5511,7 +5511,19 @@ static void ShipBindProbeTick(const EntityPacket& pkt, void* mgr, int n, Entity*
 
 struct ShipCB { uint64_t hostId; Entity* ent; uint32_t cls; uint64_t lastMs; };
 static ShipCB s_scb[64]; static int s_scbN = 0;
-static LONG s_scbNew = 0, s_scbNoCls = 0, s_scbNoShip = 0, s_scbLost = 0, s_scbHost = 0, s_scbBound = 0;
+static LONG s_scbNew = 0, s_scbNoCls = 0, s_scbNoShip = 0, s_scbLost = 0, s_scbHost = 0, s_scbBound = 0, s_scbStolen = 0;
+// [Coop] ShipClassBindSteal (default 0; re-read once a second like the mode): when every local hull of a host
+// ship's class is already bound, hand the new host ship the hull whose current host ship is furthest from the
+// peer. Measured 2026-11-27 (two-instance log): the guest has <=9 AI hulls while the host sends 10-20 ship
+// records per window, and binding is first-come + sticky for 10 s, so noLocalOfClass reached 2881 and the two
+// ships that actually carried crew (F000CEB1, F002BB22) were never bound -> crewResolved=0 for 40 crew keys.
+// Class fidelity is preserved: only a hull whose current host ship has the SAME class is stolen.
+static int ShipClassBindStealMode() {
+    static int s = 0; static uint64_t s_next = 0;
+    const uint64_t now = GetTickCount64();
+    if (now >= s_next) { s_next = now + 1000; s = GetPrivateProfileIntA("Coop", "ShipClassBindSteal", 0, Paths::Ini()); if (s < 0 || s > 1) s = 0; }
+    return s;
+}
 static double s_scbErr = 0.0; static float s_scbErrMax = 0.0f; static int s_scbErrN = 0;
 uintptr_t Phase1_ScbGuestOfLo(uint32_t hostLo) {   // spawn_census.cpp crew-key diagnostics: the guest ship bound to a host ship
     for (int i = 0; i < s_scbN; ++i) if ((uint32_t)s_scb[i].hostId == hostLo) return (uintptr_t)s_scb[i].ent;
@@ -5544,7 +5556,39 @@ static Entity* ShipClassBindFor(const EntityState& es, Entity* const* live, cons
         const float d2 = dx * dx + dy * dy;
         if (d2 < bd) { bd = d2; best = k; }
     }
-    if (best < 0) { ++s_scbNoShip; return nullptr; }
+    if (best < 0) {
+        // [Coop] ShipClassBindSteal: no free hull of this class. Take the hull whose current host ship is
+        // furthest from the peer, but only when the new ship is meaningfully closer (hysteresis, so two
+        // nearby hulls cannot swap every frame). The incumbent's hull already has es.arch (it was bound to
+        // a record of that class), so class fidelity is kept.
+        if (ShipClassBindStealMode() && g_peerPosValid && s_scbN > 0) {
+            const float ndx = es.pos[0] - g_peerPos[0], ndy = es.pos[1] - g_peerPos[1];
+            const float nd2 = ndx * ndx + ndy * ndy;
+            const float kHyst = 25.0f;                        // metres a new ship must beat the incumbent by
+            int victim = -1; float vd2 = 0.0f;
+            for (int i = 0; i < s_scbN; ++i) {
+                if (s_scb[i].cls != es.arch) continue;        // same class only
+                Entity* h = s_scb[i].ent;
+                if (!h || !readable((const char*)h + 0x40, 12)) continue;   // BaseEntity::m_GlobalMatrix.M41 (Entity.h:26)
+                float dp2 = 0.0f;
+                __try {
+                    const float dxp = h->m_GlobalMatrix.M41 - g_peerPos[0], dyp = h->m_GlobalMatrix.M42 - g_peerPos[1];
+                    dp2 = dxp * dxp + dyp * dyp;
+                } __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
+                if (dp2 > vd2) { vd2 = dp2; victim = i; }
+            }
+            if (victim >= 0 && vd2 > nd2 + kHyst * kHyst) {
+                Entity* hull = s_scb[victim].ent;
+                const float wasM = sqrtf(vd2);
+                s_scb[victim].hostId = es.objId; s_scb[victim].cls = es.arch; s_scb[victim].lastMs = now;
+                ++s_scbNew; ++s_scbBound; ++s_scbStolen;
+                L("[ShipClassBind] steal host=%016llX cls=%u -> local ship %p (peer dist %.0f -> %.0f m)\n",
+                  (unsigned long long)es.objId, (unsigned)es.arch, hull, wasM, sqrtf(nd2));
+                return hull;
+            }
+        }
+        ++s_scbNoShip; return nullptr;
+    }
     if (s_scbN < 64) {
         s_scb[s_scbN++] = { es.objId, live[best], liveCls[best], now };
         ++s_scbNew; ++s_scbBound;
@@ -5591,10 +5635,10 @@ static void ApplyShips(const EntityPacket& pkt) {
         static uint64_t s_scbLog = 0;
         if (scbNow >= s_scbLog) {
             s_scbLog = scbNow + 5000;
-            L("[ShipClassBind] mode=%d hostRecs=%ld bound=%ld new=%ld lost=%ld noClass=%ld noLocalOfClass=%ld table=%d localAI=%d | err mean=%.2f max=%.2f n=%d\n",
-              scbMode, s_scbHost, s_scbBound, s_scbNew, s_scbLost, s_scbNoCls, s_scbNoShip, s_scbN, scbLiveN,
+            L("[ShipClassBind] mode=%d hostRecs=%ld bound=%ld new=%ld stolen=%ld lost=%ld noClass=%ld noLocalOfClass=%ld table=%d localAI=%d | err mean=%.2f max=%.2f n=%d\n",
+              scbMode, s_scbHost, s_scbBound, s_scbNew, s_scbStolen, s_scbLost, s_scbNoCls, s_scbNoShip, s_scbN, scbLiveN,
               s_scbErrN ? s_scbErr / s_scbErrN : -1.0, s_scbErrMax, s_scbErrN);
-            s_scbHost = s_scbBound = s_scbNew = s_scbLost = s_scbNoCls = s_scbNoShip = 0; s_scbErr = 0.0; s_scbErrMax = 0.0f; s_scbErrN = 0;
+            s_scbHost = s_scbBound = s_scbNew = s_scbStolen = s_scbLost = s_scbNoCls = s_scbNoShip = 0; s_scbErr = 0.0; s_scbErrMax = 0.0f; s_scbErrN = 0;
         }
     }
     __try {
@@ -15852,7 +15896,7 @@ static void DumpConfigOnce()
         // The Tune* values are floats (read with strtod, see ShipTuningTick); the dump shows the integer part.
         { "Coop", "TuneConeAngle", 120 }, { "Coop", "TuneConeRange", 350 }, { "Coop", "TuneMaxTime", 30 },
         { "Coop", "TuneAggroTime", 30 }, { "Coop", "TuneHull", 0 },
-        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 }, { "Coop", "WeaponSync", 0 }, { "Coop", "ShipPeerZ", 0 }, { "Coop", "ShipBindProbe", 0 }, { "Coop", "ShipSpawnProbe", 0 }, { "Coop", "ShipSpawnFire", 0 }, { "Coop", "ShipSpawnFirePid", 0 }, { "Coop", "SpawnCensus", 0 }, { "Coop", "SpawnReplayFire", 0 }, { "Coop", "SpawnReplayFirePid", 0 }, { "Coop", "SpawnShare", 0 }, { "Coop", "SpawnKeyBind", 0 }, { "Coop", "ShipClassBind", 0 }, { "Coop", "SpawnShareRadiusM", 150 },{ "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "FastTravelCrashFix", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 },
+        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 }, { "Coop", "WeaponSync", 0 }, { "Coop", "ShipPeerZ", 0 }, { "Coop", "ShipBindProbe", 0 }, { "Coop", "ShipSpawnProbe", 0 }, { "Coop", "ShipSpawnFire", 0 }, { "Coop", "ShipSpawnFirePid", 0 }, { "Coop", "SpawnCensus", 0 }, { "Coop", "SpawnReplayFire", 0 }, { "Coop", "SpawnReplayFirePid", 0 }, { "Coop", "SpawnShare", 0 }, { "Coop", "SpawnKeyBind", 0 }, { "Coop", "ShipClassBind", 0 }, { "Coop", "ShipClassBindSteal", 0 }, { "Coop", "SpawnShareRadiusM", 150 },{ "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "FastTravelCrashFix", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 },
         { "Coop", "CombatTest", 0 }, { "Coop", "CrashContext", 0 }, { "Coop", "CorpseKeepSec", 30 }, { "Coop", "CrowdProbeIntegrate", 1 },
         { "Coop", "CrowdProbeLiveKeys", 1 }, { "Coop", "DamageRelay", 0 }, { "Coop", "Diag", 0 },
         { "Coop", "DisableCrowd", 0 }, { "Coop", "DisablePuppetAI", 1 }, { "Coop", "DisableSpawns", 0 },
