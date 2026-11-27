@@ -5422,6 +5422,43 @@ static void MirrorRetireStale() {
         }
 }
 
+// [Coop] FastTravelCrashFix (default 1): retire ALL live proxies when a world change is detected, BEFORE
+// the old world unloads. The fast-travel crash (ops/evidence/fast-travel-crash-2026-11-26.md) is a
+// use-after-free of a shared refcounted sub-object: the proxy ship shares refcounted sub-arrays with its
+// source; the source's world-unload release frees them while the proxy's registry record still references
+// them, so the proxy's later release calls sub_76E0F0 on freed memory. Retiring every proxy (live=false,
+// hostId=0) at the world-change point stops MirrorApply from driving them and clears the pool so the
+// world-update walk has no proxy components to release through the registry. This is an interim mitigation:
+// the complete fix requires making the proxy's sub-entities fully independent (audit sub_52A980), which is
+// a deeper RE task. UNVERIFIED until a guest run shows no crash on sea->Havana with ShipMirror=1.
+static int s_fastTravelCrashFix = -1;   // [Coop] FastTravelCrashFix, read once (default 1: retire proxies on world change)
+static bool FastTravelCrashFixOn() {
+    if (s_fastTravelCrashFix < 0) s_fastTravelCrashFix = GetPrivateProfileIntA("Coop", "FastTravelCrashFix", 1, Paths::Ini()) != 0 ? 1 : 0;
+    return s_fastTravelCrashFix == 1;
+}
+static void MirrorRetireAll(const char* reason) {
+    if (!FastTravelCrashFixOn()) return;
+    int retired = 0;
+    for (int i = 0; i < g_mirrorN; ++i) {
+        if (g_mirror[i].proxy) {
+            if (g_mirror[i].live) {
+                L("[ShipMirror] fast-travel: retire proxy=%p host=%llu reason=%s\n",
+                  g_mirror[i].proxy, (unsigned long long)g_mirror[i].hostId, reason ? reason : "");
+                MirrorPark(g_mirror[i]);
+                ++retired;
+            }
+            // Drop the pool slot entirely so the proxy is forgotten; the entity itself is left in the
+            // world (World::RemoveEntity crashes on clones, SHIP-RE C11) and will be cleaned up by the
+            // engine's normal world unload.
+            g_mirror[i].proxy = nullptr;
+            g_mirror[i].hostId = 0;
+            g_mirror[i].live = false;
+        }
+    }
+    g_mirrorN = 0;
+    if (retired) L("[ShipMirror] fast-travel: retired %d proxy(s), pool cleared\n", retired);
+}
+
 // Option 3: mirror the ORIGINAL ship's render (no deep-copy). For each received ship, drive the local
 // matching ship's RENDER matrix to the host's transform via the SetGlobalMatrixInternal hook. The ship's
 // own physics/AI keeps running (its logic position stays local), but the visual follows the host.
@@ -15785,7 +15822,7 @@ static void DumpConfigOnce()
         // The Tune* values are floats (read with strtod, see ShipTuningTick); the dump shows the integer part.
         { "Coop", "TuneConeAngle", 120 }, { "Coop", "TuneConeRange", 350 }, { "Coop", "TuneMaxTime", 30 },
         { "Coop", "TuneAggroTime", 30 }, { "Coop", "TuneHull", 0 },
-        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 }, { "Coop", "WeaponSync", 0 }, { "Coop", "ShipPeerZ", 0 }, { "Coop", "ShipBindProbe", 0 }, { "Coop", "ShipSpawnProbe", 0 }, { "Coop", "ShipSpawnFire", 0 }, { "Coop", "ShipSpawnFirePid", 0 }, { "Coop", "SpawnCensus", 0 }, { "Coop", "SpawnReplayFire", 0 }, { "Coop", "SpawnReplayFirePid", 0 }, { "Coop", "SpawnShare", 0 }, { "Coop", "SpawnKeyBind", 0 }, { "Coop", "ShipClassBind", 0 }, { "Coop", "SpawnShareRadiusM", 150 },{ "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 },
+        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 }, { "Coop", "WeaponSync", 0 }, { "Coop", "ShipPeerZ", 0 }, { "Coop", "ShipBindProbe", 0 }, { "Coop", "ShipSpawnProbe", 0 }, { "Coop", "ShipSpawnFire", 0 }, { "Coop", "ShipSpawnFirePid", 0 }, { "Coop", "SpawnCensus", 0 }, { "Coop", "SpawnReplayFire", 0 }, { "Coop", "SpawnReplayFirePid", 0 }, { "Coop", "SpawnShare", 0 }, { "Coop", "SpawnKeyBind", 0 }, { "Coop", "ShipClassBind", 0 }, { "Coop", "SpawnShareRadiusM", 150 },{ "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "FastTravelCrashFix", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 },
         { "Coop", "CombatTest", 0 }, { "Coop", "CrashContext", 0 }, { "Coop", "CorpseKeepSec", 30 }, { "Coop", "CrowdProbeIntegrate", 1 },
         { "Coop", "CrowdProbeLiveKeys", 1 }, { "Coop", "DamageRelay", 0 }, { "Coop", "Diag", 0 },
         { "Coop", "DisableCrowd", 0 }, { "Coop", "DisablePuppetAI", 1 }, { "Coop", "DisableSpawns", 0 },
@@ -16411,6 +16448,7 @@ static void OnFrameInner(Human* updatedHuman) {
                     if (haveWorldId && curWorld != lastWorldId) {
                         L("[E] ev=world-change world=%08X->%08X localKey=%08X\n",
                           lastWorldId, curWorld, localShow);
+                        MirrorRetireAll("world-change");   // [Coop] FastTravelCrashFix: retire proxies before unload
                     } else {
                         L("[E] ev=scene-change localKey=%08X world=%08X\n",
                           localShow, curWorld);
