@@ -7316,6 +7316,17 @@ static void CaptureGuards(EntityPacket& pkt) {
         }
 
         if (!HostHpSvcValid(w.hpSvc)) { w.hpSvc = 0; continue; }   // stale: drop it, change nothing
+        // WR-4 (F9): HostHpSvcValid proves only vtable + plausible Max, so a service freed with the vanished
+        // entity and re-allocated to ANOTHER guard passes it - and that guard's death (or 0xFFFF) was then
+        // reported as this objId's. A service that a different, still-live watch claimed in THIS capture is
+        // recycled by construction: drop it, change nothing (the same silence as the stale case above).
+        {
+            bool recycled = false;
+            for (int j = 0; j < s_hostLifeN && !recycled; ++j)
+                if (j != i && s_hostLife[j].gen == s_hostLifeGen && s_hostLife[j].hpSvc == w.hpSvc
+                    && s_hostLife[j].objId != w.objId) recycled = true;
+            if (recycled) { w.hpSvc = 0; continue; }
+        }
         bool dead = false;
         unsigned short life = w.life;
         bool readOk = true;
@@ -7547,6 +7558,18 @@ static void GktAttemptClear(uint64_t objId, unsigned int ent) {
     (void)ent;
 }
 
+// WR-15 (W-P2-3): kill pushes used GetTickCount() as seq. The receiver's stale filter (net.cpp, STALE_WINDOW
+// 4096 around g_rxDoneSeq) only lets them through untouched while that tick is far from the snapshot counter;
+// a tick inside the window below the marker was dropped as DEC_STALE, one inside it above the marker MOVED the
+// marker so the next real snapshots read as stale, and one >= 4096 below it captured the marker outright. A kill
+// seq is now pinned 2^30 ahead of this sender's own snapshot counter: SeqDiff to a marker near g_entSeq is ~+2^30,
+// i.e. never stale and never inside (0, STALE_WINDOW) or <= -STALE_WINDOW, so the marker is never moved; the
+// per-push counter keeps back-to-back kills distinct (and increasing) when no snapshot runs in between.
+static uint32_t KillPushSeq() {
+    static uint32_t s_killPushN = 0;
+    return g_entSeq + 0x40000000u + (++s_killPushN);   // no mask: a wrap would re-enter the window
+}
+
 // objId == 0 is legal: a guard the host never described (locally spawned) has no host id, and
 // ApplyPeerHealth falls back to the 4 m position match (phase1.cpp:4944) exactly for that case.
 static void GuestPushDeath(uint64_t objId, unsigned int ent, float x, float y, float z) {
@@ -7560,7 +7583,7 @@ static void GuestPushDeath(uint64_t objId, unsigned int ent, float x, float y, f
     memset(&out, 0, sizeof(out));
     out.magic    = NET_ENTITY_MAGIC;
     out.protoVer = NET_PROTO_VER;
-    out.seq      = GetTickCount();
+    out.seq      = KillPushSeq();   // WR-15: not GetTickCount (see KillPushSeq)
     out.count    = 1;
     out.ents[0].kind    = KIND_KILL;
     out.ents[0].objId   = objId;
@@ -8585,6 +8608,7 @@ struct OwnBody {
     uint32_t alias;
     GuardAnim anim; uint64_t animUs;            // proto 13: host animation block and when it last changed
     float vEma;                                 // O5: running average speed of what we wrote
+    uint64_t legacyWriteUs;                     // WR-10: probe-only time of the last LEGACY write (OwnStarved never reads it)
     GaState ga;
     // [Coop] GuardPlace (default 0; docs/design/enemy-placement.md): one link = one host guard id on this body. Reset
     // whenever the id changes or the link was dropped, so no sample, write or approach of an earlier link leaks into it.
@@ -8899,7 +8923,8 @@ static bool OwnPlaceApproaching(Human* h) {
 static void OwnNoteLegacyWrite(Human* h, const float* pos) {
     AcquireSRWLockExclusive(&s_ownLock);
     const int i = OwnFind((unsigned int)h);
-    if (i >= 0) { for (int k = 0; k < 3; ++k) s_own[i].lastWrite[k] = pos[k]; s_own[i].haveWrite = true; }
+    if (i >= 0) { for (int k = 0; k < 3; ++k) s_own[i].lastWrite[k] = pos[k]; s_own[i].haveWrite = true;
+                  s_own[i].legacyWriteUs = OwnNowUs(); }   // WR-10: lets the O1 probe time a legacy write
     ReleaseSRWLockExclusive(&s_ownLock);
     ++s_gLegacyWrites;
 }
@@ -11282,9 +11307,13 @@ static void OwnDrain(Human* h) {
     float pos[3], quat[4]; OwnSample(o, now, pos, quat);
     float vEmaNew = o.vEma;
     // moving probe: speed of the position we are about to give it, against the action it plays
-    if (o.haveWrite && o.lastWriteUs && now > o.lastWriteUs && haveCur) {
+    // WR-10 (W-P1-4): lastWriteUs is stamped only by own-update / GuardPlace writes, so with OwnUpdateGuards=0 this
+    // probe (and O1 inside it) never counted. Fall back to the legacy write's probe-only stamp; lastWriteUs itself is
+    // left alone because OwnStarved decides the legacy fallback from it.
+    const uint64_t wUs = o.lastWriteUs ? o.lastWriteUs : o.legacyWriteUs;
+    if (o.haveWrite && wUs && now > wUs && haveCur) {
         const float dx = pos[0] - o.lastWrite[0], dy = pos[1] - o.lastWrite[1], dz = pos[2] - o.lastWrite[2];
-        const float v = sqrtf(dx * dx + dy * dy + dz * dz) / ((float)(double)(now - o.lastWriteUs) * 1e-6f);
+        const float v = sqrtf(dx * dx + dy * dy + dz * dz) / ((float)(double)(now - wUs) * 1e-6f);
         if (v > 0.3f) {
             InterlockedIncrement(&s_mvFrames);
             if (curAlias == o.alias) InterlockedIncrement(&s_mvActMatch);
@@ -11417,8 +11446,13 @@ static void OwnReport() {
     {   // O1 (action, host alias stable >= 300 ms, moving frames) and O5 (step speed > 50% off the body's average)
         const LONG f1 = InterlockedExchange(&s_o1Frames, 0), m1 = InterlockedExchange(&s_o1Mis, 0);
         const LONG f5 = InterlockedExchange(&s_o5Frames, 0), b5 = InterlockedExchange(&s_o5Bad, 0);
-        L("[O5] buffer=%d O1 frames=%ld mis=%ld (agree %.1f%%) | O5 frames=%ld jitter=%ld (%.2f%%)\n",
-          s_gibOn, f1, m1, f1 ? 100.0 * (f1 - m1) / f1 : 0.0, f5, b5, f5 ? 100.0 * b5 / f5 : 0.0);
+        // WR-10 (W-P1-4): O1 now also counts legacy writes (legacyWriteUs); O5 still needs vEma, which only the
+        // own-update write stores, so with OwnUpdateGuards=0 O5 is 0 by construction. The mode is printed so a
+        // zero is attributable.
+        const int ownG = OwnGuardsOn() ? 1 : 0;
+        L("[O5] buffer=%d O1 frames=%ld mis=%ld (agree %.1f%%) | O5 frames=%ld jitter=%ld (%.2f%%) | OwnUpdateGuards=%d%s\n",
+          s_gibOn, f1, m1, f1 ? 100.0 * (f1 - m1) / f1 : 0.0, f5, b5, f5 ? 100.0 * b5 / f5 : 0.0,
+          ownG, ownG ? "" : " (O5 inert)");
     }
     if (s_fpOn) {
         const unsigned char* opt = nullptr;
@@ -12220,6 +12254,15 @@ static void GuestDeathScan() {
         GuestLifeWatch& w = s_gktWatch[q];
         if (w.gen == s_gktGen || w.tombstoned || !w.hpSvc) continue;
         if (!HostHpSvcValid(w.hpSvc)) { w.hpSvc = 0; continue; }
+        // WR-4 (F9): same recycled-service gate as the host vanish lane - a service a different, still-live
+        // watch claimed in THIS scan belongs to that body now, not to the one that vanished.
+        {
+            bool recycled = false;
+            for (int j = 0; j < s_gktWatchN && !recycled; ++j)
+                if (j != q && s_gktWatch[j].gen == s_gktGen && s_gktWatch[j].hpSvc == w.hpSvc
+                    && s_gktWatch[j].ent != w.ent) recycled = true;
+            if (recycled) { w.hpSvc = 0; continue; }
+        }
         bool dead = false; unsigned short life = w.lastLife; bool ok = true;
         __try {
             dead = (*(unsigned int*)(w.hpSvc + 0x60) & 0x01000000u) != 0;
@@ -13837,7 +13880,7 @@ static void SendHealthEvent(uint64_t objId, unsigned short life, float x, float 
     memset(&out, 0, sizeof(out));
     out.magic = NET_ENTITY_MAGIC;
     out.protoVer = NET_PROTO_VER;
-    out.seq = GetTickCount();
+    out.seq = KillPushSeq();   // WR-15: not GetTickCount (see KillPushSeq)
     out.count = 1;
     out.ents[0].kind = KIND_KILL;
     out.ents[0].objId = objId;
@@ -14023,11 +14066,11 @@ static bool KillGuardEntityInner(Entity* e, bool notifyPeer, KillRefusal* why, b
     return engineDead;
 }
 
-// ini [Coop] GuestKillMirror (default 1): let the guest run the real engine kill on a mirrored guard.
+// ini [Coop] GuestKillMirror (default 0 since M-P2-6; the shipped AC4Coop.ini sets 1, the tested value): let the guest run the real engine kill on a mirrored guard.
 static int s_guestKillMirror = -1;
 static int GuestKillMirrorEnabled() {
     if (s_guestKillMirror < 0)
-        s_guestKillMirror = GetPrivateProfileIntA("Coop", "GuestKillMirror", 1, Paths::Ini());
+        s_guestKillMirror = GetPrivateProfileIntA("Coop", "GuestKillMirror", 0, Paths::Ini());   // M-P2-6: default 0 (policy); the template ini ships 1
     return s_guestKillMirror;
 }
 
@@ -14210,6 +14253,22 @@ static bool GuestKillMirrorEntity(uint64_t objId, unsigned int ent, bool viaGues
             // does SetEnabled(false) + m_DriveEntity = false, which would freeze a body that is still
             // alive. Report unsettled so the claim retries (settled = killed || alreadyDead).
             // C2-m1: `why` already carries the inner refusal (no-health / ai-unreadable / engine-alive).
+            // WR-13 (W-P2-1): both callers marked the body MirrorKilledLocally BEFORE this call, and the mirror
+            // tick skips its disable for such a body, so the re-enable above outlived the refusal: a guard the
+            // engine did not kill kept a live behaviour (its own AI) for good. Undo exactly the two writes made
+            // above, with the same calls and guards as the pre-state block and CorpseLatchTick, so the body is
+            // back in the tick's disabled state; a retry re-enables it again.
+            int restored = 0;
+            __try {
+                if (bhvForLatch && readable(bhvForLatch, 0x40)) { bhvForLatch->SetEnabled(false); restored = 1; }
+                Human* h = AIEntityHelper::GetHuman((Entity*)ent);
+                if (h && readable(h, 4)) {
+                    CharacterController* cc = (CharacterController*)h->GetCharacterComponent();
+                    if (readable(cc, 0x600)) cc->m_DriveEntity = false;
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) { restored = 0; }
+            if (ClaimLogAllowed())
+                L("[Mirror] dead ent=%08X kill refused -> behaviour restored=%d\n", ent, restored);
             if (ClaimLogAllowed())
                 L("[Mirror] dead ent=%08X -> KillGuardEntity applied=0 reason=engine-not-dead inner=%s (GuestKillMirror=%d)\n",
                   ent, KillRefusalName(why ? *why : KILL_REFUSED_ENGINE_ALIVE), flag);
@@ -14314,7 +14373,24 @@ static void ApplyPeerHealth(uint64_t objId, unsigned short life, float x, float 
             // GuestKillMirrorEntity); MirrorVisualDeath stays first so the "[Mirror] dead ..." line is
             // still emitted exactly as before.
             bool applied = false;
-            if (g_entHost == 1) { applied = KillGuardEntity((Entity*)ent); }
+            if (g_entHost == 1) {
+                // WR-14 (W-P2-2): the host path had neither gate the guest path has. A guard the host already
+                // killed (Life == 0xFFFF, the value SetLife(-1) lands) must not get SetLife(-1) again - that is
+                // the D crash path documented in GuestKillMirrorEntity (0x67B2EA) - and a repeated KIND_KILL
+                // for the same body within the DeathAppliedRecently window is a duplicate, not a new death.
+                bool hostDead = false;
+                if (HostHpSvcValid(hp)) {
+                    __try { hostDead = *(unsigned short*)(hp + 0x5C) == 0xFFFFu; }
+                    __except (EXCEPTION_EXECUTE_HANDLER) { hostDead = false; }
+                }
+                if (hostDead || DeathAppliedRecently(ent)) {
+                    L("[Kill] peer DEATH objId=%llu ent=%08X skipped reason=%s\n", (unsigned long long)objId, ent,
+                      hostDead ? "already-dead" : "duplicate");
+                } else {
+                    applied = KillGuardEntity((Entity*)ent);
+                    if (applied) MarkDeathApplied(ent);   // only a settled kill closes the window; a refusal may retry
+                }
+            }
             else if (!DeathAppliedRecently(ent)) {
                 MarkDeathApplied(ent);
                 MirrorVisualDeath((Entity*)ent);
@@ -16048,7 +16124,7 @@ static void DumpConfigOnce()
         { "Coop", "EntitySelfTestOffset", 0 }, { "Coop", "EntitySync", 0 }, { "Coop", "FixNullReturn", 1 },
         { "Coop", "ForceUnknownBuild", 0 }, { "Coop", "GhostMarkerSuppress", 1 }, { "Coop", "GhostProxy", 0 },
         { "Coop", "GuardNullActionTarget", 0 }, { "Coop", "GuardNullTarget", 1 }, { "Coop", "GuardAnimFull", 0 }, { "Coop", "GuardBlendFix", 0 }, { "Coop", "GuardStaleReturn", 0 }, { "Coop", "GuardStaleTarget", 1 },
-        { "Coop", "GuestKillMirror", 1 }, { "Coop", "HelmSync", 0 }, { "Coop", "HookSgm", 1 }, { "Coop", "HostileOnly", 0 },
+        { "Coop", "GuestKillMirror", 0 }, { "Coop", "HelmSync", 0 }, { "Coop", "HookSgm", 1 }, { "Coop", "HostileOnly", 0 },
         { "Coop", "HybridLoco", 1 }, { "Coop", "IdentityBand", 0 }, { "Coop", "IdResolver", 1 },
         { "Coop", "InstallHooks", 1 }, { "Coop", "IntegratePuppet", 0 }, { "Coop", "KillTrace", 1 },
         { "Coop", "KrLog", 0 }, { "Coop", "LegacyPadIdHook", 1 }, { "Coop", "MirrorActions", 1 }, { "Coop", "MirrorActionsDeferred", 1 }, { "Coop", "OwnPhysicsMs", 0 }, { "Coop", "OwnUpdateGuards", 0 }, { "Coop", "OwnUpdatePuppet", 0 }, { "Coop", "MinBlendInMs", 100 },

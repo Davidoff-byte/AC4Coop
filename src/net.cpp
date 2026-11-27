@@ -745,7 +745,7 @@ namespace {
         // proto 14: a snapshot that is not newer than the last one completed is dropped BEFORE it is decoded
         // into the delta shadow (a late single-chunk datagram used to overwrite both the shadow and the
         // snapshot slot, stepping guards backwards). Only differences inside STALE_WINDOW count: kill pushes use
-        // GetTickCount as seq (another domain) and a restarted host starts again near 0 - both are far
+        // KillPushSeq (phase1.cpp, WR-15: own snapshot counter + 2^30, another domain) and a restarted host starts again near 0 - both are far
         // outside the window, pass, and do not move the marker (see SnapshotDone).
         static const int32_t STALE_WINDOW = 4096;
         // Review 2026-11-14 part 2: a host that restarts within STALE_WINDOW snapshots of its last session starts again
