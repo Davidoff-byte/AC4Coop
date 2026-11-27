@@ -53,7 +53,7 @@ LibE g_lib[kLib]; int g_libN = 0; volatile LONG g_libLock = 0;
 struct Spin { Spin() { while (InterlockedExchange(&g_libLock, 1)) YieldProcessor(); } ~Spin() { InterlockedExchange(&g_libLock, 0); } };
 
 bool g_installed = false;
-volatile LONG g_on = 0, g_follow = 1;
+volatile LONG g_on = 0, g_follow = 1, g_busyPol = 1;   // [Coop] SpawnLibBusy (see SpecUsable)
 __declspec(thread) int t_tag = 0;
 volatile uintptr_t g_ourReq = 0;
 
@@ -101,6 +101,28 @@ bool SpecValid(const LibE& e)
     const uintptr_t p0 = *(const uintptr_t*)arr;
     return Readable(p0, 0x50) && KindOfParamsVt(*(const uint32_t*)p0) == e.kind;
 }
+// Busy-spec policy. +0x3C is the spec's single current-request slot (submit sets it, the request dtor 0x79C640 clears it when
+// it still holds itself). Measured 2026-11-28 host 28620: idle specs (+0x3C == 0) were 3/27 ship specs and none built (4/4
+// timed out at 10 s); busy ones built in 1.5 s earlier. Both crashes (guest 17552, host 17860) came from RESTORING the old
+// request after our submit (owner ship record ended up {old request (freed), our ship} -> AV 0x1C27B13/0x1C27B15), so there
+// is no restore any more. [Coop] SpawnLibBusy: 0 = idle specs only; 1 (default) = also busy specs whose current request is
+// not in flight (state not 1 submitted / 2 building; UNVERIFIED that this avoids the owner-record clash); 2 = any.
+// Request +0x20 state as read here: 1 set by sub_79C6C0, 4 seen on our built requests, 6 on the freed old one (dump 17860, FC46DF00).
+LONG c_st[8] = {};   // busy specs met by Pick, by current-request state: [0]=1 [1]=2 [2]=4 [3]=6 [4]=9 [5]=other [6]=bad ptr
+int SpecState(uintptr_t spec)   // -1 idle, -2 slot not a live request, else +0x20
+{
+    const uintptr_t cur = *(const uintptr_t*)(spec + 0x3C);
+    if (!cur) return -1;
+    if (!Readable(cur, 0x24) || *(const uint32_t*)cur != 0x01E6D77Cu || *(const uintptr_t*)(cur + 0x10) != spec) return -2;
+    return (int)*(const uint32_t*)(cur + 0x20);
+}
+bool SpecUsableSt(int st)
+{
+    if (st == -1) return true;
+    InterlockedIncrement(&c_st[st == 1 ? 0 : st == 2 ? 1 : st == 4 ? 2 : st == 6 ? 3 : st == 9 ? 4 : st == -2 ? 6 : 5]);
+    const LONG pol = g_busyPol;
+    return pol >= 2 ? st != -2 : pol == 1 ? (st != 1 && st != 2 && st != -2) : false;
+}
 // Newest valid entry of a kind; key != 0 -> that key only; cls != 0 -> that learned ship class only. Invalid entries met on
 // the way are marked bad (never submitted again).
 bool Pick(int kind, uint64_t key, uint32_t cls, LibE* out, bool keyedOnly = false)
@@ -112,10 +134,7 @@ bool Pick(int kind, uint64_t key, uint32_t cls, LibE* out, bool keyedOnly = fals
         for (int i = 0; i < n; ++i) if (cand[i].spec && (best < 0 || cand[i].t > cand[best].t)) best = i;
         if (best < 0) break;
         if (SpecValid(cand[best])) {
-            // Idle specs only: +0x3C is the spec's single current-request slot (submit sets it; the request dtor 0x79C640 clears
-            // it when it still holds itself). Run 2026-11-28 host 17860: a submit on a spec whose engine request was in flight
-            // (+ restore) left the owner's ship record {old request, our ship}; the old request was freed -> AV at 0x1C27B15.
-            if (*(const uintptr_t*)(cand[best].spec + 0x3C) == 0) { *out = cand[best]; return true; }
+            if (SpecUsableSt(SpecState(cand[best].spec))) { *out = cand[best]; return true; }   // see SpecUsableSt
             ++c_busy; cand[best].spec = 0; continue;
         }
         ++c_badSpec;
@@ -176,6 +195,7 @@ bool SpawnLibOn()
         s_next = now + 1000;
         InterlockedExchange(&g_on, GetPrivateProfileIntA("Coop", "SpawnLib", 0, Paths::Ini()) != 0 ? 1 : 0);
         InterlockedExchange(&g_follow, GetPrivateProfileIntA("Coop", "SpawnLibFollow", 1, Paths::Ini()) != 0 ? 1 : 0);
+        InterlockedExchange(&g_busyPol, GetPrivateProfileIntA("Coop", "SpawnLibBusy", 1, Paths::Ini()));
     }
     return g_on != 0;
 }
@@ -208,6 +228,8 @@ extern "C" void SpawnLibNoteBuilt(uintptr_t req, uintptr_t ent)   // C linkage: 
     Spin s;
     for (int i = 0; i < g_libN; ++i) if (g_lib[i].spec == spec) { g_lib[i].cls = cls; InterlockedIncrement(&c_learned); }
 }
+
+bool SpawnLibSpecUsable(uintptr_t spec) { return SpecUsableSt(SpecState(spec)); }   // ship_spawn_replay.cpp (spec Readable 0x40 checked there)
 
 // ---- ship spec supply for ship_spawn_replay.cpp (player thread) ------------------------------------------------------
 bool SpawnLibPickShip(uint32_t cls, uintptr_t* spec, uintptr_t* specVt, uintptr_t* owner, uintptr_t* ownerVt, uintptr_t* ctx, uint32_t* gotCls)
@@ -299,8 +321,8 @@ void SpawnLibFire()
         s_stats = now + 10000;
         int ships = 0, npcs = 0, keyed = 0, learned = 0, idleS = 0, idleN = 0;
         { Spin s; for (int i = 0; i < g_libN; ++i) { if (g_lib[i].bad) continue; const int idle = Readable(g_lib[i].spec, 0x40) && *(const uintptr_t*)(g_lib[i].spec + 0x3C) == 0; if (g_lib[i].kind == K_SHIP) { ++ships; learned += g_lib[i].cls != 0; idleS += idle; } else { ++npcs; keyed += g_lib[i].key != 0; idleN += idle; } } }
-        Log("[SpawnLib] stats lib ships=%d (classKnown %d idle %d) npcs=%d (keyed %d idle %d) | want=%ld cmd=%ld follow=%ld fired=%ld submit0=%ld built=%ld placed=%ld noSpec=%ld failed=%ld badSpec=%ld busySkip=%ld queue=%d\n",
-            ships, learned, idleS, npcs, keyed, idleN, c_want, c_cmd, c_follow, c_fired, c_submit0, c_built, c_placed, c_noSpec, c_failed, c_badSpec, c_busy, g_qN);
+        Log("[SpawnLib] stats lib ships=%d (classKnown %d idle %d) npcs=%d (keyed %d idle %d) | want=%ld cmd=%ld follow=%ld fired=%ld submit0=%ld built=%ld placed=%ld noSpec=%ld failed=%ld badSpec=%ld busySkip=%ld busyState(1/2/4/6/9/other/bad)=%ld/%ld/%ld/%ld/%ld/%ld/%ld pol=%ld queue=%d\n",
+            ships, learned, idleS, npcs, keyed, idleN, c_want, c_cmd, c_follow, c_fired, c_submit0, c_built, c_placed, c_noSpec, c_failed, c_badSpec, c_busy, c_st[0], c_st[1], c_st[2], c_st[3], c_st[4], c_st[5], c_st[6], g_busyPol, g_qN);
     }
     // 4. fire at most one request
     if (g_fly.active || g_qN == 0 || now - g_lastFire < kGapMs) return;
@@ -316,17 +338,17 @@ void SpawnLibFire()
     static unsigned s_noSpecLog = 0;
     if (!have) { ++c_noSpec; if (s_noSpecLog++ < 20) Log("[SpawnLib] no valid idle spec kind=%d cls=%u key=%016llX purpose=%d\n", w.kind, w.cls, (unsigned long long)w.key, w.purpose); return; }
     if (w.purpose == P_FOLLOW) TryCount(w.host);
-    const uintptr_t old = *(const uintptr_t*)(e.spec + 0x3C);   // 0: Pick returns idle specs only (spec Readable 0x40)
+    const uintptr_t old = *(const uintptr_t*)(e.spec + 0x3C);   // spec Readable 0x40 (Pick); usable per SpecUsableSt
+    const int oldSt = SpecState(e.spec);
     g_ourReq = 0; t_tag = 1; SpawnShareReplayTag(1);
     const char submitted = ((char(__cdecl*)(uintptr_t, uintptr_t, uintptr_t, uint32_t, uint32_t))0x00569560)(e.spec, e.owner, e.ctx, 0, 0);
     SpawnShareReplayTag(0); t_tag = 0;
     const uintptr_t req = g_ourReq; g_ourReq = 0;
-    // No restore: the spec was idle, our request now holds its slot exactly as an engine submit would (2026-11-28: both
-    // restore variants crashed - guest 17552 blind, host 17860 validated - see Pick).
+    // No restore (2026-11-28: both restore variants crashed - guest 17552 blind, host 17860 validated - see SpecUsableSt).
     ++c_fired;
-    Log("[SpawnLib] req kind=%d purpose=%d spec=%08X owner=%08X ctx=%08X key=%016llX cls=%u(lib %u) host=%016llX -> submitted=%d req=%08X old3C=%08X\n",
+    Log("[SpawnLib] req kind=%d purpose=%d spec=%08X owner=%08X ctx=%08X key=%016llX cls=%u(lib %u) host=%016llX -> submitted=%d req=%08X old3C=%08X oldState=%d\n",
         w.kind, w.purpose, (unsigned)e.spec, (unsigned)e.owner, (unsigned)e.ctx, (unsigned long long)e.key, w.cls, e.cls, (unsigned long long)w.host,
-        (int)submitted, (unsigned)req, (unsigned)old);
+        (int)submitted, (unsigned)req, (unsigned)old, oldSt);
     if (!submitted || !req) { ++c_submit0; return; }
     g_fly.req = req; g_fly.ent = 0; g_fly.tBuilt = 0; g_fly.w = w; g_fly.spec = e.spec; g_fly.t = now; g_fly.active = 1;
 }
