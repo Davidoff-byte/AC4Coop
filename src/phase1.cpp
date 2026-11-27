@@ -7672,16 +7672,24 @@ static bool FiniteVec(const float* v, int n) {
 // mid-switch), and re-issuing SetTargetAction on every change restarts the clip - which reads as flicker.
 // Only apply an alias that has been stable for two consecutive snapshots.
 static bool MirrorAliasShouldApply(void* e, unsigned int alias) {
-    static struct { unsigned int ent; unsigned int pending; unsigned int applied; int count; } t[MIRROR_TABLE];
+    static struct { unsigned int ent; unsigned int pending; unsigned int applied; int count; uint64_t lastMs; } t[MIRROR_TABLE];
     static int n = 0;
+    const uint64_t nowMs = GetTickCount64();
     int slot = -1;
     for (int i = 0; i < n; ++i) if (t[i].ent == (unsigned int)e) { slot = i; break; }
     if (slot < 0) {
-        if (n >= MIRROR_TABLE) return false;
-        slot = n++;
-        t[slot].ent = (unsigned int)e; t[slot].pending = alias; t[slot].applied = 0; t[slot].count = 1;
+        if (n >= MIRROR_TABLE) {
+            // WR-3: evict stalest entry instead of saturating for process lifetime
+            int evict = 0;
+            for (int i = 1; i < n; ++i) if (t[i].lastMs < t[evict].lastMs) evict = i;
+            slot = evict;
+        } else {
+            slot = n++;
+        }
+        t[slot].ent = (unsigned int)e; t[slot].pending = alias; t[slot].applied = 0; t[slot].count = 1; t[slot].lastMs = nowMs;
         return false;                       // baseline: do not touch the clip on first sight
     }
+    t[slot].lastMs = nowMs;
     if (t[slot].pending != alias) { t[slot].pending = alias; t[slot].count = 1; return false; }
     if (t[slot].count < 2) { ++t[slot].count; return false; }
     if (t[slot].applied == alias) return false;
