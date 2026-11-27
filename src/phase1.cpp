@@ -14099,6 +14099,22 @@ static bool GuestKillMirrorEntity(uint64_t objId, unsigned int ent, bool viaGues
             // does SetEnabled(false) + m_DriveEntity = false, which would freeze a body that is still
             // alive. Report unsettled so the claim retries (settled = killed || alreadyDead).
             // C2-m1: `why` already carries the inner refusal (no-health / ai-unreadable / engine-alive).
+            // WR-13 (W-P2-1): both callers marked the body MirrorKilledLocally BEFORE this call, and the mirror
+            // tick skips its disable for such a body, so the re-enable above outlived the refusal: a guard the
+            // engine did not kill kept a live behaviour (its own AI) for good. Undo exactly the two writes made
+            // above, with the same calls and guards as the pre-state block and CorpseLatchTick, so the body is
+            // back in the tick's disabled state; a retry re-enables it again.
+            int restored = 0;
+            __try {
+                if (bhvForLatch && readable(bhvForLatch, 0x40)) { bhvForLatch->SetEnabled(false); restored = 1; }
+                Human* h = AIEntityHelper::GetHuman((Entity*)ent);
+                if (h && readable(h, 4)) {
+                    CharacterController* cc = (CharacterController*)h->GetCharacterComponent();
+                    if (readable(cc, 0x600)) cc->m_DriveEntity = false;
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) { restored = 0; }
+            if (ClaimLogAllowed())
+                L("[Mirror] dead ent=%08X kill refused -> behaviour restored=%d\n", ent, restored);
             if (ClaimLogAllowed())
                 L("[Mirror] dead ent=%08X -> KillGuardEntity applied=0 reason=engine-not-dead inner=%s (GuestKillMirror=%d)\n",
                   ent, KillRefusalName(why ? *why : KILL_REFUSED_ENGINE_ALIVE), flag);
