@@ -4473,12 +4473,30 @@ struct SyncTarget {
     float    pos[3];
     float    quat[4];
 };
-static SyncTarget g_syncTargets[MAX_SYNC_ENTITIES];
-static int        g_syncCount = 0;
+// WR-6: double-buffered. ApplyShips used to rewrite the one table in place while the SGM hook (any thread,
+// and re-entrantly from ApplyShips' own SetGlobalMatrixInternal call) scanned it, so the hook could read a
+// half-written entry or a count that did not match the entries. The writer fills the back buffer and
+// publishes its index; the hook reads the published buffer and drops the override if that buffer's
+// generation changed (odd = being written) while it copied the entry - it never spins.
+struct SyncTargetBuf {
+    volatile LONG gen;           // even = stable, odd = being written
+    int           count;
+    SyncTarget    t[MAX_SYNC_ENTITIES];
+};
+static SyncTargetBuf g_syncBuf[2];
+static volatile LONG g_syncFront = 0;   // index of the published buffer
+static void SyncTargetsPublishEmpty() {
+    const LONG back = 1 - g_syncFront;
+    SyncTargetBuf& b = g_syncBuf[back];
+    _InterlockedIncrement(&b.gen);
+    b.count = 0;
+    _InterlockedIncrement(&b.gen);
+    _InterlockedExchange(&g_syncFront, back);
+}
 
 // [Coop] ShipSync (default 1): master kill switch for the whole NPC-ship lane — capture AND apply.
 // Read once, so a live run cannot flip it mid-session. When 0 the host sends no ship entries and the
-// peer's ApplyShips empties g_syncCount, which also clears any stale render override.
+// peer's ApplyShips publishes an empty sync-target buffer, which also clears any stale render override.
 static int s_shipSync = -1;
 static bool ShipSyncEnabled() {
     if (s_shipSync < 0) s_shipSync = GetPrivateProfileIntA("Coop", "ShipSync", 1, Paths::Ini());
@@ -5598,7 +5616,7 @@ static Entity* ShipClassBindFor(const EntityState& es, Entity* const* live, cons
     return nullptr;
 }
 static void ApplyShips(const EntityPacket& pkt) {
-    if (!ShipSyncEnabled()) { g_syncCount = 0; return; }
+    if (!ShipSyncEnabled()) { SyncTargetsPublishEmpty(); return; }
     void* mgr = GetNavalManager();
     if (!mgr || !readable((char*)mgr + 0x3E8, 8)) return;
     unsigned short n = *(unsigned short*)((char*)mgr + 0x3EE);
@@ -5607,6 +5625,9 @@ static void ApplyShips(const EntityPacket& pkt) {
     Entity* localShip = GetLocalShip();
     __try { ShipBindProbeTick(pkt, mgr, (int)n, localShip, player); } __except (EXCEPTION_EXECUTE_HANDLER) {}
     int count = 0;
+    const LONG syncBack = 1 - g_syncFront;                    // WR-6: fill the back buffer, publish at the end
+    SyncTargetBuf& syncBuf = g_syncBuf[syncBack];
+    _InterlockedIncrement(&syncBuf.gen);                      // odd: being written
     uint32_t nObj = 0, nNear = 0, nUnresolved = 0, nDup = 0;
     Entity* used[MAX_SYNC_ENTITIES];
     int usedN = 0;
@@ -5702,7 +5723,7 @@ static void ApplyShips(const EntityPacket& pkt) {
             if (dup) { ++nDup; continue; }
             if (usedN < MAX_SYNC_ENTITIES) used[usedN++] = ent;
 
-            SyncTarget& t = g_syncTargets[count];
+            SyncTarget& t = syncBuf.t[count];
             t.ent = (uint32_t)ent;
             t.pos[0] = es.pos[0]; t.pos[1] = es.pos[1]; t.pos[2] = es.pos[2];
             t.quat[0] = es.quat[0]; t.quat[1] = es.quat[1]; t.quat[2] = es.quat[2]; t.quat[3] = es.quat[3];
@@ -5719,7 +5740,9 @@ static void ApplyShips(const EntityPacket& pkt) {
             }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    g_syncCount = count;
+    syncBuf.count = count;
+    _InterlockedIncrement(&syncBuf.gen);                      // even: stable
+    _InterlockedExchange(&g_syncFront, syncBack);             // publish
     if (mirror) {
         MirrorRetireStale();
         const uint64_t now = GetTickCount64();
@@ -16914,19 +16937,25 @@ static void LogSetGlobalMatrixBody(uint32_t thisEnt, uint32_t sgmMatrix, uint32_
     // Entity sync (NPCs + ships): override the RENDER for each synced entity, and clear `updatePhysics`
     // so the override does NOT feed back into the entity's own physics (verified: SetGlobalMatrixInternal
     // 0x00528200 always writes the matrix, then only updates physics components when updatePhysics!=0).
-    for (int i = 0; i < g_syncCount; ++i) {
-        if (g_syncTargets[i].ent != thisEnt) continue;
+    const SyncTargetBuf& sb = g_syncBuf[g_syncFront & 1];     // WR-6: published buffer, generation-checked copy
+    const LONG sbGen = sb.gen;
+    const int sbCount = (sbGen & 1) ? 0 : sb.count;
+    for (int i = 0; i < sbCount && i < MAX_SYNC_ENTITIES; ++i) {
+        if (sb.t[i].ent != thisEnt) continue;
+        const SyncTarget tgt = sb.t[i];
+        _ReadWriteBarrier();
+        if (sb.gen != sbGen) break;                           // rewritten while copying: skip the override this call
         if (sgmPhysPtr) *(uint32_t*)sgmPhysPtr = (ShipClassBindMode() == 2 && *(uint32_t*)thisEnt == 0x01E4A128u) ? 1u : 0u;   // render-only, or [Coop] ShipClassBind=2: the hull moves too
         float* m = (float*)sgmMatrix;
         // ToMatrix, never hand-build: the hand-built off-diagonals were transposed and only appeared
         // correct while FromMatrix returned the conjugate (audit 2026-11-20).
-        HookMath::Quaternion q; q.x = g_syncTargets[i].quat[0]; q.y = g_syncTargets[i].quat[1];
-                                q.z = g_syncTargets[i].quat[2]; q.w = g_syncTargets[i].quat[3];
+        HookMath::Quaternion q; q.x = tgt.quat[0]; q.y = tgt.quat[1];
+                                q.z = tgt.quat[2]; q.w = tgt.quat[3];
         HookMath::Transform tm; HookMath::ToMatrix(&q, &tm);
         m[0] = tm.M11;  m[1] = tm.M12;  m[2]  = tm.M13;
         m[4] = tm.M21;  m[5] = tm.M22;  m[6]  = tm.M23;
         m[8] = tm.M31;  m[9] = tm.M32;  m[10] = tm.M33;
-        m[12] = g_syncTargets[i].pos[0]; m[13] = g_syncTargets[i].pos[1]; m[14] = g_syncTargets[i].pos[2];
+        m[12] = tgt.pos[0]; m[13] = tgt.pos[1]; m[14] = tgt.pos[2];
         return;
     }
 
