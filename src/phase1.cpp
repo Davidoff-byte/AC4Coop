@@ -1392,17 +1392,17 @@ static inline int GhostProxyEnabled() {
 // Oldest-overwrite ring: insertion never fails, and exclusion is always a finite set of <= 8 pairs,
 // so no code path can leave selection impossible. An eviction only lets the evicted source be
 // duplicated once more - bounded, never a disablement.
-struct ProxySrcPair { uint32_t srcId; uint32_t ghostId; };
+struct ProxySrcPair { uint64_t srcId; uint64_t ghostId; };   // F12: full 64-bit ids (ResolveEntityById compares 64-bit)
 static ProxySrcPair g_proxySrcRing[8];
 static int g_proxySrcCount = 0;    // live pairs, <= 8 - diagnostic only, never gates selection
 static int g_proxySrcNext  = 0;    // next write slot
 // Every duplicate id we have ever created. DespawnGhostShip hides a ghost instead of destroying it
 // (SHIP-RE C11), so its id can stay live forever; this keeps such a ghost out of the candidate set.
-static uint32_t g_proxyGhostIds[8];
+static uint64_t g_proxyGhostIds[8];
 static int      g_proxyGhostCount = 0, g_proxyGhostNext = 0;
 
 // What the selector reports. A pure-query result: the selector records nothing.
-struct ProxyPick { uint32_t srcId; int idx; float srcMax; float tierDelta; uint32_t hint; uint32_t cls; int classMiss; const char* camSrc; };
+struct ProxyPick { uint64_t srcId; int idx; float srcMax; float tierDelta; uint32_t hint; uint32_t cls; int classMiss; const char* camSrc; };
 
 static void PuppetOwnNote(Human* h, Entity* e, const HookMath::Transform& m);   // own-update block, before ApplyGuards
 bool FightIntentOwnsPuppet();   // [Coop] FightIntents (S7 slice 1), defined with OwnDrain
@@ -1487,7 +1487,7 @@ static void PuppetOwnClear();
 static Entity* ResolveEntityById(uint64_t id);   // engine registry, defined with the ApplyGuards
 static void ProxySrcClearAll();
 
-static void ProxySrcRemember(uint32_t srcId, uint32_t ghostId) {
+static void ProxySrcRemember(uint64_t srcId, uint64_t ghostId) {
     g_proxySrcRing[g_proxySrcNext].srcId   = srcId;
     g_proxySrcRing[g_proxySrcNext].ghostId = ghostId;
     g_proxySrcNext = (g_proxySrcNext + 1) % 8;
@@ -1497,12 +1497,12 @@ static void ProxySrcRemember(uint32_t srcId, uint32_t ghostId) {
     if (g_proxySrcCount   < 8) ++g_proxySrcCount;
     if (g_proxyGhostCount < 8) ++g_proxyGhostCount;
 }
-static bool ProxySrcUsed(uint32_t srcId) {
+static bool ProxySrcUsed(uint64_t srcId) {
     if (!srcId) return false;
     for (int k = 0; k < 8; ++k) if (g_proxySrcRing[k].srcId == srcId) return true;
     return false;
 }
-static bool ProxyGhostIdKnown(uint32_t ghostId) {
+static bool ProxyGhostIdKnown(uint64_t ghostId) {
     if (!ghostId) return false;
     for (int k = 0; k < 8; ++k) if (g_proxyGhostIds[k] == ghostId) return true;
     return false;
@@ -4107,7 +4107,7 @@ static void* SpawnGhostShip() {
             static unsigned s_proxyDupFails     = 0;   // saturated at 8: only the shift (clamped to 4)
                                                        // and the [GhostProxy] log field consume it
             static uint64_t s_proxyLogLast      = 0;   // wall-clock throttle, 1 s
-            static uint32_t s_pickLastSrcId     = 0;   // PX-m5: last pick line's source id
+            static uint64_t s_pickLastSrcId     = 0;   // PX-m5: last pick line's source id
             static int      s_pickSpawn         = 0;   // PX-m5: pick count (first spawn always logs)
             const uint64_t nowMs = GetTickCount64();
             ProxySrcWorldCheck();
@@ -4136,8 +4136,8 @@ static void* SpawnGhostShip() {
                     ++s_pickSpawn;
                     void* dup = DuplicateShip(chosen);
                     if (dup) {
-                        uint32_t ghostId = 0;
-                        __try { ghostId = (uint32_t)((ManagedObject*)dup)->GetObjectID(); }
+                        uint64_t ghostId = 0;
+                        __try { ghostId = (uint64_t)((ManagedObject*)dup)->GetObjectID(); }
                         __except (EXCEPTION_EXECUTE_HANDLER) { ghostId = 0; }
                         if (GhostSetHullIdentity(dup, g_ghostPeerMaxHP)) {
                             // The pair is recorded only now - after the duplicate exists. On any
@@ -4805,7 +4805,7 @@ static Entity* SelectProxySource(float peerMax, uint32_t peerClass, ProxyPick* o
             }
         }
         Entity* localShip = GetLocalShip();
-        const uint32_t curGhostId = (uint32_t)g_ghostObjId;
+        const uint64_t curGhostId = (uint64_t)g_ghostObjId;
 
         // Camera-focus proxy: the local ship's position (the naval camera orbits it). When the local
         // ship cannot be read the tie-break silently degrades to "distance from world origin", so the
@@ -4821,7 +4821,7 @@ static Entity* SelectProxySource(float peerMax, uint32_t peerClass, ProxyPick* o
         Entity* best = nullptr;
         float bestTier = 0.0f, bestDist = -1.0f, bestMax = 0.0f;
         float bestTieDelta = 0.0f;
-        uint32_t bestId = 0;
+        uint64_t bestId = 0;
         int bestIdx = -1, bestHint = 0;
         bool bestHintOk = false;
         uint32_t bestCls = 0;
@@ -4838,8 +4838,8 @@ static Entity* SelectProxySource(float peerMax, uint32_t peerClass, ProxyPick* o
             if (se == (Entity*)g_ghostShip) { ghostInList = true; continue; }
             void* hc = GetShipHandle(mgr, i);
             if (!hc || !readable(hc, 0x14)) continue;
-            uint32_t candId = 0;
-            __try { candId = (uint32_t)(*(uint64_t*)((char*)hc + 0x0C)); }
+            uint64_t candId = 0;
+            __try { candId = *(uint64_t*)((char*)hc + 0x0C); }
             __except (EXCEPTION_EXECUTE_HANDLER) { candId = 0; }
             if (!candId) continue;                        // no identity -> cannot be tracked/pruned
             if (candId == curGhostId) { ghostInList = true; continue; }
@@ -5922,10 +5922,27 @@ static uint32_t AdAliasGet(uint64_t objId) {
     return 0;
 }
 
+// [Coop] TableEvict (default 0): saturating per-scene tables (F10 host life watch, F17 mirror-death relay
+// watch, M-P1-3 mirror last-transform cache, M-P2-1 pushed-death tombstone) recycle an entry instead of
+// silently refusing every new body once full. 0 = the old refuse-when-full behaviour.
+static int s_tableEvict = -1;
+static bool TableEvictOn() {
+    if (s_tableEvict < 0) s_tableEvict = GetPrivateProfileIntA("Coop", "TableEvict", 0, Paths::Ini()) != 0 ? 1 : 0;
+    return s_tableEvict != 0;
+}
+
 static HostLifeWatch* HostLifeFor(uint64_t objId) {
     for (int i = 0; i < s_hostLifeN; ++i) if (s_hostLife[i].objId == objId) return &s_hostLife[i];
-    if (s_hostLifeN >= 256) return nullptr;
-    HostLifeWatch* w = &s_hostLife[s_hostLifeN++];
+    HostLifeWatch* w = nullptr;
+    if (s_hostLifeN >= 256) {
+        static int s_fullLines = 0;   // F10: a full table used to refuse with no trace
+        if (s_fullLines < 3) { ++s_fullLines; L("[KT] host life-watch table full (256) objId=%llu TableEvict=%d\n", (unsigned long long)objId, TableEvictOn() ? 1 : 0); }
+        if (!TableEvictOn()) return nullptr;
+        for (int i = 0; i < s_hostLifeN && !w; ++i) if (s_hostLife[i].tombstoned) w = &s_hostLife[i];   // only a finished watch is recycled
+        if (!w) return nullptr;
+    } else {
+        w = &s_hostLife[s_hostLifeN++];
+    }
     w->objId = objId; w->life = 0; w->hpSvc = 0; w->gen = 0; w->vanishedLogged = false;
     w->lastLife = 0; w->seen = false; w->tombstoned = false;
     w->lastX = 0; w->lastY = 0; w->lastZ = 0; w->lastDist = 0; w->lastEnt = 0; w->adEmitted = false;
@@ -7554,8 +7571,10 @@ static void TrackMirrorDeathForRelay(Entity* e, const EntityState& es) {
         if (s_mirrLifeN >= 64) {
             // A full table used to mean "this body is never watched" with no trace at all.
             GktSkip(es.objId, (unsigned int)e, "mirror-watch-table-full");
-            return;
-        }
+            if (!TableEvictOn()) return;
+            static unsigned s_mirrLifeRing = 0;   // F17: [Coop] TableEvict - recycle round-robin as a new baseline
+            slot = (int)(s_mirrLifeRing++ % 64u);
+        } else
         slot = s_mirrLifeN++;
         s_mirrLife[slot].ent = (unsigned int)e;
         s_mirrLife[slot].life = life;
@@ -8579,17 +8598,23 @@ static int64_t OwnHostUs(uint32_t hostMs) {
     // WR-11: host change -> host clock restarts; drop retained offset + base so old host clock doesn't linger
     static uint32_t s_lastHostMs = 0;
     if (s_hostBaseSet && (int32_t)(hostMs - s_lastHostMs) < -10000) {
-        s_hostBaseMs = hostMs; s_offCur = INT64_MAX; s_offPrev = INT64_MAX; s_offWinUs = 0;
+        s_hostBaseMs = hostMs; InterlockedExchange64((volatile LONGLONG*)&s_offCur, INT64_MAX); InterlockedExchange64((volatile LONGLONG*)&s_offPrev, INT64_MAX); s_offWinUs = 0;   // M-P1-1
     }
     s_lastHostMs = hostMs;
     return (int64_t)(int32_t)(hostMs - s_hostBaseMs) * 1000;
 }
 static void OwnOffsetNote(int64_t hostUs, uint64_t rxUs) {   // under s_ownLock (exclusive)
-    if (rxUs - s_offWinUs > 2000000) { s_offPrev = s_offCur; s_offCur = INT64_MAX; s_offWinUs = rxUs; }
+    // M-P1-1: 64-bit stores are interlocked so the lock-free reader in OwnOffset never sees a torn value.
+    if (rxUs - s_offWinUs > 2000000) { InterlockedExchange64((volatile LONGLONG*)&s_offPrev, s_offCur); InterlockedExchange64((volatile LONGLONG*)&s_offCur, INT64_MAX); s_offWinUs = rxUs; }
     const int64_t off = (int64_t)rxUs - hostUs;
-    if (off < s_offCur) s_offCur = off;
+    if (off < s_offCur) InterlockedExchange64((volatile LONGLONG*)&s_offCur, off);
 }
-static int64_t OwnOffset() { return s_offCur < s_offPrev ? s_offCur : s_offPrev; }
+// M-P1-1: callers read this after s_ownLock is released, so each int64 is read atomically (no torn half on x86).
+static int64_t OwnOffset() {
+    const int64_t c = (int64_t)InterlockedCompareExchange64((volatile LONGLONG*)&s_offCur, 0, 0);
+    const int64_t p = (int64_t)InterlockedCompareExchange64((volatile LONGLONG*)&s_offPrev, 0, 0);
+    return c < p ? c : p;
+}
 static float OwnLerpRatio(float a, float b, float f, bool* wrapped) {
     *wrapped = b < a;                     // the clip looped between the two samples
     if (*wrapped) b += 1.0f;
@@ -11866,6 +11891,10 @@ static void ApplyGuards(const EntityPacket& pkt) {
                 int slot = -1;
                 for (int k = 0; k < s_lastN; ++k) if (s_last[k].ent == (unsigned int)best) { slot = k; break; }
                 if (slot < 0 && s_lastN < MIRROR_TABLE) { slot = s_lastN++; s_last[slot].ent = (unsigned int)best; s_last[slot].pos[0] = 1e30f; }
+                else if (slot < 0 && TableEvictOn()) {   // M-P1-3: [Coop] TableEvict - recycle round-robin instead of dp=1e30 forever
+                    static unsigned s_lastRing = 0;
+                    slot = (int)(s_lastRing++ % (unsigned)MIRROR_TABLE); s_last[slot].ent = (unsigned int)best; s_last[slot].pos[0] = 1e30f;
+                }
                 bool moved = true;
                 float dp = 1e30f;
                 if (slot >= 0) {
@@ -13718,6 +13747,7 @@ static void SendHealthEvent(uint64_t objId, unsigned short life, float x, float 
                 return;
             }
         if (s_pushedDeathN < 256) s_pushedDeathIds[s_pushedDeathN++] = objId;
+        else if (TableEvictOn()) { static unsigned s_pushedDeathRing = 0; s_pushedDeathIds[s_pushedDeathRing++ % 256u] = objId; }   // M-P2-1: ring when full
     }
     static EntityPacket out;   // static: ~16 KB at proto 13 (player-update thread only)
     memset(&out, 0, sizeof(out));
@@ -13926,17 +13956,24 @@ static int GuestKillMirrorEnabled() {
 // existing per-tick generation counter (s_gktGen, phase1.cpp:3681) - no threads, no timers - and the
 // write set is exactly the tick's (:3494 behaviour disable, :3499 drive-flag clear), so a latched body
 // ends in the same state as every other playback dummy.
-struct CorpseLatch { unsigned int ent; unsigned int bornGen; Component* bhv; };
+struct CorpseLatch { unsigned int ent; unsigned int bornGen; Component* bhv; unsigned int bhvVt; };   // M-P2-2: bhvVt = vtable seen at arm time
 static CorpseLatch s_corpseLatch[64];
 static int s_corpseLatchN = 0;
 static const unsigned int CORPSE_LATCH_TICKS = 8;     // ~0.4 s at SnapshotHz: enough for the fall to start
 
+// M-P2-2: first dword of the behaviour component (its vtable) at arm time; 0 = unreadable. Re-checked before the
+// latch writes, so a component freed and reused for another object within the latch window is not written.
+static unsigned int CorpseLatchVt(Component* bhv) {
+    if (!bhv || !readable(bhv, 4)) return 0;
+    __try { return *(unsigned int*)bhv; } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
 static void CorpseLatchArm(unsigned int ent, Component* bhv) {
     if (!ent) return;
     for (int i = 0; i < s_corpseLatchN; ++i)
         if (s_corpseLatch[i].ent == ent) {
             s_corpseLatch[i].bornGen = s_gktGen;
             s_corpseLatch[i].bhv = bhv;
+            s_corpseLatch[i].bhvVt = CorpseLatchVt(bhv);
             return;
         }
     int slot = s_corpseLatchN;
@@ -13945,6 +13982,7 @@ static void CorpseLatchArm(unsigned int ent, Component* bhv) {
     s_corpseLatch[slot].ent = ent;
     s_corpseLatch[slot].bornGen = s_gktGen;
     s_corpseLatch[slot].bhv = bhv;
+    s_corpseLatch[slot].bhvVt = CorpseLatchVt(bhv);
     static int s_latchLines = 0;
     if (s_latchLines < 10) {
         ++s_latchLines;
@@ -13961,7 +13999,7 @@ static void CorpseLatchTick() {
         if ((unsigned int)(s_gktGen - c.bornGen) < CORPSE_LATCH_TICKS) { ++i; continue; }
         int ok = 0;
         __try {
-            if (c.bhv && readable(c.bhv, 0x40)) {
+            if (c.bhv && readable(c.bhv, 0x40) && c.bhvVt && *(unsigned int*)c.bhv == c.bhvVt) {   // M-P2-2
                 ((Component*)c.bhv)->SetEnabled(false);
                 ok = 1;
             }
@@ -15905,7 +15943,7 @@ static void DumpConfigOnce()
         // The Tune* values are floats (read with strtod, see ShipTuningTick); the dump shows the integer part.
         { "Coop", "TuneConeAngle", 120 }, { "Coop", "TuneConeRange", 350 }, { "Coop", "TuneMaxTime", 30 },
         { "Coop", "TuneAggroTime", 30 }, { "Coop", "TuneHull", 0 },
-        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 }, { "Coop", "WeaponSync", 0 }, { "Coop", "ShipPeerZ", 0 }, { "Coop", "ShipBindProbe", 0 }, { "Coop", "ShipSpawnProbe", 0 }, { "Coop", "ShipSpawnFire", 0 }, { "Coop", "ShipSpawnFirePid", 0 }, { "Coop", "SpawnCensus", 0 }, { "Coop", "SpawnReplayFire", 0 }, { "Coop", "SpawnReplayFirePid", 0 }, { "Coop", "SpawnShare", 0 }, { "Coop", "SpawnKeyBind", 0 }, { "Coop", "ShipClassBind", 0 }, { "Coop", "ShipClassBindSteal", 0 }, { "Coop", "SpawnShareRadiusM", 150 },{ "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "FastTravelCrashFix", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 },
+        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 }, { "Coop", "WeaponSync", 0 }, { "Coop", "ShipPeerZ", 0 }, { "Coop", "ShipBindProbe", 0 }, { "Coop", "ShipSpawnProbe", 0 }, { "Coop", "ShipSpawnFire", 0 }, { "Coop", "ShipSpawnFirePid", 0 }, { "Coop", "SpawnCensus", 0 }, { "Coop", "SpawnReplayFire", 0 }, { "Coop", "SpawnReplayFirePid", 0 }, { "Coop", "SpawnShare", 0 }, { "Coop", "SpawnKeyBind", 0 }, { "Coop", "ShipClassBind", 0 }, { "Coop", "ShipClassBindSteal", 0 }, { "Coop", "SpawnShareRadiusM", 150 },{ "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "TableEvict", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "FastTravelCrashFix", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 },
         { "Coop", "CombatTest", 0 }, { "Coop", "CrashContext", 0 }, { "Coop", "CorpseKeepSec", 30 }, { "Coop", "CrowdProbeIntegrate", 1 },
         { "Coop", "CrowdProbeLiveKeys", 1 }, { "Coop", "DamageRelay", 0 }, { "Coop", "Diag", 0 },
         { "Coop", "DisableCrowd", 0 }, { "Coop", "DisablePuppetAI", 1 }, { "Coop", "DisableSpawns", 0 },
