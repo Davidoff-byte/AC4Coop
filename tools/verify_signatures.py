@@ -119,6 +119,9 @@ IAT_SITES = [
 CALL_SITES = [
     ("CreateSwapChain call", 0x0094A1D7, bytes.fromhex("8B 52 28 57 51 50 FF D2"), "mov edx,[edx+28h]; push edi,ecx,eax; call edx"),
     ("factory thunk", 0x00976220, bytes.fromhex("FF 25 18 A6 E3 01"), "jmp [0x01E3A618]"),
+    # [Coop] ShipNoAutoSink (src/phase1.cpp Phase1_ShipNoAutoSinkInstall): sub_1205280's > 1000 m sink post; the plugin
+    # checks the same 10 bytes and rewrites only the rel32 of the E8 at 0x01205379 (E8 22 C1 7F FF -> sub_A014A0).
+    ("ShipNoAutoSink call", 0x01205374, bytes.fromhex("6A 00 52 8B CE E8 22 C1 7F FF"), "push 0; push edx; mov ecx,esi; call sub_A014A0"),
 ]
 
 

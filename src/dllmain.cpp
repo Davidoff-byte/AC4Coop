@@ -41,6 +41,7 @@
 #include "conflict_probe.h"
 #include "puppet_listener.h"
 void Phase1_OwnerDamageInstall();   // phase1.cpp: [Coop] OwnerDamage SetLife detour (S9)
+void Phase1_ShipNoAutoSinkInstall();   // phase1.cpp: [Coop] ShipNoAutoSink call-site redirect at 0x01205379 (default 0)
 #include "action_guard.h"
 #include "deref_guard.h"
 #include "walk_guard.h"
@@ -694,6 +695,9 @@ BOOL APIENTRY DllMain(HMODULE hMod, DWORD reason, LPVOID)
         // S9 owner-decides damage ([Coop] OwnerDamage, default follows FightIntents): SetLife detour, after CombatObserve so
         // a CombatObserve hook on the same site is detected (prologue check) instead of stacked.
         Phase1_OwnerDamageInstall();
+
+        // [Coop] ShipNoAutoSink (default 0): one E8 rel32 at 0x01205379 redirected after a 10-byte check. Flag 0 = nothing patched.
+        Phase1_ShipNoAutoSinkInstall();
 
         // Menu probe (boot straight into the world, part B): observation-only hooks on the title-menu save path.
         // [Coop] MenuProbe, default 0 -> one GetPrivateProfileIntA, nothing patched.

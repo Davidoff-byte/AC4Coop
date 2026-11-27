@@ -5241,6 +5241,62 @@ static int ShipClassBindMode() {
     if (now >= s_next) { s_next = now + 1000; s_mode = GetPrivateProfileIntA("Coop", "ShipClassBind", 0, Paths::Ini()); if (s_mode < 0 || s_mode > 2) s_mode = 0; }
     return s_mode;
 }
+// ---- [Coop] ShipStateSync / ShipNoAutoSink (both default 0, read once) --------------------------------------------
+// docs/design/naval-state-sync.md; evidence ops/evidence/naval-boarding-noclass-sink-2026-11-27.md s0 + Q3.
+// Host: every ship record carries the ship's lowest active health state in EntityState.stage (a guard-only field until
+// now; EF_STAGE is kind-agnostic in net.cpp, so no layout change): 0 unknown, 1..5 = state 91..95; plus the hull
+// per-mille in hp, exactly as ShipMirror fills it.
+// Guest: for each host ship bound to a REAL local ship (never a ShipMirror proxy), NavStateFire (OnFrame, after the
+// OnFrameInner __try, player-update thread) posts the engine's own statechart event through sub_A014A0 on a transition:
+//   host 95,    local 91    -> sub_1207960(gcl,1) when +0x540 == 0, then post *(u16*)0x4DEAD5C   (91 -> 95)
+//   host 94|93, local 91|95 -> post *(u16*)0x4DEADE0                                            (-> 94; 94 -> 93 is local)
+// and drives the hull through the setter 0x1225A10 + the +0xD4 regen cap (the ShipApplyHull route), clamped >= 1.0 while
+// the host is 91/92/95, and above max * IncapacitatedHealthRatio (params+0x58) while the host is 91, so the drive itself
+// can never post 95 or the sink. ShipNoAutoSink: call site 0x01205379 (sub_1205280, state 95's > 1000 m sink) is
+// redirected to NavNoAutoSinkPost, which drops the post for a ship in this table on the guest and forwards every other.
+static int ShipStateSyncOn() {
+    static int s = -1;
+    if (s < 0) s = GetPrivateProfileIntA("Coop", "ShipStateSync", 0, Paths::Ini()) != 0 ? 1 : 0;
+    return s;
+}
+static int ShipNoAutoSinkOn() {
+    static int s = -1;
+    if (s < 0) s = GetPrivateProfileIntA("Coop", "ShipNoAutoSink", 0, Paths::Ini()) != 0 ? 1 : 0;
+    return s;
+}
+static const uint32_t kGcLShipVtable = 0x026A34E8u;   // coord_sync.cpp's vtable gate for the same setter
+struct NavRow {
+    uint64_t hostId; void* ent; void* gcl; volatile DWORD seenTick; uint8_t hostSt; uint16_t hostPm; bool used;
+    // guest bookkeeping (NavStateFire only)
+    uint8_t actedSt, tries, driveSt, failLoggedSt, passLoggedSt; bool sinkPosted, unsancLogged;
+    DWORD actedTick, mismSinceTick, driveLogTick; uint16_t appliedPm;
+};
+static const int NAV_MAX = 32;
+static NavRow s_nav[NAV_MAX];
+static SRWLOCK s_navLock = SRWLOCK_INIT;
+static volatile LONG c_navPost95 = 0, c_navPostSink = 0, c_navPass = 0, c_navFail = 0, c_navUnsanc = 0,
+                     c_navDrive = 0, c_navNoThr = 0, c_navBad = 0, c_nasSkip = 0, c_nasPass = 0;
+// Guest, from ApplyShips (inside its __try): remember the binding. The lock section touches only s_nav.
+static void NavStateNote(Entity* ent, const EntityState& es) {
+    void* gcl = ShipGcLObj(ent);                                  // readable(gcl, 0xD4) validated
+    if (!gcl || *(uint32_t*)gcl != kGcLShipVtable || !readable(gcl, 0x548)) return;
+    const DWORD now = GetTickCount();
+    AcquireSRWLockExclusive(&s_navLock);
+    NavRow* r = nullptr;
+    for (int i = 0; i < NAV_MAX && !r; ++i) if (s_nav[i].used && s_nav[i].hostId == es.objId) r = &s_nav[i];
+    for (int i = 0; i < NAV_MAX && !r; ++i) if (!s_nav[i].used) r = &s_nav[i];
+    if (r) {
+        if (!r->used || r->ent != ent || r->gcl != gcl) {           // new binding: fresh bookkeeping
+            memset(r, 0, sizeof(*r));
+            r->appliedPm = 0xFFFF;
+        }
+        r->hostId = es.objId; r->ent = ent; r->gcl = gcl;
+        r->hostSt = (es.stage >= 1 && es.stage <= 5) ? (uint8_t)(90 + es.stage) : 0;
+        r->hostPm = es.hp <= 1000 ? es.hp : 0xFFFF;
+        r->seenTick = now; r->used = true;
+    }
+    ReleaseSRWLockExclusive(&s_navLock);
+}
 static void fillShipState(EntityState& es, Entity* ent, uint32_t key, uint64_t objId) {
     es.key = key; es.kind = 1;
     // Real identity, from the same HandleContainer accessor the guard lane uses (phase1.cpp:3217).
@@ -5266,6 +5322,20 @@ static void fillShipState(EntityState& es, Entity* ent, uint32_t key, uint64_t o
         es.arch = (uint16_t)ReadShipClass(ent);
         float mx = 0.0f;   // class 0: the max hull as float bits in actionAlias (ships never use it; 0 = none)
         if (!es.arch && ReadShipHullMax(ent, &mx)) memcpy(&es.actionAlias, &mx, sizeof(mx));
+    }
+    if (ShipStateSyncOn()) {   // [Coop] ShipStateSync: health state 91..95 as 1..5 in stage, hull per-mille in hp
+        void* ho = ShipGcLObj(ent);
+        const uint8_t st = ShipHStateOf(ShipHealthBits(ho));
+        es.stage = st ? (uint8_t)(st - 90) : 0;
+        es.hp = 1001;   // "no hull" (> 1000: every reader ignores it; never 0xFFFF, which net.cpp decodes as dead)
+        float hp = -1.0f;
+        const float mx = (ho && readable((char*)ho + 0xB4, 4)) ? *(float*)((char*)ho + 0xB4) : 0.0f;
+        if (mx > 0.0f && ReadShipHullHP(ent, &hp)) {
+            float pm = hp / mx * 1000.0f;
+            if (!(pm >= 0.0f)) pm = 0.0f;
+            if (pm > 1000.0f) pm = 1000.0f;
+            es.hp = (uint16_t)(pm + 0.5f);
+        }
     }
 }
 
@@ -6098,6 +6168,7 @@ static void ApplyShips(const EntityPacket& pkt) {
             for (int u = 0; u < usedN; ++u) if (used[u] == ent) { dup = true; break; }
             if (dup) { ++nDup; continue; }
             if (usedN < MAX_SYNC_ENTITIES) used[usedN++] = ent;
+            if (es.objId && (ShipStateSyncOn() || ShipNoAutoSinkOn()) && !IsMirrorProxy(ent)) NavStateNote(ent, es);   // real local ship only
 
             SyncTarget& t = syncBuf.t[count];
             t.ent = (uint32_t)ent;
@@ -6139,6 +6210,178 @@ static void ApplyShips(const EntityPacket& pkt) {
     if ((++s_applyCalls % 600) == 0 && (nDup || nUnresolved))
         L("[ShipSync] apply targets=%d byObjId=%u byPos=%u unresolved=%u dupSkipped=%u\n",
           count, nObj, nNear, nUnresolved, nDup);
+}
+
+// ---- [Coop] ShipStateSync guest fire / [Coop] ShipNoAutoSink (see the block above fillShipState) ----------------------
+// What one row's GcLShip looks like right now. All reads under SEH; false = not a readable GcLShip any more.
+struct NavLocal { int bits; float hull, max, thr; uint8_t a540; };
+static bool NavRead(void* gcl, NavLocal* o) {
+    if (!gcl || !readable(gcl, 0x548)) return false;
+    __try {
+        if (*(uint32_t*)gcl != kGcLShipVtable) return false;
+        o->bits = ShipHealthBits(gcl);
+        o->hull = *(float*)((char*)gcl + 0xD0);
+        o->max  = *(float*)((char*)gcl + 0xB4);
+        o->a540 = *(unsigned char*)((char*)gcl + 0x540);
+        o->thr  = 0.0f;   // max * ShipAISettings.IncapacitatedHealthRatio: params = GcLShip+0x444 (set lazily by the setter)
+        void* prm = *(void**)((char*)gcl + 0x444);
+        if (prm && readable((char*)prm + 0x58, 4)) {
+            const float ratio = *(float*)((char*)prm + 0x58);
+            if (ratio > 0.0f && ratio < 1.0f) o->thr = o->max * ratio;
+        }
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+// Run-time event id (sub_11F20D0 assigns them from a counter at start-up; doc s0): the low word of the dword.
+static uint16_t NavEvt(uintptr_t a) {
+    if (!readable((void*)a, 2)) return 0;
+    __try { return *(volatile uint16_t*)a; } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+// The +0xD4 regen cap written back after the setter (ShipApplyHull, ship-hull-live-write-2026-11-21.md s1-2).
+static float NavHoldCap(void* gcl, float v) {
+    __try { *(float*)((char*)gcl + 0xD4) = v; return *(float*)((char*)gcl + 0xD0); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1.0f; }
+}
+// sub_A014A0(obj, u16 event, 0), __thiscall, retn 8 (IDA 0xA014A0..0xA014EA; forwards to [obj+0x20], sub_A00FD0).
+// The two engine posts a guest copy may need. NO __try here and none around the callers: the post dispatches the
+// statechart (enter/exit handlers), which can take engine locks; a swallowed fault would leave one held.
+static void NavPost(void* gcl, uint16_t evt) { ((int (__thiscall*)(void*, uint32_t, int))0x00A014A0)(gcl, evt, 0); }
+// Enter state 95 the engine's way: the boardable setter (it early-returns when +0x3A9 already equals the value), then
+// the "incapacitate" event, which has a transition only from 91 (0x11F372A). Shared with [Coop] BoardStartGuest.
+static void NavEnter95(void* gcl, bool setBoardable) {
+    if (setBoardable) CallSetBoardable(gcl, 1);
+    NavPost(gcl, NavEvt(0x04DEAD5Cu));
+}
+
+static void NavStateFire() {
+    if (!ShipStateSyncOn() || g_entHost != 0) return;
+    const DWORD now = GetTickCount();
+    NavRow rows[NAV_MAX]; int rn = 0;
+    AcquireSRWLockExclusive(&s_navLock);
+    for (int i = 0; i < NAV_MAX; ++i) {
+        if (!s_nav[i].used) continue;
+        if (now - s_nav[i].seenTick > 3000) { s_nav[i].used = false; continue; }   // host record gone 3 s
+        rows[rn++] = s_nav[i];
+    }
+    ReleaseSRWLockExclusive(&s_navLock);
+    for (int k = 0; k < rn; ++k) {
+        NavRow& r = rows[k];
+        NavLocal L0;
+        if (!NavRead(r.gcl, &L0)) { InterlockedIncrement(&c_navBad); continue; }
+        const uint8_t host = r.hostSt, local = ShipHStateOf(L0.bits);
+        // 1. the state transition, once per host state (retried at most twice, 1 s apart, while the pair still asks for it)
+        const bool want95 = host == 95 && local == 91;
+        const bool wantSink = (host == 94 || host == 93) && (local == 91 || local == 95);
+        if ((want95 || wantSink) && (r.actedSt != host || (now - r.actedTick >= 1000 && r.tries < 3))) {
+            if (r.actedSt != host) r.tries = 0;
+            const uint16_t evt = NavEvt(want95 ? 0x04DEAD5Cu : 0x04DEADE0u);
+            if (want95) { NavEnter95(r.gcl, L0.a540 == 0); InterlockedIncrement(&c_navPost95); }
+            else        { NavPost(r.gcl, evt);              InterlockedIncrement(&c_navPostSink); r.sinkPosted = true; }
+            r.actedSt = host; r.actedTick = now; ++r.tries;
+            NavLocal L1; const int after = NavRead(r.gcl, &L1) ? (int)ShipHStateOf(L1.bits) : -1;
+            L("[ShipSt] key=%016llX host=%u localBefore=%u posted=%s evt=%u a540=%u localAfter=%d try=%u\n",
+              (unsigned long long)r.hostId, host, local, want95 ? "4DEAD5C" : "4DEADE0", (unsigned)evt,
+              (unsigned)L0.a540, after, (unsigned)r.tries);
+        }
+        // 2. oracle bookkeeping on the state read at the top of this frame (the post's effect shows next frame)
+        if (host && local) {
+            const bool match = local == host || (host == 93 && local == 94) || (host == 94 && local == 93);
+            if (match) {
+                if (r.passLoggedSt != host && r.actedSt == host) {
+                    r.passLoggedSt = host; InterlockedIncrement(&c_navPass);
+                    L("[ShipSt] PASS key=%016llX host=%u local=%u dtMs=%u\n", (unsigned long long)r.hostId, host, local, now - r.actedTick);
+                }
+                r.mismSinceTick = 0;
+            } else {
+                if (!r.mismSinceTick) r.mismSinceTick = now ? now : 1;
+                else if (now - r.mismSinceTick > 1000 && r.failLoggedSt != host) {
+                    r.failLoggedSt = host; InterlockedIncrement(&c_navFail);
+                    L("[ShipSt] FAIL mismatch key=%016llX host=%u local=%u heldMs=%u\n", (unsigned long long)r.hostId, host, local, now - r.mismSinceTick);
+                }
+            }
+            if ((local == 93 || local == 94) && (host == 91 || host == 92 || host == 95) && !r.sinkPosted && !r.unsancLogged) {
+                r.unsancLogged = true; InterlockedIncrement(&c_navUnsanc);
+                L("[ShipSt] UNSANCTIONED sink key=%016llX host=%u local=%u hull=%.1f\n", (unsigned long long)r.hostId, host, local, L0.hull);
+            }
+        }
+        // 3. the hull drive (the setter + cap hold), never while the local copy is sinking/sunk
+        if (host && r.hostPm <= 1000 && local != 93 && local != 94 && L0.max > 0.0f) {
+            const int dpm = r.appliedPm == 0xFFFF ? 1000 : abs((int)r.hostPm - (int)r.appliedPm);
+            if (dpm >= 5 || r.driveSt != host) {
+                float t = L0.max * (float)r.hostPm / 1000.0f;
+                bool ok = true;
+                if (host == 91 || host == 92 || host == 95) { if (t < 1.0f) t = 1.0f; }
+                if (host == 91) {                       // stay above the incapacitate threshold: the drive never posts 95
+                    if (!(L0.thr > 0.0f)) { ok = false; InterlockedIncrement(&c_navNoThr); }
+                    else if (t <= L0.thr) t = L0.thr + 1.0f;
+                    if (t > L0.max) ok = false;
+                }
+                r.appliedPm = r.hostPm; r.driveSt = host;
+                if (ok && fabsf(t - L0.hull) > 0.5f) {
+                    ((void (__thiscall*)(void*, float))0x01225A10)(r.gcl, t);   // outside any __try (see NavPost)
+                    const float after = NavHoldCap(r.gcl, t);
+                    InterlockedIncrement(&c_navDrive);
+                    if (now - r.driveLogTick >= 1000) {
+                        r.driveLogTick = now;
+                        L("[ShipSt] hull key=%016llX host=%u pm=%u target=%.1f before=%.1f after=%.1f thr=%.1f\n",
+                          (unsigned long long)r.hostId, host, (unsigned)r.hostPm, t, L0.hull, after, L0.thr);
+                    }
+                }
+            }
+        }
+        // write the bookkeeping back (only if the row still names the same binding)
+        AcquireSRWLockExclusive(&s_navLock);
+        for (int i = 0; i < NAV_MAX; ++i) {
+            NavRow& d = s_nav[i];
+            if (!d.used || d.hostId != r.hostId || d.ent != r.ent || d.gcl != r.gcl) continue;
+            d.actedSt = r.actedSt; d.tries = r.tries; d.actedTick = r.actedTick; d.sinkPosted = r.sinkPosted;
+            d.driveSt = r.driveSt; d.appliedPm = r.appliedPm; d.driveLogTick = r.driveLogTick;
+            d.mismSinceTick = r.mismSinceTick; d.failLoggedSt = r.failLoggedSt; d.passLoggedSt = r.passLoggedSt;
+            d.unsancLogged = r.unsancLogged;
+            break;
+        }
+        ReleaseSRWLockExclusive(&s_navLock);
+    }
+    static DWORD s_next = 0;
+    if (now - s_next < 5000) return;
+    s_next = now;
+    L("[ShipSt] stats rows=%d post95=%ld postSink=%ld pass=%ld fail=%ld unsanctioned=%ld drive=%ld noThr=%ld bad=%ld noAutoSink skip=%ld pass=%ld evt5C=%u evtE0=%u\n",
+      rn, c_navPost95, c_navPostSink, c_navPass, c_navFail, c_navUnsanc, c_navDrive, c_navNoThr, c_navBad, c_nasSkip, c_nasPass,
+      (unsigned)NavEvt(0x04DEAD5Cu), (unsigned)NavEvt(0x04DEADE0u));
+}
+
+// [Coop] ShipNoAutoSink: the redirected `call sub_A014A0` at 0x01205379 (sub_1205280 = state 95's handler; ecx = the
+// GcLShip, args = the sink event and 0, retn 8 -> __fastcall with a dummy edx). Runs on the engine's statechart path:
+// no lock, no log, no allocation - a lock-free compare against the table NavStateNote fills, then the original call.
+// Returning 0 for a dropped post is a value sub_1205280 already returns itself (no player ship: `result` = 0).
+static bool NavIsHostOwnedGcl(void* gcl) {
+    const DWORD now = GetTickCount();
+    for (int i = 0; i < NAV_MAX; ++i)
+        if (s_nav[i].used && s_nav[i].gcl == gcl && now - s_nav[i].seenTick <= 3000) return true;
+    return false;
+}
+static int __fastcall NavNoAutoSinkPost(void* ship, void* edx, uint32_t evt, int a3) {
+    (void)edx;
+    if (g_entHost == 0 && NavIsHostOwnedGcl(ship)) { InterlockedIncrement(&c_nasSkip); return 0; }
+    InterlockedIncrement(&c_nasPass);
+    return ((int (__thiscall*)(void*, uint32_t, int))0x00A014A0)(ship, evt, a3);
+}
+// dllmain, at load (no world, no naval code running). Patches only when the 10 bytes at 0x01205374 are exactly
+// `push 0; push edx; mov ecx,esi; call sub_A014A0` (tools/verify_signatures.py CALL_SITES checks the same bytes).
+void Phase1_ShipNoAutoSinkInstall() {
+    if (!ShipNoAutoSinkOn()) return;
+    static const uint8_t kSite[10] = { 0x6A, 0x00, 0x52, 0x8B, 0xCE, 0xE8, 0x22, 0xC1, 0x7F, 0xFF };
+    uint8_t* p = (uint8_t*)(uintptr_t)0x01205374u;
+    if (!readable(p, sizeof(kSite)) || memcmp(p, kSite, sizeof(kSite)) != 0) {
+        L("[ShipSt] ShipNoAutoSink: bytes at 0x01205374 differ - NOT patched\n");
+        return;
+    }
+    DWORD old = 0;
+    if (!VirtualProtect(p + 6, 4, PAGE_EXECUTE_READWRITE, &old)) { L("[ShipSt] ShipNoAutoSink: VirtualProtect failed (%lu)\n", GetLastError()); return; }
+    *(int32_t*)(p + 6) = (int32_t)((uintptr_t)&NavNoAutoSinkPost - (0x01205379u + 5u));
+    VirtualProtect(p + 6, 4, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), p + 5, 5);
+    L("[ShipSt] ShipNoAutoSink: call 0x01205379 -> %p (was sub_A014A0)\n", (void*)&NavNoAutoSinkPost);
 }
 
 // ---- guard/character sync (G1) -------------------------------------------------
@@ -16475,6 +16718,8 @@ static void __cdecl OnFrame(Human* updatedHuman) {
     // [Coop] ShipSpawnReplay: the one engine submit (sub_569560) runs HERE, on the player-update thread and outside every
     // __try (it reaches EnterCriticalSection(client+4) at 0x5BCAE0; a swallowed fault would leave the lock held).
     if ((DWORD)s_playerWorkTid == GetCurrentThreadId()) ShipSpawnReplayFire();
+    // [Coop] ShipStateSync: the guest's statechart posts / hull setter calls, same thread and same no-__try rule.
+    if ((DWORD)s_playerWorkTid == GetCurrentThreadId()) NavStateFire();
     InterlockedCompareExchange(&s_playerWorkTid, 0, (LONG)GetCurrentThreadId());   // player work over (if it was ours)
 }
 
@@ -16508,7 +16753,7 @@ static void DumpConfigOnce()
         // The Tune* values are floats (read with strtod, see ShipTuningTick); the dump shows the integer part.
         { "Coop", "TuneConeAngle", 120 }, { "Coop", "TuneConeRange", 350 }, { "Coop", "TuneMaxTime", 30 },
         { "Coop", "TuneAggroTime", 30 }, { "Coop", "TuneHull", 0 },
-        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 }, { "Coop", "WeaponSync", 0 }, { "Coop", "ShipPeerZ", 0 }, { "Coop", "ShipBindProbe", 0 }, { "Coop", "ShipSpawnProbe", 0 }, { "Coop", "ShipSpawnFire", 0 }, { "Coop", "ShipSpawnFirePid", 0 }, { "Coop", "SpawnCensus", 0 }, { "Coop", "SpawnReplayFire", 0 }, { "Coop", "SpawnReplayFirePid", 0 }, { "Coop", "SpawnShare", 0 }, { "Coop", "SpawnKeyBind", 0 }, { "Coop", "ShipClassBind", 0 }, { "Coop", "ShipClassBindSteal", 0 }, { "Coop", "ShipClassFix", 0 }, { "Coop", "ShipClassProbe", 0 }, { "Coop", "SpawnShareRadiusM", 150 }, { "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "TableEvict", 0 }, { "Coop", "UsedEntAllPaths", 0 }, { "Coop", "PuppetSeqResync", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "FastTravelCrashFix", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 }, { "Coop", "PuppetListener", 0 }, { "Coop", "PuppetListenerAttach", 0 }, { "Coop", "PuppetMaxLife", 0 }, { "Coop", "ConflictProbe", 0 }, { "Coop", "OwnSnapAtTarget", 0 }, { "Coop", "PuppetWorldDropRef", 0 }, { "Coop", "PadIdPreferOffered", 0 }, { "Coop", "GuardPerceivePuppet", 0 },
+        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 }, { "Coop", "WeaponSync", 0 }, { "Coop", "ShipPeerZ", 0 }, { "Coop", "ShipBindProbe", 0 }, { "Coop", "ShipSpawnProbe", 0 }, { "Coop", "ShipSpawnFire", 0 }, { "Coop", "ShipSpawnFirePid", 0 }, { "Coop", "SpawnCensus", 0 }, { "Coop", "SpawnReplayFire", 0 }, { "Coop", "SpawnReplayFirePid", 0 }, { "Coop", "SpawnShare", 0 }, { "Coop", "SpawnKeyBind", 0 }, { "Coop", "ShipClassBind", 0 }, { "Coop", "ShipClassBindSteal", 0 }, { "Coop", "ShipClassFix", 0 }, { "Coop", "ShipClassProbe", 0 }, { "Coop", "ShipStateSync", 0 }, { "Coop", "ShipNoAutoSink", 0 }, { "Coop", "SpawnShareRadiusM", 150 }, { "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "TableEvict", 0 }, { "Coop", "UsedEntAllPaths", 0 }, { "Coop", "PuppetSeqResync", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "FastTravelCrashFix", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 }, { "Coop", "PuppetListener", 0 }, { "Coop", "PuppetListenerAttach", 0 }, { "Coop", "PuppetMaxLife", 0 }, { "Coop", "ConflictProbe", 0 }, { "Coop", "OwnSnapAtTarget", 0 }, { "Coop", "PuppetWorldDropRef", 0 }, { "Coop", "PadIdPreferOffered", 0 }, { "Coop", "GuardPerceivePuppet", 0 },
         { "Coop", "ShipSpawnReplay", 0 },
         { "Coop", "ShipFields", 0 }, { "Coop", "HelmBoth", 0 }, { "Coop", "BoardingForce", 0 }, { "Coop", "PlayerFrameFallback", 0 },
         { "Coop", "CombatTest", 0 }, { "Coop", "CrashContext", 0 }, { "Coop", "CorpseKeepSec", 30 }, { "Coop", "CrowdProbeIntegrate", 1 },
