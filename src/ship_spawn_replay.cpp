@@ -26,6 +26,7 @@ uint64_t Phase1_ScbHostOf(uintptr_t guestShip);
 bool SpawnCensusCtxOf(uintptr_t req, uintptr_t* ctx);   // spawn_census.cpp: ctx argument DetFac saw for this request
 void SpawnShareReplayTag(int v);                        // spawn_census.cpp: SpawnShareDecide passes requests we submit
 bool SpawnLibSpecUsable(uintptr_t spec);   // spawn_lib.cpp
+uintptr_t SpawnLibSubmit(uintptr_t spec, uintptr_t owner, uintptr_t ctx, int* priv, char* submitted);   // spawn_lib.cpp
 bool SpawnLibPickShip(uint32_t cls, uintptr_t* spec, uintptr_t* specVt, uintptr_t* owner, uintptr_t* ownerVt, uintptr_t* ctx, uint32_t* gotCls);   // spawn_lib.cpp
 
 namespace {
@@ -288,14 +289,13 @@ void ShipSpawnReplayFire()
         if (SpawnLibPickShip(wq.cls, &sp, &spv, &ow, &owv, &cx, &gc)) s = { sp, spv, ow, owv, cx, now, 1, 1 };
         return;
     }
-    g_ourReq = 0; t_tag = 1; SpawnShareReplayTag(1);
-    const char submitted = ((char(__cdecl*)(uintptr_t, uintptr_t, uintptr_t, uint32_t, uint32_t))0x00569560)(s.spec, s.owner, s.ctx, 0, 0);
-    SpawnShareReplayTag(0); t_tag = 0;
-    const uintptr_t req = g_ourReq; g_ourReq = 0;
-    // No restore (addendum 1 withdrawn 2026-11-28): the spec was idle; our request holds its slot as an engine submit would.
+    // Submit through spawn_lib.cpp SubmitPrivate: private owner for the naval owner class (no engine adoption; T3 crash
+    // 0x1C27B25) + slot borrow restored at build. Same tagging (SpawnShareReplayTag) as before.
+    int priv = 0; char submitted = 0;
+    const uintptr_t req = SpawnLibSubmit(s.spec, s.owner, s.ctx, &priv, &submitted);
     ++c_fired;
-    _snprintf_s(line, sizeof(line), _TRUNCATE, "[ShipSpawnReplay] req host=%016llX cls=%u item=%08X owner=%08X ctx=%08X -> submitted=%d req=%08X\n",
-                (unsigned long long)wq.host, wq.cls, (unsigned)s.spec, (unsigned)s.owner, (unsigned)s.ctx, (int)submitted, (unsigned)req);
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[ShipSpawnReplay] req host=%016llX cls=%u item=%08X owner=%08X ctx=%08X -> submitted=%d req=%08X old3C=%08X privOwner=%d\n",
+                (unsigned long long)wq.host, wq.cls, (unsigned)s.spec, (unsigned)s.owner, (unsigned)s.ctx, (int)submitted, (unsigned)req, (unsigned)old, priv);
     Phase1_LogLine(line);
     if (!submitted || !req) { ++c_submit0; NoteFail(wq.cls, now); return; }
     g_fly = { req, s.spec, wq.host, wq.cls, now, 1 };

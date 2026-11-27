@@ -136,6 +136,79 @@ bool SpecUsableSt(int st)
     const LONG pol = g_busyPol;
     return pol >= 2 ? st != -2 : pol == 1 ? (st != 1 && st != 2 && st != -2) : false;
 }
+// ---- private owner + slot borrow (2026-11-28) ------------------------------------------------------------------------
+// The engine's naval owner adopts each built ship 1:1 with its spec (owner vt[10] sub_196E910 via sub_5C5FC0). Extra
+// ships of ours on one spec broke that: run T3 (asi 129C6403, 7deff59) host 16180 + guest 6104 both died at 0x1C27B25 -
+// owner record {our request FC0B3840, our ship}, its spec FC64CB40 already freed (params count 0 -> sub_4F33C0 = 0).
+// So our submits carry a PRIVATE owner, never the engine's. Owner interface class 0x02708E80 (at +8 of its object; +0
+// 0x02708F04, +4 0x02708EE0; dumps 17860/16180). Its slots (IDA): [0][3][9] nullsub_1 0x54DEB0 retn 8; [1][2][12][13][14]
+// [22][23] nullsub_25 0x1243A70 retn 4; [4] sub_196E610, [5] sub_19709F0, [6] sub_1970A70, [7] sub_1970AB0, [8]
+// sub_1970AF0, [11] sub_1970B30 = entity removed/lost notices (thiscall, 2 args, retn 8, use this-8); [10] sub_196E910
+// adoption (retn 8); [15] sub_1944E90 stdcall(a1) retn 4 (uses a1 only); [16] [19..21] return 0; [17] sub_19644B0 =
+// deleting-dtor thunk (this-8, char); [18] sub_4E0490 retn 4 (static null-id handle 0x27F3F90, no this). The built
+// entity keeps the owner pointer (sub_5C5FC0: sub_6F5FD0(ent) = ent+0xE8, sub_734600: +0x60 = owner), so the private
+// owner lives forever and has no fields: a zeroed object whose three vtable slots all point at our copy of 0x02708E80
+// with [4]-[8] [10] [11] [17] replaced by counting no-ops; every slot kept from the engine ignores this.
+// Slot borrow: the submit makes our request the spec's current one (+0x3C, single slot). At build (DetSet, manager job
+// thread, before the owner callbacks and before our request ends) the previous current request goes back into the slot
+// if it is still a live built request of this spec (vt 0x01E6D77C, +0x10 == spec, +0x20 == 4), so our request's end does
+// not un-arm the spec (dtor 0x79C65B acts only when the slot holds itself) and the engine sees its own state unchanged.
+constexpr uint32_t kOwnerNavalVt = 0x02708E80u;
+volatile LONG c_fo[24] = {}; LONG c_foUsed = 0, c_realOwner = 0, c_bwRestored = 0, c_bwKept = 0;
+#define FO_STUB2(i) uintptr_t __fastcall FoS##i(uintptr_t, uintptr_t, uintptr_t, uintptr_t) { InterlockedIncrement(&c_fo[i]); return 0; }
+FO_STUB2(4) FO_STUB2(5) FO_STUB2(6) FO_STUB2(7) FO_STUB2(8) FO_STUB2(10) FO_STUB2(11)
+#undef FO_STUB2
+uintptr_t __fastcall FoS17(uintptr_t self, uintptr_t, uint32_t) { InterlockedIncrement(&c_fo[17]); return self; }   // retn 4
+uintptr_t g_foVt[24] = {};
+alignas(16) uint8_t g_foObj[0x400] = {};   // the private owner object (zeroed); interface pointer = g_foObj + 8
+uintptr_t PrivateOwnerFor(uintptr_t real)   // player thread; real validated by the caller
+{
+    if (*(const uint32_t*)real != kOwnerNavalVt) { InterlockedIncrement(&c_realOwner); return real; }   // other owner classes: unread
+    if (!g_foVt[0]) {
+        if (!Readable(kOwnerNavalVt, sizeof(g_foVt))) return 0;
+        memcpy(g_foVt, (const void*)kOwnerNavalVt, sizeof(g_foVt));
+        g_foVt[4] = (uintptr_t)&FoS4; g_foVt[5] = (uintptr_t)&FoS5; g_foVt[6] = (uintptr_t)&FoS6; g_foVt[7] = (uintptr_t)&FoS7;
+        g_foVt[8] = (uintptr_t)&FoS8; g_foVt[10] = (uintptr_t)&FoS10; g_foVt[11] = (uintptr_t)&FoS11; g_foVt[17] = (uintptr_t)&FoS17;
+        for (int i = 0; i < 3; ++i) *(uintptr_t*)(g_foObj + 4 * i) = (uintptr_t)g_foVt;
+    }
+    ++c_foUsed;
+    return (uintptr_t)(g_foObj + 8);
+}
+bool IsPrivateOwner(uintptr_t o) { return o == (uintptr_t)(g_foObj + 8); }
+uintptr_t g_pendSpec = 0, g_pendOld = 0;   // set around our submit (player thread), consumed in SpawnLibNoteFac (same thread)
+struct Borrow { volatile uintptr_t req; uintptr_t spec, old; };
+Borrow g_bw[32] = {}; volatile LONG g_bwNext = 0;
+void BorrowRestore(uintptr_t req)   // DetSet, manager job thread
+{
+    for (int i = 0; i < 32; ++i) {
+        Borrow& b = g_bw[i];
+        if (b.req != req) continue;
+        b.req = 0;
+        const uintptr_t o = b.old, s = b.spec;
+        if (o && Readable(o, 0x24) && *(const uint32_t*)o == 0x01E6D77Cu && *(const uintptr_t*)(o + 0x10) == s && *(const uint32_t*)(o + 0x20) == 4
+            && Readable(s, 0x40) && (uintptr_t)InterlockedCompareExchange((volatile LONG*)(s + 0x3C), (LONG)o, (LONG)req) == req) InterlockedIncrement(&c_bwRestored);
+        else InterlockedIncrement(&c_bwKept);
+        return;
+    }
+}
+
+// Submit through the SpawningManager (player thread, outside __try; spec/owner validated by the caller). The private owner
+// is used for the naval owner class; any other owner class is passed as it is and gets no slot borrow (its callbacks are
+// unread, and restoring the slot before an engine adoption is what crashed host 17860).
+uintptr_t SubmitPrivate(uintptr_t spec, uintptr_t owner, uintptr_t ctx, int* priv, char* submitted)
+{
+    *submitted = 0;
+    const uintptr_t po = PrivateOwnerFor(owner);
+    *priv = (po && po != owner) ? 1 : 0;
+    if (!po) return 0;
+    g_pendSpec = *priv ? spec : 0; g_pendOld = *(const uintptr_t*)(spec + 0x3C);
+    g_ourReq = 0; t_tag = 1; SpawnShareReplayTag(1);
+    *submitted = ((char(__cdecl*)(uintptr_t, uintptr_t, uintptr_t, uint32_t, uint32_t))0x00569560)(spec, po, ctx, 0, 0);
+    SpawnShareReplayTag(0); t_tag = 0; g_pendSpec = 0;
+    const uintptr_t req = g_ourReq; g_ourReq = 0;
+    return req;
+}
+
 // Newest valid entry of a kind; key != 0 -> that key only; cls != 0 -> that learned ship class only. Invalid entries met on
 // the way are marked bad (never submitted again).
 bool Pick(int kind, uint64_t key, uint32_t cls, LibE* out, bool keyedOnly = false)
@@ -214,11 +287,16 @@ bool SpawnLibOn()
     return g_on != 0;
 }
 // DetFac (any thread): our own submit's request.
-void SpawnLibNoteFac(uintptr_t req) { if (t_tag && req) g_ourReq = req; }
+void SpawnLibNoteFac(uintptr_t req)
+{
+    if (!t_tag || !req) return;
+    g_ourReq = req;
+    if (g_pendSpec) { Borrow& b = g_bw[(InterlockedIncrement(&g_bwNext) - 1) & 31]; b.spec = g_pendSpec; b.old = g_pendOld; MemoryBarrier(); b.req = req; g_pendSpec = 0; }
+}
 // SpawnKeyNoteReq (submit, game threads): one submitted request with its factory args; key = static spawn key or 0.
 void SpawnLibNoteSubmit(uintptr_t item, uintptr_t owner, uintptr_t ctx, uint64_t key)
 {
-    if (!g_installed || !item || !owner) return;
+    if (!g_installed || !item || !owner || IsPrivateOwner(owner)) return;   // our own submits are not library entries
     int kind = K_NONE; uintptr_t specVt = 0, ownerVt = 0;
     if (!ReadSpecInfo(item, owner, &kind, &specVt, &ownerVt) || kind == K_NONE) return;
     const ULONGLONG now = GetTickCount64();
@@ -236,6 +314,7 @@ void SpawnLibNoteSubmit(uintptr_t item, uintptr_t owner, uintptr_t ctx, uint64_t
 extern "C" void SpawnLibNoteBuilt(uintptr_t req, uintptr_t ent)   // C linkage: declared inside extern "C" SpawnKeyNoteEnt
 {
     if (!g_installed || !req || !ent) return;
+    BorrowRestore(req);
     if (g_fly.active && req == g_fly.req) { g_fly.ent = ent; g_fly.tBuilt = GetTickCount64(); }
     uint32_t cls = 0; uintptr_t spec = 0;
     if (!ReadBuiltShip(req, ent, &cls, &spec) || !cls || !spec) return;
@@ -243,6 +322,7 @@ extern "C" void SpawnLibNoteBuilt(uintptr_t req, uintptr_t ent)   // C linkage: 
     for (int i = 0; i < g_libN; ++i) if (g_lib[i].spec == spec) { g_lib[i].cls = cls; InterlockedIncrement(&c_learned); }
 }
 
+uintptr_t SpawnLibSubmit(uintptr_t spec, uintptr_t owner, uintptr_t ctx, int* priv, char* submitted) { return SubmitPrivate(spec, owner, ctx, priv, submitted); }   // ship_spawn_replay.cpp
 bool SpawnLibSpecUsable(uintptr_t spec) { return SpecArmed(spec) && SpecUsableSt(SpecState(spec)); }   // ship_spawn_replay.cpp (spec Readable 0x40 checked there)
 
 // ---- ship spec supply for ship_spawn_replay.cpp (player thread) ------------------------------------------------------
@@ -336,8 +416,8 @@ void SpawnLibFire()
         int ships = 0, npcs = 0, keyed = 0, learned = 0, idleS = 0, idleN = 0, armS = 0, armN = 0;
         { Spin s; for (int i = 0; i < g_libN; ++i) { if (g_lib[i].bad) continue; const bool rd = Readable(g_lib[i].spec, 0x40); const int idle = rd && *(const uintptr_t*)(g_lib[i].spec + 0x3C) == 0; const int arm = rd && SpecArmed(g_lib[i].spec);
             if (g_lib[i].kind == K_SHIP) { ++ships; learned += g_lib[i].cls != 0; idleS += idle; armS += arm; } else { ++npcs; keyed += g_lib[i].key != 0; idleN += idle; armN += arm; } } }
-        Log("[SpawnLib] stats lib ships=%d (classKnown %d idle %d armed %d) npcs=%d (keyed %d idle %d armed %d) | want=%ld cmd=%ld follow=%ld fired=%ld submit0=%ld built=%ld placed=%ld noSpec=%ld failed=%ld badSpec=%ld busySkip=%ld unarmedSkip=%ld busyState(1/2/4/6/9/other/bad)=%ld/%ld/%ld/%ld/%ld/%ld/%ld pol=%ld queue=%d\n",
-            ships, learned, idleS, armS, npcs, keyed, idleN, armN, c_want, c_cmd, c_follow, c_fired, c_submit0, c_built, c_placed, c_noSpec, c_failed, c_badSpec, c_busy, c_unarmed, c_st[0], c_st[1], c_st[2], c_st[3], c_st[4], c_st[5], c_st[6], g_busyPol, g_qN);
+        Log("[SpawnLib] stats lib ships=%d (classKnown %d idle %d armed %d) npcs=%d (keyed %d idle %d armed %d) | want=%ld cmd=%ld follow=%ld fired=%ld submit0=%ld built=%ld placed=%ld noSpec=%ld failed=%ld badSpec=%ld busySkip=%ld unarmedSkip=%ld busyState(1/2/4/6/9/other/bad)=%ld/%ld/%ld/%ld/%ld/%ld/%ld pol=%ld queue=%d | owner priv=%ld real=%ld slot restored=%ld kept=%ld privCalls(4/5/6/7/8/10/11/17)=%ld/%ld/%ld/%ld/%ld/%ld/%ld/%ld\n",
+            ships, learned, idleS, armS, npcs, keyed, idleN, armN, c_want, c_cmd, c_follow, c_fired, c_submit0, c_built, c_placed, c_noSpec, c_failed, c_badSpec, c_busy, c_unarmed, c_st[0], c_st[1], c_st[2], c_st[3], c_st[4], c_st[5], c_st[6], g_busyPol, g_qN, c_foUsed, c_realOwner, c_bwRestored, c_bwKept, c_fo[4], c_fo[5], c_fo[6], c_fo[7], c_fo[8], c_fo[10], c_fo[11], c_fo[17]);
     }
     // 4. fire at most one request
     if (g_fly.active || g_qN == 0 || now - g_lastFire < kGapMs) return;
@@ -355,15 +435,13 @@ void SpawnLibFire()
     if (w.purpose == P_FOLLOW) TryCount(w.host);
     const uintptr_t old = *(const uintptr_t*)(e.spec + 0x3C);   // spec Readable 0x40 (Pick); usable per SpecUsableSt
     const int oldSt = SpecState(e.spec);
-    g_ourReq = 0; t_tag = 1; SpawnShareReplayTag(1);
-    const char submitted = ((char(__cdecl*)(uintptr_t, uintptr_t, uintptr_t, uint32_t, uint32_t))0x00569560)(e.spec, e.owner, e.ctx, 0, 0);
-    SpawnShareReplayTag(0); t_tag = 0;
-    const uintptr_t req = g_ourReq; g_ourReq = 0;
+    int priv = 0; char submitted = 0;
+    const uintptr_t req = SubmitPrivate(e.spec, e.owner, e.ctx, &priv, &submitted);
     // No restore (2026-11-28: both restore variants crashed - guest 17552 blind, host 17860 validated - see SpecUsableSt).
     ++c_fired;
-    Log("[SpawnLib] req kind=%d purpose=%d spec=%08X owner=%08X ctx=%08X key=%016llX cls=%u(lib %u) host=%016llX -> submitted=%d req=%08X old3C=%08X oldState=%d\n",
+    Log("[SpawnLib] req kind=%d purpose=%d spec=%08X owner=%08X ctx=%08X key=%016llX cls=%u(lib %u) host=%016llX -> submitted=%d req=%08X old3C=%08X oldState=%d privOwner=%d\n",
         w.kind, w.purpose, (unsigned)e.spec, (unsigned)e.owner, (unsigned)e.ctx, (unsigned long long)e.key, w.cls, e.cls, (unsigned long long)w.host,
-        (int)submitted, (unsigned)req, (unsigned)old, oldSt);
+        (int)submitted, (unsigned)req, (unsigned)old, oldSt, priv);
     if (!submitted || !req) { ++c_submit0; return; }
     g_fly.req = req; g_fly.ent = 0; g_fly.tBuilt = 0; g_fly.w = w; g_fly.spec = e.spec; g_fly.t = now; g_fly.active = 1;
 }
