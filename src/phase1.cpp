@@ -4601,10 +4601,17 @@ static const char* BoardBitStr(int v, char* buf, size_t n) {
     return buf;
 }
 
-static void BoardableTestTick() {
-    static int s_on = -1, s_done = 0; static DWORD s_next = 0;
-    if (s_on < 0) s_on = GetPrivateProfileIntA("Coop", "BoardableTest", 0, Paths::Ini()) != 0 ? 1 : 0;
-    if (!s_on || s_done) return;
+// mode 0 = [Coop] BoardableTest: one-shot, verbose BEFORE/AFTER + both predicates (unchanged behaviour).
+// mode 1 = [Coop] BoardingForce (ported from 4093cb3's branch, b4d1692): repeats on the same 2 s cadence,
+//          compact one-line log, never touches s_done (the one-shot test's state must survive the other mode).
+//          Mode 1 has its own cadence so the two flags never steal each other's tick.
+static void BoardableTestTick(int mode) {
+    static int s_on = -1, s_done = 0; static DWORD s_next0 = 0, s_next1 = 0;
+    if (mode == 0) {
+        if (s_on < 0) s_on = GetPrivateProfileIntA("Coop", "BoardableTest", 0, Paths::Ini()) != 0 ? 1 : 0;
+        if (!s_on || s_done) return;
+    }
+    DWORD& s_next = mode == 0 ? s_next0 : s_next1;
     const DWORD now = GetTickCount();
     if (now < s_next) return;
     s_next = now + 2000;                                       // look every 2 s until one ship qualifies
@@ -4617,23 +4624,228 @@ static void BoardableTestTick() {
         Entity* best = PickNearestNonLocalShip(mgr, player, GetLocalShip(), 200.0f, &bestD2);
         if (!best) return;
         void* obj = ((void* (__cdecl*)(void*))0x0122BA20)((void*)best);
-        if (!readable(obj, 0x548) || !readable(*(void**)obj, 0x1A0)) { L("[Board] ship=%p obj=%p unreadable - skipped\n", best, obj); s_done = 1; return; }
+        if (!readable(obj, 0x548) || !readable(*(void**)obj, 0x1A0)) { L("[Board] ship=%p obj=%p unreadable - skipped\n", best, obj); if (mode == 0) s_done = 1; return; }
         typedef unsigned char (__thiscall* Pred)(void*);
         void** vt = *(void***)obj;
         const unsigned char b0 = *((unsigned char*)obj + 0x3A9), m0 = *((unsigned char*)obj + 0x540);
-        const unsigned char p408a = ((Pred)vt[408 / 4])(obj), p368a = ((Pred)vt[368 / 4])(obj);
-        L("[Board] BEFORE ship=%p obj=%p dist=%.1f +0x3A9=%u +0x540=%u pred408=%u pred368=%u\n",
-          best, obj, sqrtf(bestD2), b0, m0, p408a, p368a);
+        if (mode == 0) {
+            const unsigned char p408a = ((Pred)vt[408 / 4])(obj), p368a = ((Pred)vt[368 / 4])(obj);
+            L("[Board] BEFORE ship=%p obj=%p dist=%.1f +0x3A9=%u +0x540=%u pred408=%u pred368=%u\n",
+              best, obj, sqrtf(bestD2), b0, m0, p408a, p368a);
+        }
         CallSetBoardable(obj, 1);                                                        // SetBoardable(obj, 1)
         const unsigned char b1 = *((unsigned char*)obj + 0x3A9), m1 = *((unsigned char*)obj + 0x540);
-        const unsigned char p408b = ((Pred)vt[408 / 4])(obj), p368b = ((Pred)vt[368 / 4])(obj);
-        L("[Board] AFTER  ship=%p +0x3A9=%u +0x540=%u pred408=%u pred368=%u\n", best, b1, m1, p408b, p368b);
-        L("[E] ev=boardable-set ok=%d\n", (b1 == 1) ? 1 : 0);
-        s_done = 1;
+        if (mode == 0) {
+            const unsigned char p408b = ((Pred)vt[408 / 4])(obj), p368b = ((Pred)vt[368 / 4])(obj);
+            L("[Board] AFTER  ship=%p +0x3A9=%u +0x540=%u pred408=%u pred368=%u\n", best, b1, m1, p408b, p368b);
+            L("[E] ev=boardable-set ok=%d\n", (b1 == 1) ? 1 : 0);
+            s_done = 1;
+        } else {
+            L("[Board] ent=%p was=%d now=%d (IsBoardable +0x3A9)\n", best, (int)b0, (int)b1);
+        }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         L("[Board] EXCEPTION code=0x%08X\n", GetExceptionCode());
-        s_done = 1;
+        if (mode == 0) s_done = 1;
     }
+}
+
+// ---- Ship field family: [Coop] ShipFields / HelmBoth / BoardingForce (all default 0) -----------------
+// Hand-ported from archive/feat-ship-fields (4093cb3, b4d1692, 84ff8a5). Offsets are the ones those commits
+// cite as REFLECTION-VERIFIED against the engine property table (2026-11-16):
+//   GcLShip (classinfo 0x028F0C38, size 0xB70)
+//     +0xCC   SailState                       Enum (0 Up, 1 Half, 2 Full, 3 AnimusTravel, 4 Count)
+//     +0x13C  BoardingDecisionMenuMask        U32
+//     +0x148  CachedShipAIDectionSettings     ObjectPtr      +0x14C OverriddenShipAIDectionSettings Handle
+//     +0x399  IsPlayerDrivable  +0x39A CaptainAtWheel  +0x39E IsPlayerSoloBoarding
+//     +0x3A9  IsBoardable (written by sub_1207960)  +0x3AB IsAbortBoardingAllowed
+//     +0x68   HealthOverride                  Reference -> ShipHealthData (+0x8 HullHealth)
+//   PerceptionHandler (classinfo 0x0295E2B8, vtable 0x026C0830 named offline): +0x5C/+0x60 Handles,
+//     +0x64/+0x6C override stacks.
+// UNVERIFIED: the deref form of +0x148/+0x14C/+0x68 (a wrong form logs null, it cannot fault); the override
+// stacks' first dword as a count. None of these lines has been observed live.
+// NOT ported (overlap with code that exists now): the Day-cone [ShpF] line and the original ShipTuning /
+// ShipTuningWrite pair - the [Coop] ShipTuning lane (ShipTuningTick, ShipTuningProbe/Apply) owns those fields
+// and that flag name; HelmBoth's raw +0x39A CaptainAtWheel store - +0x39A is owned by the helm lever
+// ([Coop] HelmSync / HelmSeat, sub_11FE840), so HelmBoth only writes +0x399 and +0x39E and reads +0x39A back.
+// The only engine calls are ShipGcLObj (0x01038330) and BoardableTestTick's existing 0x0122BA20/0x01207960.
+static int s_shipFields = -1, s_helmBoth = -1, s_boardingForce = -1;
+static inline int ShipFieldsOn() {
+    if (s_shipFields < 0) s_shipFields = GetPrivateProfileIntA("Coop", "ShipFields", 0, Paths::Ini()) != 0 ? 1 : 0;
+    return s_shipFields;
+}
+static inline int HelmBothOn() {
+    if (s_helmBoth < 0) s_helmBoth = GetPrivateProfileIntA("Coop", "HelmBoth", 0, Paths::Ini()) != 0 ? 1 : 0;
+    return s_helmBoth;
+}
+static inline int BoardingForceOn() {
+    if (s_boardingForce < 0) s_boardingForce = GetPrivateProfileIntA("Coop", "BoardingForce", 0, Paths::Ini()) != 0 ? 1 : 0;
+    return s_boardingForce;
+}
+static const char* SailStateName(int v) {
+    switch (v) {
+    case 0: return "Up"; case 1: return "Half"; case 2: return "Full";
+    case 3: return "AnimusTravel"; case 4: return "Count";
+    default: return "?";
+    }
+}
+// ShipHealthData for a GcLShip (+0x68), or null when it does not read through +0x10.
+static void* ShipFieldsHealthDataOf(void* gcl) {
+    if (!gcl || !readable((char*)gcl + 0x68, 4)) return nullptr;
+    void* hd = *(void**)((char*)gcl + 0x68);
+    return readable(hd, 0x14) ? hd : nullptr;
+}
+// One read-only probe line for a ship entity.
+static void ShpFLogOne(const char* who, void* ent) {
+    __try {
+        void* gcl = ent ? ShipGcLObj(ent) : nullptr;
+        if (gcl && !readable((char*)gcl + 0x3AC, 1)) gcl = nullptr;
+        const int  sail  = gcl ? *(int*)((char*)gcl + 0xCC) : -1;
+        const uint32_t mask = gcl ? *(uint32_t*)((char*)gcl + 0x13C) : 0u;
+        const int  drv   = gcl ? (int)*(unsigned char*)((char*)gcl + 0x399) : 0;
+        const int  cap   = gcl ? (int)*(unsigned char*)((char*)gcl + 0x39A) : 0;
+        const int  solo  = gcl ? (int)*(unsigned char*)((char*)gcl + 0x39E) : 0;
+        const int  board = gcl ? (int)*(unsigned char*)((char*)gcl + 0x3A9) : 0;
+        const int  abort = gcl ? (int)*(unsigned char*)((char*)gcl + 0x3AB) : 0;
+        void* aiDet = gcl ? *(void**)((char*)gcl + 0x148) : nullptr;
+        void* aiHc  = gcl ? *(void**)((char*)gcl + 0x14C) : nullptr;
+        void* hpRaw = gcl ? *(void**)((char*)gcl + 0x68) : nullptr;
+        void* hull  = gcl ? ShipFieldsHealthDataOf(gcl) : nullptr;
+        L("[ShpF] who=%s ent=%p gcl=%p sail=%d(%s) mask=%08X drivable=%d captain=%d solo=%d boardable=%d abort=%d aiDet=%p aiOvr=%p hp=%p hull=%p\n",
+          who, ent, gcl, sail, SailStateName(sail), mask, drv, cap, solo, board, abort, aiDet, aiHc, hpRaw, hull);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        L("[ShpF] who=%s EXCEPTION code=0x%08X\n", who, GetExceptionCode());
+    }
+}
+// [Coop] HelmBoth: write +0x399 IsPlayerDrivable and +0x39E IsPlayerSoloBoarding on the local ship, then read
+// all three helm bytes back. The readback IS the result (does the engine keep or overwrite them).
+static void HelmWriteAndLog(void* ent) {
+    __try {
+        void* gcl = ent ? ShipGcLObj(ent) : nullptr;
+        if (!gcl || !readable((char*)gcl + 0x39F, 1)) { L("[Helm] ent=%p gcl=null (skip)\n", ent); return; }
+        *(unsigned char*)((char*)gcl + 0x399) = 1;   // IsPlayerDrivable
+        *(unsigned char*)((char*)gcl + 0x39E) = 1;   // IsPlayerSoloBoarding
+        L("[Helm] ent=%p drivable=%d captain=%d solo=%d (readback; +0x39A not written - HelmSync owns it)\n", ent,
+          (int)*(unsigned char*)((char*)gcl + 0x399),
+          (int)*(unsigned char*)((char*)gcl + 0x39A),
+          (int)*(unsigned char*)((char*)gcl + 0x39E));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        L("[Helm] EXCEPTION code=0x%08X\n", GetExceptionCode());
+    }
+}
+// [Perc] component logging: the SAME matcher for the puppet and for the local player (positive control).
+// Components are walked as FindComponentByVtable does (entity+0x60 array, entity+0x66 count); every component
+// is logged, a count over 96 is clamped and the clamp logged.
+static const uint32_t PERC_HANDLER_CLASSINFO = 0x0295E2B8u;
+static const uint32_t PERC_HANDLER_VTABLE    = 0x026C0830u;
+static unsigned PercDumpComponents(Entity* e, const char* who, int isPlayer, void** outHandler, int* outVtHit) {
+    const unsigned rawN = *(unsigned short*)((uint8_t*)e + 0x66);
+    void** arr = *(void***)((uint8_t*)e + 0x60);
+    unsigned n = rawN;
+    if (rawN > 96) { n = 96; L("[Perc] %s=%p comps=%u CLAMPED\n", who, e, rawN); }
+    if (!n || !arr || !readable(arr, 4u * n)) { L("[Perc] %s=%p comps=%u unreadable\n", who, e, rawN); return 0; }
+    for (unsigned i = 0; i < n; ++i) {
+        void* c = arr[i];
+        const uint32_t vt = (c && readable(c, 4)) ? *(uint32_t*)c : 0u;
+        if (vt == PERC_HANDLER_VTABLE && outVtHit) *outVtHit = 1;
+        if (c && outHandler && !*outHandler) {
+            if (vt == PERC_HANDLER_CLASSINFO) *outHandler = c;
+            else if (readable((char*)c - 4, 4) && *(uint32_t*)((char*)c - 4) == PERC_HANDLER_CLASSINFO) *outHandler = c;
+        }
+        if (isPlayer) {
+            L("[Perc]   playercomp[%u]=%p vt=%08X\n", i, c, vt);
+        } else {
+            const uint32_t ci = (c && readable((char*)c - 4, 4)) ? *(uint32_t*)((char*)c - 4) : 0u;
+            L("[Perc]   comp[%u]=%p vt=%08X before=%08X\n", i, c, vt, ci);
+        }
+    }
+    return n;
+}
+static void PercProbeEntity(Entity* e, const char* who, int isPlayer) {
+    if (!e) { L("[Perc] %s=null\n", who); return; }
+    __try {
+        if (!readable(e, 0x68)) { L("[Perc] %s=%p entity unreadable - skipped\n", who, e); return; }
+        void* handler = nullptr;
+        int vtHit = 0;
+        const unsigned n = PercDumpComponents(e, who, isPlayer, &handler, &vtHit);
+        if (!n) return;
+        void* pv = nullptr; void* dv = nullptr;
+        unsigned pu = 0, du = 0;
+        if (handler && readable((char*)handler + 0x70, 1)) {
+            pv = *(void**)((char*)handler + 0x5C);
+            dv = *(void**)((char*)handler + 0x60);
+            void* ps = *(void**)((char*)handler + 0x64);
+            void* ds = *(void**)((char*)handler + 0x6C);
+            pu = (ps && readable(ps, 4)) ? *(unsigned*)ps : 0u;   // UNVERIFIED: first dword as a count
+            du = (ds && readable(ds, 4)) ? *(unsigned*)ds : 0u;
+        }
+        L("[Perc] %s=%p handler=%p percVals=%p detVals=%p stacks=%u/%u comps=%u vtHit=%d\n",
+          who, e, handler, pv, dv, pu, du, n, vtHit);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        L("[Perc] %s EXCEPTION code=0x%08X\n", who, GetExceptionCode());
+    }
+}
+// [Nav] player position + the 5 nearest naval-list ships (works on foot, where GetLocalShip() is null).
+// Positions are the entity global matrix, as everywhere else in this file; ship count clamped to 128.
+struct NavShipRow { Entity* e; float x; float y; float z; float d; };
+static void NavDumpNearestShips() {
+    __try {
+        World* world = World::GetCurrentWorld();
+        Entity* player = world ? world->GetPlayer() : nullptr;
+        if (!player || !readable(player, sizeof(HookMath::Transform))) {
+            L("[Nav] player=%p pos=(0.0,0.0,0.0) ships=0 nearest=00000000 dist=0.0\n", player);
+            return;
+        }
+        const float px = player->m_GlobalMatrix.M41, py = player->m_GlobalMatrix.M42, pz = player->m_GlobalMatrix.M43;
+        unsigned ships = 0;
+        NavShipRow best[5];
+        int nb = 0;
+        void* mgr = GetNavalManager();
+        if (mgr && readable((char*)mgr + 0x3E8, 8)) {
+            const unsigned short raw = *(unsigned short*)((char*)mgr + 0x3EE);
+            const int lim = raw > 128 ? 128 : (int)raw;
+            for (int i = 0; i < lim; ++i) {
+                Entity* se = GetShipEntity(mgr, i);
+                if (!se || !readable(se, sizeof(HookMath::Transform))) continue;
+                const float sx = se->m_GlobalMatrix.M41, sy = se->m_GlobalMatrix.M42, sz = se->m_GlobalMatrix.M43;
+                const float dx = sx - px, dy = sy - py, dz = sz - pz;
+                const float d = sqrtf(dx * dx + dy * dy + dz * dz);
+                if (!(d >= 0.0f)) continue;
+                ++ships;
+                int at;
+                if (nb < 5) at = nb++;
+                else if (d < best[4].d) at = 4;
+                else continue;
+                while (at > 0 && best[at - 1].d > d) { best[at] = best[at - 1]; --at; }
+                best[at].e = se; best[at].x = sx; best[at].y = sy; best[at].z = sz; best[at].d = d;
+            }
+        }
+        L("[Nav] player=%p pos=(%.1f,%.1f,%.1f) ships=%u nearest=%p dist=%.1f\n",
+          player, px, py, pz, ships, nb ? (void*)best[0].e : nullptr, nb ? best[0].d : 0.0f);
+        for (int i = 0; i < nb; ++i)
+            L("[Nav]   ship[%d]=%p pos=(%.1f,%.1f,%.1f) dist=%.1f\n", i, (void*)best[i].e, best[i].x, best[i].y, best[i].z, best[i].d);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        L("[Nav] EXCEPTION code=0x%08X\n", GetExceptionCode());
+    }
+}
+// Called from OnFrameInner. Returns at once when all three flags are off (defaults): behaviour unchanged.
+static void ShipFieldsTick() {
+    const int probe = ShipFieldsOn(), helm = HelmBothOn(), board = BoardingForceOn();
+    if (!probe && !helm && !board) return;
+    if (board) BoardableTestTick(1);   // reuses the F8 test's calls (sub_122BA20 -> sub_1207960), own 2 s cadence
+    static DWORD s_next = 0;
+    const DWORD now = GetTickCount();
+    if (now < s_next) return;
+    s_next = now + 1000;
+    void* local = (void*)GetLocalShip();
+    if (probe) {
+        ShpFLogOne("local", local);
+        if (g_ghostShip) ShpFLogOne("ghost", (void*)g_ghostShip);
+        PercProbeEntity(g_puppet, "puppet", 0);
+        World* world = World::GetCurrentWorld();
+        PercProbeEntity(world ? world->GetPlayer() : nullptr, "player", 1);
+        NavDumpNearestShips();
+    }
+    if (helm) HelmWriteAndLog(local);
 }
 
 // ---- [Coop] BoardProbe (default 0) - TEST HARNESS, not shipped behaviour --------------------------------
@@ -15896,7 +16108,7 @@ static void DumpConfigOnce()
         // The Tune* values are floats (read with strtod, see ShipTuningTick); the dump shows the integer part.
         { "Coop", "TuneConeAngle", 120 }, { "Coop", "TuneConeRange", 350 }, { "Coop", "TuneMaxTime", 30 },
         { "Coop", "TuneAggroTime", 30 }, { "Coop", "TuneHull", 0 },
-        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 }, { "Coop", "WeaponSync", 0 }, { "Coop", "ShipPeerZ", 0 }, { "Coop", "ShipBindProbe", 0 }, { "Coop", "ShipSpawnProbe", 0 }, { "Coop", "ShipSpawnFire", 0 }, { "Coop", "ShipSpawnFirePid", 0 }, { "Coop", "SpawnCensus", 0 }, { "Coop", "SpawnReplayFire", 0 }, { "Coop", "SpawnReplayFirePid", 0 }, { "Coop", "SpawnShare", 0 }, { "Coop", "SpawnKeyBind", 0 }, { "Coop", "ShipClassBind", 0 }, { "Coop", "ShipClassBindSteal", 0 }, { "Coop", "SpawnShareRadiusM", 150 },{ "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "FastTravelCrashFix", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 }, { "Coop", "PuppetListener", 0 }, { "Coop", "PuppetListenerAttach", 0 }, { "Coop", "PuppetMaxLife", 0 }, { "Coop", "ConflictProbe", 0 },
+        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 }, { "Coop", "WeaponSync", 0 }, { "Coop", "ShipPeerZ", 0 }, { "Coop", "ShipBindProbe", 0 }, { "Coop", "ShipSpawnProbe", 0 }, { "Coop", "ShipSpawnFire", 0 }, { "Coop", "ShipSpawnFirePid", 0 }, { "Coop", "SpawnCensus", 0 }, { "Coop", "SpawnReplayFire", 0 }, { "Coop", "SpawnReplayFirePid", 0 }, { "Coop", "SpawnShare", 0 }, { "Coop", "SpawnKeyBind", 0 }, { "Coop", "ShipClassBind", 0 }, { "Coop", "ShipClassBindSteal", 0 }, { "Coop", "ShipFields", 0 }, { "Coop", "HelmBoth", 0 }, { "Coop", "BoardingForce", 0 }, { "Coop", "SpawnShareRadiusM", 150 },{ "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "NavalCountLog", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "FastTravelCrashFix", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 }, { "Coop", "PuppetListener", 0 }, { "Coop", "PuppetListenerAttach", 0 }, { "Coop", "PuppetMaxLife", 0 }, { "Coop", "ConflictProbe", 0 },
         { "Coop", "CombatTest", 0 }, { "Coop", "CrashContext", 0 }, { "Coop", "CorpseKeepSec", 30 }, { "Coop", "CrowdProbeIntegrate", 1 },
         { "Coop", "CrowdProbeLiveKeys", 1 }, { "Coop", "DamageRelay", 0 }, { "Coop", "Diag", 0 },
         { "Coop", "DisableCrowd", 0 }, { "Coop", "DisablePuppetAI", 1 }, { "Coop", "DisableSpawns", 0 },
@@ -16334,7 +16546,8 @@ static void OnFrameInner(Human* updatedHuman) {
     }
     // F8 live test (no-op unless [Coop] BoardableTest=1). Must sit ABOVE the Net::Enabled() block: that block always
     // returns, so anything after it never runs in a networked session (first placement, 19788a1, never fired).
-    BoardableTestTick();
+    BoardableTestTick(0);
+    ShipFieldsTick();                                          // [Coop] ShipFields / HelmBoth / BoardingForce (default 0)
     BoardProbeTick();                                          // [Coop] BoardProbe (default 0): no-op unless set
     { extern void FortProbeTick(); FortProbeTick(); }           // [Coop] FortProbe (default 0): read-only fort/tower enumeration
     { extern void CoordEnumTick(); CoordEnumTick(); }           // [Coop] CoordEnum (default 0): read-only coordinator census
