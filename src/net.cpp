@@ -1591,7 +1591,7 @@ namespace {
             InterlockedExchange(&g_peerReady, 0);
             PeerSet(from, slot);
             g_lockedNonce = p.nonce;
-            g_lastRecvMs = 0;
+            InterlockedExchange64((volatile LONGLONG*)&g_lastRecvMs, 0);   // N5: 64-bit store, never torn on x86
             InterlockedExchange(&g_linkVia, viaRelay ? 2 : 1);
             InterlockedExchange(&g_peerReady, 1);
             SendLobby(LOBBY_WELCOME, p.nonce, 0, from, slot);
@@ -2291,7 +2291,7 @@ namespace {
                         // g_rxRejects is the subset that produced no state, EXCLUDING the chunks that
                         // were merely deferred (DEC_PENDING) or superseded (DEC_STALE).
                         const bool heartbeatOnly = accepted && entityPkt && decoded.count == 0;
-                        if (accepted && !heartbeatOnly) g_lastRecvMs = GetTickCount64();
+                        if (accepted && !heartbeatOnly) InterlockedExchange64((volatile LONGLONG*)&g_lastRecvMs, (LONGLONG)GetTickCount64());   // N5
                         InterlockedIncrement(&g_rxPackets);
                         InterlockedAdd(&g_rxBytes, (LONG)n);
                         LeaveCriticalSection(&g_lock);
@@ -2940,17 +2940,13 @@ void SetLocalWorldId(uint64_t id) {
 
 uint64_t LastRecvMs() {
     if (!g_enabled) return 0;
-    EnterCriticalSection(&g_lock);
-    uint64_t t = g_lastRecvMs;
-    LeaveCriticalSection(&g_lock);
+    uint64_t t = (uint64_t)InterlockedCompareExchange64((volatile LONGLONG*)&g_lastRecvMs, 0, 0);   // N5: atomic 64-bit read
     return t;
 }
 
 uint32_t MillisSinceRecv() {
     if (!g_enabled) return 0xFFFFFFFFu;
-    EnterCriticalSection(&g_lock);
-    uint64_t t = g_lastRecvMs;
-    LeaveCriticalSection(&g_lock);
+    uint64_t t = (uint64_t)InterlockedCompareExchange64((volatile LONGLONG*)&g_lastRecvMs, 0, 0);   // N5: atomic 64-bit read
     if (t == 0) return 0xFFFFFFFFu;               // nothing received yet
     return (uint32_t)(GetTickCount64() - t);       // 64-bit delta, narrowed after the subtraction
 }
