@@ -2529,8 +2529,9 @@ namespace {
         _snprintf(exe, sizeof(exe), "%s\\eos_bridge.exe", dir); exe[sizeof(exe) - 1] = 0;
         _snprintf(logPath, sizeof(logPath), "%s\\bridge.log", dir); logPath[sizeof(logPath) - 1] = 0;
         _snprintf(g_eosStatusPath, sizeof(g_eosStatusPath), "%s\\status.txt", dir); g_eosStatusPath[sizeof(g_eosStatusPath) - 1] = 0;
-        { char def[MAX_PATH]; _snprintf(def, sizeof(def), "%s\\eos.ini", dir); def[sizeof(def) - 1] = 0;
-          GetPrivateProfileStringA("Net", "EosIni", def, ini, sizeof(ini), Paths::Ini()); }
+        // [Net] EosIni: empty/absent = <ModuleDir>\eos\eos.ini (the runtime default, unchanged); otherwise the given path.
+        GetPrivateProfileStringA("Net", "EosIni", "", ini, sizeof(ini), Paths::Ini());
+        if (!ini[0]) { _snprintf(ini, sizeof(ini), "%s\\eos.ini", dir); ini[sizeof(ini) - 1] = 0; }
         if (roleArg) lstrcpynA(role, roleArg, sizeof(role)); else GetPrivateProfileStringA("Net", "EosRole", "host", role, sizeof(role), Paths::Ini());
         if (codeArg) lstrcpynA(code, codeArg, sizeof(code)); else GetPrivateProfileStringA("Net", "EosCode", "", code, sizeof(code), Paths::Ini());
         GetPrivateProfileStringA("Net", "EosRelay", "allow", relay, sizeof(relay), Paths::Ini());
