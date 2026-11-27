@@ -1175,6 +1175,21 @@
    "size": 0,
    "status": "unknown"
   },
+  "018480F0": {
+   "addr": "018480F0",
+   "claimed_at": "2026-11-27T14:40:15Z",
+   "name": "NewFightDamageResponseEvent",
+   "owner": "counter-sync",
+   "receipts": [
+    {
+     "arm": "probe",
+     "at": "2026-11-27T14:40:15Z",
+     "verdict": "UNVERIFIED-EVIDENCE"
+    }
+   ],
+   "size": 152,
+   "status": "claimed"
+  },
   "018B9EA0": {
    "addr": "018B9EA0",
    "claimed_at": "2026-11-08T12:12:51Z",
