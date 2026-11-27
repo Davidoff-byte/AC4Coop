@@ -53,6 +53,9 @@ namespace {
     uint32_t           g_lockedNonce = 0;     // host: nonce of the HELLO that locked the current guest (recv thread)
     uint64_t           g_lockedMs = 0;        // host: GetTickCount64() of that lock (WR-22; recv thread)
     char               g_joinCodeText[16] = {0};   // the code of the current attempt, for the status line
+    // [Net] MaxPeers (multi-guest S0, ops/design-multi-guest-2026-11-27.md): players in the session including the host,
+    // clamped 1..4. 1 (default) = the 1+1 link exactly as before.
+    int                g_maxPeers = 1;
 
     // ---- host: UPnP + STUN (slices 4-5) ------------------------------------------------------------
     // The STUN request goes out of the GAME socket (so the NAT mapping it reports is the one the guest
@@ -2620,6 +2623,14 @@ bool Init() {
         }
     }
     PreflightLog(g_eos, (int)g_mode, peerIp, localPort, peerPort);
+    {   // [Net] MaxPeers (multi-guest S0): read and logged here; values 0 / 9 log as clamped to 1 / 4.
+        const int raw = GetPrivateProfileIntA("Net", "MaxPeers", 1, Paths::Ini());
+        g_maxPeers = raw < 1 ? 1 : raw > 4 ? 4 : raw;
+        char m[96];
+        if (raw != g_maxPeers) wsprintfA(m, "[Net] MaxPeers=%d (ini %d clamped to 1..4)\n", g_maxPeers, raw);
+        else wsprintfA(m, "[Net] MaxPeers=%d\n", g_maxPeers);
+        dbg(m);
+    }
     // Host mode only: [Net] Upnp=1 (default) and [Net] StunServer=stun.l.google.com:19302 (default; empty = off).
     g_upnpEnabled = GetPrivateProfileIntA("Net", "Upnp", 1, Paths::Ini());
     GetPrivateProfileStringA("Net", "StunServer", "stun.l.google.com:19302", g_stunServer, sizeof(g_stunServer), Paths::Ini());
@@ -2887,6 +2898,8 @@ void LobbyStatus(char* out, size_t n) {
 bool Enabled() { return g_enabled; }
 
 bool IsSecondInstance() { return g_secondInstance; }
+
+int MaxPeers() { return g_maxPeers; }
 
 void Send(const PlayerState& s) {
     if (!g_enabled || InterlockedCompareExchange(&g_peerReady, 0, 0) == 0) return;   // lobby: no peer yet

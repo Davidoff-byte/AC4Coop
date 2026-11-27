@@ -8,6 +8,7 @@ namespace Net {
     bool Init();                        // read ini, open socket, start recv thread; returns Enabled()
     bool Enabled();
     bool IsSecondInstance();            // true if LocalPort was taken (this is the same-PC 2nd instance)
+    int  MaxPeers();                    // [Net] MaxPeers clamped 1..4 (players incl. the host; 1 = the 1+1 link); valid after Init
     void Send(const PlayerState& s);    // sendto peer (no-op if disabled)
     bool GetRemote(PlayerState& out);   // copy latest received state; false if none yet
     int  DrainRemote(PlayerState* out, int max); // pop up to max queued player packets, arrival order

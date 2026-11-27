@@ -16425,7 +16425,7 @@ static void DumpConfigOnce()
         { "Display", "Borderless", 0 }, { "Display", "ForceWindowedMs", 5000 }, { "Display", "Fullscreen", 0 },
         { "Net", "Enabled", 0 }, { "Net", "InterpDelayMs", 100 }, { "Net", "InterpMaxExtrapMs", 100 },
         { "Net", "Interpolation", 1 }, { "Net", "LocalPort", 47801 }, { "Net", "PeerPort", 47801 },
-        { "Net", "SnapshotHz", 20 },
+        { "Net", "SnapshotHz", 20 }, { "Net", "MaxPeers", 1 },
         // M-P3-4: every remaining int key the code reads with a constant default (section, key, code default).
         { "Coop", "AttackForward", 0 }, { "Coop", "AutoContinue", 0 }, { "Coop", "AutoContinueSlot", -1 },
         { "Coop", "BindFarRadiusM", 0 }, { "Coop", "BindHideM", 35 }, { "Coop", "CoordEnum", 0 }, { "Coop", "CoordSync", 0 },

@@ -230,7 +230,7 @@ def case_multi(exe: Path, proto: int, port: int, max_peers: int):
 def main(argv):
     ap = argparse.ArgumentParser()
     ap.add_argument("--tree", default=str(ROOT))
-    ap.add_argument("--cases", default="r1host,r1join,multi,ctl1")
+    ap.add_argument("--cases", default="s0,slots,r1host,r1join,multi,ctl1")
     ap.add_argument("--capture-golden", action="store_true")
     ap.add_argument("--port", type=int, default=47930)
     a = ap.parse_args(argv)
@@ -252,6 +252,33 @@ def main(argv):
     gold = json.loads(GOLDEN.read_text())
     gp = gold["proto"]
     fails, cases = [], a.cases.split(",")
+    if "s0" in cases:   # S0: [Net] MaxPeers logged; absent -> 1, 0 -> 1, 9 -> 4 (clamped), 3 -> 3
+        got = {}
+        for v, want in ((None, "[Net] MaxPeers=1\n"), (0, "[Net] MaxPeers=1 (ini 0 clamped to 1..4)"),
+                        (9, "[Net] MaxPeers=4 (ini 9 clamped to 1..4)"), (3, "[Net] MaxPeers=3\n")):
+            net = {"Mode": "host", "LocalPort": a.port + 9, "PeerPort": a.port + 9}
+            if v is not None:
+                net["MaxPeers"] = v
+            write_ini(exe.parent, net)
+            run_harness(exe, 1).communicate(timeout=20)
+            got[str(v)] = want in net_log(exe.parent)
+        ok = all(got.values())
+        print(f"[mg] s0 MaxPeers log/clamp={'PASS' if ok else 'FAIL'} {got}")
+        if not ok:
+            fails.append("s0")
+    if "slots" in cases:   # S1: 4 copies (one shared dir + ini) -> instance slot 1,2,3,4 once each, one net_log per slot
+        write_ini(exe.parent, {"Mode": "join", "LocalPort": a.port + 8, "PeerPort": a.port + 8})
+        procs = []
+        for _ in range(4):
+            procs.append(run_harness(exe, 3)); time.sleep(0.4)
+        outs = [p.communicate(timeout=30)[0] for p in procs]
+        slots = [int(m.group(1)) for o in outs for m in [re.search(r"\[Net\] instance slot=(\d+)", o)] if m]
+        files = {k: (exe.parent / ("net_log.txt" if k == 1 else f"net_log_slot{k}.txt")) for k in (1, 2, 3, 4)}
+        per_file = {k: (f.exists() and f.read_text(encoding="latin-1").count(f"[Net] instance slot={k} ") == 1) for k, f in files.items()}
+        ok = sorted(slots) == [1, 2, 3, 4] and all(per_file.values())
+        print(f"[mg] slots S1 instance slots={'PASS' if ok else 'FAIL'} stdout slots={slots} per-slot net_log={per_file}")
+        if not ok:
+            fails.append("slots")
     if "r1host" in cases:
         r = case_r1host(exe, proto, a.port)
         okP = bool(r["player"]) and norm_player(bytes.fromhex(r["player"]), gp) == norm_player(bytes.fromhex(gold["host"]["player"]), gp)
