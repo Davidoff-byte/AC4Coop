@@ -20,6 +20,7 @@
 namespace {
     bool               g_enabled = false;
     bool               g_secondInstance = false;   // LocalPort taken -> this is the same-PC 2nd instance
+    int                g_instanceSlot = 1;         // multi-guest S1: same-PC instance slot 1..4 (NOT the player slot)
     SOCKET             g_sock = INVALID_SOCKET;
     sockaddr_in        g_peer{};
     CRITICAL_SECTION   g_lock;
@@ -122,11 +123,19 @@ namespace {
     int                g_rxqHead = 0;    // next write slot
     int                g_rxqCount = 0;   // filled entries (<= NET_RXQ); full -> the OLDEST is overwritten
 
+    int DetectInstanceSlot();   // below; never logs (dbg calls it to pick the file)
     void dbg(const char* s) {
         printf("%s", s);
         OutputDebugStringA(s);
         static FILE* f = nullptr;
-        if (!f) f = _fsopen(Paths::LogPath("net_log.txt"), "a", _SH_DENYWR);   // next to the ASI, not the CWD
+        if (!f) {
+            // net_log.txt is opened _SH_DENYWR, so on a same-PC run only the first copy could write it and every other
+            // copy's lines were lost (multi-guest S1): instance slot k > 1 writes net_log_slot<k>.txt instead.
+            const int slot = DetectInstanceSlot();
+            char name[32];
+            if (slot > 1) wsprintfA(name, "net_log_slot%d.txt", slot); else lstrcpyA(name, "net_log.txt");
+            f = _fsopen(Paths::LogPath(name), "a", _SH_DENYWR);   // next to the ASI, not the CWD
+        }
         if (f) { fputs(s, f); fflush(f); }
     }
     // Per-process twin of dbg: net_log.txt is opened _SH_DENYWR, so on a same-PC two-copy run only the first copy can
@@ -144,24 +153,46 @@ namespace {
     // SO_REUSEADDR, which (deliberately, see the bind comment below) lets any number of sockets
     // bind the same port, so bind() never fails and the old "LocalPort taken" signal was dead.
     HANDLE             g_slotMutex = NULL;   // kept open for the process lifetime; closing it releases the marker
+    // Multi-guest S1: one marker per slot. AC4Coop_InstanceSlot_v1 is the slot-1 marker exactly as before (every copy
+    // opens it, the creator is slot 1); a copy that finds it existing takes the first of ..._s2, _s3, _s4 it CREATES
+    // (first free wins), so copies 3 and 4 no longer both read "slot 2". The handles are never closed: they ARE the markers.
+    HANDLE             g_slotMutexK = NULL;
+    DWORD              g_slotErr = 0;        // CreateMutexW failure (logged by Init; this function must not log)
+    bool               g_slotOverflow = false;   // all of s2..s4 held: a 5th copy shares slot 4 (logged by Init)
 
-    bool DetectSecondInstance() {
-        static bool s_done   = false;
-        static bool s_second = false;
-        if (!s_done) {
-            s_done = true;
+    int DetectInstanceSlot() {
+        static volatile LONG s_slot = 0;
+        if (s_slot) return (int)s_slot;
+        static SRWLOCK s_lk = SRWLOCK_INIT;
+        AcquireSRWLockExclusive(&s_lk);
+        if (!s_slot) {
+            int slot = 1;
             SetLastError(0);
             HANDLE h = CreateMutexW(NULL, FALSE, L"AC4Coop_InstanceSlot_v1");
             if (!h) {
-                char m[96]; wsprintfA(m, "[Net] instance marker failed err=%lu (assuming slot 1)\n", GetLastError()); dbg(m);
-                s_second = false;
+                g_slotErr = GetLastError();   // assume slot 1, as before
             } else {
-                s_second = (GetLastError() == ERROR_ALREADY_EXISTS);
-                g_slotMutex = h;   // never closed, not even on shutdown: it IS the marker
+                const bool exists = (GetLastError() == ERROR_ALREADY_EXISTS);
+                g_slotMutex = h;
+                if (exists) {
+                    slot = 4; g_slotOverflow = true;
+                    for (int k = 2; k <= 4; ++k) {
+                        wchar_t nm[48]; wsprintfW(nm, L"AC4Coop_InstanceSlot_v1_s%d", k);
+                        SetLastError(0);
+                        HANDLE hk = CreateMutexW(NULL, FALSE, nm);
+                        if (!hk) continue;
+                        if (GetLastError() == ERROR_ALREADY_EXISTS) { CloseHandle(hk); continue; }
+                        g_slotMutexK = hk; slot = k; g_slotOverflow = false;
+                        break;
+                    }
+                }
             }
+            InterlockedExchange(&s_slot, slot);
         }
-        return s_second;
+        ReleaseSRWLockExclusive(&s_lk);
+        return (int)s_slot;
     }
+    bool DetectSecondInstance() { return DetectInstanceSlot() > 1; }
 
     volatile LONG g_txPackets = 0, g_txBytes = 0, g_txEnts = 0, g_rxPackets = 0, g_rxBytes = 0;
     // Rejects: datagrams from the peer that arrived but contributed NO state (version mismatch, a
@@ -2669,6 +2700,9 @@ bool Init() {
     // Instance slot comes from the owned mutex marker FIRST (D-018). With SO_REUSEADDR below the
     // bind can never fail, so a bind failure alone can no longer tell the 2nd instance apart.
     g_secondInstance = DetectSecondInstance();
+    g_instanceSlot = DetectInstanceSlot();
+    if (g_slotErr) { char m[96]; wsprintfA(m, "[Net] instance marker failed err=%lu (assuming slot 1)\n", g_slotErr); dbg(m); }
+    if (g_slotOverflow) dbg("[Net] instance markers 1..4 all held: more than 4 copies on this PC, this one shares slot 4\n");
 
     // Bind LocalPort; if it's already taken (2nd instance on the same PC sharing this ini), bind
     // PeerPort instead and send to LocalPort. Two-PC setups use LocalPort==PeerPort and just bind.
@@ -2728,13 +2762,14 @@ bool Init() {
         bindPort = g_secondInstance ? localPort : peerPort;
         sendPort = g_secondInstance ? peerPort : localPort;
         g_secondInstance = true;   // bind failure (secondary signal) -> this is the same-PC 2nd instance (guest)
+        if (g_instanceSlot < 2) g_instanceSlot = 2;
         local.sin_port = htons((u_short)bindPort);
         if (bind(g_sock, (sockaddr*)&local, sizeof(local)) == SOCKET_ERROR) {
             char m[96]; wsprintfA(m, "[Net] bind(%d/%d) failed err=%d\n", localPort, peerPort, WSAGetLastError()); dbg(m);
             closesocket(g_sock); g_sock = INVALID_SOCKET; return false;
         }
     }
-    { char m[96]; wsprintfA(m, "[Net] instance slot=%d bind=%d peer=%d\n", g_secondInstance ? 2 : 1, bindPort, sendPort); dbg(m); }
+    { char m[96]; wsprintfA(m, "[Net] instance slot=%d bind=%d peer=%d\n", g_instanceSlot, bindPort, sendPort); dbg(m); }
 
     if (bindPort == 0) {   // ephemeral: log the port the OS picked
         sockaddr_in got{}; int gl = sizeof(got);
@@ -2900,6 +2935,8 @@ bool Enabled() { return g_enabled; }
 bool IsSecondInstance() { return g_secondInstance; }
 
 int MaxPeers() { return g_maxPeers; }
+
+int InstanceSlot() { return g_instanceSlot; }
 
 void Send(const PlayerState& s) {
     if (!g_enabled || InterlockedCompareExchange(&g_peerReady, 0, 0) == 0) return;   // lobby: no peer yet

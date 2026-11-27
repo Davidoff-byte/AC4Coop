@@ -12570,7 +12570,7 @@ static void EntitySyncTick() {
     if (g_entHost < 0) {
         g_entHost = GetPrivateProfileIntA("Coop", "EntityHost", 0, Paths::Ini());
         // Same-PC 2nd instance (instance-slot mutex marker) = the mirror/guest, regardless of the ini.
-        if (Net::IsSecondInstance()) { g_entHost = 0; L("[Net] instance slot=2 not host (g_entHost=0)\n"); }
+        if (Net::IsSecondInstance()) { g_entHost = 0; L("[Net] instance slot=%d not host (g_entHost=0)\n", Net::InstanceSlot()); }
     }
     if (!g_entSync) return;
 
