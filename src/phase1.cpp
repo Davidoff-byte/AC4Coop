@@ -12717,7 +12717,33 @@ static void EntitySyncTick() {
             static EntityPacket pkt;
         std::memset(&pkt, 0, sizeof(pkt));   // every field of every record starts at 0 (anim.valid = 0)
             CaptureShips(pkt);
+            const uint32_t nShipRec = pkt.count;
             CaptureGuards(pkt);   // append the characters after the ships
+            // [Coop] SyncBudget (default 0, re-read every 10 s): 1 = measure only - one [Sync] budget line per 10 s with the
+            // record count per section of the last snapshot (ships / live guards / corpses = guard dead=1 / kills) and the
+            // in-memory size (n x sizeof(EntityState)); wire bytes after the compact encoder and its byte-break drops are
+            // counted in net.cpp ([Net] entwire), not here. atCap = snapshots that filled MAX_SYNC_ENTITIES (the binding
+            // cap per evidence/selection-policy-spec.md). No selection/aging policy is implemented (AGING_TICKS UNPROVEN).
+            {
+                static int s_sbOn = 0; static uint64_t s_sbNext = 0, s_sbLog = 0; static uint32_t s_sbSnaps = 0, s_sbAtCap = 0;
+                if (snapNow >= s_sbNext) { s_sbNext = snapNow + 10000; s_sbOn = GetPrivateProfileIntA("Coop", "SyncBudget", 0, Paths::Ini()); }
+                if (s_sbOn == 1) {
+                    ++s_sbSnaps; if (pkt.count >= (uint32_t)MAX_SYNC_ENTITIES) ++s_sbAtCap;
+                    if (!s_sbLog) s_sbLog = snapNow;
+                    if (snapNow - s_sbLog >= 10000) {
+                        uint32_t g = 0, c = 0, k = 0;
+                        for (uint32_t i = nShipRec; i < pkt.count && i < (uint32_t)MAX_SYNC_ENTITIES; ++i) {
+                            const EntityState& e = pkt.ents[i];
+                            if (e.kind == EK_KILL) ++k; else if (e.kind == EK_GUARD) { if (e.dead) ++c; else ++g; }
+                        }
+                        const unsigned es = (unsigned)sizeof(EntityState);
+                        L("[Sync] budget snaps=%u atCap=%u cap=%d last: ships=%u(%uB) guards=%u(%uB) corpses=%u(%uB) kills=%u(%uB) total=%u(%uB raw)\n",
+                          s_sbSnaps, s_sbAtCap, MAX_SYNC_ENTITIES, nShipRec, nShipRec * es, g, g * es, c, c * es, k, k * es,
+                          (unsigned)pkt.count, (unsigned)pkt.count * es);
+                        s_sbLog = snapNow; s_sbSnaps = 0; s_sbAtCap = 0;
+                    }
+                }
+            }
             if (pkt.count) { Net::SendEntities(pkt); CombatTiming::HostSnapshotSent(pkt.hostMs, pkt.count); }   // [Coop] CombatTimingProbe
         }
         // Peer-reported kills (guest -> host): resolve by position and kill the real guard. Kill
@@ -16424,7 +16450,7 @@ static void DumpConfigOnce()
         { "Coop", "ShipGhost", 0 }, { "Coop", "ShipGhostSelfTest", 0 }, { "Coop", "ShipHPSync", 0 },
         { "Coop", "ShipPassenger", 0 }, { "Coop", "ShipRelevanceRadiusM", 1000 }, { "Coop", "ShipSync", 1 },
         { "Coop", "ShipTest", 0 }, { "Coop", "ShipTestFracPct", 45 }, { "Coop", "ShipTestRadiusM", 250 },
-        { "Coop", "ActionWriterProbe", 0 }, { "Coop", "BlendTypeSafe", 0 }, { "Coop", "EntityFrameCadence", 0 },
+        { "Coop", "ActionWriterProbe", 0 }, { "Coop", "BlendTypeSafe", 0 }, { "Coop", "EntityFrameCadence", 0 }, { "Coop", "SyncBudget", 0 },
         { "Coop", "FloatProbe", 0 }, { "Coop", "FootOffsetFix", 0 }, { "Coop", "GuardActionGate", 0 }, { "Coop", "GuardActionLane", 0 }, { "Coop", "RespawnHitGraceMs", 0 }, { "Coop", "GuardStageApply", 0 }, { "Coop", "GuardStageForceEnter", 0 }, { "Coop", "CombatTimingProbe", 0 }, { "Coop", "GuardExtrapMs", 100 },
         { "Coop", "GuardInterpBuffer", 0 }, { "Coop", "GuardInterpDelayMs", 120 }, { "Coop", "GuardPhaseLock", 0 },
         { "Coop", "GuardSeesPuppet", 0 }, { "Coop", "PuppetActionReassert", 0 }, { "Coop", "PuppetHostTime", 0 },
