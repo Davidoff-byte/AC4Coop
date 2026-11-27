@@ -1,15 +1,22 @@
-// In-game co-op panel with RmlUi (see overlay_ui.h). The only RmlUi-aware translation unit in the ASI.
+// In-game co-op panel with RmlUi (see overlay_ui.h): the opt-in alternative to overlay_ui_imgui.cpp, plus the stub.
+// The only RmlUi-aware translation unit in the ASI.
 #define _CRT_SECURE_NO_WARNINGS
 #include "overlay_ui.h"
 
 #ifndef AC4COOP_OVERLAY
 #define AC4COOP_OVERLAY 0
 #endif
+#ifndef AC4COOP_UI_RMLUI
+#define AC4COOP_UI_RMLUI 0
+#endif
 
-#if !AC4COOP_OVERLAY
+#if AC4COOP_OVERLAY && !AC4COOP_UI_RMLUI
+// The ImGui panel (overlay_ui_imgui.cpp) is compiled in; this translation unit is empty.
+#elif !AC4COOP_OVERLAY
 namespace OverlayUi {
 bool Built() { return false; }
-bool Init(ID3D11Device*, HWND, int, int, const char*, ActionFn, LogFn log) { if (log) log("[Overlay] built without RmlUi (run third_party\\rmlui\\build_rmlui.cmd)\n"); return false; }
+const char* Name() { return "none"; }
+bool Init(ID3D11Device*, HWND, int, int, const char*, ActionFn, LogFn log) { if (log) log("[Overlay] built without a UI library (third_party\\imgui missing, RmlUi not selected)\n"); return false; }
 void Resize(int, int) {}
 void Render(ID3D11RenderTargetView*) {}
 bool OnMessage(HWND, UINT, WPARAM, LPARAM) { return false; }
@@ -90,6 +97,7 @@ void OnAct(Rml::DataModelHandle, Rml::Event&, const Rml::VariantList& args) {
 namespace OverlayUi {
 
 bool Built() { return true; }
+const char* Name() { return "rmlui"; }
 
 bool Init(ID3D11Device* dev, HWND hwnd, int w, int h, const char* uiDir, ActionFn onAction, LogFn log) {
     g_onAction = onAction; g_log = log;

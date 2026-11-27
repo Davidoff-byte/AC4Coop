@@ -18,6 +18,11 @@
 bool Phase1_SetEntityHost(int host);
 int  Phase1_EntityHostState();
 bool Phase1_InSave();   // a save is loaded (player frame with m_CharacterList >= 2 in the last second)
+// Read-only status rows (phase1.cpp / dllmain.cpp; plain global reads, no engine calls).
+void* Phase1_PuppetEntity();      // live puppet entity or nullptr (shared SRW lock)
+int   Phase1_ShipBindCount();     // ship class-bind table entries
+int   Phase1_GuardBindCount();    // guard binds counted in the current [Sync] report window
+extern "C" int AC4Coop_FormatBuildLine(char* out, int cap);
 #pragma comment(lib, "dxguid.lib")
 
 namespace {
@@ -50,7 +55,9 @@ bool PatchSlot(void** vtbl, int slot, void* hook, void** orig) {
 
 // ---- config / shared state ---------------------------------------------------------------------------------------
 bool g_probe = false, g_enable = false;
-int  g_key = VK_F10;
+// Default Insert (0x2D): F10 is the always-on "sink nearby ships" harness key in dllmain.cpp's poll loop, so
+// toggling the panel with it also sank ships. Insert is not read by any GetAsyncKeyState/GetKeyState in src\.
+int  g_key = VK_INSERT;
 CRITICAL_SECTION g_cs;                   // guards everything below that two threads touch
 volatile LONG c_present = 0, c_scCreated = 0, c_resize = 0, c_wmMouse = 0, c_wmKey = 0, c_diState = 0, c_diData = 0, c_diZeroed = 0;
 IDXGISwapChain* volatile g_sc = nullptr; // the game's swap chain (from the CreateSwapChain wrap)
@@ -257,7 +264,7 @@ void OnPresent(IDXGISwapChain* sc) {
     const bool inSave = Phase1_InSave();
     if (down && !g_keyWas) {
         if (g_open || inSave) SetOpen(!g_open);
-        else { static DWORD s_last = 0; if (GetTickCount() - s_last > 2000) { s_last = GetTickCount(); Log("[Overlay] F10 ignored: not in a loaded save\n"); } }
+        else { static DWORD s_last = 0; if (GetTickCount() - s_last > 2000) { s_last = GetTickCount(); Log("[Overlay] toggle key 0x%x ignored: not in a loaded save\n", g_key); } }
     }
     if (g_open && !inSave) { SetOpen(false); Log("[Overlay] panel closed: the save is no longer loaded\n"); }
     g_keyWas = down;
@@ -453,6 +460,26 @@ void ReadStatus() {
         else if (ms < 3000) lstrcpynA(s.peer, "linked", sizeof(s.peer));
         else _snprintf(s.peer, sizeof(s.peer), "no data for %u s", ms / 1000);
     }
+    // Read-only rows: existing mod globals through accessors (this is the overlay thread, never the render thread).
+    s.proto = NET_PROTO_VER;
+    {
+        static char s_commit[16] = {0}, s_asi[16] = {0};
+        if (!s_commit[0]) {   // [Build] asi=<sha256> commit=<short> ... (dllmain.cpp BuildLine, cached there)
+            char b[256] = {0};
+            if (AC4Coop_FormatBuildLine(b, (int)sizeof(b)) > 0) {
+                auto take = [&](const char* key, char* dst, size_t cap) {
+                    const char* p = strstr(b, key); if (!p) return;
+                    p += strlen(key); size_t i = 0; while (*p && *p != ' ' && *p != '\r' && *p != '\n' && i + 1 < cap) dst[i++] = *p++; dst[i] = 0;
+                };
+                take("asi=", s_asi, 13); take("commit=", s_commit, sizeof(s_commit));
+            }
+            if (!s_commit[0]) lstrcpynA(s_commit, "?", sizeof(s_commit));
+        }
+        lstrcpynA(s.commit, s_commit, sizeof(s.commit)); lstrcpynA(s.asi, s_asi, sizeof(s.asi));
+    }
+    s.puppet = Phase1_PuppetEntity() != nullptr;
+    s.shipsBound = Phase1_ShipBindCount();
+    s.guardsBound = Phase1_GuardBindCount();
     EnterCriticalSection(&g_cs);
     lstrcpynA(s.note, g_note, sizeof(s.note));
     if (memcmp(&s, &g_status, sizeof(s)) != 0) { g_status = s; g_statusDirty = true; }
@@ -483,14 +510,14 @@ void InstallEarly() {
     g_enable = GetPrivateProfileIntA("Overlay", "Enable", 0, Paths::Ini()) != 0;
     g_probe = g_enable || GetPrivateProfileIntA("Overlay", "Probe", 0, Paths::Ini()) != 0;
     if (!g_probe) return;
-    g_key = GetPrivateProfileIntA("Overlay", "Key", VK_F10, Paths::Ini());
+    g_key = GetPrivateProfileIntA("Overlay", "Key", VK_INSERT, Paths::Ini());
     InitializeCriticalSection(&g_logCs); InitializeCriticalSection(&g_cs); g_logInit = true;
     HMODULE dx = GetModuleHandleA("dxgi.dll");
     void* real = dx ? (void*)GetProcAddress(dx, "CreateDXGIFactory1") : nullptr;
     void* cur = nullptr;
     __try { cur = *kIatCreateDXGIFactory1; } __except (EXCEPTION_EXECUTE_HANDLER) { cur = nullptr; }
     Log("[Overlay] ---- pid=%lu enable=%d key=0x%x ui=%s | IAT 0x01E3A618 holds %p, dxgi!CreateDXGIFactory1=%p\n",
-        GetCurrentProcessId(), g_enable, g_key, OverlayUi::Built() ? "rmlui" : "none", cur, real);
+        GetCurrentProcessId(), g_enable, g_key, OverlayUi::Name(), cur, real);
     if (!real || cur != real) { Log("[Overlay] IAT slot does not hold dxgi!CreateDXGIFactory1 - not patched (overlay off)\n"); return; }
     o_CreateFactory1 = (CreateDXGIFactory1_t)real;
     void* orig = nullptr;

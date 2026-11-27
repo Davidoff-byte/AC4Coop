@@ -5566,6 +5566,7 @@ uintptr_t Phase1_ScbGuestOfLo(uint32_t hostLo) {   // spawn_census.cpp crew-key 
     for (int i = 0; i < s_scbN; ++i) if ((uint32_t)s_scb[i].hostId == hostLo) return (uintptr_t)s_scb[i].ent;
     return 0;
 }
+int Phase1_ShipBindCount() { return s_scbN; }   // overlay.cpp status row: class-bind table entries (plain read)
 uint64_t Phase1_ScbHostOf(uintptr_t guestShip) {   // spawn_census.cpp crew keys: the host ship bound to this guest ship
     for (int i = 0; i < s_scbN; ++i) if ((uintptr_t)s_scb[i].ent == guestShip) return s_scb[i].hostId;
     return 0;
@@ -6396,6 +6397,7 @@ static void KrRejectAdd(const KindRole& kr) {
 // large max is one badly bound body; a large mean everywhere is a systematic binding error.
 static unsigned s_bindSent      = 0;
 static unsigned s_bindBound     = 0;
+int Phase1_GuardBindCount() { return (int)s_bindBound; }   // overlay.cpp status row: character binds this 5 s window
 // T28 (2026-11-08): why a guest record binds nothing. Counted per window and logged only when
 // [Coop] BindDiag=1, so the coop_report.py bind-line format is untouched.
 static unsigned s_bindScanN     = 0;
@@ -16161,7 +16163,7 @@ static void DumpConfigOnce()
         { "Coop", "GuardPhaseNudgePct", 25 },
         { "Launcher", "ArmWindowSec", 300 }, { "Launcher", "RequireArm", 0 },
         { "Net", "EosBridgePort", 47900 }, { "Net", "RelayForce", 0 }, { "Net", "Upnp", 1 },
-        { "Overlay", "Enable", 0 }, { "Overlay", "Key", VK_F10 }, { "Overlay", "Probe", 0 }, { "Overlay", "RoleFromPanel", 0 },
+        { "Overlay", "Enable", 0 }, { "Overlay", "Key", VK_INSERT }, { "Overlay", "Probe", 0 }, { "Overlay", "RoleFromPanel", 0 },
         { "Pilot", "ClimbIntent", 1 }, { "Pilot", "Enabled", 0 }, { "Pilot", "FpsCap", 0 }, { "Pilot", "Intent", 1 },
         { "Pilot", "KeepFocus", 0 }, { "Pilot", "PadIndex", 0 },
         { "Probe", "Enabled", 0 },
