@@ -8688,6 +8688,7 @@ static void OwnPublish(Human* h, Entity* e, const float* pos, const float* quat,
     } else if (i >= 0) {
         OwnBody& o = s_own[i];
         o.ent = (unsigned int)e;
+        o.unlinked = 0;   // WR-8: re-publishing a guard re-links it; mirrors don't stay disabled after host stops/resumes
         const bool changed = std::memcmp(o.toPos, pos, 12) != 0 || std::memcmp(o.toQuat, quat, 16) != 0;
         if (changed) {
             float cp[3], cq[4]; OwnSample(o, now, cp, cq);
