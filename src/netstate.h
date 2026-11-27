@@ -158,7 +158,9 @@ static_assert(sizeof(PlayerState) == 576, "PlayerState wire size changed - updat
 static const uint32_t NET_MAGIC = 0x43344341; // 'AC4C'
 // Wire/struct-layout version. PlayerState is #pragma pack(1): adding a field shifts every following
 // offset, so both peers MUST run the same build. Bump this whenever the layout changes.
-static const uint32_t NET_PROTO_VER = 17;  // 17: IC_ACTION (GuardActionLane) payload may be 18 B: + u8 perception stage,
+static const uint32_t NET_PROTO_VER = 18;  // 18: integration wave 1121 bump (one bump for the wave): pose lane 'AC4P',
+                                           //     perceive GAL 18 B payload; later branches of this wave also target 18
+                                           // 17: IC_ACTION (GuardActionLane) payload may be 18 B: + u8 perception stage,
                                            //     u8 targetIsPuppet ([Coop] GuardPerceivePuppet, phase1.cpp GalPayloadP);
                                            //     the 16 B payload is still sent with the flag off and still accepted
                                            //     + pose lane (feat/pose-parity): new datagram type 'AC4P',
