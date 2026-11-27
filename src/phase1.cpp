@@ -7598,16 +7598,21 @@ static int   s_mirroredN = 0;
 struct MirrorAction { unsigned int ent; unsigned int alias; };
 static MirrorAction s_mirrorAct[MIRROR_TABLE];
 static int s_mirrorActN = 0;
+// WR-2: eviction cursors. Once a table is full the next write replaces the OLDEST entry (FIFO), not
+// slot ptr % 512 - that hashed eviction could overwrite an entry recorded a moment ago (two pointers
+// with the same residue) while stale ones lived on, so a fresh body re-ran its first-sight path.
+static int s_mirroredNext = 0;
+static int s_mirrorActNext = 0;
 
-static void MirrorTablePut(void** table, int& n, void* e) {
+static void MirrorTablePut(void** table, int& n, int& next, void* e) {
     if (n < MIRROR_TABLE) { table[n++] = e; return; }
-    int slot = (int)((unsigned int)e % (unsigned int)MIRROR_TABLE);   // deterministic eviction
-    table[slot] = e;
+    table[next] = e;                                                    // evict the oldest
+    next = (next + 1) % MIRROR_TABLE;
 }
 
 static bool MirrorFirstSight(void* e) {
     for (int i = 0; i < s_mirroredN; ++i) if (s_mirroredEnt[i] == e) return false;
-    MirrorTablePut(s_mirroredEnt, s_mirroredN, e);
+    MirrorTablePut(s_mirroredEnt, s_mirroredN, s_mirroredNext, e);
     return true;
 }
 
@@ -7618,7 +7623,8 @@ static void MirrorAliasRemember(void* e, unsigned int alias) {
         ++s_mirrorActN;
         return;
     }
-    int slot = (int)((unsigned int)e % (unsigned int)MIRROR_TABLE);
+    const int slot = s_mirrorActNext;                                   // WR-2: evict the oldest
+    s_mirrorActNext = (s_mirrorActNext + 1) % MIRROR_TABLE;
     s_mirrorAct[slot].ent = (unsigned int)e;
     s_mirrorAct[slot].alias = alias;
 }
@@ -7639,6 +7645,7 @@ static bool MirrorAliasChanged(void* e, unsigned int alias) {
 // corpse's transform/clip from the host snapshot and it would stand back up or slide around.
 static void* s_mirrorDeadLocal[MIRROR_TABLE];
 static int   s_mirrorDeadLocalN = 0;
+static int   s_mirrorDeadLocalNext = 0;   // WR-2: FIFO eviction cursor
 
 static bool MirrorKilledLocally(void* e) {
     for (int i = 0; i < s_mirrorDeadLocalN; ++i) if (s_mirrorDeadLocal[i] == e) return true;
@@ -7646,7 +7653,7 @@ static bool MirrorKilledLocally(void* e) {
 }
 static void MarkMirrorKilledLocally(void* e) {
     if (MirrorKilledLocally(e)) return;
-    MirrorTablePut(s_mirrorDeadLocal, s_mirrorDeadLocalN, e);
+    MirrorTablePut(s_mirrorDeadLocal, s_mirrorDeadLocalN, s_mirrorDeadLocalNext, e);
 }
 
 // Reverse lookup: which host objId is this local body already playing? Used to stop one body being
