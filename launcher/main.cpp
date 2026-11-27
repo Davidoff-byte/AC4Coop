@@ -15,6 +15,7 @@
 //   --game-dir DIR  --payload DIR  --no-launch  --auto-play (install + arm + launch once)  --exit-after S
 //   --report FILE (state as key=value)  --shot FILE.bmp (window image after 3 s)
 //   --ini FILE (use this AC4Coop.ini instead of <game>\AC4Coop.ini)  --set-role host|guest (one [Coop] EntityHost write)
+//   --install-dry FILE (run only Install()'s ini-key step on FILE, then exit)
 #define _CRT_SECURE_NO_WARNINGS
 #include <winsock2.h>   // before windows.h (winsock.h clash); bind test, local IPv4s, UPnP probe
 #include <ws2tcpip.h>
@@ -35,6 +36,7 @@
 #include "backends/imgui_impl_dx11.h"
 #include "netstate.h"   // NET_PROTO_VER only (header-only constants)
 #include "upnp.h"       // src/upnp.cpp (Winsock + WinHTTP only, no engine calls): the self-check's UPnP probe
+#include "stun.h"       // src/stun.cpp (Winsock only, no engine calls): the self-check's STUN probe
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "bcrypt.lib")
@@ -51,7 +53,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM,
 namespace {
 
 // ---------------------------------------------------------------- settings + args
-struct Args { std::string gameDir, report, shot, payload, ini, setRole; int exitAfter = 0; bool noLaunch = false, autoPlay = false; } A;
+struct Args { std::string gameDir, report, shot, payload, ini, setRole, installDry; int exitAfter = 0; bool noLaunch = false, autoPlay = false; } A;
 char g_exeDir[MAX_PATH], g_settings[MAX_PATH], g_gameDir[MAX_PATH] = {0};
 
 void LoadSettings() {
@@ -214,6 +216,8 @@ void CheckGame() {
 std::string g_msg; bool g_msgOk = false;
 void Msg(bool ok, const std::string& m) { g_msg = m; g_msgOk = ok; LogLine("%s", m.c_str()); }
 
+std::wstring Widen(const std::string& s);
+bool ApplyInstallKeys(const std::string& iniA);
 bool Install() {
     if (!G.payloadOk) { Msg(false, "This launcher's files\\ folder is incomplete - unzip the whole package again"); return false; }
     if (GameRunning()) { Msg(false, "Close Assassin's Creed IV first"); return false; }
@@ -230,10 +234,28 @@ bool Install() {
     if (!FileExists(ini) && FileExists(tpl)) CopyFileA(tpl.c_str(), ini.c_str(), TRUE);   // never overwrite the player's ini
     if (!FileExists(ini)) { Msg(false, "AC4Coop.ini could not be created in the game folder"); return false; }
     CopyFileA(ini.c_str(), (ini + ".launcher.bak").c_str(), FALSE);
-    // The keys the co-op start needs; everything else in the player's ini is left alone.
-    const char* kv[][3] = {
+    if (!ApplyInstallKeys(ini)) { Msg(false, "Could not write " + ini); return false; }
+    CheckGame();
+    Msg(true, "Co-op mod installed (" + G.loaderName + " loader)");
+    return true;
+}
+
+// The keys the co-op start needs; everything else in the player's ini is left alone. One key per
+// WritePrivateProfileStringW (the file is never rewritten whole). [Net] Mode / Transport are the player's choice
+// (Mode dropdown, eos vs udp): they are written only when ABSENT, so an install/update never resets them.
+// (12d5abc wrote them on every install as first-install defaults; it was not a migration.)
+bool IniKeyPresent(const std::wstring& ini, const wchar_t* sec, const wchar_t* key) {
+    static const wchar_t kAbsent[] = L"\x01<absent>";   // a value no real ini line can carry
+    wchar_t b[64];
+    GetPrivateProfileStringW(sec, key, kAbsent, b, 64, ini.c_str());
+    return wcscmp(b, kAbsent) != 0;
+}
+bool ApplyInstallKeys(const std::string& iniA) {
+    const std::wstring ini = Widen(iniA);
+    struct KV { const char* sec; const char* key; const char* val; bool onlyIfAbsent; };
+    const KV kv[] = {
         { "Launcher", "RequireArm", "1" },        // plain Steam / Ubisoft starts stay unmodded
-        { "Net", "Enabled", "1" }, { "Net", "Mode", "manual" }, { "Net", "Transport", "eos" }, { "Net", "EosAutoStart", "0" },
+        { "Net", "Enabled", "1" }, { "Net", "Mode", "manual", true }, { "Net", "Transport", "eos", true }, { "Net", "EosAutoStart", "0" },
         { "Overlay", "Enable", "1" }, { "Overlay", "RoleFromPanel", "1" },
         // Co-op sync profile (role-independent; the role comes from the panel). Same set the party launcher wrote.
         { "Coop", "EntitySync", "1" }, { "Coop", "EntityFrameCadence", "1" }, { "Coop", "OwnUpdateGuards", "1" },
@@ -244,10 +266,13 @@ bool Install() {
         { "Coop", "PuppetActionReassert", "1" }, { "Coop", "BindRadiusM", "60" }, { "Coop", "CrashContext", "1" },
         { "Coop", "GuardActionGate", "1" }, { "Coop", "FootOffsetFix", "1" },
     };
-    for (auto& p : kv) WritePrivateProfileStringA(p[0], p[1], p[2], ini.c_str());
-    CheckGame();
-    Msg(true, "Co-op mod installed (" + G.loaderName + " loader)");
-    return true;
+    bool ok = true;
+    for (auto& p : kv) {
+        const std::wstring sec = Widen(p.sec), key = Widen(p.key);
+        if (p.onlyIfAbsent && IniKeyPresent(ini, sec.c_str(), key.c_str())) { LogLine("ini [%s] %s present - kept", p.sec, p.key); continue; }
+        ok &= WritePrivateProfileStringW(sec.c_str(), key.c_str(), Widen(p.val).c_str(), ini.c_str()) != 0;
+    }
+    return ok;
 }
 
 bool g_launched = false;
@@ -438,6 +463,28 @@ DWORD WINAPI UpnpThread(void*) {
     else m = "UPnP: gateway found on " + IpStr(lan) + ", external IP " + IpStr(ext) + " (read only, no mapping made)";
     g_upnpMsg = m; InterlockedExchange(&g_upnpState, 2); return 0;
 }
+// STUN: one Binding query from an ephemeral UDP socket (not the game port, which the game may hold). Stun::Query
+// does up to 3 tries x timeoutMs, so 1000 ms each = 3 s for the exchange; the DNS lookup before it is blocking.
+volatile LONG g_stunState = 0;   // 0 idle, 1 running, 2 done
+std::string g_stunMsg; bool g_stunOk = false;
+const char kStunServer[] = "stun.l.google.com:19302";   // same default as launcher/party_net.h Config::stunServer
+DWORD WINAPI StunThread(void*) {
+    std::string m; bool ok = false; sockaddr_in srv{};
+    if (!Stun::Resolve(kStunServer, &srv)) m = std::string("STUN: could not resolve ") + kStunServer;
+    else {
+        SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        sockaddr_in a{}; a.sin_family = AF_INET; a.sin_addr.s_addr = INADDR_ANY; a.sin_port = 0;
+        if (s == INVALID_SOCKET || bind(s, (sockaddr*)&a, sizeof(a)) != 0) m = Fmt("STUN: socket/bind failed (%d)", WSAGetLastError());
+        else {
+            uint32_t ip = 0; uint16_t port = 0;
+            if (Stun::Query(s, srv, 1000, &ip, &port)) { ok = true; m = Fmt("STUN: public endpoint %s:%u (ephemeral socket, via %s)", IpStr(ip).c_str(), (unsigned)port, kStunServer); }
+            else m = std::string("STUN: no answer from ") + kStunServer + " within 3 s - outbound UDP may be blocked";
+        }
+        if (s != INVALID_SOCKET) closesocket(s);
+    }
+    g_stunMsg = m; g_stunOk = ok; InterlockedExchange(&g_stunState, 2); return 0;
+}
+
 void SelfCheck() {
     g_check.clear(); RefreshNet();
     static bool wsa = false; if (!wsa) { WSADATA d; wsa = WSAStartup(MAKEWORD(2, 2), &d) == 0; }
@@ -455,7 +502,10 @@ void SelfCheck() {
         bool bad = false; for (auto& p : g_pre) bad |= p.text.rfind("NET FAIL", 0) == 0;
         g_check.push_back({ bad ? 2 : 0, Fmt("PeerIP %s: %s", N.peerIp, bad ? "NOT on this PC's /24" : "on this PC's /24") });
     } else g_check.push_back({ 1, Fmt("PeerIP not used (Mode=%s, Transport=%s)", N.mode, N.transport) });
-    g_check.push_back({ 1, "STUN: skipped (src/stun.* not wired into the launcher in this change)" });
+    if (wsa && InterlockedCompareExchange(&g_stunState, 1, 0) != 1) {
+        InterlockedExchange(&g_stunState, 1);
+        HANDLE t = CreateThread(nullptr, 0, StunThread, nullptr, 0, nullptr); if (t) CloseHandle(t); else InterlockedExchange(&g_stunState, 0);
+    }
     if (InterlockedCompareExchange(&g_upnpState, 1, 0) != 1) {
         InterlockedExchange(&g_upnpState, 1);
         HANDLE t = CreateThread(nullptr, 0, UpnpThread, nullptr, 0, nullptr); if (t) CloseHandle(t); else InterlockedExchange(&g_upnpState, 0);
@@ -552,6 +602,9 @@ void NetUi() {
     const LONG us = InterlockedCompareExchange(&g_upnpState, 0, 0);
     if (us == 1) ImGui::TextColored(kDim, "UPnP: probing the router...");
     else if (us == 2) ImGui::TextColored(g_upnpMsg.find("external IP ") != std::string::npos ? kOk : kWarn, "%s", g_upnpMsg.c_str());
+    const LONG ss = InterlockedCompareExchange(&g_stunState, 0, 0);
+    if (ss == 1) ImGui::TextColored(kDim, "STUN: asking %s...", kStunServer);
+    else if (ss == 2) ImGui::TextColored(g_stunOk ? kOk : kWarn, "%s", g_stunMsg.c_str());
     for (auto& p : g_pre) ImGui::TextColored(SevColor(p.sev), "%s", p.text.c_str());
     ImGui::PopStyleColor(3);
 }
@@ -606,6 +659,7 @@ void ParseArgs() {
         if (a == "--game-dir") A.gameDir = next(); else if (a == "--report") A.report = next(); else if (a == "--shot") A.shot = next();
         else if (a == "--payload") A.payload = next(); else if (a == "--exit-after") A.exitAfter = atoi(next().c_str());
         else if (a == "--ini") A.ini = next(); else if (a == "--set-role") A.setRole = next();
+        else if (a == "--install-dry") A.installDry = next();
         else if (a == "--no-launch") A.noLaunch = true; else if (a == "--auto-play") A.autoPlay = true;
     }
     LocalFree(w);
@@ -624,6 +678,13 @@ void Report() {
 
 int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int) {
     ParseArgs(); LoadSettings();
+    if (!A.installDry.empty()) {   // test flag: only Install()'s ini-key step on FILE (no copies, no game folder, no window)
+        const bool ok = FileExists(A.installDry) && ApplyInstallKeys(A.installDry);
+        Msg(ok, ok ? "install-dry: keys applied to " + A.installDry : "install-dry: could not write " + A.installDry);
+        LoadNet();   // report mode= from the file (pass --ini FILE too)
+        Report();
+        return ok ? 0 : 1;
+    }
     if (!A.gameDir.empty()) lstrcpynA(g_gameDir, A.gameDir.c_str(), MAX_PATH);
     if (!g_gameDir[0]) FindGame();
     CheckGame();
