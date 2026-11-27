@@ -3322,7 +3322,7 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
     __try {
         // Position + orientation of the entity. SetGlobalMatrixInternal writes the entity matrix and updates
         // the graphic node/skeleton unconditionally; only the physics components are touched when
-        // updatePhysics!=0 (verified at the 0x00528200 detour, and relied on by the entity-sync override
+        // updatePhysics!=0 (observed at the 0x00528200 detour - decomp/units.json receipt is UNVERIFIED-EVIDENCE, M-P3-2 - and relied on by the entity-sync override
         // which clears that same bool). PuppetPhysics=1 therefore keeps today's physics warp
         // (updatePhysics=true); PuppetPhysics=0 writes the matrix with updatePhysics=false -> render-only,
         // no capsule push, no physics invalidation. s.matrix is pack(1)/const, so copy to an aligned local.
@@ -11736,6 +11736,15 @@ static void ApplyGuards(const EntityPacket& pkt) {
                     continue;
                 }
             }
+            // M-P1-4: [Coop] UsedEntAllPaths (default 0) - the one-body-per-record check also covers the sticky and
+            // resolver picks (and objId==0 records), which skip the scan's usedEnt test above.
+            static int s_usedEntAll = -1;
+            if (s_usedEntAll < 0) s_usedEntAll = GetPrivateProfileIntA("Coop", "UsedEntAllPaths", 0, Paths::Ini()) != 0 ? 1 : 0;
+            if (s_usedEntAll) {
+                bool taken = false;
+                for (int u = 0; u < usedN; ++u) if (usedEnt[u] == (unsigned int)best) { taken = true; break; }
+                if (taken) { ++s_covStolen; continue; }
+            }
             if (usedN < MAX_SYNC_ENTITIES) usedEnt[usedN++] = (unsigned int)best;
             ++s_covMatched;
             if (plBand >= 0) ++s_plBandLinked[plBand];
@@ -13057,7 +13066,7 @@ static unsigned int FindHealthInAI(unsigned int ai) {
     if (!ai || !readable((void*)ai, 0x78)) return 0;
     unsigned int arr = *(unsigned int*)(ai + 0x70);
     unsigned int n   = *(unsigned short*)(ai + 0x76);
-    if (!arr || !readable((void*)arr, 4) || n == 0 || n > 64) return 0;
+    if (!arr || n == 0 || n > 64 || !readable((void*)arr, n * 4)) return 0;   // M-P2-3: prove the whole n*4 array, not 4 bytes
     for (unsigned int k = 0; k < n; ++k) {
         unsigned int svc = *(unsigned int*)(arr + k * 4);
         if (!svc || !readable((void*)svc, 0x70)) continue;
@@ -14929,6 +14938,7 @@ static uint64_t PuppetStampUs(const PlayerState& s, uint64_t nowUs) {
     const int64_t t = hostUs + best;
     return t > 0 ? (uint64_t)t : nowUs;
 }
+static uint32_t s_consecReorder = 0;   // M-P2-4: consecutive reorder drops (PuppetSeqResync)
 static uint32_t s_sameStamp = 0;   // [Coop] CaptureAtWrite + PuppetHostTime: packets merged into the newest (no new engine write)
 static void PushSnapshot(const PlayerState& s, uint64_t nowUs) {
     nowUs = PuppetStampUs(s, nowUs);
@@ -14945,11 +14955,22 @@ static void PushSnapshot(const PlayerState& s, uint64_t nowUs) {
                 g_snapCount = 0; g_snapHead = 0;
                 ++s_wipeCount;
             } else {
-                ++s_reorderDrops;                      // late/reordered packet: drop it, keep the buffer
-                return;
+                // M-P2-4: [Coop] PuppetSeqResync (default 0) - a peer restart with an old seq <= 1000 used to drop every
+                // new packet as a reorder until the new seq overtook the old one (frozen puppet). 30 consecutive
+                // "reorders" are treated as a restart instead.
+                static int s_seqResync = -1;
+                if (s_seqResync < 0) s_seqResync = GetPrivateProfileIntA("Coop", "PuppetSeqResync", 0, Paths::Ini()) != 0 ? 1 : 0;
+                if (s_seqResync && ++s_consecReorder >= 30) {
+                    g_snapCount = 0; g_snapHead = 0; s_consecReorder = 0;
+                    ++s_wipeCount;
+                } else {
+                    ++s_reorderDrops;                      // late/reordered packet: drop it, keep the buffer
+                    return;
+                }
             }
         }
     }
+    s_consecReorder = 0;
     g_snaps[g_snapHead].st = s;
     g_snaps[g_snapHead].t  = nowUs;
     g_snapHead = (g_snapHead + 1) % SNAP_MAX;
@@ -15026,7 +15047,7 @@ static bool ComputeInterpolated(uint64_t nowUs, PlayerState& out) {
             return true;
         }
     }
-    out = g_snaps[newestIdx].st; return true;         // shouldn't reach; be safe
+    out = g_snaps[newestIdx].st; return true;         // M-P3-7: reachable when PuppetHostTime=1 stamps step backwards - snaps to the newest sample
 }
 
 // True while the engine is streaming/loading a world. Guards puppet construction so we never build an
@@ -15334,7 +15355,7 @@ static void ProbeIdentityOnce() {
 // never the process. Nothing below is even reached unless [Coop] TransformProbe=1.
 // ============================================================================================
 const uintptr_t TP_PTR_LO      = 0x00010000u;   // user-space floor: never a valid object
-const uintptr_t TP_PTR_HI      = 0x7F000000u;   // ceiling we accept for object pointers
+const uintptr_t TP_PTR_HI      = 0xFFFF0000u;   // M-P3-5: top of 32-bit user space; readable() has no 2 GB cap (see its comment) - 0x7F000000 rejected valid >2 GB pointers
 const uintptr_t TP_CC_EXTENT   = 0x600;         // == the readable(cc, 0x600) probe already in this file
 const uintptr_t TP_CC_OFF_A    = 0x1A0;         // documented CC translation lane
 const uintptr_t TP_CC_OFF_B    = 0x1C0;         // documented CC basis/quaternion lane
@@ -15943,7 +15964,7 @@ static void DumpConfigOnce()
         // The Tune* values are floats (read with strtod, see ShipTuningTick); the dump shows the integer part.
         { "Coop", "TuneConeAngle", 120 }, { "Coop", "TuneConeRange", 350 }, { "Coop", "TuneMaxTime", 30 },
         { "Coop", "TuneAggroTime", 30 }, { "Coop", "TuneHull", 0 },
-        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 }, { "Coop", "WeaponSync", 0 }, { "Coop", "ShipPeerZ", 0 }, { "Coop", "ShipBindProbe", 0 }, { "Coop", "ShipSpawnProbe", 0 }, { "Coop", "ShipSpawnFire", 0 }, { "Coop", "ShipSpawnFirePid", 0 }, { "Coop", "SpawnCensus", 0 }, { "Coop", "SpawnReplayFire", 0 }, { "Coop", "SpawnReplayFirePid", 0 }, { "Coop", "SpawnShare", 0 }, { "Coop", "SpawnKeyBind", 0 }, { "Coop", "ShipClassBind", 0 }, { "Coop", "ShipClassBindSteal", 0 }, { "Coop", "SpawnShareRadiusM", 150 },{ "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "TableEvict", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "FastTravelCrashFix", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 },
+        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 }, { "Coop", "WeaponSync", 0 }, { "Coop", "ShipPeerZ", 0 }, { "Coop", "ShipBindProbe", 0 }, { "Coop", "ShipSpawnProbe", 0 }, { "Coop", "ShipSpawnFire", 0 }, { "Coop", "ShipSpawnFirePid", 0 }, { "Coop", "SpawnCensus", 0 }, { "Coop", "SpawnReplayFire", 0 }, { "Coop", "SpawnReplayFirePid", 0 }, { "Coop", "SpawnShare", 0 }, { "Coop", "SpawnKeyBind", 0 }, { "Coop", "ShipClassBind", 0 }, { "Coop", "ShipClassBindSteal", 0 }, { "Coop", "SpawnShareRadiusM", 150 },{ "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "TableEvict", 0 }, { "Coop", "UsedEntAllPaths", 0 }, { "Coop", "PuppetSeqResync", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "FastTravelCrashFix", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 },
         { "Coop", "CombatTest", 0 }, { "Coop", "CrashContext", 0 }, { "Coop", "CorpseKeepSec", 30 }, { "Coop", "CrowdProbeIntegrate", 1 },
         { "Coop", "CrowdProbeLiveKeys", 1 }, { "Coop", "DamageRelay", 0 }, { "Coop", "Diag", 0 },
         { "Coop", "DisableCrowd", 0 }, { "Coop", "DisablePuppetAI", 1 }, { "Coop", "DisableSpawns", 0 },
@@ -16952,7 +16973,7 @@ static void LogSetGlobalMatrixBody(uint32_t thisEnt, uint32_t sgmMatrix, uint32_
     }
 
     // Entity sync (NPCs + ships): override the RENDER for each synced entity, and clear `updatePhysics`
-    // so the override does NOT feed back into the entity's own physics (verified: SetGlobalMatrixInternal
+    // so the override does NOT feed back into the entity's own physics (UNVERIFIED-EVIDENCE per decomp/units.json, M-P3-2: SetGlobalMatrixInternal
     // 0x00528200 always writes the matrix, then only updates physics components when updatePhysics!=0).
     for (int i = 0; i < g_syncCount; ++i) {
         if (g_syncTargets[i].ent != thisEnt) continue;
