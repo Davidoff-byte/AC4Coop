@@ -12943,7 +12943,7 @@ static void KillNearestGuard() {
     unsigned int   flags = *(unsigned int*)(hp + 0x60);
     L("[Kill] health=%08X before life=%u/%u flags=%08X -> writing dead encoding\n", hp, life, maxv, flags);
     *(unsigned short*)(hp + 0x5C) = 0xFFFF;
-    *(unsigned int*)(hp + 0x60) = flags | 0x01000000u;
+    _InterlockedOr((volatile LONG*)(hp + 0x60), (LONG)0x01000000u);   // WR-16: atomic read-modify-write
     L("[Kill] health=%08X after  life=%u flags=%08X\n",
       hp, *(unsigned short*)(hp + 0x5C), *(unsigned int*)(hp + 0x60));
 }
@@ -13773,7 +13773,7 @@ static bool KillGuardEntityInner(Entity* e, bool notifyPeer, KillRefusal* why, b
         int rc = ((int (__thiscall*)(void*, int))0x19FB4C0)((void*)hp, -1);
         t_odRelay = 0;
         L("[KF] SetLife(-1) rc=%d  life %d -> %u\n", rc, prev, *(unsigned short*)(hp + 0x5C));
-        *(unsigned int*)(hp + 0x60) |= 0x01000000u;   // the engine sets this on death too
+        _InterlockedOr((volatile LONG*)(hp + 0x60), (LONG)0x01000000u);   // WR-16: atomic read-modify-write; engine sets this on death too
     }
     // Combat dead: the engine's is-alive (sub_133F550) checks bit 0x1000 at +4 of the service returned by
     // sub_10EF8C0(entity) (class 0x5EB03CEC, found in ai+0x5C). SetLife alone does NOT set it — verified
@@ -15616,7 +15616,7 @@ static void CombatTestKill() {
     __try {
         const unsigned int flags = *(unsigned int*)(bestHp + 0x60);
         *(unsigned short*)(bestHp + 0x5C) = (unsigned short)0xFFFF;
-        *(unsigned int*)(bestHp + 0x60)   = flags | 0x01000000u;
+        _InterlockedOr((volatile LONG*)(bestHp + 0x60), (LONG)0x01000000u);   // WR-16: atomic read-modify-write
         wrote = 1;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         L("[CT] EXC write 0x%08X\n", GetExceptionCode());
