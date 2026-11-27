@@ -48,7 +48,7 @@ const size_t    STEAL_LEN     = 6;            // mov ecx,[esi+disp32]
 //   0A  0F 84 <rel32>       jz   <reject>               ; null
 //   10  81 F9 00 00 01 00   cmp  ecx,0x00010000         ; cheap wild-pointer bound, low
 //   16  0F 82 <rel32>       jb   <reject>               ; below the bound
-//   1C  81 F9 00 00 00 7F   cmp  ecx,0x7F000000         ; cheap wild-pointer bound, high
+//   1C  81 F9 <imm32>       cmp  ecx,g_maxTargetPtr     ; wild-pointer bound, high (user VA top + 1)
 //   22  0F 83 <rel32>       jae  <reject>               ; at/above the bound
 //   28  8B 01               mov  eax,[ecx]              ; the object's vtable pointer
 //   2A  2D <imm32>          sub  eax,IMAGE_BASE         ; vtable - module base, as an unsigned delta
@@ -79,10 +79,23 @@ const size_t    STUB_REGION   = 448;          // 6 * 72 = 432, rounded so the sh
 const size_t    CAVE_SIZE     = 1024;         // 6*72 + 6*18 = 540 used; the rest is headroom
 const size_t    SITE_COUNT    = 6;
 
-// Wild-pointer bound for an object pointer. Anything outside [64 KiB, 0x7F000000) is not a heap
-// object on this build; in particular 0xFFFFFFFF (the observed sentinel) fails the high test.
+// Wild-pointer bound for an object pointer: [64 KiB, g_maxTargetPtr). WR-23: the high bound used to be
+// a literal 0x7F000000, but AC4BFSP.exe is LARGE_ADDRESS_AWARE (PE Characteristics 0x6F6E, bit 0x0020;
+// evidence ops/evidence/wr23-laa-2026-11-27.md), so heap objects above 2 GB are legal and were being
+// rejected as stale. The bound is now one past GetSystemInfo().lpMaximumApplicationAddress, read once
+// in Init() before any stub is built (0x7FFF0000 without LAA, 0xC0000000 on a /3GB boot, 0xFFFF0000
+// under WOW64). 0xFFFFFFFF (the observed sentinel) still fails the high test in every case.
 const uint32_t  MIN_TARGET_PTR = 0x00010000;
-const uint32_t  MAX_TARGET_PTR = 0x7F000000;
+uint32_t        g_maxTargetPtr = 0x7F000000;   // overwritten by Init() via ReadMaxTargetPtr()
+
+uint32_t ReadMaxTargetPtr()
+{
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    const uintptr_t hi = (uintptr_t)si.lpMaximumApplicationAddress;
+    // Exclusive bound; clamp so 0xFFFFFFFF can never be accepted even if the OS reported it.
+    return (hi >= 0xFFFFFFFEu) ? 0xFFFFFFFFu : (uint32_t)(hi + 1);
+}
 
 // Part B: the unchecked [node+0x114] loader at the head of the action-lane call chain that crashed
 // with EIP=0x0073448F, EDX=0xFFFFFFFF. It is NOT one of the six sites above, so the null guards do
@@ -432,12 +445,12 @@ void BuildStub(BYTE* stub, BYTE* shim, DWORD fieldOff, uintptr_t cont, uintptr_t
     stub[23] = 0x82;
     *reinterpret_cast<int32_t*>(stub + 24) = Rel32(stub + 28, reject);
 
-    // 1C  81 F9 <imm32>   cmp ecx,MAX_TARGET_PTR
+    // 1C  81 F9 <imm32>   cmp ecx,g_maxTargetPtr
     stub[28] = 0x81;
     stub[29] = 0xF9;
-    *reinterpret_cast<uint32_t*>(stub + 30) = MAX_TARGET_PTR;
+    *reinterpret_cast<uint32_t*>(stub + 30) = g_maxTargetPtr;
 
-    // 22  0F 83 <rel32>   jae <reject>     (ecx >= MAX_TARGET_PTR, unsigned)
+    // 22  0F 83 <rel32>   jae <reject>     (ecx >= g_maxTargetPtr, unsigned)
     stub[34] = 0x0F;
     stub[35] = 0x83;
     *reinterpret_cast<int32_t*>(stub + 36) = Rel32(stub + 40, reject);
@@ -1113,6 +1126,11 @@ void DerefGuard::Init()
     g_imageSize = sizeOfImage;
     Log("[DG] vtable range 0x%08X..0x%08X (module image)\n",
         (unsigned)g_imageBase, (unsigned)(g_imageBase + g_imageSize));
+
+    // WR-23: object-pointer high bound from the OS (LAA-aware), before any stub is built.
+    g_maxTargetPtr = ReadMaxTargetPtr();
+    Log("[DG] object pointer range 0x%08X..0x%08X (user VA)\n",
+        (unsigned)MIN_TARGET_PTR, (unsigned)g_maxTargetPtr);
 
     bool installedAny = false;
     if (nullGuard)  installedAny |= InstallNullGuards(game, moduleBase);
