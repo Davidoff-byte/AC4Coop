@@ -7,7 +7,8 @@
 //   request +0x08 ctx key, +0x0C owner, +0x10 spec, +0x18/+0x1C id. No transform field.
 //   spec    u16 +0x32 params count, +0x2C params array, first entry = AI SpawnShipParams (vt 0x0270A538); +0x3C = the
 //           spec's current request, overwritten by each submit (0x5B06C8) and read by spec vt slot 21 (sub_4F70A0) ->
-//           restored after our submit (the request dtor clears it only when it holds itself, 0x79C65B).
+//           NOT restored (2026-11-28, both restore variants crashed): we submit only on an IDLE spec (+0x3C == 0), so our
+//           request holds the slot exactly as an engine submit would (the request dtor clears it when it holds itself, 0x79C65B).
 //   built   sub_5BC470(client, req, ent) on the manager job thread (spawn_census.cpp DetSet) -> captured lock-free here.
 //   class   entity +0x9C (ReadShipClass, phase1.cpp). The class is NOT fixed per spec (addendum: template chosen at spawn
 //           time from world state + position), so want == got is a hard gate.
@@ -50,7 +51,7 @@ struct Fly { uintptr_t req, spec; uint64_t host; uint32_t cls; ULONGLONG t; int 
 ULONGLONG g_lastFire = 0, g_lastFrame = 0;
 struct Fail { ULONGLONG t0; int n; } g_fail[64];
 LONG c_captured = 0, c_want = 0, c_fired = 0, c_submit0 = 0, c_built = 0, c_classOk = 0, c_classMiss = 0, c_bound = 0,
-     c_noSpec = 0, c_failed = 0, c_gone = 0, c_badPtr = 0, c_restored = 0;
+     c_noSpec = 0, c_failed = 0, c_gone = 0, c_badPtr = 0, c_busy = 0;
 
 bool Readable(uintptr_t p, size_t n)   // VirtualQuery only: no fault, no __try
 {
@@ -229,8 +230,8 @@ void ShipSpawnReplayFrame(void* const* live, const uint32_t* liveCls, int liveN,
         s_next = now + 5000;
         int specs = 0; for (int c = 0; c < 64; ++c) specs += g_spec[c].valid;
         _snprintf_s(line, sizeof(line), _TRUNCATE,
-                    "[ShipSpawnReplay] stats want=%ld captured=%ld fired=%ld submit0=%ld built=%ld classOk=%ld classMiss=%ld bound=%ld pool=%d noSpec=%ld failed=%ld gone=%ld badPtr=%ld restored=%ld specs=%d queue=%d res=%d | localAI=%d boundTotal=%d\n",
-                    c_want, c_captured, c_fired, c_submit0, c_built, c_classOk, c_classMiss, c_bound, g_poolN, c_noSpec, c_failed, c_gone, c_badPtr, c_restored,
+                    "[ShipSpawnReplay] stats want=%ld captured=%ld fired=%ld submit0=%ld built=%ld classOk=%ld classMiss=%ld bound=%ld pool=%d noSpec=%ld failed=%ld gone=%ld badPtr=%ld busySkip=%ld specs=%d queue=%d res=%d | localAI=%d boundTotal=%d\n",
+                    c_want, c_captured, c_fired, c_submit0, c_built, c_classOk, c_classMiss, c_bound, g_poolN, c_noSpec, c_failed, c_gone, c_badPtr, c_busy,
                     specs, g_qN, g_resN, liveN, scbN);
         Phase1_LogLine(line);
     }
@@ -278,18 +279,22 @@ void ShipSpawnReplayFire()
         return;
     }
     const uintptr_t old = *(const uintptr_t*)(s.spec + 0x3C);
+    if (old) {   // busy spec: its single current-request slot holds the engine's own request -> never submit on it. Run 2026-11-28
+        // host 17860: submit on a busy spec + restore left an owner ship record {old request, our ship}; the old request was
+        // freed -> AV 0x1C27B15 (sub_1C27A90 <- sub_1C4BDC0 <- sub_1972150). Swap in an idle SpawnLib spec for the next fire.
+        ++c_busy;
+        uintptr_t sp = 0, spv = 0, ow = 0, owv = 0, cx = 0; uint32_t gc = 0;
+        if (SpawnLibPickShip(wq.cls, &sp, &spv, &ow, &owv, &cx, &gc)) s = { sp, spv, ow, owv, cx, now, 1, 1 };
+        return;
+    }
     g_ourReq = 0; t_tag = 1; SpawnShareReplayTag(1);
     const char submitted = ((char(__cdecl*)(uintptr_t, uintptr_t, uintptr_t, uint32_t, uint32_t))0x00569560)(s.spec, s.owner, s.ctx, 0, 0);
     SpawnShareReplayTag(0); t_tag = 0;
     const uintptr_t req = g_ourReq; g_ourReq = 0;
-    int restored = 0;
-    if (req && old && Readable(old, 0x14) && *(const uint32_t*)old == 0x01E6D77Cu && *(const uintptr_t*)(old + 0x10) == s.spec) {   // addendum 1, but ONLY when the old request is still a live request of this spec (2026-11-28: a blind restore re-installed a freed request -> 0x1C27B13 executed heap)
-        restored = (uintptr_t)InterlockedCompareExchange((volatile LONG*)(s.spec + 0x3C), (LONG)old, (LONG)req) == req ? 1 : 0;
-        if (restored) ++c_restored;
-    }
+    // No restore (addendum 1 withdrawn 2026-11-28): the spec was idle; our request holds its slot as an engine submit would.
     ++c_fired;
-    _snprintf_s(line, sizeof(line), _TRUNCATE, "[ShipSpawnReplay] req host=%016llX cls=%u item=%08X owner=%08X ctx=%08X -> submitted=%d req=%08X old3C=%08X restored=%d\n",
-                (unsigned long long)wq.host, wq.cls, (unsigned)s.spec, (unsigned)s.owner, (unsigned)s.ctx, (int)submitted, (unsigned)req, (unsigned)old, restored);
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[ShipSpawnReplay] req host=%016llX cls=%u item=%08X owner=%08X ctx=%08X -> submitted=%d req=%08X\n",
+                (unsigned long long)wq.host, wq.cls, (unsigned)s.spec, (unsigned)s.owner, (unsigned)s.ctx, (int)submitted, (unsigned)req);
     Phase1_LogLine(line);
     if (!submitted || !req) { ++c_submit0; NoteFail(wq.cls, now); return; }
     g_fly = { req, s.spec, wq.host, wq.cls, now, 1 };

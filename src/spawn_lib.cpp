@@ -64,7 +64,7 @@ Fly g_fly = {};
 struct Tried { uint64_t id; ULONGLONG t0; int n; } g_tried[kTried]; int g_triedN = 0;
 ULONGLONG g_lastFire = 0;
 LONG c_noted = 0, c_learned = 0, c_want = 0, c_fired = 0, c_submit0 = 0, c_built = 0, c_placed = 0, c_noSpec = 0, c_failed = 0,
-     c_badSpec = 0, c_follow = 0, c_cmd = 0;
+     c_badSpec = 0, c_follow = 0, c_cmd = 0, c_busy = 0;
 
 bool Readable(uintptr_t p, size_t n)   // VirtualQuery only: no fault, no __try
 {
@@ -111,7 +111,13 @@ bool Pick(int kind, uint64_t key, uint32_t cls, LibE* out, bool keyedOnly = fals
         int best = -1;
         for (int i = 0; i < n; ++i) if (cand[i].spec && (best < 0 || cand[i].t > cand[best].t)) best = i;
         if (best < 0) break;
-        if (SpecValid(cand[best])) { *out = cand[best]; return true; }
+        if (SpecValid(cand[best])) {
+            // Idle specs only: +0x3C is the spec's single current-request slot (submit sets it; the request dtor 0x79C640 clears
+            // it when it still holds itself). Run 2026-11-28 host 17860: a submit on a spec whose engine request was in flight
+            // (+ restore) left the owner's ship record {old request, our ship}; the old request was freed -> AV at 0x1C27B15.
+            if (*(const uintptr_t*)(cand[best].spec + 0x3C) == 0) { *out = cand[best]; return true; }
+            ++c_busy; cand[best].spec = 0; continue;
+        }
         ++c_badSpec;
         { Spin s; for (int i = 0; i < g_libN; ++i) if (g_lib[i].spec == cand[best].spec && g_lib[i].owner == cand[best].owner) g_lib[i].bad = 1; }
         cand[best].spec = 0;
@@ -291,10 +297,10 @@ void SpawnLibFire()
     static ULONGLONG s_stats = 0;
     if (now >= s_stats) {
         s_stats = now + 10000;
-        int ships = 0, npcs = 0, keyed = 0, learned = 0;
-        { Spin s; for (int i = 0; i < g_libN; ++i) { if (g_lib[i].bad) continue; if (g_lib[i].kind == K_SHIP) { ++ships; learned += g_lib[i].cls != 0; } else { ++npcs; keyed += g_lib[i].key != 0; } } }
-        Log("[SpawnLib] stats lib ships=%d (classKnown %d) npcs=%d (keyed %d) | want=%ld cmd=%ld follow=%ld fired=%ld submit0=%ld built=%ld placed=%ld noSpec=%ld failed=%ld badSpec=%ld queue=%d\n",
-            ships, learned, npcs, keyed, c_want, c_cmd, c_follow, c_fired, c_submit0, c_built, c_placed, c_noSpec, c_failed, c_badSpec, g_qN);
+        int ships = 0, npcs = 0, keyed = 0, learned = 0, idleS = 0, idleN = 0;
+        { Spin s; for (int i = 0; i < g_libN; ++i) { if (g_lib[i].bad) continue; const int idle = Readable(g_lib[i].spec, 0x40) && *(const uintptr_t*)(g_lib[i].spec + 0x3C) == 0; if (g_lib[i].kind == K_SHIP) { ++ships; learned += g_lib[i].cls != 0; idleS += idle; } else { ++npcs; keyed += g_lib[i].key != 0; idleN += idle; } } }
+        Log("[SpawnLib] stats lib ships=%d (classKnown %d idle %d) npcs=%d (keyed %d idle %d) | want=%ld cmd=%ld follow=%ld fired=%ld submit0=%ld built=%ld placed=%ld noSpec=%ld failed=%ld badSpec=%ld busySkip=%ld queue=%d\n",
+            ships, learned, idleS, npcs, keyed, idleN, c_want, c_cmd, c_follow, c_fired, c_submit0, c_built, c_placed, c_noSpec, c_failed, c_badSpec, c_busy, g_qN);
     }
     // 4. fire at most one request
     if (g_fly.active || g_qN == 0 || now - g_lastFire < kGapMs) return;
@@ -307,23 +313,20 @@ void SpawnLibFire()
     if (w.kind == K_SHIP) have = (w.cls && Pick(K_SHIP, 0, w.cls, &e)) || Pick(K_SHIP, 0, 0, &e);
     else if (w.key) have = Pick(K_NPC, w.key, 0, &e);
     else { have = Pick(K_NPC, 0, 0, &e, true) || Pick(K_NPC, 0, 0, &e); }   // prefer a keyed spec: the guest can follow it by key
-    if (!have) { ++c_noSpec; Log("[SpawnLib] no valid spec kind=%d cls=%u key=%016llX purpose=%d\n", w.kind, w.cls, (unsigned long long)w.key, w.purpose); return; }
+    static unsigned s_noSpecLog = 0;
+    if (!have) { ++c_noSpec; if (s_noSpecLog++ < 20) Log("[SpawnLib] no valid idle spec kind=%d cls=%u key=%016llX purpose=%d\n", w.kind, w.cls, (unsigned long long)w.key, w.purpose); return; }
     if (w.purpose == P_FOLLOW) TryCount(w.host);
-    const uintptr_t old = *(const uintptr_t*)(e.spec + 0x3C);   // spec validated in Pick (Readable 0x40)
+    const uintptr_t old = *(const uintptr_t*)(e.spec + 0x3C);   // 0: Pick returns idle specs only (spec Readable 0x40)
     g_ourReq = 0; t_tag = 1; SpawnShareReplayTag(1);
     const char submitted = ((char(__cdecl*)(uintptr_t, uintptr_t, uintptr_t, uint32_t, uint32_t))0x00569560)(e.spec, e.owner, e.ctx, 0, 0);
     SpawnShareReplayTag(0); t_tag = 0;
     const uintptr_t req = g_ourReq; g_ourReq = 0;
-    int restored = 0;
-    // Restore the spec's previous request ONLY if it is still a live request of this spec (vt 0x01E6D77C, +0x10 == spec).
-    // Run 2026-11-28 (guest 17552): a blind restore re-installed a FREED request; sub_1C27A90 (0x1C27B13) then called its
-    // vt[2] and executed heap memory. If the old one is gone, our request stays (its dtor clears the slot, 0x79C65B).
-    if (req && old && Readable(old, 0x14) && *(const uint32_t*)old == 0x01E6D77Cu && *(const uintptr_t*)(old + 0x10) == e.spec)
-        restored = (uintptr_t)InterlockedCompareExchange((volatile LONG*)(e.spec + 0x3C), (LONG)old, (LONG)req) == req ? 1 : 0;
+    // No restore: the spec was idle, our request now holds its slot exactly as an engine submit would (2026-11-28: both
+    // restore variants crashed - guest 17552 blind, host 17860 validated - see Pick).
     ++c_fired;
-    Log("[SpawnLib] req kind=%d purpose=%d spec=%08X owner=%08X ctx=%08X key=%016llX cls=%u(lib %u) host=%016llX -> submitted=%d req=%08X restored=%d\n",
+    Log("[SpawnLib] req kind=%d purpose=%d spec=%08X owner=%08X ctx=%08X key=%016llX cls=%u(lib %u) host=%016llX -> submitted=%d req=%08X old3C=%08X\n",
         w.kind, w.purpose, (unsigned)e.spec, (unsigned)e.owner, (unsigned)e.ctx, (unsigned long long)e.key, w.cls, e.cls, (unsigned long long)w.host,
-        (int)submitted, (unsigned)req, restored);
+        (int)submitted, (unsigned)req, (unsigned)old);
     if (!submitted || !req) { ++c_submit0; return; }
     g_fly.req = req; g_fly.ent = 0; g_fly.tBuilt = 0; g_fly.w = w; g_fly.spec = e.spec; g_fly.t = now; g_fly.active = 1;
 }
