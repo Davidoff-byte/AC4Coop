@@ -64,7 +64,7 @@ Fly g_fly = {};
 struct Tried { uint64_t id; ULONGLONG t0; int n; } g_tried[kTried]; int g_triedN = 0;
 ULONGLONG g_lastFire = 0;
 LONG c_noted = 0, c_learned = 0, c_want = 0, c_fired = 0, c_submit0 = 0, c_built = 0, c_placed = 0, c_noSpec = 0, c_failed = 0,
-     c_badSpec = 0, c_follow = 0, c_cmd = 0, c_busy = 0;
+     c_badSpec = 0, c_follow = 0, c_cmd = 0, c_busy = 0, c_unarmed = 0;
 
 bool Readable(uintptr_t p, size_t n)   // VirtualQuery only: no fault, no __try
 {
@@ -116,6 +116,19 @@ int SpecState(uintptr_t spec)   // -1 idle, -2 slot not a live request, else +0x
     if (!Readable(cur, 0x24) || *(const uint32_t*)cur != 0x01E6D77Cu || *(const uintptr_t*)(cur + 0x10) != spec) return -2;
     return (int)*(const uint32_t*)(cur + 0x20);
 }
+// Armed: spec+0x1C must hold an object with a readable vtable at build time. Every params class builds through
+// sub_46D6F0 (ship/playership vt[32]; npc vt[32] sub_18A03A0 and char vt[32] sub_189FDE0 call it), which does
+// sub_6B3CE0(sub_E05060(params) = params+4 = spec) = spec+0x1C ->vt[2](). Runs 2026-11-28 host 25716 + guest 24228:
+// the 2nd submit on one spec, after our 1st request had ended (request dtor 0x79C65B -> sub_4EDF60(0) -> spec vt[16]),
+// found spec+0x1C == 0 -> AV 0x6B3CE3 on the manager job thread on both copies.
+bool SpecArmed(uintptr_t spec)
+{
+    const uintptr_t a = *(const uintptr_t*)(spec + 0x1C);
+    if (!a || !Readable(a, 4)) return false;
+    const uintptr_t v = *(const uintptr_t*)a;
+    // vtable inside .rdata (0x01E3A000..0x0274274A) and vt[2] inside .text (0x00401000..0x01E399F2), AC4BFSP.exe section table
+    return v >= 0x01E3A000u && v < 0x0274274Au && Readable(v, 0x0C) && *(const uintptr_t*)(v + 8) >= 0x00401000u && *(const uintptr_t*)(v + 8) < 0x01E399F2u;
+}
 bool SpecUsableSt(int st)
 {
     if (st == -1) return true;
@@ -134,6 +147,7 @@ bool Pick(int kind, uint64_t key, uint32_t cls, LibE* out, bool keyedOnly = fals
         for (int i = 0; i < n; ++i) if (cand[i].spec && (best < 0 || cand[i].t > cand[best].t)) best = i;
         if (best < 0) break;
         if (SpecValid(cand[best])) {
+            if (!SpecArmed(cand[best].spec)) { ++c_unarmed; cand[best].spec = 0; continue; }   // see SpecArmed (not marked bad: may re-arm)
             if (SpecUsableSt(SpecState(cand[best].spec))) { *out = cand[best]; return true; }   // see SpecUsableSt
             ++c_busy; cand[best].spec = 0; continue;
         }
@@ -229,7 +243,7 @@ extern "C" void SpawnLibNoteBuilt(uintptr_t req, uintptr_t ent)   // C linkage: 
     for (int i = 0; i < g_libN; ++i) if (g_lib[i].spec == spec) { g_lib[i].cls = cls; InterlockedIncrement(&c_learned); }
 }
 
-bool SpawnLibSpecUsable(uintptr_t spec) { return SpecUsableSt(SpecState(spec)); }   // ship_spawn_replay.cpp (spec Readable 0x40 checked there)
+bool SpawnLibSpecUsable(uintptr_t spec) { return SpecArmed(spec) && SpecUsableSt(SpecState(spec)); }   // ship_spawn_replay.cpp (spec Readable 0x40 checked there)
 
 // ---- ship spec supply for ship_spawn_replay.cpp (player thread) ------------------------------------------------------
 bool SpawnLibPickShip(uint32_t cls, uintptr_t* spec, uintptr_t* specVt, uintptr_t* owner, uintptr_t* ownerVt, uintptr_t* ctx, uint32_t* gotCls)
@@ -319,10 +333,11 @@ void SpawnLibFire()
     static ULONGLONG s_stats = 0;
     if (now >= s_stats) {
         s_stats = now + 10000;
-        int ships = 0, npcs = 0, keyed = 0, learned = 0, idleS = 0, idleN = 0;
-        { Spin s; for (int i = 0; i < g_libN; ++i) { if (g_lib[i].bad) continue; const int idle = Readable(g_lib[i].spec, 0x40) && *(const uintptr_t*)(g_lib[i].spec + 0x3C) == 0; if (g_lib[i].kind == K_SHIP) { ++ships; learned += g_lib[i].cls != 0; idleS += idle; } else { ++npcs; keyed += g_lib[i].key != 0; idleN += idle; } } }
-        Log("[SpawnLib] stats lib ships=%d (classKnown %d idle %d) npcs=%d (keyed %d idle %d) | want=%ld cmd=%ld follow=%ld fired=%ld submit0=%ld built=%ld placed=%ld noSpec=%ld failed=%ld badSpec=%ld busySkip=%ld busyState(1/2/4/6/9/other/bad)=%ld/%ld/%ld/%ld/%ld/%ld/%ld pol=%ld queue=%d\n",
-            ships, learned, idleS, npcs, keyed, idleN, c_want, c_cmd, c_follow, c_fired, c_submit0, c_built, c_placed, c_noSpec, c_failed, c_badSpec, c_busy, c_st[0], c_st[1], c_st[2], c_st[3], c_st[4], c_st[5], c_st[6], g_busyPol, g_qN);
+        int ships = 0, npcs = 0, keyed = 0, learned = 0, idleS = 0, idleN = 0, armS = 0, armN = 0;
+        { Spin s; for (int i = 0; i < g_libN; ++i) { if (g_lib[i].bad) continue; const bool rd = Readable(g_lib[i].spec, 0x40); const int idle = rd && *(const uintptr_t*)(g_lib[i].spec + 0x3C) == 0; const int arm = rd && SpecArmed(g_lib[i].spec);
+            if (g_lib[i].kind == K_SHIP) { ++ships; learned += g_lib[i].cls != 0; idleS += idle; armS += arm; } else { ++npcs; keyed += g_lib[i].key != 0; idleN += idle; armN += arm; } } }
+        Log("[SpawnLib] stats lib ships=%d (classKnown %d idle %d armed %d) npcs=%d (keyed %d idle %d armed %d) | want=%ld cmd=%ld follow=%ld fired=%ld submit0=%ld built=%ld placed=%ld noSpec=%ld failed=%ld badSpec=%ld busySkip=%ld unarmedSkip=%ld busyState(1/2/4/6/9/other/bad)=%ld/%ld/%ld/%ld/%ld/%ld/%ld pol=%ld queue=%d\n",
+            ships, learned, idleS, armS, npcs, keyed, idleN, armN, c_want, c_cmd, c_follow, c_fired, c_submit0, c_built, c_placed, c_noSpec, c_failed, c_badSpec, c_busy, c_unarmed, c_st[0], c_st[1], c_st[2], c_st[3], c_st[4], c_st[5], c_st[6], g_busyPol, g_qN);
     }
     // 4. fire at most one request
     if (g_fly.active || g_qN == 0 || now - g_lastFire < kGapMs) return;
