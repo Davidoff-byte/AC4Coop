@@ -8453,7 +8453,7 @@ static unsigned s_wbNeed = 0, s_wbExact = 0, s_wbWide = 0, s_wbNoArch = 0, s_wbF
 static float    s_wbFarMin = 1e9f;   // nearest same-archetype free body that was beyond the radius (m)
 static unsigned s_wbFarLinked = 0, s_wbBeyond[3] = {};   // round-3 links; beyond-R nearest in 12-20 / 20-40 / >=40 m
 
-bool SpawnKeyBindOn(); uint64_t SpawnKeyForHostObj(uint64_t); uintptr_t SpawnEntityOfKey(uint64_t);   // spawn_census.cpp
+bool SpawnKeyBindOn(); uint64_t SpawnKeyForHostObj(uint64_t); uintptr_t SpawnEntityOfKey(uint64_t); void SpawnLibWantKey(uint64_t, uint64_t);   // spawn_census.cpp
 static unsigned s_wbKey = 0, s_wbKeyNoLocal = 0, s_wbKeyNotFree = 0, s_wbKeyArchDiff = 0, s_wbKeyUnknown = 0;
 
 static void WideBindPrepass(const EntityPacket& pkt, World* world, Entity* player) {
@@ -8529,10 +8529,10 @@ static void WideBindPrepass(const EntityPacket& pkt, World* world, Entity* playe
             const uint64_t k = SpawnKeyForHostObj(need[a].objId);
             if (!k) { ++s_wbKeyUnknown; continue; }
             const uintptr_t le = SpawnEntityOfKey(k);
-            if (!le) { ++s_wbKeyNoLocal; continue; }
+            if (!le) { ++s_wbKeyNoLocal; SpawnLibWantKey(k, need[a].objId); continue; }   // [Coop] SpawnLib follow: replay our spec for k
             int hit = -1;
             for (int b = 0; b < nC; ++b) if (!cand[b].taken && (uintptr_t)cand[b].e == le) { hit = b; break; }
-            if (hit < 0) { ++s_wbKeyNotFree; continue; }
+            if (hit < 0) { ++s_wbKeyNotFree; SpawnLibWantKey(k, need[a].objId); continue; }   // body taken/gone: one more of the same
             if (cand[hit].arch != need[a].arch) ++s_wbKeyArchDiff;
             const float dx = cand[hit].pos[0] - need[a].pos[0], dy = cand[hit].pos[1] - need[a].pos[1], dz = cand[hit].pos[2] - need[a].pos[2];
             need[a].cand = hit; need[a].d2 = dx * dx + dy * dy + dz * dz; cand[hit].taken = true;
@@ -16544,6 +16544,7 @@ static void __cdecl OnFrame(Human* updatedHuman) {
         DespawnPuppetDeferred();      // [Coop] DespawnLeaveFight: RemoveFighter (no-op unless queued)
         HostilityRefreshDeferred();   // CaptureGuards' hostility cache (no-op unless queued)
         ShipSpawnReplayFire();        // [Coop] ShipSpawnReplay (no-op unless queued)
+        { void SpawnLibFire(); SpawnLibFire(); }   // [Coop] SpawnLib: on-demand / follow spawns (no-op unless queued)
     }
     InterlockedCompareExchange(&s_playerWorkTid, 0, (LONG)GetCurrentThreadId());   // player work over (if it was ours)
 }
@@ -16578,7 +16579,7 @@ static void DumpConfigOnce()
         // The Tune* values are floats (read with strtod, see ShipTuningTick); the dump shows the integer part.
         { "Coop", "TuneConeAngle", 120 }, { "Coop", "TuneConeRange", 350 }, { "Coop", "TuneMaxTime", 30 },
         { "Coop", "TuneAggroTime", 30 }, { "Coop", "TuneHull", 0 },
-        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 }, { "Coop", "WeaponSync", 0 }, { "Coop", "ShipPeerZ", 0 }, { "Coop", "ShipBindProbe", 0 }, { "Coop", "ShipSpawnProbe", 0 }, { "Coop", "ShipSpawnFire", 0 }, { "Coop", "ShipSpawnFirePid", 0 }, { "Coop", "SpawnCensus", 0 }, { "Coop", "SpawnReplayFire", 0 }, { "Coop", "SpawnReplayFirePid", 0 }, { "Coop", "SpawnShare", 0 }, { "Coop", "SpawnKeyBind", 0 }, { "Coop", "ShipClassBind", 0 }, { "Coop", "ShipClassBindSteal", 0 }, { "Coop", "SpawnShareRadiusM", 150 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "TableEvict", 0 }, { "Coop", "UsedEntAllPaths", 0 }, { "Coop", "PuppetSeqResync", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "FastTravelCrashFix", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 }, { "Coop", "PuppetListener", 0 }, { "Coop", "PuppetListenerAttach", 0 }, { "Coop", "PuppetMaxLife", 0 }, { "Coop", "ConflictProbe", 0 }, { "Coop", "OwnSnapAtTarget", 0 }, { "Coop", "PuppetWorldDropRef", 0 }, { "Coop", "PadIdPreferOffered", 0 }, { "Coop", "GuardPerceivePuppet", 0 },
+        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 }, { "Coop", "WeaponSync", 0 }, { "Coop", "ShipPeerZ", 0 }, { "Coop", "ShipBindProbe", 0 }, { "Coop", "ShipSpawnProbe", 0 }, { "Coop", "ShipSpawnFire", 0 }, { "Coop", "ShipSpawnFirePid", 0 }, { "Coop", "SpawnCensus", 0 }, { "Coop", "SpawnReplayFire", 0 }, { "Coop", "SpawnReplayFirePid", 0 }, { "Coop", "SpawnShare", 0 }, { "Coop", "SpawnKeyBind", 0 }, { "Coop", "SpawnLib", 0 }, { "Coop", "SpawnLibFollow", 1 }, { "Coop", "SpawnCmdSeq", 0 }, { "Coop", "SpawnCmdPid", 0 }, { "Coop", "ShipClassBind", 0 }, { "Coop", "ShipClassBindSteal", 0 }, { "Coop", "SpawnShareRadiusM", 150 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "TableEvict", 0 }, { "Coop", "UsedEntAllPaths", 0 }, { "Coop", "PuppetSeqResync", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "FastTravelCrashFix", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 }, { "Coop", "PuppetListener", 0 }, { "Coop", "PuppetListenerAttach", 0 }, { "Coop", "PuppetMaxLife", 0 }, { "Coop", "ConflictProbe", 0 }, { "Coop", "OwnSnapAtTarget", 0 }, { "Coop", "PuppetWorldDropRef", 0 }, { "Coop", "PadIdPreferOffered", 0 }, { "Coop", "GuardPerceivePuppet", 0 },
         { "Coop", "ShipSpawnReplay", 0 },
         { "Coop", "ShipFields", 0 }, { "Coop", "HelmBoth", 0 }, { "Coop", "BoardingForce", 0 }, { "Coop", "PlayerFrameFallback", 0 },
         { "Coop", "CombatTest", 0 }, { "Coop", "CrashContext", 0 }, { "Coop", "CorpseKeepSec", 30 }, { "Coop", "CrowdProbeIntegrate", 1 },
@@ -16669,6 +16670,7 @@ static void DumpConfigOnce()
     struct S { const char* s; const char* k; const char* d; };
     static const S skeys[] = {
         { "Coop", "PuppetFightStimIds", "257" }, { "Coop", "PuppetStimIds", "48,49" }, { "Coop", "CallTraceVt", "" },   // call_trace.cpp:70
+        { "Coop", "SpawnCmd", "" },                                                                   // spawn_lib.cpp
         { "Net", "BindIP", "auto" }, { "Net", "EosCode", "" }, { "Net", "EosIni", nullptr },     // <bridge dir>\eos.ini
         { "Net", "EosRelay", "allow" }, { "Net", "EosRole", nullptr },                           // "host" (net.cpp) / "" (overlay.cpp)
         { "Net", "JoinCode", "" }, { "Net", "Mode", "manual" }, { "Net", "RelayRoom", "" }, { "Net", "RelayServer", "" },

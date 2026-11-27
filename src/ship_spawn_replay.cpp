@@ -24,6 +24,7 @@ bool Phase1_InSave();
 uint64_t Phase1_ScbHostOf(uintptr_t guestShip);
 bool SpawnCensusCtxOf(uintptr_t req, uintptr_t* ctx);   // spawn_census.cpp: ctx argument DetFac saw for this request
 void SpawnShareReplayTag(int v);                        // spawn_census.cpp: SpawnShareDecide passes requests we submit
+bool SpawnLibPickShip(uint32_t cls, uintptr_t* spec, uintptr_t* specVt, uintptr_t* owner, uintptr_t* ownerVt, uintptr_t* ctx, uint32_t* gotCls);   // spawn_lib.cpp
 
 namespace {
 constexpr uint32_t kShipVt = 0x01E4A128u;         // ship entity vtable (phase1.cpp ShipClassBind)
@@ -247,6 +248,14 @@ void ShipSpawnReplayFire()
     int pick = -1;
     for (int i = 0; i < g_qN; ++i) {
         const uint32_t cls = g_q[i].cls;
+        if (cls < 64 && !g_spec[cls].valid) {   // [Coop] SpawnLib: newest VALID spec of this class, else of any ship class
+            uintptr_t sp = 0, spv = 0, ow = 0, owv = 0, cx = 0; uint32_t gc = 0;
+            if (SpawnLibPickShip(cls, &sp, &spv, &ow, &owv, &cx, &gc)) {
+                g_spec[cls] = { sp, spv, ow, owv, cx, now, 1, 1 };
+                char ln[200]; _snprintf_s(ln, sizeof(ln), _TRUNCATE, "[ShipSpawnReplay] spec from SpawnLib want=%u libClass=%u spec=%08X owner=%08X\n", cls, gc, (unsigned)sp, (unsigned)ow);
+                Phase1_LogLine(ln);
+            }
+        }
         if (cls >= 64 || !g_spec[cls].valid) { if (!g_q[i].noSpecCounted) { g_q[i].noSpecCounted = 1; ++c_noSpec; } continue; }
         if (GaveUp(cls, now)) continue;
         if (pick < 0 || g_q[i].t < g_q[pick].t) pick = i;

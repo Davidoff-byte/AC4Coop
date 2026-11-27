@@ -40,6 +40,7 @@ DWORD g_tF = 0, g_tR = 0, g_tA = 0, g_tD = 0;
 volatile LONG g_lock = 0, g_lines = 0, g_watch = 0;
 bool g_keyBind = false;    // [Coop] SpawnKeyBind (see the end of this file)
 DWORD g_tSet = 0;          // trampoline of sub_5BC470 (request <- built entity)
+bool g_libFlag = false;    // [Coop] SpawnLib hooks requested and installed (spawn_lib.cpp)
 bool g_share = false;      // [Coop] SpawnShare (see the SpawnShare section at the end of this file)
 float g_shareR = 150.f;    // [Coop] SpawnShareRadiusM
 
@@ -242,7 +243,7 @@ uintptr_t __fastcall DetFac(void* self, void*, uintptr_t ctx, uintptr_t item)
             c.req = 0; c.ctx = ctx; c.item = item; c.itemVt = item ? *(const uintptr_t*)item : 0; c.owner = 0;
             c.idLo = c.idHi = 0; c.t = GetTickCount64(); c.printed = 0; c.req = req;
         }
-        { void ShipReplayNoteFac(uintptr_t); ShipReplayNoteFac(req); }   // [Coop] ShipSpawnReplay: our own submit's request (tagged thread)
+        { void ShipReplayNoteFac(uintptr_t); ShipReplayNoteFac(req); void SpawnLibNoteFac(uintptr_t); SpawnLibNoteFac(req); }   // [Coop] ShipSpawnReplay: our own submit's request (tagged thread)
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
     return req;
 }
@@ -310,7 +311,9 @@ void SpawnCensusInit()
     const bool shareFlag = GetPrivateProfileIntA("Coop", "SpawnShare", 0, Paths::Ini()) != 0;
     int ShipSpawnReplayInitFlag(); void ShipSpawnReplaySetHooked(bool);
     const bool ssr = ShipSpawnReplayInitFlag() != 0;   // [Coop] ShipSpawnReplay needs DetFac + DetSrc + DetSet
-    if (!census && !g_keyBind && !shareFlag && !ssr) return;   // SpawnKeyBind / SpawnShare need the request hooks below
+    int SpawnLibInitFlag(); void SpawnLibSetHooked(bool);
+    g_libFlag = SpawnLibInitFlag() != 0;               // [Coop] SpawnLib (spawn_lib.cpp) needs DetFac + DetSrc + DetR + DetSet
+    if (!census && !g_keyBind && !shareFlag && !ssr && !g_libFlag) return;   // SpawnKeyBind / SpawnShare need the request hooks below
     const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)GameModuleBase;
     const IMAGE_NT_HEADERS32* nt = (const IMAGE_NT_HEADERS32*)(GameModuleBase + dos->e_lfanew);
     g_lo = GameModuleBase + nt->OptionalHeader.BaseOfCode;
@@ -331,8 +334,9 @@ void SpawnCensusInit()
     // sub_5BC470(client, req, entity), thiscall retn 8: the manager job stores the built entity into its request
     // (0x005C57A9 in sub_5C5770; the job object IS the request: 0x79B8D0 sets req+0x20 = 1, sub_5C5770 sets +0x20 = 2).
     static const BYTE pSet[7] = { 0x55, 0x8B, 0xEC, 0x53, 0x56, 0x8B, 0xF1 };
-    const bool set = (g_keyBind || shareFlag || ssr) && Install(0x005BC470, pSet, 7, (void*)&DetSet, &g_tSet, "RequestSetEntity");
+    const bool set = (g_keyBind || shareFlag || ssr || g_libFlag) && Install(0x005BC470, pSet, 7, (void*)&DetSet, &g_tSet, "RequestSetEntity");
     if (ssr) ShipSpawnReplaySetHooked(fac && src && set);
+    if (g_libFlag) { g_libFlag = fac && src && set && r; SpawnLibSetHooked(g_libFlag); }
     g_keyBind = g_keyBind && r && fac && src && set;
     g_share = shareFlag && r && fac && src;   // the lane is checked at use: Net::Init runs after this init (run 2026-11-25 13:5x)
     { char rb[32]; GetPrivateProfileStringA("Coop", "SpawnShareRadiusM", "150", rb, sizeof(rb), Paths::Ini()); g_shareR = (float)atof(rb); }
@@ -697,7 +701,7 @@ volatile LONG k_req = 0, k_ent = 0, k_entNoKey = 0, k_pub = 0, k_rx = 0, k_hostN
 }
 void SpawnKeyNoteReq(uintptr_t req)
 {
-    if (!g_keyBind && !g_share) return;
+    if (!g_keyBind && !g_share && !g_libFlag) return;
     Cap c = {}; if (!CapFor(req, c) || !c.item) return;
     uint64_t key = 0; float w[3], loc[3]; uintptr_t anc = 0;
     int kind = SpawnPoint(c.item, w, loc, &anc);
@@ -705,10 +709,12 @@ void SpawnKeyNoteReq(uintptr_t req)
     if (kind == 1 && avt == 0x01E4CE90u) key = KeyOf(w); else if (kind == 1) kind = 4;
     RK& r = g_rk[(InterlockedIncrement(&g_rkPos) - 1) & (kRK - 1)]; r.req = 0; r.key = key; r.kind = kind; r.anc = anc; r.avt = avt; r.loc[0] = loc[0]; r.loc[1] = loc[1]; r.loc[2] = loc[2]; r.req = req;
     InterlockedIncrement(&k_req);
+    if (g_libFlag) { void SpawnLibNoteSubmit(uintptr_t, uintptr_t, uintptr_t, uint64_t); SpawnLibNoteSubmit(c.item, c.owner, c.ctx, key); }   // [Coop] SpawnLib
 }
 extern "C" void __cdecl SpawnKeyNoteEnt(const uint32_t* esp)   // esp[1] = request, esp[2] = entity
 {
     { void ShipReplayNoteEnt(uintptr_t, uintptr_t); ShipReplayNoteEnt(esp[1], esp[2]); }   // [Coop] ShipSpawnReplay capture (lock-free)
+    if (g_libFlag) { void SpawnLibNoteBuilt(uintptr_t, uintptr_t); SpawnLibNoteBuilt(esp[1], esp[2]); }   // [Coop] SpawnLib (lock-free reads)
     if (!g_keyBind) return;
     const uintptr_t req = esp[1], ent = esp[2];
     if (!req || !ent) return;
