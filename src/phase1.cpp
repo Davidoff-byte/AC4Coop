@@ -13943,11 +13943,11 @@ static bool KillGuardEntityInner(Entity* e, bool notifyPeer, KillRefusal* why, b
     return engineDead;
 }
 
-// ini [Coop] GuestKillMirror (default 1): let the guest run the real engine kill on a mirrored guard.
+// ini [Coop] GuestKillMirror (default 0 since M-P2-6; the shipped AC4Coop.ini sets 1, the tested value): let the guest run the real engine kill on a mirrored guard.
 static int s_guestKillMirror = -1;
 static int GuestKillMirrorEnabled() {
     if (s_guestKillMirror < 0)
-        s_guestKillMirror = GetPrivateProfileIntA("Coop", "GuestKillMirror", 1, Paths::Ini());
+        s_guestKillMirror = GetPrivateProfileIntA("Coop", "GuestKillMirror", 0, Paths::Ini());   // M-P2-6: default 0 (policy); the template ini ships 1
     return s_guestKillMirror;
 }
 
@@ -15981,7 +15981,7 @@ static void DumpConfigOnce()
         { "Coop", "EntitySelfTestOffset", 0 }, { "Coop", "EntitySync", 0 }, { "Coop", "FixNullReturn", 1 },
         { "Coop", "ForceUnknownBuild", 0 }, { "Coop", "GhostMarkerSuppress", 1 }, { "Coop", "GhostProxy", 0 },
         { "Coop", "GuardNullActionTarget", 0 }, { "Coop", "GuardNullTarget", 1 }, { "Coop", "GuardAnimFull", 0 }, { "Coop", "GuardBlendFix", 0 }, { "Coop", "GuardStaleReturn", 0 }, { "Coop", "GuardStaleTarget", 1 },
-        { "Coop", "GuestKillMirror", 1 }, { "Coop", "HelmSync", 0 }, { "Coop", "HookSgm", 1 }, { "Coop", "HostileOnly", 0 },
+        { "Coop", "GuestKillMirror", 0 }, { "Coop", "HelmSync", 0 }, { "Coop", "HookSgm", 1 }, { "Coop", "HostileOnly", 0 },
         { "Coop", "HybridLoco", 1 }, { "Coop", "IdentityBand", 0 }, { "Coop", "IdResolver", 1 },
         { "Coop", "InstallHooks", 1 }, { "Coop", "IntegratePuppet", 0 }, { "Coop", "KillTrace", 1 },
         { "Coop", "KrLog", 0 }, { "Coop", "LegacyPadIdHook", 1 }, { "Coop", "MirrorActions", 1 }, { "Coop", "MirrorActionsDeferred", 1 }, { "Coop", "OwnPhysicsMs", 0 }, { "Coop", "OwnUpdateGuards", 0 }, { "Coop", "OwnUpdatePuppet", 0 }, { "Coop", "MinBlendInMs", 100 },
