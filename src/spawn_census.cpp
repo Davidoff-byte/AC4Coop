@@ -271,6 +271,21 @@ __declspec(naked) void DetSet()   // sub_5BC470 entry: [esp+4] = request, [esp+8
             jmp dword ptr [g_tSet] }
 }
 
+// [Coop] SpawnLib: sub_501DF0 = SpawningSpecification dtor body (thiscall, ecx = spec; called by the deleting dtor vt[0]
+// sub_504560 and by owners of embedded specs). It releases +0x24/+0x28/+0x2C/+0x34/+0x38 and never touches the request
+// in +0x3C, so a queued request of ours would build from freed memory (run T5 guest 29392, AV 0x69D0A5).
+DWORD g_tSpecDt = 0;
+extern "C" void SpawnLibSpecDying(uintptr_t spec);   // spawn_lib.cpp
+__declspec(naked) void DetSpecDtor()
+{
+    __asm { pushad
+            push ecx
+            call SpawnLibSpecDying
+            add esp, 4
+            popad
+            jmp dword ptr [g_tSpecDt] }
+}
+
 bool Install(uintptr_t va, const BYTE* pro, int n, void* det, DWORD* slot, const char* name)
 {
     BYTE* site = (BYTE*)(GameModuleBase + (va - 0x00400000));
@@ -336,7 +351,10 @@ void SpawnCensusInit()
     static const BYTE pSet[7] = { 0x55, 0x8B, 0xEC, 0x53, 0x56, 0x8B, 0xF1 };
     const bool set = (g_keyBind || shareFlag || ssr || g_libFlag) && Install(0x005BC470, pSet, 7, (void*)&DetSet, &g_tSet, "RequestSetEntity");
     if (ssr) ShipSpawnReplaySetHooked(fac && src && set);
-    if (g_libFlag) { g_libFlag = fac && src && set && r; SpawnLibSetHooked(g_libFlag); }
+    // sub_501DF0 prologue (IDA): 55 push ebp / 8B EC mov ebp,esp / 51 push ecx / 53 push ebx / 56 push esi (6 bytes)
+    static const BYTE pSpecDt[6] = { 0x55, 0x8B, 0xEC, 0x51, 0x53, 0x56 };
+    const bool specDt = g_libFlag && Install(0x00501DF0, pSpecDt, 6, (void*)&DetSpecDtor, &g_tSpecDt, "SpecDtor");
+    if (g_libFlag) { g_libFlag = fac && src && set && r && specDt; SpawnLibSetHooked(g_libFlag); }
     g_keyBind = g_keyBind && r && fac && src && set;
     g_share = shareFlag && r && fac && src;   // the lane is checked at use: Net::Init runs after this init (run 2026-11-25 13:5x)
     { char rb[32]; GetPrivateProfileStringA("Coop", "SpawnShareRadiusM", "150", rb, sizeof(rb), Paths::Ini()); g_shareR = (float)atof(rb); }
