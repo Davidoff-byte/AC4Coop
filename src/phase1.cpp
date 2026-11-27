@@ -11825,7 +11825,13 @@ static void ApplyGuards(const EntityPacket& pkt) {
                     CombatTiming::ScopeBody(bh, best, es.objId);
                     CombatTiming::GuestGuardRx(es.objId, best, es.actionAlias, es.anim.ratioQ, pkt.hostMs);
                 }
-                const bool ownWrites = bh && !s_selfTestMode && (OwnGuardsOn() || place) && !OwnStarved(bh);
+                // CR-5 fix: when OwnGuardsOn() is true, the guard's own update (OwnDrain) handles the write
+                // via the per-frame blend. Falling back to the legacy direct snap when starved (OwnStarved)
+                // fights the blend and causes jitter (scored worse: 11.78 m vs 2.02 m). So when OwnGuardsOn()
+                // is true, ignore OwnStarved and never take the legacy direct-write path — the guard catches
+                // up when its own update runs. When OwnGuardsOn() is false, keep the original behaviour.
+                const bool ownStarved = OwnStarved(bh) && !OwnGuardsOn();
+                const bool ownWrites = bh && !s_selfTestMode && (OwnGuardsOn() || place) && !ownStarved;
                 PlaceNoteLinked(best, es, place && ownWrites ? (OwnPlaceApproaching(bh) ? 1 : 0)
                                                              : (BindApproachActive((unsigned int)best) ? 1 : 0));
                 // [Coop] BindLock: a body linked up to BindRadiusM away from its host guard used to SNAP there (scorecard
