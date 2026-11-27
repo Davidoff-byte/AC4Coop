@@ -22,6 +22,7 @@
 #include "guard_brain.h"        // [Coop] Brain: shared-brain command lane + player (S0/S2)
 #include "peer_clock.h"         // [Coop] PeerClock: shared host clock (S0)
 #include "ground_tick_probe.h"   // [Coop] GroundTickProbe: R1, does the Ground statechart tick on guard copies
+#include "pose_sync.h"          // [Coop] PoseSync: F3 pose parity (default 0)
 #include <windows.h>
 #include <cstdint>
 #include <cstdio>
@@ -3685,6 +3686,7 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
 void Phase1::DespawnPuppet() {
     if (!g_puppet) return;
     Entity* dead = g_puppet;
+    PoseSync::ForgetPuppet();   // [Coop] PoseSync: stop applying to its skeleton before anything else
     g_puppet = nullptr;      // stop driving it right away, before the deferred removal runs
     PuppetOwnClear();        // and stop the own-update re-assert / probe
     g_blockReg = nullptr;    // clear the pad-suppression marker
@@ -15926,6 +15928,8 @@ static void DumpConfigOnce()
         { "Coop", "VPadTest", 0 }, { "Coop", "WatchDeadBit", 0 }, { "Coop", "WatchTarget", 0 },
         { "Coop", "HookFrame", 1 }, { "Coop", "HookPad", 1 }, { "Coop", "HookWindowed", 1 }, { "Coop", "ActMatchProbe", 0 }, { "Coop", "FightIntents", 0 }, { "Coop", "SpawnerIdProbe", 0 }, { "Coop", "OwnerDamage", 0 },
         { "Coop", "HookMultiInstance", 1 },
+        { "Coop", "PoseSync", 0 }, { "Coop", "PoseSyncApply", 0 }, { "Coop", "PoseSyncApplyTrans", 1 }, { "Coop", "PoseSyncHz", 10 },
+        { "Coop", "PoseSyncBlendPct", 100 }, { "Coop", "PoseSyncMaxAgeMs", 500 }, { "Coop", "PoseSyncLoopback", 0 },
         { "Display", "Borderless", 0 }, { "Display", "ForceWindowedMs", 5000 }, { "Display", "Fullscreen", 0 },
         { "Net", "Enabled", 0 }, { "Net", "InterpDelayMs", 100 }, { "Net", "InterpMaxExtrapMs", 100 },
         { "Net", "Interpolation", 1 }, { "Net", "LocalPort", 47801 }, { "Net", "PeerPort", 47801 },
@@ -16340,6 +16344,7 @@ static void OnFrameInner(Human* updatedHuman) {
     { extern void CoordEnumTick(); CoordEnumTick(); }           // [Coop] CoordEnum (default 0): read-only coordinator census
     { extern void FortDamageTestTick(); FortDamageTestTick(); } // [Coop] FortDamageTest (default 0): one-shot damage->disable->phase oracle
     CoordSyncTick();                                            // [Coop] CoordSync (default 0): host publishes GcLShip fields
+    PoseSync::Tick((Entity*)updatedHuman, g_puppet);            // [Coop] PoseSync (default 0): no-op unless set
     if (Net::Enabled()) {
         EntitySyncTick();   // host broadcasts entity transforms; peer mirrors them (synced worlds)
         // Capture only succeeds in a real playable world (not title/whiteroom). Require it to be
@@ -16556,6 +16561,7 @@ static void OnFrameInner(Human* updatedHuman) {
         if (g_puppet) {
             if (!puppetAlive) {                          // entity was freed (world change / teardown)
                 L("[Net] puppet entity gone -> drop ref\n");
+                PoseSync::ForgetPuppet();   // [Coop] PoseSync: no-op unless set
                 g_puppet = nullptr; g_blockReg = nullptr; g_puppetWorldId = 0; g_puppetVtbl = nullptr;
                 PuppetOwnClear();                        // as DespawnPuppet does: stop OwnDrain / Phase1_PuppetEntity using the freed body (review 2026-11-14 part 2)
                 g_lastRemoteCtx = -1;                    // fresh puppet next time -> re-apply first context

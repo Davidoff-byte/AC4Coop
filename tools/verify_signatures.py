@@ -119,6 +119,9 @@ IAT_SITES = [
 CALL_SITES = [
     ("CreateSwapChain call", 0x0094A1D7, bytes.fromhex("8B 52 28 57 51 50 FF D2"), "mov edx,[edx+28h]; push edi,ecx,eax; call edx"),
     ("factory thunk", 0x00976220, bytes.fromhex("FF 25 18 A6 E3 01"), "jmp [0x01E3A618]"),
+    # src/pose_sync.cpp ([Coop] PoseSync): the compose call in sub_453330 redirected to ComposeThunk. The plugin
+    # re-checks these 10 bytes at install time and refuses to patch on any difference.
+    ("pose compose call", 0x0045349A, bytes.fromhex("52 50 E8 AF 5C 31 00 5F 5E C3"), "push edx; push eax; call sub_769150; pop edi; pop esi; retn"),
 ]
 
 

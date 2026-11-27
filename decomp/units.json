@@ -9,6 +9,15 @@
    "size": 153,
    "status": "unknown"
   },
+  "0044DB80": {
+   "addr": "0044DB80",
+   "claimed_at": null,
+   "name": "SkeletonBoneIndexByHash",
+   "owner": null,
+   "receipts": [],
+   "size": 99,
+   "status": "unknown"
+  },
   "0045ABB0": {
    "addr": "0045ABB0",
    "claimed_at": null,
@@ -590,6 +599,33 @@
    "size": 192,
    "status": "claimed"
   },
+  "00758C30": {
+   "addr": "00758C30",
+   "claimed_at": null,
+   "name": "PoseGetBoneRotation",
+   "owner": null,
+   "receipts": [],
+   "size": 540,
+   "status": "unknown"
+  },
+  "00759060": {
+   "addr": "00759060",
+   "claimed_at": null,
+   "name": "PoseSetBoneRotation",
+   "owner": null,
+   "receipts": [],
+   "size": 492,
+   "status": "unknown"
+  },
+  "00759250": {
+   "addr": "00759250",
+   "claimed_at": null,
+   "name": "PoseSetBoneTranslation",
+   "owner": null,
+   "receipts": [],
+   "size": 322,
+   "status": "unknown"
+  },
   "0075A1B0": {
    "addr": "0075A1B0",
    "claimed_at": null,
@@ -606,6 +642,24 @@
    "owner": null,
    "receipts": [],
    "size": 29,
+   "status": "unknown"
+  },
+  "0075A2E0": {
+   "addr": "0075A2E0",
+   "claimed_at": null,
+   "name": "PoseGetBoneTranslation",
+   "owner": null,
+   "receipts": [],
+   "size": 234,
+   "status": "unknown"
+  },
+  "00769150": {
+   "addr": "00769150",
+   "claimed_at": null,
+   "name": "PoseComposeLocalToWorld",
+   "owner": null,
+   "receipts": [],
+   "size": 58,
    "status": "unknown"
   },
   "0079B8D0": {
