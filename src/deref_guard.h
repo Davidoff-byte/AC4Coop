@@ -23,8 +23,8 @@ namespace DerefGuard {
     // used only as the fallback route when a pattern finds nothing on a KNOWN build.
     //
     // Each stub now validates the loaded pointer before letting it reach the engine: non-null, inside
-    // [0x10000, 0x7F000000), and its first dword (the vtable) inside the module image
-    // [ImageBase, ImageBase+SizeOfImage) - D5: not just .rdata, see deref_guard.cpp. A failure counts the hit and takes the
+    // [0x10000, lpMaximumApplicationAddress+1) -- the game is LARGE_ADDRESS_AWARE (WR-23) --, and its first dword (the vtable)
+    // inside the module image [ImageBase, ImageBase+SizeOfImage) - D5: not just .rdata, see deref_guard.cpp. A failure counts the hit and takes the
     // site's documented skip target, exactly as a null did before.
     //
     // A separate guard covers the loader at 0x006795FD (the action-lane chain that crashed with

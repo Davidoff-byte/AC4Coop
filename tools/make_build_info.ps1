@@ -34,11 +34,15 @@ try {
 }
 
 # --- tree -----------------------------------------------------------------------------------------
-# Only src\ counts: the ASI is built from it, and a dirty README does not change the binary. The
-# generated header itself is excluded so the stamp can never make the tree dirty (it is gitignored
-# too; the filter also covers the case of the file being tracked by mistake).
+# Paths that decide a run's behaviour, not just the binary: src\ (the ASI is built from it), the shipped
+# ini template AC4Coop.ini (a hand-edited flag changes the run as much as a code edit), decomp\ (the
+# extracted engine units the gates check src\ against) and tools\ (the gates and this stamp itself).
+# A dirty README still does not count. The generated header is excluded so the stamp can never make the
+# tree dirty (it is gitignored too; the filter also covers the case of the file being tracked by mistake).
+# Untracked files under these paths count as dirty (porcelain '??').
+$dirtyPaths = @('src', 'AC4Coop.ini', 'decomp', 'tools')
 try {
-    $porcelain = & git -C $root status --porcelain -- src 2>$null
+    $porcelain = & git -C $root status --porcelain -- @dirtyPaths 2>$null
     if ($LASTEXITCODE -eq 0) {
         $dirty = @($porcelain | Where-Object { $_ -and ($_ -notmatch 'build_info\.h$') })
         $tree = if ($dirty.Count -eq 0) { 'clean' } else { 'dirty' }

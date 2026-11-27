@@ -16149,6 +16149,22 @@ static void DumpConfigOnce()
         { "Net", "Enabled", 0 }, { "Net", "InterpDelayMs", 100 }, { "Net", "InterpMaxExtrapMs", 100 },
         { "Net", "Interpolation", 1 }, { "Net", "LocalPort", 47801 }, { "Net", "PeerPort", 47801 },
         { "Net", "SnapshotHz", 20 },
+        // M-P3-4: every remaining int key the code reads with a constant default (section, key, code default).
+        { "Coop", "AttackForward", 0 }, { "Coop", "AutoContinue", 0 }, { "Coop", "AutoContinueSlot", -1 },
+        { "Coop", "BindFarRadiusM", 0 }, { "Coop", "BindHideM", 35 }, { "Coop", "CoordEnum", 0 }, { "Coop", "CoordSync", 0 },
+        { "Coop", "FortDamageTest", 0 }, { "Coop", "FortProbe", 0 }, { "Coop", "GuardPlace", 0 }, { "Coop", "HelmSeat", 0 },
+        { "Coop", "HpRelayScale", 0 }, { "Coop", "IntentLane", 0 }, { "Coop", "MenuProbe", 0 }, { "Coop", "MirrorParkFar", 0 },
+        { "Coop", "NativeReplicaClimbBhvOff", 0 }, { "Coop", "NativeReplicaClimbExitGate", 0 }, { "Coop", "ReleaseStaleGuard", 0 },
+        { "Coop", "SailApplyRaw", 0 }, { "Coop", "SailSync", 0 }, { "Coop", "SailTestCycle", 0 }, { "Coop", "SenseOwnerGuard", 1 },
+        { "Coop", "SkipIntroVideos", 0 }, { "Coop", "TraversalProbe", 0 }, { "Coop", "UiProbe", 0 }, { "Coop", "VideoLog", 0 },
+        { "Coop", "GuardPhaseSeekPct", 15 }, { "Coop", "GuardPhaseSeekMs", 500 }, { "Coop", "GuardPhaseCloseMs", 500 },
+        { "Coop", "GuardPhaseNudgePct", 25 },
+        { "Launcher", "ArmWindowSec", 300 }, { "Launcher", "RequireArm", 0 },
+        { "Net", "EosBridgePort", 47900 }, { "Net", "RelayForce", 0 }, { "Net", "Upnp", 1 },
+        { "Overlay", "Enable", 0 }, { "Overlay", "Key", VK_F10 }, { "Overlay", "Probe", 0 }, { "Overlay", "RoleFromPanel", 0 },
+        { "Pilot", "ClimbIntent", 1 }, { "Pilot", "Enabled", 0 }, { "Pilot", "FpsCap", 0 }, { "Pilot", "Intent", 1 },
+        { "Pilot", "KeepFocus", 0 }, { "Pilot", "PadIndex", 0 },
+        { "Probe", "Enabled", 0 },
     };
 
     const char sent[] = "\x1A\x1B absent";
@@ -16166,6 +16182,38 @@ static void DumpConfigOnce()
     L("[AC4Coop] CFG Net.PeerIP=%s\n", str);
     GetPrivateProfileStringA("Coop", "DriveContextMask", "", str, sizeof(str), Paths::Ini());
     L("[AC4Coop] CFG Coop.DriveContextMask=%s%s\n", str[0] ? str : "(empty)", str[0] ? "" : " (default)");
+
+    // M-P3-4: int keys whose default is computed at the call site (same expression as the reader).
+    {
+        const int fi = GetPrivateProfileIntA("Coop", "FightIntents", 0, Paths::Ini()) != 0 ? 1 : 0;   // phase1 BindLockOn / player_damage_probe
+        const int autoDef = GetPrivateProfileIntA("Overlay", "Enable", 0, Paths::Ini()) ? 0 : 1;        // net.cpp EosAutoStart
+        const K dyn[] = { { "Coop", "BindLock", fi }, { "Coop", "PlayerDamageRelay", fi }, { "Net", "EosAutoStart", autoDef } };
+        for (size_t i = 0; i < sizeof(dyn) / sizeof(dyn[0]); ++i) {
+            GetPrivateProfileStringA(dyn[i].s, dyn[i].k, sent, sv, sizeof(sv), Paths::Ini());
+            const bool absent = (strcmp(sv, sent) == 0);
+            const int v = GetPrivateProfileIntA(dyn[i].s, dyn[i].k, dyn[i].d, Paths::Ini());
+            L("[AC4Coop] CFG %s.%s=%d%s\n", dyn[i].s, dyn[i].k, v, absent ? " (default)" : "");
+        }
+    }
+
+    // M-P3-4: string keys. d == nullptr: the default depends on the call site (printed as "(absent)").
+    struct S { const char* s; const char* k; const char* d; };
+    static const S skeys[] = {
+        { "Coop", "PuppetFightStimIds", "257" }, { "Coop", "PuppetStimIds", "48,49" },
+        { "Net", "BindIP", "auto" }, { "Net", "EosCode", "" }, { "Net", "EosIni", nullptr },     // <bridge dir>\eos.ini
+        { "Net", "EosRelay", "allow" }, { "Net", "EosRole", nullptr },                           // "host" (net.cpp) / "" (overlay.cpp)
+        { "Net", "JoinCode", "" }, { "Net", "Mode", "manual" }, { "Net", "RelayRoom", "" }, { "Net", "RelayServer", "" },
+        { "Net", "StunServer", "stun.l.google.com:19302" }, { "Net", "Transport", "udp" },
+    };
+    for (size_t i = 0; i < sizeof(skeys) / sizeof(skeys[0]); ++i) {
+        GetPrivateProfileStringA(skeys[i].s, skeys[i].k, sent, str, sizeof(str), Paths::Ini());
+        if (strcmp(str, sent) != 0)
+            L("[AC4Coop] CFG %s.%s=%s\n", skeys[i].s, skeys[i].k, str[0] ? str : "(empty)");
+        else if (skeys[i].d)
+            L("[AC4Coop] CFG %s.%s=%s (default)\n", skeys[i].s, skeys[i].k, skeys[i].d[0] ? skeys[i].d : "(empty)");
+        else
+            L("[AC4Coop] CFG %s.%s=(absent)\n", skeys[i].s, skeys[i].k);
+    }
 }
 
 static void OnFrameInner(Human* updatedHuman) {
