@@ -14219,7 +14219,24 @@ static void ApplyPeerHealth(uint64_t objId, unsigned short life, float x, float 
             // GuestKillMirrorEntity); MirrorVisualDeath stays first so the "[Mirror] dead ..." line is
             // still emitted exactly as before.
             bool applied = false;
-            if (g_entHost == 1) { applied = KillGuardEntity((Entity*)ent); }
+            if (g_entHost == 1) {
+                // WR-14 (W-P2-2): the host path had neither gate the guest path has. A guard the host already
+                // killed (Life == 0xFFFF, the value SetLife(-1) lands) must not get SetLife(-1) again - that is
+                // the D crash path documented in GuestKillMirrorEntity (0x67B2EA) - and a repeated KIND_KILL
+                // for the same body within the DeathAppliedRecently window is a duplicate, not a new death.
+                bool hostDead = false;
+                if (HostHpSvcValid(hp)) {
+                    __try { hostDead = *(unsigned short*)(hp + 0x5C) == 0xFFFFu; }
+                    __except (EXCEPTION_EXECUTE_HANDLER) { hostDead = false; }
+                }
+                if (hostDead || DeathAppliedRecently(ent)) {
+                    L("[Kill] peer DEATH objId=%llu ent=%08X skipped reason=%s\n", (unsigned long long)objId, ent,
+                      hostDead ? "already-dead" : "duplicate");
+                } else {
+                    applied = KillGuardEntity((Entity*)ent);
+                    if (applied) MarkDeathApplied(ent);   // only a settled kill closes the window; a refusal may retry
+                }
+            }
             else if (!DeathAppliedRecently(ent)) {
                 MarkDeathApplied(ent);
                 MirrorVisualDeath((Entity*)ent);
