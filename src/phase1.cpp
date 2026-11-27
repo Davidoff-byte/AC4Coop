@@ -8907,6 +8907,38 @@ static int s_gibDelay = 120, s_gibExtrap = 100; static uint64_t s_gibDelayN = 0,
 static int OwnInt(const char* key, int def, int* cache, uint64_t* next);
 static int OwnFlag(const char* key, int* cache, uint64_t* next);
 static bool GuardInterpBufferOn() { return OwnFlag("GuardInterpBuffer", &s_gibOn, &s_gibNext) != 0; }
+// [Coop] InterpAdaptive (default 0; I-402): the GuardInterpBuffer render delay follows the measured snapshot jitter instead
+// of the fixed GuardInterpDelayMs. Jitter buffer: guest receive-time gaps between distinct host snapshots (last 64),
+// delay = clamp(p95 + InterpAdaptiveMarginMs, 1000/SnapshotHz, 2 x GuardInterpDelayMs). Fewer than 8 gaps -> fixed delay.
+// One [Interp] adaptive line per 10 s while on. 0 = the fixed delay (old behaviour). UNVERIFIED: smoothness on a real link.
+static int s_iaOn = 0; static uint64_t s_iaOnN = 0;
+static int s_iaMargin = 20; static uint64_t s_iaMarginN = 0;
+static volatile LONG s_iaDelayMs = 0;                         // 0 = not enough data, use the fixed delay
+static uint32_t s_iaGap[64]; static int s_iaN = 0, s_iaHead = 0;
+static int64_t s_iaLastHostUs = INT64_MIN; static uint64_t s_iaLastRxUs = 0, s_iaLogUs = 0; static uint32_t s_iaP95 = 0;
+static bool InterpAdaptiveOn() { return OwnFlag("InterpAdaptive", &s_iaOn, &s_iaOnN) != 0; }
+static void InterpAdaptiveNote(int64_t hostUs, uint64_t rxUs) {   // ApplyGuards' ring push (one call per body; one gap per snapshot)
+    if (hostUs == s_iaLastHostUs) return;
+    s_iaLastHostUs = hostUs;
+    const uint64_t prev = s_iaLastRxUs; s_iaLastRxUs = rxUs;
+    if (!prev || rxUs <= prev) return;
+    const uint64_t gapUs = rxUs - prev;
+    if (gapUs > 2000000) return;                              // a stall/reconnect, not jitter
+    s_iaGap[s_iaHead] = (uint32_t)gapUs; s_iaHead = (s_iaHead + 1) % 64; if (s_iaN < 64) ++s_iaN;
+    const int fixedMs = s_gibDelay > 0 ? s_gibDelay : 120;
+    if (s_iaN < 8) { InterlockedExchange(&s_iaDelayMs, 0); return; }
+    uint32_t tmp[64]; for (int i = 0; i < s_iaN; ++i) tmp[i] = s_iaGap[i];
+    for (int i = 1; i < s_iaN; ++i) { const uint32_t v = tmp[i]; int j = i - 1; while (j >= 0 && tmp[j] > v) { tmp[j + 1] = tmp[j]; --j; } tmp[j + 1] = v; }
+    s_iaP95 = tmp[(s_iaN * 95) / 100 < s_iaN ? (s_iaN * 95) / 100 : s_iaN - 1];
+    int d = (int)(s_iaP95 / 1000) + OwnInt("InterpAdaptiveMarginMs", 20, &s_iaMargin, &s_iaMarginN);
+    const int lo = g_snapHz > 0 ? 1000 / g_snapHz : 50, hi = fixedMs * 2 > lo ? fixedMs * 2 : lo;
+    if (d < lo) d = lo; if (d > hi) d = hi;
+    InterlockedExchange(&s_iaDelayMs, d);
+    if (rxUs - s_iaLogUs >= 10000000) {
+        s_iaLogUs = rxUs;
+        L("[Interp] adaptive delayMs=%d p95=%.1fms n=%d bounds=[%d,%d] fixed=%d margin=%d\n", d, s_iaP95 / 1000.0, s_iaN, lo, hi, fixedMs, s_iaMargin);
+    }
+}
 static int64_t OwnHostUs(uint32_t hostMs) {
     if (!s_hostBaseSet) { s_hostBaseMs = hostMs; s_hostBaseSet = true; }
     // WR-11: host change -> host clock restarts; drop retained offset + base so old host clock doesn't linger
@@ -8957,7 +8989,8 @@ static bool OwnRingSample(const OwnBody& o, uint64_t nowUs, float* pos, float* q
     if (!o.ringN) return false;
     const int64_t off = OwnOffset();
     if (off == INT64_MAX) return false;
-    const int64_t delay = (int64_t)OwnInt("GuardInterpDelayMs", 120, &s_gibDelay, &s_gibDelayN) * 1000;
+    int64_t delay = (int64_t)OwnInt("GuardInterpDelayMs", 120, &s_gibDelay, &s_gibDelayN) * 1000;
+    if (InterpAdaptiveOn()) { const LONG a = InterlockedCompareExchange(&s_iaDelayMs, 0, 0); if (a > 0) delay = (int64_t)a * 1000; }
     const int64_t T = (int64_t)nowUs - off - delay;           // render time on the host timeline
     // newest .. oldest
     const OwnSnap* a = nullptr; const OwnSnap* b = nullptr; const OwnSnap* prev = nullptr;
@@ -9014,6 +9047,7 @@ static void OwnSample(const OwnBody& o, uint64_t nowUs, float* pos, float* quat)
 static void OwnRingPush(OwnBody& o, int64_t hostUs, const float* pos, const float* quat, uint32_t alias,
                         const GuardAnim& anim) {
     if (o.ringN && hostUs <= o.ring[o.ringHead].hostUs) return;   // same or older snapshot: nothing new
+    if (InterpAdaptiveOn()) InterpAdaptiveNote(hostUs, OwnNowUs());   // [Coop] InterpAdaptive
     o.ringHead = (uint8_t)((o.ringHead + 1) % OWN_RING);
     OwnSnap& s = o.ring[o.ringHead];
     s.hostUs = hostUs; s.alias = alias; s.anim = anim;
@@ -16452,7 +16486,7 @@ static void DumpConfigOnce()
         { "Coop", "ShipTest", 0 }, { "Coop", "ShipTestFracPct", 45 }, { "Coop", "ShipTestRadiusM", 250 },
         { "Coop", "ActionWriterProbe", 0 }, { "Coop", "BlendTypeSafe", 0 }, { "Coop", "EntityFrameCadence", 0 }, { "Coop", "SyncBudget", 0 },
         { "Coop", "FloatProbe", 0 }, { "Coop", "FootOffsetFix", 0 }, { "Coop", "GuardActionGate", 0 }, { "Coop", "GuardActionLane", 0 }, { "Coop", "RespawnHitGraceMs", 0 }, { "Coop", "GuardStageApply", 0 }, { "Coop", "GuardStageForceEnter", 0 }, { "Coop", "CombatTimingProbe", 0 }, { "Coop", "GuardExtrapMs", 100 },
-        { "Coop", "GuardInterpBuffer", 0 }, { "Coop", "GuardInterpDelayMs", 120 }, { "Coop", "GuardPhaseLock", 0 },
+        { "Coop", "GuardInterpBuffer", 0 }, { "Coop", "GuardInterpDelayMs", 120 }, { "Coop", "InterpAdaptive", 0 }, { "Coop", "InterpAdaptiveMarginMs", 20 }, { "Coop", "GuardPhaseLock", 0 },
         { "Coop", "GuardSeesPuppet", 0 }, { "Coop", "PuppetActionReassert", 0 }, { "Coop", "PuppetHostTime", 0 },
         { "Coop", "AlertQueryAsPlayer", 0 }, { "Coop", "ConflictNullGuard", 0 }, { "Coop", "ConflictKeepPuppet", 0 }, { "Coop", "GuardPoiFightTarget", 0 }, { "Coop", "FightOrderPuppet", 0 }, { "Coop", "DespawnLeaveFight", 0 }, { "Coop", "FightKeepOnConflictEnd", 0 }, { "Coop", "FightStateProbe", 0 }, { "Coop", "PuppetNavService", 0 }, { "Coop", "NativeReplica", 0 }, { "Coop", "NativeReplicaSnapCm", 300 }, { "Coop", "NativeReplicaBlendCmS", 150 }, { "Coop", "NativeReplicaStartBoostCmS", 400 }, { "Coop", "NativeReplicaParkour", 0 }, { "Coop", "NativeReplicaFreeRun", 0 }, { "Coop", "NativeReplicaClimbIntent", 0 }, { "Coop", "NativeReplicaClimbMoves", 0 }, { "Coop", "NativeReplicaClimbChoice", 0 }, { "Coop", "NativeReplicaBeam", 0 }, { "Coop", "NativeReplicaWallEntry", 0 }, { "Coop", "NativeReplicaClimbNoSnap", 0 }, { "Coop", "NativeReplicaParkourSnapCm", 800 }, { "Coop", "FightProbe", 0 }, { "Coop", "PeerLastPacket", 0 }, { "Coop", "PuppetActionsOwnUpdate", 1 }, { "Coop", "DetectKeepTarget", 0 }, { "Coop", "GuardPlayerOfInterest", 0 }, { "Coop", "EventProbe", 0 }, { "Coop", "PlayerDamageProbe", 0 }, { "Coop", "ReactProbe", 0 }, { "Coop", "FightSkipPuppet", 0 }, { "Coop", "NavNullGuard", 0 }, { "Coop", "PuppetStimMode", 1 }, { "Coop", "PuppetStimSeq", 0 }, { "Coop", "PuppetStimSource", 0 }, { "Coop", "PuppetFightStim", 1 }, { "Coop", "PuppetFightStimMs", 1000 }, { "Coop", "SightProbe", 0 }, { "Coop", "StateProbe", 0 }, { "Coop", "StuckProbe", 0 },
         { "Coop", "StageLog", 0 }, { "Coop", "SyncEnemiesOnly", 1 }, { "Coop", "SyncMaxEntities", 32 },
