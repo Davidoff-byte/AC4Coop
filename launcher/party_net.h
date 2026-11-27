@@ -4,6 +4,7 @@
 // All blocking work runs on its own threads; the UI reads Snapshot().
 #include <cstdint>
 #include "party_proto.h"
+#include "netstate.h"   // NET_PROTO_VER (single source; pulls <Windows.h> via HookMath.h - include winsock2.h first)
 
 namespace PartyNet {
 
@@ -29,7 +30,7 @@ struct Config {
     int      port = 47801;            // [Net] LocalPort of the game
     char     name[Party::kNameLen] = "Player";
     char     relay[128] = {0};        // "host[:port]" or ""
-    uint32_t gameProto = 12;          // NET_PROTO_VER of the shipped build
+    uint32_t gameProto = NET_PROTO_VER;   // src/netstate.h - must match the shipped ASI
     bool     upnp = true;
     char     stunServer[128] = "stun.l.google.com:19302";
 };
