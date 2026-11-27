@@ -8537,6 +8537,7 @@ struct OwnBody {
     uint32_t alias;
     GuardAnim anim; uint64_t animUs;            // proto 13: host animation block and when it last changed
     float vEma;                                 // O5: running average speed of what we wrote
+    uint64_t legacyWriteUs;                     // WR-10: probe-only time of the last LEGACY write (OwnStarved never reads it)
     GaState ga;
     // [Coop] GuardPlace (default 0; docs/design/enemy-placement.md): one link = one host guard id on this body. Reset
     // whenever the id changes or the link was dropped, so no sample, write or approach of an earlier link leaks into it.
@@ -8845,7 +8846,8 @@ static bool OwnPlaceApproaching(Human* h) {
 static void OwnNoteLegacyWrite(Human* h, const float* pos) {
     AcquireSRWLockExclusive(&s_ownLock);
     const int i = OwnFind((unsigned int)h);
-    if (i >= 0) { for (int k = 0; k < 3; ++k) s_own[i].lastWrite[k] = pos[k]; s_own[i].haveWrite = true; }
+    if (i >= 0) { for (int k = 0; k < 3; ++k) s_own[i].lastWrite[k] = pos[k]; s_own[i].haveWrite = true;
+                  s_own[i].legacyWriteUs = OwnNowUs(); }   // WR-10: lets the O1 probe time a legacy write
     ReleaseSRWLockExclusive(&s_ownLock);
     ++s_gLegacyWrites;
 }
@@ -11206,9 +11208,13 @@ static void OwnDrain(Human* h) {
     float pos[3], quat[4]; OwnSample(o, now, pos, quat);
     float vEmaNew = o.vEma;
     // moving probe: speed of the position we are about to give it, against the action it plays
-    if (o.haveWrite && o.lastWriteUs && now > o.lastWriteUs && haveCur) {
+    // WR-10 (W-P1-4): lastWriteUs is stamped only by own-update / GuardPlace writes, so with OwnUpdateGuards=0 this
+    // probe (and O1 inside it) never counted. Fall back to the legacy write's probe-only stamp; lastWriteUs itself is
+    // left alone because OwnStarved decides the legacy fallback from it.
+    const uint64_t wUs = o.lastWriteUs ? o.lastWriteUs : o.legacyWriteUs;
+    if (o.haveWrite && wUs && now > wUs && haveCur) {
         const float dx = pos[0] - o.lastWrite[0], dy = pos[1] - o.lastWrite[1], dz = pos[2] - o.lastWrite[2];
-        const float v = sqrtf(dx * dx + dy * dy + dz * dz) / ((float)(double)(now - o.lastWriteUs) * 1e-6f);
+        const float v = sqrtf(dx * dx + dy * dy + dz * dz) / ((float)(double)(now - wUs) * 1e-6f);
         if (v > 0.3f) {
             InterlockedIncrement(&s_mvFrames);
             if (curAlias == o.alias) InterlockedIncrement(&s_mvActMatch);
@@ -11331,8 +11337,13 @@ static void OwnReport() {
     {   // O1 (action, host alias stable >= 300 ms, moving frames) and O5 (step speed > 50% off the body's average)
         const LONG f1 = InterlockedExchange(&s_o1Frames, 0), m1 = InterlockedExchange(&s_o1Mis, 0);
         const LONG f5 = InterlockedExchange(&s_o5Frames, 0), b5 = InterlockedExchange(&s_o5Bad, 0);
-        L("[O5] buffer=%d O1 frames=%ld mis=%ld (agree %.1f%%) | O5 frames=%ld jitter=%ld (%.2f%%)\n",
-          s_gibOn, f1, m1, f1 ? 100.0 * (f1 - m1) / f1 : 0.0, f5, b5, f5 ? 100.0 * b5 / f5 : 0.0);
+        // WR-10 (W-P1-4): O1 now also counts legacy writes (legacyWriteUs); O5 still needs vEma, which only the
+        // own-update write stores, so with OwnUpdateGuards=0 O5 is 0 by construction. The mode is printed so a
+        // zero is attributable.
+        const int ownG = OwnGuardsOn() ? 1 : 0;
+        L("[O5] buffer=%d O1 frames=%ld mis=%ld (agree %.1f%%) | O5 frames=%ld jitter=%ld (%.2f%%) | OwnUpdateGuards=%d%s\n",
+          s_gibOn, f1, m1, f1 ? 100.0 * (f1 - m1) / f1 : 0.0, f5, b5, f5 ? 100.0 * b5 / f5 : 0.0,
+          ownG, ownG ? "" : " (O5 inert)");
     }
     if (s_fpOn) {
         const unsigned char* opt = nullptr;
