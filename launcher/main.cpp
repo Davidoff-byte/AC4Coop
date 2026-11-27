@@ -14,8 +14,12 @@
 // Test flags (unattended checks; normal users start it with no arguments):
 //   --game-dir DIR  --payload DIR  --no-launch  --auto-play (install + arm + launch once)  --exit-after S
 //   --report FILE (state as key=value)  --shot FILE.bmp (window image after 3 s)
+//   --ini FILE (use this AC4Coop.ini instead of <game>\AC4Coop.ini)  --set-role host|guest (one [Coop] EntityHost write)
 #define _CRT_SECURE_NO_WARNINGS
+#include <winsock2.h>   // before windows.h (winsock.h clash); bind test, local IPv4s, UPnP probe
+#include <ws2tcpip.h>
 #include <windows.h>
+#include <iphlpapi.h>
 #include <shellapi.h>
 #include <commdlg.h>
 #include <bcrypt.h>
@@ -30,6 +34,7 @@
 #include "backends/imgui_impl_win32.h"
 #include "backends/imgui_impl_dx11.h"
 #include "netstate.h"   // NET_PROTO_VER only (header-only constants)
+#include "upnp.h"       // src/upnp.cpp (Winsock + WinHTTP only, no engine calls): the self-check's UPnP probe
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "bcrypt.lib")
@@ -37,13 +42,16 @@
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "version.lib")
+#pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "iphlpapi.lib")
+#pragma comment(lib, "winhttp.lib")
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 
 namespace {
 
 // ---------------------------------------------------------------- settings + args
-struct Args { std::string gameDir, report, shot, payload; int exitAfter = 0; bool noLaunch = false, autoPlay = false; } A;
+struct Args { std::string gameDir, report, shot, payload, ini, setRole; int exitAfter = 0; bool noLaunch = false, autoPlay = false; } A;
 char g_exeDir[MAX_PATH], g_settings[MAX_PATH], g_gameDir[MAX_PATH] = {0};
 
 void LoadSettings() {
@@ -266,6 +274,194 @@ bool Play() {
     return true;
 }
 
+// ---------------------------------------------------------------- co-op ini: role, mode, relay (plan Phase 5)
+// Every write is ONE key through WritePrivateProfileStringW - the file is never rewritten whole (a WriteAllText once
+// truncated the live ini to 4096 B mid-run). The first write of a launcher run backs it up to AC4Coop.ini.bak-launcher.
+std::wstring Widen(const std::string& s) {
+    const int n = MultiByteToWideChar(CP_ACP, 0, s.c_str(), -1, nullptr, 0);
+    std::wstring w(n > 1 ? n - 1 : 0, L'\0'); if (n > 1) MultiByteToWideChar(CP_ACP, 0, s.c_str(), -1, &w[0], n);
+    return w;
+}
+std::string IniPathA() { return A.ini.empty() ? Join(g_gameDir, "AC4Coop.ini") : A.ini; }
+bool g_iniBackedUp = false;
+bool IniSet(const wchar_t* sec, const wchar_t* key, const std::wstring& val) {
+    const std::wstring ini = Widen(IniPathA());
+    if (GetFileAttributesW(ini.c_str()) == INVALID_FILE_ATTRIBUTES) { Msg(false, "AC4Coop.ini not found - press Play once to install"); return false; }
+    if (!g_iniBackedUp) g_iniBackedUp = CopyFileW(ini.c_str(), (ini + L".bak-launcher").c_str(), FALSE) != 0;
+    if (!g_iniBackedUp) { Msg(false, "Could not back up AC4Coop.ini - nothing written"); return false; }
+    const bool ok = WritePrivateProfileStringW(sec, key, val.c_str(), ini.c_str()) != 0;
+    LogLine("ini [%ls] %ls=%ls -> %s", sec, key, val.c_str(), ok ? "ok" : "FAILED");
+    if (!ok) Msg(false, "Could not write AC4Coop.ini");
+    return ok;
+}
+
+// The keys and defaults the mod reads: src/net.cpp Net::Init ([Net] Enabled/LocalPort/PeerPort/PeerIP/Mode/Transport/
+// RelayServer/RelayRoom) and src/phase1.cpp ([Coop] EntityHost 0, NetStrictPeer 1, HostileOnly 0).
+struct NetCfg {
+    bool present = false; int entityHost = 0, strictPeer = 1, hostileOnly = 0, localPort = 47801, peerPort = 47801;
+    char mode[16] = "manual", transport[16] = "udp", peerIp[64] = "127.0.0.1", relay[128] = "", room[32] = "";
+} N;
+int g_netGen = 0;   // bumps on every reload so the edit boxes resync
+void LoadNet() {
+    N = NetCfg{}; ++g_netGen;
+    const std::string ini = IniPathA(); N.present = FileExists(ini); if (!N.present) return;
+    const char* p = ini.c_str();
+    N.entityHost = GetPrivateProfileIntA("Coop", "EntityHost", 0, p);
+    N.strictPeer = GetPrivateProfileIntA("Coop", "NetStrictPeer", 1, p);
+    N.hostileOnly = GetPrivateProfileIntA("Coop", "HostileOnly", 0, p);
+    N.localPort = GetPrivateProfileIntA("Net", "LocalPort", 47801, p);
+    N.peerPort = GetPrivateProfileIntA("Net", "PeerPort", 47801, p);
+    GetPrivateProfileStringA("Net", "Mode", "manual", N.mode, sizeof(N.mode), p);
+    GetPrivateProfileStringA("Net", "Transport", "udp", N.transport, sizeof(N.transport), p);
+    GetPrivateProfileStringA("Net", "PeerIP", "127.0.0.1", N.peerIp, sizeof(N.peerIp), p);
+    GetPrivateProfileStringA("Net", "RelayServer", "", N.relay, sizeof(N.relay), p);
+    GetPrivateProfileStringA("Net", "RelayRoom", "", N.room, sizeof(N.room), p);
+}
+// net.cpp accepts exactly these Mode values (anything else logs "unknown [Net] Mode" and runs manual).
+const char* kModes[] = { "manual", "host", "join", "lobby" };
+int ModeIndex() { for (int i = 0; i < 4; ++i) if (!_stricmp(N.mode, kModes[i])) return i; return -1; }
+// PeerIP / ports matter only in manual mode over UDP: Transport=eos forces the peer to the local bridge, host/join/lobby
+// take the peer from the HELLO / the code (net.cpp Init).
+bool ManualUdp() { return _stricmp(N.transport, "eos") != 0 && ModeIndex() <= 0; }
+bool ParseIPv4(const char* s, uint32_t* ip) { in_addr a{}; if (inet_pton(AF_INET, s, &a) != 1) return false; *ip = ntohl(a.s_addr); return true; }
+bool IsLoopback(const char* s) { uint32_t ip = 0; return ParseIPv4(s, &ip) && (ip >> 24) == 127; }
+std::string IpStr(uint32_t ip) { char b[20]; _snprintf(b, sizeof(b), "%u.%u.%u.%u", ip >> 24, (ip >> 16) & 255, (ip >> 8) & 255, ip & 255); return b; }
+
+std::vector<uint32_t> LocalIPv4s() {   // up adapters, loopback excluded, host order
+    std::vector<uint32_t> out; ULONG n = 16384; std::vector<char> buf(n);
+    const ULONG fl = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+    ULONG r = GetAdaptersAddresses(AF_INET, fl, nullptr, (IP_ADAPTER_ADDRESSES*)buf.data(), &n);
+    if (r == ERROR_BUFFER_OVERFLOW) { buf.resize(n); r = GetAdaptersAddresses(AF_INET, fl, nullptr, (IP_ADAPTER_ADDRESSES*)buf.data(), &n); }
+    if (r != NO_ERROR) return out;
+    for (auto* a = (IP_ADAPTER_ADDRESSES*)buf.data(); a; a = a->Next) {
+        if (a->OperStatus != IfOperStatusUp) continue;
+        for (auto* u = a->FirstUnicastAddress; u; u = u->Next) {
+            const uint32_t ip = ntohl(((sockaddr_in*)u->Address.lpSockaddr)->sin_addr.s_addr);
+            if ((ip >> 24) != 127) out.push_back(ip);
+        }
+    }
+    return out;
+}
+
+// Co-op ASIs in the folders Ultimate ASI Loader loads from (root, scripts\, plugins\ - UNVERIFIED list, from the
+// loader's documentation, not measured here). More than one = two copies of the mod hooking the same game.
+std::vector<std::string> CoopAsis() {
+    std::vector<std::string> out;
+    for (const char* sub : { "", "scripts\\", "plugins\\" }) {
+        WIN32_FIND_DATAA fd; HANDLE h = FindFirstFileA((std::string(g_gameDir) + "\\" + sub + "*.asi").c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        do { std::string lo = fd.cFileName; for (auto& c : lo) c = (char)tolower((unsigned char)c);
+             if (lo.find("coop") != std::string::npos) out.push_back(std::string(sub) + fd.cFileName); }
+        while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+    return out;
+}
+
+// Preflight (backlog I-801/I-802, ops/PREFLIGHT-TWO-MACHINE-2026-11-09.md B1-B4): each of these fails silently in game.
+struct Line { int sev; std::string text; };   // 0 ok, 1 warn, 2 fail
+std::vector<Line> g_pre, g_check;
+std::string Fmt(const char* fmt, ...) { char b[512]; va_list ap; va_start(ap, fmt); _vsnprintf(b, sizeof(b), fmt, ap); va_end(ap); b[sizeof(b) - 1] = 0; return b; }
+void Preflight() {
+    g_pre.clear(); if (!N.present) return;
+    auto add = [](int s, const std::string& t) { g_pre.push_back({ s, t }); };
+    if (G.found) {
+        const std::string dep = Join(g_gameDir, "AC4Coop.asi"), pay = Join(PayloadDir(), "AC4Coop.asi");
+        if (FileExists(dep) && FileExists(pay) && !SameFile(dep, pay))
+            add(2, "B1 FAIL installed AC4Coop.asi is not this launcher's build - press Play to update; both PCs need the same build");
+        const auto asis = CoopAsis();
+        if (asis.size() > 1) { std::string l; for (auto& a : asis) l += (l.empty() ? "" : ", ") + a;
+            add(2, "ASI2 FAIL " + std::to_string(asis.size()) + " co-op ASIs in the game folder (" + l + ") - keep only AC4Coop.asi"); }
+    }
+    if (ModeIndex() < 0) add(1, Fmt("MODE [Net] Mode=%s is not manual/host/join/lobby - the mod falls back to manual", N.mode));
+    const bool manual = ManualUdp(), loop = IsLoopback(N.peerIp);
+    if (manual && loop && N.strictPeer)
+        add(2, "B2 FAIL PeerIP=127.0.0.1 with NetStrictPeer=1: packets from another PC are dropped - set PeerIP to the other PC (OK only for a same-PC two-instance test)");
+    if (manual && !loop && N.localPort != N.peerPort)
+        add(2, Fmt("B3 FAIL LocalPort=%d != PeerPort=%d with a remote PeerIP: the same ini on both PCs gives a one-way link - use one port on both", N.localPort, N.peerPort));
+    if (N.hostileOnly) add(2, "B4 FAIL [Coop] HostileOnly=1 gates sync on a predicate never observed in game - set HostileOnly=0");
+    if (manual && !loop) {
+        uint32_t peer = 0; const auto ips = LocalIPv4s(); bool same = false; std::string l;
+        if (!ParseIPv4(N.peerIp, &peer)) add(2, Fmt("NET FAIL PeerIP=%s is not an IPv4 address", N.peerIp));
+        else {
+            for (uint32_t ip : ips) { same |= (ip >> 8) == (peer >> 8); l += (l.empty() ? "" : ", ") + IpStr(ip); }
+            if (!same) add(2, Fmt("NET FAIL PeerIP=%s is not on the same /24 as this PC (%s) - a LAN peer is unreachable; check the other PC's address", N.peerIp, l.empty() ? "no IPv4" : l.c_str()));
+        }
+    }
+    bool bad = false; for (auto& p : g_pre) bad |= p.sev == 2;
+    if (!bad) add(0, "Preflight: no known two-machine blocker in AC4Coop.ini");
+}
+void RefreshNet() { LoadNet(); Preflight(); }
+
+// ---------------------------------------------------------------- firewall (elevated, after an explicit confirmation)
+std::string FwName() { return "AC4Coop UDP " + std::to_string(N.localPort); }
+std::string FwAddArgs() {
+    return "advfirewall firewall add rule name=\"" + FwName() + "\" dir=in action=allow protocol=UDP localport=" +
+           std::to_string(N.localPort) + " program=\"" + Join(g_gameDir, "AC4BFSP.exe") + "\" enable=yes";
+}
+DWORD RunNetsh(const std::string& args) {   // not elevated, hidden; exit code (or -1)
+    wchar_t sys[MAX_PATH]; GetSystemDirectoryW(sys, MAX_PATH);
+    const std::wstring exe = std::wstring(sys) + L"\\netsh.exe"; std::wstring cl = L"\"" + exe + L"\" " + Widen(args);
+    STARTUPINFOW si{ sizeof(si) }; si.dwFlags = STARTF_USESHOWWINDOW; si.wShowWindow = SW_HIDE; PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(exe.c_str(), &cl[0], nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) return (DWORD)-1;
+    WaitForSingleObject(pi.hProcess, 15000); DWORD code = (DWORD)-1; GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hThread); CloseHandle(pi.hProcess); return code;
+}
+bool FwRuleExists() { return RunNetsh("advfirewall firewall show rule name=\"" + FwName() + "\"") == 0; }
+void AddFirewallRule() {
+    if (!G.found) { Msg(false, "Find the game folder first"); return; }
+    if (FwRuleExists()) { Msg(true, "Firewall rule \"" + FwName() + "\" already exists - nothing to do"); return; }
+    const std::string cmd = "netsh " + FwAddArgs();
+    const std::wstring q = L"Windows will ask for administrator rights to run exactly this command:\n\n" + Widen(cmd) + L"\n\nCreate the rule?";
+    if (MessageBoxW(GetActiveWindow(), q.c_str(), L"AC4 Co-op - firewall", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) { Msg(false, "Firewall rule not created (cancelled)"); return; }
+    const std::wstring args = Widen(FwAddArgs());
+    SHELLEXECUTEINFOW se{ sizeof(se) }; se.fMask = SEE_MASK_NOCLOSEPROCESS; se.lpVerb = L"runas"; se.lpFile = L"netsh.exe";
+    se.lpParameters = args.c_str(); se.nShow = SW_HIDE;
+    if (!ShellExecuteExW(&se) || !se.hProcess) { Msg(false, "Firewall rule not created (administrator rights refused)"); return; }
+    WaitForSingleObject(se.hProcess, 15000); DWORD code = (DWORD)-1; GetExitCodeProcess(se.hProcess, &code); CloseHandle(se.hProcess);
+    LogLine("firewall: %s -> exit %lu", cmd.c_str(), code);
+    if (FwRuleExists()) Msg(true, "Firewall rule \"" + FwName() + "\" created");
+    else Msg(false, Fmt("Firewall rule not found after netsh (exit %lu)", code));
+}
+
+// ---------------------------------------------------------------- network self-check
+// No peer ping: the mod's only request/answer packet is the lobby HELLO, which a host in Mode=host answers by LOCKING
+// its guest slot (net.cpp "the guest slot is taken by the first HELLO") - a probe would take the real guest's place.
+volatile LONG g_upnpState = 0;   // 0 idle, 1 running, 2 done
+std::string g_upnpMsg;
+DWORD WINAPI UpnpThread(void*) {
+    uint32_t lan = 0, ext = 0; char name[128] = { 0 }, err[256] = { 0 }; Upnp::Gateway gw{};
+    std::string m;
+    if (!Upnp::PrimaryIPv4(&lan, name, sizeof(name))) m = "UPnP: no adapter with an internet route";
+    else if (!Upnp::Discover(lan, &gw, err, sizeof(err))) m = "UPnP: no gateway answered from " + IpStr(lan) + " (" + err + ") - a host needs a manual port forward or the relay";
+    else if (!Upnp::GetExternalIp(gw, &ext, err, sizeof(err))) m = std::string("UPnP: gateway found, external IP query failed (") + err + ")";
+    else m = "UPnP: gateway found on " + IpStr(lan) + ", external IP " + IpStr(ext) + " (read only, no mapping made)";
+    g_upnpMsg = m; InterlockedExchange(&g_upnpState, 2); return 0;
+}
+void SelfCheck() {
+    g_check.clear(); RefreshNet();
+    static bool wsa = false; if (!wsa) { WSADATA d; wsa = WSAStartup(MAKEWORD(2, 2), &d) == 0; }
+    SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == INVALID_SOCKET) g_check.push_back({ 2, Fmt("Bind: socket() failed (%d)", WSAGetLastError()) });
+    else {
+        sockaddr_in a{}; a.sin_family = AF_INET; a.sin_addr.s_addr = INADDR_ANY; a.sin_port = htons((u_short)N.localPort);
+        if (bind(s, (sockaddr*)&a, sizeof(a)) == 0) g_check.push_back({ 0, Fmt("Bind: UDP %d is free on this PC", N.localPort) });
+        else g_check.push_back({ 2, Fmt("Bind: UDP %d is taken (error %d) - close the game or the other program using it", N.localPort, WSAGetLastError()) });
+        closesocket(s);
+    }
+    std::string l; for (uint32_t ip : LocalIPv4s()) l += (l.empty() ? "" : ", ") + IpStr(ip);
+    g_check.push_back({ l.empty() ? 2 : 0, "This PC's IPv4: " + (l.empty() ? std::string("none") : l) });
+    if (ManualUdp() && !IsLoopback(N.peerIp)) {
+        bool bad = false; for (auto& p : g_pre) bad |= p.text.rfind("NET FAIL", 0) == 0;
+        g_check.push_back({ bad ? 2 : 0, Fmt("PeerIP %s: %s", N.peerIp, bad ? "NOT on this PC's /24" : "on this PC's /24") });
+    } else g_check.push_back({ 1, Fmt("PeerIP not used (Mode=%s, Transport=%s)", N.mode, N.transport) });
+    g_check.push_back({ 1, "STUN: skipped (src/stun.* not wired into the launcher in this change)" });
+    if (InterlockedCompareExchange(&g_upnpState, 1, 0) != 1) {
+        InterlockedExchange(&g_upnpState, 1);
+        HANDLE t = CreateThread(nullptr, 0, UpnpThread, nullptr, 0, nullptr); if (t) CloseHandle(t); else InterlockedExchange(&g_upnpState, 0);
+    }
+}
+
 // ---------------------------------------------------------------- D3D11 + window
 ID3D11Device* g_dev = nullptr; ID3D11DeviceContext* g_ctx = nullptr; IDXGISwapChain* g_sc = nullptr; ID3D11RenderTargetView* g_rtv = nullptr;
 void CreateRTV() { ID3D11Texture2D* bb = nullptr; g_sc->GetBuffer(0, IID_PPV_ARGS(&bb)); g_dev->CreateRenderTargetView(bb, nullptr, &g_rtv); bb->Release(); }
@@ -317,6 +513,50 @@ void Style() {
 ImFont* g_big = nullptr; ImFont* g_mid = nullptr;
 const ImVec4 kOk(0.56f, 0.82f, 0.54f, 1), kWarn(0.91f, 0.76f, 0.48f, 1), kBad(0.88f, 0.48f, 0.39f, 1), kDim(0.55f, 0.52f, 0.45f, 1), kGold(0.85f, 0.71f, 0.42f, 1);
 
+ImVec4 SevColor(int s);
+void NetUi() {
+    if (!N.present) { ImGui::TextColored(kDim, "Co-op settings appear after the first install (AC4Coop.ini in the game folder)."); return; }
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.23f, 0.20f, 0.15f, 1)); ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.31f, 0.27f, 0.20f, 1));
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.16f, 0.14f, 0.10f, 1));
+    ImGui::TextColored(kDim, "This PC's role ([Coop] EntityHost) - the other PC must pick the other one");
+    if (ImGui::RadioButton("Host (EntityHost=1)", N.entityHost != 0) && !N.entityHost) { if (IniSet(L"Coop", L"EntityHost", L"1")) Msg(true, "Role: host ([Coop] EntityHost=1)"); RefreshNet(); }
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Guest (EntityHost=0)", N.entityHost == 0) && N.entityHost) { if (IniSet(L"Coop", L"EntityHost", L"0")) Msg(true, "Role: guest ([Coop] EntityHost=0)"); RefreshNet(); }
+
+    int mi = ModeIndex();
+    ImGui::SetNextItemWidth(140);
+    if (ImGui::Combo("[Net] Mode", &mi, kModes, 4) && mi >= 0) { if (IniSet(L"Net", L"Mode", Widen(kModes[mi]))) Msg(true, std::string("[Net] Mode=") + kModes[mi]); RefreshNet(); }
+    ImGui::SameLine(); ImGui::TextColored(kDim, "Transport=%s", N.transport);
+    static char relay[128], room[32]; static int gen = -1;
+    if (gen != g_netGen) { gen = g_netGen; lstrcpynA(relay, N.relay, sizeof(relay)); lstrcpynA(room, N.room, sizeof(room)); }
+    ImGui::SetNextItemWidth(260); ImGui::InputText("[Net] RelayServer (host[:port])", relay, sizeof(relay));
+    ImGui::SetNextItemWidth(260); ImGui::InputText("[Net] RelayRoom (hex, empty = new)", room, sizeof(room));
+    if (ImGui::Button("Save relay")) {
+        // net.cpp: RelayRoom = _strtoui64(.., 16) & 0xFFFFFFFFFF (40 bits) - accept 0-10 hex digits only.
+        bool hex = strlen(room) <= 10; for (const char* c = room; *c; ++c) hex &= isxdigit((unsigned char)*c) != 0;
+        bool sp = false; for (const char* c = relay; *c; ++c) sp |= *c == ' ';
+        if (!hex) Msg(false, "RelayRoom must be 0-10 hex digits");
+        else if (sp) Msg(false, "RelayServer must be host or host:port, no spaces");
+        else if (IniSet(L"Net", L"RelayServer", Widen(relay)) && IniSet(L"Net", L"RelayRoom", Widen(room))) Msg(true, "Relay saved");
+        RefreshNet();
+    }
+    if (N.relay[0] && (ModeIndex() <= 0 || !_stricmp(N.transport, "eos")))
+        ImGui::TextColored(kWarn, "RelayServer is used only with Mode=host/join/lobby and Transport=udp (net.cpp)");
+
+    ImGui::TextColored(kDim, "Firewall (runs elevated only after you confirm):");
+    ImGui::TextWrapped("netsh %s", FwAddArgs().c_str());
+    if (ImGui::Button(Fmt("Allow UDP %d in the firewall", N.localPort).c_str())) AddFirewallRule();
+    ImGui::SameLine();
+    if (ImGui::Button("Network self-check")) SelfCheck();
+    for (auto& c : g_check) ImGui::TextColored(SevColor(c.sev), "%s", c.text.c_str());
+    const LONG us = InterlockedCompareExchange(&g_upnpState, 0, 0);
+    if (us == 1) ImGui::TextColored(kDim, "UPnP: probing the router...");
+    else if (us == 2) ImGui::TextColored(g_upnpMsg.find("external IP ") != std::string::npos ? kOk : kWarn, "%s", g_upnpMsg.c_str());
+    for (auto& p : g_pre) ImGui::TextColored(SevColor(p.sev), "%s", p.text.c_str());
+    ImGui::PopStyleColor(3);
+}
+ImVec4 SevColor(int s) { return s == 2 ? kBad : s == 1 ? kWarn : kOk; }
+
 void Ui() {
     ImGui::PushFont(g_big); ImGui::TextColored(kGold, "AC4 CO-OP"); ImGui::PopFont();
     ImGui::TextColored(kDim, "Starts Assassin's Creed IV with the co-op mod. Host or join in the game: press F10.");
@@ -325,11 +565,11 @@ void Ui() {
     ImGui::TextColored(kDim, "Game folder");
     ImGui::TextWrapped("%s", g_gameDir[0] ? g_gameDir : "(not found)");
     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.23f, 0.20f, 0.15f, 1)); ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.31f, 0.27f, 0.20f, 1));
-    if (ImGui::Button("Find")) { if (!FindGame()) Msg(false, "Not found in Steam or Ubisoft Connect libraries - use Browse"); SaveSettings(); CheckGame(); }
+    if (ImGui::Button("Find")) { if (!FindGame()) Msg(false, "Not found in Steam or Ubisoft Connect libraries - use Browse"); SaveSettings(); CheckGame(); RefreshNet(); }
     ImGui::SameLine();
     if (ImGui::Button("Browse...")) {
         char file[MAX_PATH] = "AC4BFSP.exe"; OPENFILENAMEA o{ sizeof(o) }; o.lpstrFilter = "AC4BFSP.exe\0AC4BFSP.exe\0"; o.lpstrFile = file; o.nMaxFile = MAX_PATH; o.Flags = OFN_FILEMUSTEXIST;
-        if (GetOpenFileNameA(&o)) { *strrchr(file, '\\') = 0; lstrcpynA(g_gameDir, file, MAX_PATH); SaveSettings(); CheckGame(); }
+        if (GetOpenFileNameA(&o)) { *strrchr(file, '\\') = 0; lstrcpynA(g_gameDir, file, MAX_PATH); SaveSettings(); CheckGame(); RefreshNet(); }
     }
     ImGui::PopStyleColor(2);
 
@@ -347,11 +587,13 @@ void Ui() {
     ImGui::BeginDisabled(!canPlay);
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.08f, 0.07f, 0.05f, 1));
     ImGui::PushFont(g_mid);
-    if (ImGui::Button("PLAY CO-OP", ImVec2(260, 52))) Play();
+    if (ImGui::Button("PLAY CO-OP", ImVec2(260, 52))) { Play(); RefreshNet(); }
     ImGui::PopFont(); ImGui::PopStyleColor();
     ImGui::EndDisabled();
     if (!g_msg.empty()) ImGui::TextColored(g_msgOk ? kOk : kBad, "%s", g_msg.c_str());
     ImGui::Spacing(); ImGui::Separator();
+    NetUi();
+    ImGui::Separator();
     ImGui::TextColored(kDim, "Starting the game from Steam or Ubisoft Connect runs the normal game, without co-op.");
     ImGui::TextColored(kDim, "Steam and Ubisoft Connect must be running. Mod protocol %u.", (unsigned)NET_PROTO_VER);
 }
@@ -363,6 +605,7 @@ void ParseArgs() {
         std::string a = s(i); auto next = [&]() { return i + 1 < argc ? s(++i) : std::string(); };
         if (a == "--game-dir") A.gameDir = next(); else if (a == "--report") A.report = next(); else if (a == "--shot") A.shot = next();
         else if (a == "--payload") A.payload = next(); else if (a == "--exit-after") A.exitAfter = atoi(next().c_str());
+        else if (a == "--ini") A.ini = next(); else if (a == "--set-role") A.setRole = next();
         else if (a == "--no-launch") A.noLaunch = true; else if (a == "--auto-play") A.autoPlay = true;
     }
     LocalFree(w);
@@ -372,6 +615,8 @@ void Report() {
     FILE* f = fopen(A.report.c_str(), "w"); if (!f) return;
     fprintf(f, "gameDir=%s\nfound=%d\nknown=%d\npayloadOk=%d\nupToDate=%d\nloader=%s\nloaderNote=%s\nmsg=%s\nmsgOk=%d\nlaunched=%d\n",
             g_gameDir, G.found, G.known, G.payloadOk, G.upToDate, G.loaderName.c_str(), G.loaderNote.c_str(), g_msg.c_str(), g_msgOk, g_launched);
+    fprintf(f, "ini=%s\nentityHost=%d\nmode=%s\n", IniPathA().c_str(), N.entityHost, N.mode);
+    for (auto& p : g_pre) fprintf(f, "preflight=%d %s\n", p.sev, p.text.c_str());
     fclose(f);
 }
 
@@ -382,11 +627,18 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int) {
     if (!A.gameDir.empty()) lstrcpynA(g_gameDir, A.gameDir.c_str(), MAX_PATH);
     if (!g_gameDir[0]) FindGame();
     CheckGame();
+    RefreshNet();
+    if (!A.setRole.empty()) {   // test flag: exactly one [Coop] EntityHost write, same path as the Host/Guest buttons
+        const bool host = A.setRole == "host";
+        if (host || A.setRole == "guest") { if (IniSet(L"Coop", L"EntityHost", host ? L"1" : L"0")) Msg(true, host ? "Role: host" : "Role: guest"); }
+        else Msg(false, "--set-role takes host or guest");
+        RefreshNet();
+    }
     if (A.autoPlay) Play();
 
     WNDCLASSEXW wc{ sizeof(wc), CS_CLASSDC, WndProc, 0, 0, inst, LoadIcon(nullptr, IDI_APPLICATION), LoadCursor(nullptr, IDC_ARROW), nullptr, nullptr, L"AC4CoopLauncher", nullptr };
     RegisterClassExW(&wc);
-    HWND hwnd = CreateWindowW(wc.lpszClassName, L"AC4 Co-op", WS_OVERLAPPEDWINDOW & ~(WS_MAXIMIZEBOX | WS_THICKFRAME), 100, 100, 640, 520, nullptr, nullptr, inst, nullptr);
+    HWND hwnd = CreateWindowW(wc.lpszClassName, L"AC4 Co-op", WS_OVERLAPPEDWINDOW & ~(WS_MAXIMIZEBOX | WS_THICKFRAME), 100, 60, 720, 900, nullptr, nullptr, inst, nullptr);
     if (!CreateDevice(hwnd)) { MessageBoxA(nullptr, "Direct3D 11 is not available on this PC.", "AC4 Co-op", MB_ICONERROR); return 1; }
     ShowWindow(hwnd, SW_SHOWDEFAULT); UpdateWindow(hwnd);
     IMGUI_CHECKVERSION(); ImGui::CreateContext();
