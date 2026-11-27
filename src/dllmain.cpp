@@ -64,6 +64,11 @@ void Phase1_OwnerDamageInstall();   // phase1.cpp: [Coop] OwnerDamage SetLife de
 #  define BUILD_GIT_TREE   "unknown"
 #endif
 
+// I-704: one greppable literal carrying the stamp, so tools/deploy_check.py can read the commit out of a
+// built or deployed ASI without running it. Exported only so /OPT:REF cannot drop it; nothing calls it.
+extern "C" __declspec(dllexport) const char AC4Coop_BuildStamp[] =
+    "AC4COOP_BUILD commit=" BUILD_GIT_COMMIT " tree=" BUILD_GIT_TREE;
+
 // ---- Target function RVAs (file VA - 0x400000) ---------------------------------
 static const uintptr_t RVA_GetWorld          = 0x14D4D0;
 static const uintptr_t RVA_GetPlayer         = 0x30E810;
