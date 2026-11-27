@@ -1,0 +1,59 @@
+sizeof(HookMath::Transform)              64  alignof 16
+sizeof(HookMath::Vector4)                16  alignof 16
+sizeof(SwimBlock)                       108  alignof  1
+sizeof(ClimbBlock)                       52  alignof  1
+sizeof(ContextBlock)                    128  alignof  1
+sizeof(PlayerState)                      576  alignof 16
+NET_PROTO_VER=16 NET_MAGIC=0x43344341 BLEND_MAX=46
+----
+magic                                     0
+protoVer                                  4
+seq                                       8
+worldId                                  12
+sceneKey                                 20
+sceneCellId                              24
+matrix                                   32
+curSpeed                                 96
+destSpeed                               100
+heading                                 112
+isSet                                   128
+sprint                                  129
+breakHardOnEdge                         130
+breakHard                               131
+curMvt                                  132
+destMvt                                 133
+contextId                               134
+subState                                138
+humanGroundStage                        142
+weaponTotallyOut                        146
+isInTree                                147
+isOnShip                                148
+isOnOcean                               149
+doJumpToVoid                            150
+stalkingZoneCount                       151
+stalkingZoneBlendedCount                155
+stalkingClipCount                       159
+stalkingClipBlendedCount                163
+stalkingClipAllowFastStalkingCount      167
+disturbedZoneCount                      171
+actionAlias                             175
+actionChannel                           179
+actionLayer                             183
+blendCount                              187
+blendFactors                            188
+actionRatio                             372
+blendInLen                              376
+blendInStartFromEnd                     380
+blendInTargetStart                      384
+blendInFlags                            388
+isTransitionAction                      390
+timeScale                               391
+ctx                                     395
+shipValid                               523
+shipPos                                 524
+shipQuat                                536
+shipHP                                  552
+shipMaxHP                               556
+shipClass                               560
+valid                                   564
+hostTimeMs                              565

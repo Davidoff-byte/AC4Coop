@@ -38,6 +38,8 @@
 #include "react_probe.h"
 #include "guard_poi.h"
 #include "fight_probe.h"
+#include "conflict_probe.h"
+#include "puppet_listener.h"
 void Phase1_OwnerDamageInstall();   // phase1.cpp: [Coop] OwnerDamage SetLife detour (S9)
 #include "action_guard.h"
 #include "deref_guard.h"
@@ -654,6 +656,7 @@ BOOL APIENTRY DllMain(HMODULE hMod, DWORD reason, LPVOID)
         // Event probe on sub_64A020 (observation only): which events shooting / attacking posts. [Coop] EventProbe, default 0.
         EventProbe::Init();
         PlayerDamageProbe::Init();   // [Coop] PlayerDamageProbe (default 0) / PlayerDamageRelay (default follows FightIntents)
+        PuppetListener::Init();      // [Coop] PuppetListener / PuppetListenerAttach / PuppetMaxLife (code default 0; harvested from re/conflict-gate-probe b9cd5ab)
         CombatTiming::Init();        // [Coop] CombatTimingProbe (default 0): read-only attack timing lines
         { void SenseGuardInit(); SenseGuardInit(); }
         { void SpawnCensusInit(); SpawnCensusInit(); }   // [Coop] SpawnCensus, default 0: origin of every world add
@@ -671,6 +674,9 @@ BOOL APIENTRY DllMain(HMODULE hMod, DWORD reason, LPVOID)
 
         // Which path removes the puppet's fighter record (sub_161F420). [Coop] FightProbe, default 0.
         FightProbe::Init();
+
+        // Who asks the FightManager to start a fight, player vs puppet (sub_1625330 / sub_1620140). [Coop] ConflictProbe, default 0.
+        ConflictProbe::Init();
 
         // Stage 2A combat observer (E2-combat.md §1.2). OBSERVATION ONLY, installed as a byte-patch
         // hook: four whole-instruction prologues are detoured into private stubs that log the call
