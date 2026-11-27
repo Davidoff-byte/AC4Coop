@@ -224,7 +224,8 @@ uintptr_t SubmitPrivate(uintptr_t spec, uintptr_t owner, uintptr_t ctx, int* pri
 bool Pick(int kind, uint64_t key, uint32_t cls, LibE* out, bool keyedOnly = false, uintptr_t exclude = 0)
 {
     LibE cand[kLib]; int n = 0;
-    { Spin s; for (int i = 0; i < g_libN; ++i) { const LibE& e = g_lib[i]; if (!e.bad && e.kind == kind && (!key || e.key == key) && (!cls || e.cls == cls) && (!keyedOnly || e.key) && e.spec != exclude) cand[n++] = e; } }
+    { Spin s; for (int i = 0; i < g_libN; ++i) { const LibE& e = g_lib[i]; if (!e.bad && e.kind == kind && (!key || e.key == key) && (!cls || e.cls == cls) && (!keyedOnly || e.key) && e.spec != exclude
+        && (kind != K_SHIP || e.ownerVt == kOwnerNavalVt)) cand[n++] = e; } }   // ships: naval owner only (T5: 5/5 other-owner ship submits never built)
     for (int pass = 0; pass < n; ++pass) {
         int best = -1;
         for (int i = 0; i < n; ++i) if (cand[i].spec && (best < 0 || cand[i].t > cand[best].t)) best = i;
@@ -263,7 +264,8 @@ bool PlayerFront(float dist, float* out)
 }
 void Log(const char* fmt, ...)
 {
-    char line[400]; va_list ap; va_start(ap, fmt); _vsnprintf_s(line, sizeof(line), _TRUNCATE, fmt, ap); va_end(ap);
+    char line[1024]; va_list ap; va_start(ap, fmt); const int n = _vsnprintf_s(line, sizeof(line), _TRUNCATE, fmt, ap); va_end(ap);
+    if (n < 0) { line[sizeof(line) - 2] = '\n'; line[sizeof(line) - 1] = 0; }   // truncated: keep the line ending
     Phase1_LogLine(line);
 }
 // __try helpers kept apart from the spinlock users (MSVC: no __try in a function with an object that has a destructor).
@@ -344,6 +346,7 @@ extern "C" void SpawnLibNoteBuilt(uintptr_t req, uintptr_t ent)   // C linkage: 
 }
 
 uintptr_t SpawnLibSubmit(uintptr_t spec, uintptr_t owner, uintptr_t ctx, int* priv, char* submitted) { return SubmitPrivate(spec, owner, ctx, priv, submitted); }   // ship_spawn_replay.cpp
+bool SpawnLibShipOwnerOk(uintptr_t owner) { return Readable(owner, 4) && *(const uint32_t*)owner == kOwnerNavalVt; }   // ship_spawn_replay.cpp
 bool SpawnLibSpecUsable(uintptr_t spec) { return SpecArmed(spec) && SpecUsableSt(SpecState(spec)); }   // ship_spawn_replay.cpp (spec Readable 0x40 checked there)
 
 // spawn_census.cpp DetSpecDtor: sub_501DF0 (SpawningSpecification dtor body) entry, any thread. Our queued requests on this
@@ -414,7 +417,11 @@ void SpawnLibFire()
         constexpr int kAbsent = -0x7F00;
         const int seq = GetPrivateProfileIntA("Coop", "SpawnCmdSeq", kAbsent, Paths::Ini());
         const int pid = GetPrivateProfileIntA("Coop", "SpawnCmdPid", kAbsent, Paths::Ini());
-        if (seq == kAbsent || pid == kAbsent) {}   // transient read: no decision this second
+        // + debounce: a new value must be read twice in a row (1 s apart); a key caught mid-write reads as an empty value = 0
+        // (run T6: 19 commands from 6 changes even with the sentinel).
+        static int s_cand = -1;
+        const bool stable = (seq == s_cand); s_cand = seq;
+        if (seq == kAbsent || pid == kAbsent || !stable) {}   // transient or not yet confirmed: no decision this second
         else if (s_seq < 0) s_seq = seq;   // the value at start is not a command
         else if (seq != s_seq && (pid == 0 || (DWORD)pid == GetCurrentProcessId())) {   // SpawnCmdPid: one copy only
             s_seq = seq;

@@ -25,7 +25,7 @@ bool Phase1_InSave();
 uint64_t Phase1_ScbHostOf(uintptr_t guestShip);
 bool SpawnCensusCtxOf(uintptr_t req, uintptr_t* ctx);   // spawn_census.cpp: ctx argument DetFac saw for this request
 void SpawnShareReplayTag(int v);                        // spawn_census.cpp: SpawnShareDecide passes requests we submit
-bool SpawnLibSpecUsable(uintptr_t spec);   // spawn_lib.cpp
+bool SpawnLibSpecUsable(uintptr_t spec); bool SpawnLibShipOwnerOk(uintptr_t owner);   // spawn_lib.cpp
 uintptr_t SpawnLibSubmit(uintptr_t spec, uintptr_t owner, uintptr_t ctx, int* priv, char* submitted);   // spawn_lib.cpp
 bool SpawnLibPickShip(uint32_t cls, uintptr_t* spec, uintptr_t* specVt, uintptr_t* owner, uintptr_t* ownerVt, uintptr_t* ctx, uint32_t* gotCls);   // spawn_lib.cpp
 
@@ -281,7 +281,7 @@ void ShipSpawnReplayFire()
         return;
     }
     const uintptr_t old = *(const uintptr_t*)(s.spec + 0x3C);
-    if (!SpawnLibSpecUsable(s.spec)) {   // busy spec not usable per [Coop] SpawnLibBusy (spawn_lib.cpp SpecUsableSt). Run 2026-11-28
+    if (!SpawnLibSpecUsable(s.spec) || !SpawnLibShipOwnerOk(s.owner)) {   // + naval owner only (T5: other-owner ship submits never built)   // busy spec not usable per [Coop] SpawnLibBusy (spawn_lib.cpp SpecUsableSt). Run 2026-11-28
         // host 17860: submit on a busy spec + restore left an owner ship record {old request, our ship}; the old request was
         // freed -> AV 0x1C27B15 (sub_1C27A90 <- sub_1C4BDC0 <- sub_1972150). Swap in an idle SpawnLib spec for the next fire.
         ++c_busy;

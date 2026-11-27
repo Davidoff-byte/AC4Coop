@@ -1,0 +1,42 @@
+# SpawnLib — spawn any engine entity on demand, and keep it synced (`src/spawn_lib.cpp`)
+
+Flag `[Coop] SpawnLib` (default 0; hooks installed only when non-zero at load, then re-read every second).
+Evidence: `docs/evidence/spawn-lib-2026-11-28.md` (runs, four crash root causes, IDA receipts).
+
+## What it does
+1. **Library.** Every engine submit seen by `spawn_census.cpp` (`SpawnKeyNoteReq`) is recorded as
+   (spec, owner, ctx, static key, kind ship/NPC, learned ship class). Our own submits are not recorded.
+2. **On demand.** `SpawnCmd = ship[:class] | npc[:keyhex]`, fired by a change of `SpawnCmdSeq`, only in the copy whose
+   pid is `SpawnCmdPid` (0 = any). Built entity is placed in front of the player (ship 80 m, NPC 4 m) 1.5 s after build.
+   `npc` without a key prefers a keyed spec, so the guest can follow it by key.
+3. **Guest follow** (`SpawnLibFollow`, default 1). WideBind's key round finds a host guard whose static key has no free
+   local body → the guest replays its own spec for that key; while that is queued/in flight/just built (< 4 s) the
+   distance rounds skip that guard (`pendingFollow=`), so the key round binds the new body.
+4. **Ship supply** for ShipSpawnReplay (`SpawnLibPickShip`): newest usable spec of the wanted class, else any class.
+
+## Rules every submit obeys (each one is a crash we had)
+| rule | why (crash) |
+|---|---|
+| never restore `spec+0x3C` right after the submit | A (guest 17552) and B (host 17860): the owner paired the old request with our ship; it was freed |
+| spec must be **armed**: `spec+0x1C` object with a vtable in .rdata and vt[2] in .text | C (host 25716 + guest 24228): `sub_46D6F0 → sub_6B3CE0(spec)` on an un-armed spec, AV 0x6B3CE3 |
+| busy spec only if its current request is not in flight (`SpawnLibBusy=1`; 0 idle only, 2 any) | idle specs did not build (4/4 timeouts); in-flight is where B's pairing came from |
+| naval submits use the **private owner** (no adoption) + slot borrow restored at build | D (T3, both copies): owner adoption is 1:1 per spec; it freed a spec another record still used, AV 0x1C27B25 |
+
+Private owner: one static zeroed object; its vtables point at a copy of the owner interface 0x02708E80 with the
+adoption / entity-removed / dtor slots ([4]–[8], [10], [11], [17]) replaced by counting no-ops; the other slots are the
+engine's own and ignore `this`. Owner classes other than 0x02708E80 are passed through unchanged (`[SpawnLib] owner class`
+lines list them; their callbacks are unread — NPC spawns still use the engine owner).
+
+## Sync path
+- Ships: host ShipSync carries every host AI ship; guest ShipClassBind=2 binds a free local hull of that class, else
+  ShipSpawnReplay builds one through the same submit (private owner) and binds it; driven by
+  `Entity::SetGlobalMatrixInternal` per snapshot.
+- NPCs: host publishes each guard's static key (IC_SPAWN kind 2) or crew key; guest key round binds its own body for the
+  key, else SpawnLib follow builds one; guard lanes mirror it.
+
+## Not done / unverified
+- Ships under the private owner get no owner AI setup (sub_196E910 also sets navigation); whether host-spawned ships
+  still sail is measured per run.
+- NPC owner classes: not read; adoption 1:1 risk unmeasured for NPCs.
+- Nothing despawns our private-owner ships before world unload.
+- World-unload behaviour with SpawnLib ships alive: untested.
