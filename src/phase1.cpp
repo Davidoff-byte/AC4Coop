@@ -10639,7 +10639,16 @@ static volatile LONG s_afSeen[2] = {}, s_afTx[2] = {}, s_afRx[2] = {}, s_afPost[
 // sub_184C9D0 / sub_1862530). AttackForward_Post's dispatch is synchronous, so when it returns the FDE's
 // FightDamageResponse R (fde+0x70) holds the decision: type fde+0x90 (= R+0x20) 20/21/22 counter-kill (sub_1861EC0),
 // 16/17/18/23 block family; phase fde+0x54 (sub_1861EC0 sets 1 on a counter-kill).
-static int g_ctrProbe = 0;
+static int g_ctrProbe = 0, g_ctrSync = 0;
+// [Coop] CounterSync wire (proto 18): guest -> host, IC_ATK_A + IC_ATK_B on ONE key (wireId kCtrWire, like kPdrWire), so the
+// host's per-guard ForgetIntents (AttackForwardHostPump, 2 s idle) never drops this key's receive order. Joined by
+// (seq, guard low 32). IntentMsg.hostMs = the decision time on the host clock (PeerClock::HostUs / 1000), 0 = no estimate.
+static const uint64_t kCtrWire = 0x4156415441524F33ull;   // 'AVATARO3': the guest avatar's defence results
+#pragma pack(push, 1)
+struct CtrA { uint64_t guard; uint32_t seq; uint8_t phase, type, postedPh, b48, b49, b4A, b4B, rsv; uint32_t r24, r28, r2C; };
+struct CtrB { uint32_t seq, guardLo, r30, r38, r3C, r40, r44, r4C; };
+#pragma pack(pop)
+static_assert(sizeof(CtrA) == 32 && sizeof(CtrB) == 32, "CounterSync payloads are wire layouts");
 struct CtrResp { uint32_t phase, type, r24, r28, r2C, r30, r38, r3C, r40, r44, r4C; uint8_t b48, b49, b4A, b4B; };
 static bool CtrRead(const void* fde, CtrResp& r) {   // plain reads of the FDE the engine just handled; no engine calls
     __try {
@@ -10651,9 +10660,23 @@ static bool CtrRead(const void* fde, CtrResp& r) {   // plain reads of the FDE t
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
-static volatile LONG s_ctrSeen = 0, s_ctrResp = 0, s_ctrKill = 0, s_ctrDup = 0;
+static volatile LONG s_ctrSeen = 0, s_ctrResp = 0, s_ctrKill = 0, s_ctrDup = 0, s_ctrTx = 0, s_ctrTxFail = 0, s_ctrRx = 0, s_ctrStale = 0;
 static struct { uint64_t id; uint32_t seq; } s_ctrDone[16]; static int s_ctrDoneI = 0;   // (guard, AF seq) already resolved
-static bool CtrGuestOn() { return g_ctrProbe != 0; }
+static bool CtrGuestOn() { return g_ctrProbe != 0 || g_ctrSync != 0; }
+// Guest: ship one resolved response to the host (S1).
+static void CounterGuestTx(uint64_t id, uint32_t seq, int postedPh, const CtrResp& r) {
+    if (!g_ctrSync || g_entHost == 1) return;
+    CtrA a = { id, seq, (uint8_t)r.phase, (uint8_t)r.type, (uint8_t)postedPh, r.b48, r.b49, r.b4A, r.b4B, 0, r.r24, r.r28, r.r2C };
+    CtrB b = { seq, (uint32_t)id, r.r30, r.r38, r.r3C, r.r40, r.r44, r.r4C };
+    uint64_t hu = 0;
+    const uint32_t hostMs = PeerClock::HostUs(&hu) ? (uint32_t)(hu / 1000) : 0;
+    const bool ok = Net::PublishIntent(0, kCtrWire, IC_ATK_A, hostMs, &a, 32) && Net::PublishIntent(0, kCtrWire, IC_ATK_B, hostMs, &b, 32);
+    InterlockedIncrement(ok ? &s_ctrTx : &s_ctrTxFail);
+    if (ok) Net::PumpIntents();
+    static LONG s_lines = 0;
+    if (InterlockedIncrement(&s_lines) <= 400)
+        L("[CTR] guest tx guard=%016llX seq=%u type=%u ph=%u hostMs=%u ok=%d\n", (unsigned long long)id, seq, r.type, r.phase, hostMs, ok ? 1 : 0);
+}
 // Guest, player frame, right after AttackForward_Post(.., &f) returned for guard `id`, AF event `seq`. True = the post
 // resolved to a response (type != 0) for the first time for this (guard, seq).
 static bool CounterGuestPosted(uint64_t id, uint32_t seq, int postedPh, void* f) {
@@ -10669,10 +10692,51 @@ static bool CounterGuestPosted(uint64_t id, uint32_t seq, int postedPh, void* f)
     if (g_ctrProbe && InterlockedIncrement(&s_lines) <= 400)
         L("[CTR] guest resp guard=%016llX seq=%u ph=%u type=%u var=%u posted=%d r28=%u r2C=%u r30=%u b4B=%u\n", (unsigned long long)id,
           seq, r.phase, r.type, r.r40, postedPh, r.r28, r.r2C, r.r30, r.b4B);
+    CounterGuestTx(id, seq, postedPh, r);   // [Coop] CounterSync
     return true;
+}
+// Host: (guard, AF seq) -> publish time, so a CounterSync result can be dated without PeerClock and stale replays dropped.
+static struct { uint64_t id; uint32_t seq; ULONGLONG ms; } s_ctrTxRing[256]; static int s_ctrTxRingI = 0;
+static bool CtrHostPath(uint64_t id, uint16_t p[6]) {   // the guard's Ground path now (host)
+    Entity* e = FiResolve(id);
+    Human* h = e ? AIEntityHelper::GetHuman(e) : nullptr;
+    char* hg = h ? FiHumanGround(h) : nullptr;
+    return hg && FiPath(hg, p, nullptr);
+}
+static void CounterHostResolved(const CtrA& a, const CtrB& b, uint32_t hostMs);   // S2 (below the drain helpers)
+// Host, player frame (lane drain): one half of a result; both halves -> CounterHostResolved.
+static struct { uint32_t seq, lo; uint8_t mask; CtrA a; CtrB b; uint32_t hostMs; } s_ctrAsm[8]; static int s_ctrAsmI = 0;
+static void CounterHostRx(const Net::IntentMsg& m) {
+    if (!g_ctrSync || g_entHost != 1 || m.len != 32) return;
+    CtrA a = {}; CtrB b = {}; uint32_t seq, lo;
+    if (m.channel == IC_ATK_A) { memcpy(&a, m.payload, 32); seq = a.seq; lo = (uint32_t)a.guard; }
+    else { memcpy(&b, m.payload, 32); seq = b.seq; lo = b.guardLo; }
+    int k = -1;
+    for (int i = 0; i < 8; ++i) if (s_ctrAsm[i].mask && s_ctrAsm[i].seq == seq && s_ctrAsm[i].lo == lo) { k = i; break; }
+    if (k < 0) { k = s_ctrAsmI; s_ctrAsmI = (s_ctrAsmI + 1) & 7; s_ctrAsm[k].seq = seq; s_ctrAsm[k].lo = lo; s_ctrAsm[k].mask = 0; }
+    if (m.channel == IC_ATK_A) { s_ctrAsm[k].a = a; s_ctrAsm[k].mask |= 1; } else { s_ctrAsm[k].b = b; s_ctrAsm[k].mask |= 2; }
+    s_ctrAsm[k].hostMs = m.hostMs;
+    if (s_ctrAsm[k].mask != 3) return;
+    s_ctrAsm[k].mask = 0;
+    InterlockedIncrement(&s_ctrRx);
+    const CtrA& ra = s_ctrAsm[k].a;
+    const ULONGLONG now = GetTickCount64();
+    long long rt = -1;
+    for (int i = 0; i < 256; ++i) if (s_ctrTxRing[i].id == ra.guard && s_ctrTxRing[i].seq == ra.seq) { rt = (long long)(now - s_ctrTxRing[i].ms); break; }
+    long long age = -1; uint64_t hu = 0;
+    if (s_ctrAsm[k].hostMs && PeerClock::HostUs(&hu)) age = (long long)(int32_t)((uint32_t)(hu / 1000) - s_ctrAsm[k].hostMs);
+    uint16_t p[6] = {}; const bool have = CtrHostPath(ra.guard, p);
+    const bool stale = rt < 0 || rt > 2000;   // not an attack we forwarded in the last 2 s: a replay to a rejoined peer, or lost
+    if (stale) InterlockedIncrement(&s_ctrStale);
+    static LONG s_lines = 0;
+    if (InterlockedIncrement(&s_lines) <= 400)
+        L("[CTR] host rx guard=%016llX seq=%u type=%u ph=%u age=%lldms rt=%lldms path=%u/%u%s%s\n", (unsigned long long)ra.guard, ra.seq, ra.type,
+          ra.phase, age, rt, p[4], p[5], have ? "" : " (no path)", stale ? " STALE (dropped)" : "");
+    if (!stale) CounterHostResolved(ra, s_ctrAsm[k].b, s_ctrAsm[k].hostMs);
 }
 // Host, player frame (AttackForwardHostPump): the guard's Ground path at each forwarded warning / hit to the puppet.
 static void CounterHostTxNote(uintptr_t att, uint64_t id, uint32_t seq, int ph) {
+    if (g_ctrSync) { s_ctrTxRing[s_ctrTxRingI].id = id; s_ctrTxRing[s_ctrTxRingI].seq = seq; s_ctrTxRing[s_ctrTxRingI].ms = GetTickCount64(); s_ctrTxRingI = (s_ctrTxRingI + 1) & 255; }
     if (!g_ctrProbe) return;
     static LONG s_lines = 0;
     if (InterlockedIncrement(&s_lines) > 400) return;
@@ -10682,6 +10746,7 @@ static void CounterHostTxNote(uintptr_t att, uint64_t id, uint32_t seq, int ph) 
     L("[CTR] host atk guard=%016llX seq=%u ph=%d path=%u/%u/%u/%u/%u/%u%s\n", (unsigned long long)id, seq, ph, p[0], p[1], p[2], p[3], p[4],
       p[5], have ? "" : " (unreadable)");
 }
+static void CounterHostResolved(const CtrA&, const CtrB&, uint32_t) {}
 
 // Host, any thread (the attacker's event post).
 void Phase1_PuppetAttackPosted(uintptr_t att, const AtkFields& a) {
@@ -10820,7 +10885,8 @@ static void AttackForwardReport() {
     L("[AF] stats seen warn/hit=%ld/%ld tx=%ld/%ld dropped=%ld | rx=%ld/%ld posted=%ld/%ld unresolved=%ld (hits applied as DamageEvent %ld) failed=%ld\n",
       s_afSeen[0], s_afSeen[1], s_afTx[0], s_afTx[1], s_afDropped, s_afRx[0], s_afRx[1], s_afPost[0], s_afPost[1], s_afUnres, s_afFallback, s_afFail);
     if (CtrGuestOn())
-        L("[CTR] stats guest examined=%ld resp=%ld counterKill=%ld dup=%ld\n", s_ctrSeen, s_ctrResp, s_ctrKill, s_ctrDup);
+        L("[CTR] stats guest examined=%ld resp=%ld counterKill=%ld dup=%ld tx=%ld txFail=%ld | host rx=%ld stale=%ld\n", s_ctrSeen, s_ctrResp,
+          s_ctrKill, s_ctrDup, s_ctrTx, s_ctrTxFail, s_ctrRx, s_ctrStale);
 }
 
 bool SpawnShareOn(); void SpawnShareRx(uint64_t key, const uint8_t* payload, uint8_t len);   // spawn_census.cpp ([Coop] SpawnShare / SpawnKeyBind)
@@ -10828,12 +10894,14 @@ bool SpawnShareOn(); void SpawnShareRx(uint64_t key, const uint8_t* payload, uin
 static void FightIntentDrain() {
     const bool fi = FightIntentsOn();
     if (!fi && !(OwnerDamageOn() && Net::IntentLaneOn()) && !(PdrOn() && Net::IntentLaneOn()) && !(AfOn() && Net::IntentLaneOn())
-        && !SailSyncOn() && !CoordSyncOn() && !(g_guardActLane && Net::IntentLaneOn()) && !(Brain::On() && Net::IntentLaneOn()) && !(PchanOn() && Net::IntentLaneOn()) && !SpawnShareOn()) return;   // [Coop] SailSync/CoordSync/GuardActionLane keep the lane drained with every fight flag off
+        && !SailSyncOn() && !CoordSyncOn() && !(g_guardActLane && Net::IntentLaneOn()) && !(Brain::On() && Net::IntentLaneOn()) && !(PchanOn() && Net::IntentLaneOn()) && !SpawnShareOn()
+        && !(g_ctrSync && Net::IntentLaneOn())) return;   // [Coop] SailSync/CoordSync/GuardActionLane keep the lane drained with every fight flag off
     OwnerHitStalePoll();   // [Coop] RespawnHitGraceMs
     Net::IntentMsg m;
     while (Net::PollIntent(m)) {
         if (m.channel == IC_SHIP) { SailApplyMsg(m); continue; }   // [Coop] SailSync, docs/design/sail-memento.md
         if (m.channel == IC_COORD) { CoordSyncApplyMsg(m.wireId, m.seq, m.payload, m.len); continue; }   // [Coop] CoordSync
+        if ((m.channel == IC_ATK_A || m.channel == IC_ATK_B) && m.wireId == kCtrWire) { CounterHostRx(m); continue; }      // [Coop] CounterSync (guest -> host)
         if (m.channel == IC_ATK_A || m.channel == IC_ATK_B || m.channel == IC_ATK_C) { AttackForwardOwnerRx(m); continue; }   // [Coop] AttackForward
         if (m.channel == IC_BRAIN) { Brain::OnIntent(m.wireId, m.seq, m.flags, m.payload, m.len); continue; }                 // [Coop] Brain
         if (m.channel == IC_ACTION) { GalGuestRx(m); continue; }                                                              // [Coop] GuardActionLane
@@ -16208,7 +16276,7 @@ static void DumpConfigOnce()
         { "Coop", "TuneAggroTime", 30 }, { "Coop", "TuneHull", 0 },
         { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 }, { "Coop", "WeaponSync", 0 }, { "Coop", "ShipPeerZ", 0 }, { "Coop", "ShipBindProbe", 0 }, { "Coop", "ShipSpawnProbe", 0 }, { "Coop", "ShipSpawnFire", 0 }, { "Coop", "ShipSpawnFirePid", 0 }, { "Coop", "SpawnCensus", 0 }, { "Coop", "SpawnReplayFire", 0 }, { "Coop", "SpawnReplayFirePid", 0 }, { "Coop", "SpawnShare", 0 }, { "Coop", "SpawnKeyBind", 0 }, { "Coop", "ShipClassBind", 0 }, { "Coop", "ShipClassBindSteal", 0 }, { "Coop", "SpawnShareRadiusM", 150 }, { "Coop", "CallTraceVt", 0 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "TableEvict", 0 }, { "Coop", "UsedEntAllPaths", 0 }, { "Coop", "PuppetSeqResync", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "FastTravelCrashFix", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 }, { "Coop", "PuppetListener", 0 }, { "Coop", "PuppetListenerAttach", 0 }, { "Coop", "PuppetMaxLife", 0 }, { "Coop", "ConflictProbe", 0 }, { "Coop", "OwnSnapAtTarget", 0 }, { "Coop", "PuppetWorldDropRef", 0 }, { "Coop", "PadIdPreferOffered", 0 }, { "Coop", "GuardPerceivePuppet", 0 },
         { "Coop", "ShipSpawnReplay", 0 },
-        { "Coop", "CounterProbe", 0 },
+        { "Coop", "CounterProbe", 0 }, { "Coop", "CounterSync", 0 },
         { "Coop", "CombatTest", 0 }, { "Coop", "CrashContext", 0 }, { "Coop", "CorpseKeepSec", 30 }, { "Coop", "CrowdProbeIntegrate", 1 },
         { "Coop", "CrowdProbeLiveKeys", 1 }, { "Coop", "DamageRelay", 0 }, { "Coop", "Diag", 0 },
         { "Coop", "DisableCrowd", 0 }, { "Coop", "DisablePuppetAI", 1 }, { "Coop", "DisableSpawns", 0 },
@@ -17525,6 +17593,7 @@ void Phase1::InstallFrameHook() {
     g_guardActLane = GetPrivateProfileIntA("Coop", "GuardActionLane", 0, Paths::Ini()) != 0 ? 1 : 0;   // default 0 until verified live
     g_respawnGraceMs = GetPrivateProfileIntA("Coop", "RespawnHitGraceMs", 0, Paths::Ini());            // default 0 = off
     g_ctrProbe = GetPrivateProfileIntA("Coop", "CounterProbe", 0, Paths::Ini()) != 0 ? 1 : 0;          // default 0 (docs/design/counter-sync.md S0)
+    g_ctrSync = GetPrivateProfileIntA("Coop", "CounterSync", 0, Paths::Ini()) != 0 ? 1 : 0;            // default 0 (S1 wire)
     if (g_snapHz < 1) g_snapHz = 1;
     if (g_snapHz > 60) g_snapHz = 60;
     g_driveContext = GetPrivateProfileIntA("Coop", "DriveContext", 0, Paths::Ini());
