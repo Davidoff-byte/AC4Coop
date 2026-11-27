@@ -3698,6 +3698,32 @@ void Phase1::ApplyRemoteState(const PlayerState& s) {
     }
 }
 
+// [Coop] DespawnLeaveFight: puppet queued by DespawnPuppet for RemoveFighter + RemoveEntity outside any __try.
+// Main thread only (set in OnFrameInner, drained in OnFrame).
+static Entity* s_pendingDespawn = nullptr;
+
+// Called from OnFrame AFTER the OnFrameInner __try. RemoveFighter runs with no __try on the call path; World lookup
+// and RemoveEntity keep the __try they had in DespawnPuppet.
+static void DespawnPuppetDeferred() {
+    Entity* dead = s_pendingDespawn;
+    if (!dead) return;
+    s_pendingDespawn = nullptr;
+    World* world = nullptr;
+    __try { world = World::GetCurrentWorld(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        L("[Net] DespawnPuppet EXCEPTION (code=0x%08X)\n", GetExceptionCode());
+        return;
+    }
+    if (!world) return;
+    GuardPoi::LeaveFightBeforeDespawn(dead);   // validates under its own __try, calls sub_161F420 outside it
+    __try {
+        world->RemoveEntity(dead);
+        L("[Net] puppet despawned (%p)\n", dead);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        L("[Net] DespawnPuppet EXCEPTION (code=0x%08X)\n", GetExceptionCode());
+    }
+}
+
 // Remove the puppet from the world when the peer leaves our world or disconnects. World::RemoveEntity
 // is the deferred counterpart to World::AddEntity (processes next frame). Clears g_puppet immediately
 // so nothing drives the entity after we've asked for its removal. Main-thread only (like spawn).
@@ -3712,12 +3738,20 @@ void Phase1::DespawnPuppet() {
     g_bhvState = -1;                 // re-establish the next puppet's behavior state (toggle from unknown)
     g_switchCd = 0;
     g_casActivated = false;          // re-activate its CharacterActionSet
+    // [Coop] DespawnLeaveFight (default 0): RemoveFighter (sub_161F420) takes the FightManager CS and the global
+    // handle CS (design-2026-11-27 Addendum A3), and DespawnPuppet runs inside OnFrameInner, i.e. inside OnFrame's
+    // __try. Lock rule: never call a lock-taking engine function under __try. With the flag on, the whole
+    // RemoveFighter -> RemoveEntity sequence (same order) is deferred to DespawnPuppetDeferred, which OnFrame runs
+    // after the OnFrameInner __try has closed. Flag off: unchanged below.
+    if (GetPrivateProfileIntA("Coop", "DespawnLeaveFight", 0, Paths::Ini()) != 0) {
+        s_pendingDespawn = dead;
+        return;
+    }
     __try {
         World* world = World::GetCurrentWorld();
         if (!world)
             return;
 
-        GuardPoi::LeaveFightBeforeDespawn(dead);   // [Coop] DespawnLeaveFight (default 0)
         world->RemoveEntity(dead);
 
         L("[Net] puppet despawned (%p)\n", dead);
@@ -16082,6 +16116,7 @@ static void __cdecl OnFrame(Human* updatedHuman) {
         static int s_n = 0;
         if (s_n < 20) { ++s_n; L("[Frame] EXCEPTION 0x%08X in on-frame work (skipped)\n", GetExceptionCode()); }
     }
+    DespawnPuppetDeferred();   // [Coop] DespawnLeaveFight: RemoveFighter outside any __try (no-op unless queued)
     InterlockedCompareExchange(&s_playerWorkTid, 0, (LONG)GetCurrentThreadId());   // player work over (if it was ours)
 }
 

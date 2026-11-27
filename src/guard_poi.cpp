@@ -509,16 +509,22 @@ void GuardPoi::Init()
 void GuardPoi::LeaveFightBeforeDespawn(void* puppet)
 {
     if (!puppet || GetPrivateProfileIntA("Coop", "DespawnLeaveFight", 0, Paths::Ini()) == 0) return;
+    // Lock rule (ops/evidence/guard-perceive-puppet-design-2026-11-27.md, Addendum A3): sub_161F420 enters the
+    // FightManager CS (0x161F42A lea edi,[esi+66Ch] / call sub_D587F0) and, nested, the global CS [0x4DD5FA0+0x7C].
+    // Inputs are read and checked under __try; the call itself runs OUTSIDE any __try. The caller
+    // (Phase1 DespawnPuppetDeferred, from OnFrame after the OnFrameInner __try) holds no __try either.
+    char* fm = nullptr;
+    const char* rec = nullptr;
     __try {
         const char* e = (const char*)puppet;
         const char* w = *(const char* const*)(e + 0x5C);
-        char* fm = w ? *(char* const*)(w + 0x8DC) : nullptr;
+        fm = w ? *(char* const*)(w + 0x8DC) : nullptr;
         const char* ai = *(const char* const*)(e + 0xE8);
-        const char* rec = ai ? *(const char* const*)(ai + 0x98) : nullptr;
+        rec = ai ? *(const char* const*)(ai + 0x98) : nullptr;
         if (!fm || !rec || EntOf(rec) != puppet) return;
-        Hook::CallClassMethod<void, char*, const char*>((unsigned long)Va(0x0161F420), fm, rec);
-        OutputDebugStringA("[Poi] DespawnLeaveFight: RemoveFighter(puppet record) before despawn\n");
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+    Hook::CallClassMethod<void, char*, const char*>((unsigned long)Va(0x0161F420), fm, rec);
+    OutputDebugStringA("[Poi] DespawnLeaveFight: RemoveFighter(puppet record) before despawn\n");
 }
 
 int GuardPoi::FormatReport(char* out, int cap)
