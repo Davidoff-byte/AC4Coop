@@ -7496,6 +7496,18 @@ static void GktAttemptClear(uint64_t objId, unsigned int ent) {
     (void)ent;
 }
 
+// WR-15 (W-P2-3): kill pushes used GetTickCount() as seq. The receiver's stale filter (net.cpp, STALE_WINDOW
+// 4096 around g_rxDoneSeq) only lets them through untouched while that tick is far from the snapshot counter;
+// a tick inside the window below the marker was dropped as DEC_STALE, one inside it above the marker MOVED the
+// marker so the next real snapshots read as stale, and one >= 4096 below it captured the marker outright. A kill
+// seq is now pinned 2^30 ahead of this sender's own snapshot counter: SeqDiff to a marker near g_entSeq is ~+2^30,
+// i.e. never stale and never inside (0, STALE_WINDOW) or <= -STALE_WINDOW, so the marker is never moved; the
+// per-push counter keeps back-to-back kills distinct (and increasing) when no snapshot runs in between.
+static uint32_t KillPushSeq() {
+    static uint32_t s_killPushN = 0;
+    return g_entSeq + 0x40000000u + (++s_killPushN);   // no mask: a wrap would re-enter the window
+}
+
 // objId == 0 is legal: a guard the host never described (locally spawned) has no host id, and
 // ApplyPeerHealth falls back to the 4 m position match (phase1.cpp:4944) exactly for that case.
 static void GuestPushDeath(uint64_t objId, unsigned int ent, float x, float y, float z) {
@@ -7509,7 +7521,7 @@ static void GuestPushDeath(uint64_t objId, unsigned int ent, float x, float y, f
     memset(&out, 0, sizeof(out));
     out.magic    = NET_ENTITY_MAGIC;
     out.protoVer = NET_PROTO_VER;
-    out.seq      = GetTickCount();
+    out.seq      = KillPushSeq();   // WR-15: not GetTickCount (see KillPushSeq)
     out.count    = 1;
     out.ents[0].kind    = KIND_KILL;
     out.ents[0].objId   = objId;
@@ -13734,7 +13746,7 @@ static void SendHealthEvent(uint64_t objId, unsigned short life, float x, float 
     memset(&out, 0, sizeof(out));
     out.magic = NET_ENTITY_MAGIC;
     out.protoVer = NET_PROTO_VER;
-    out.seq = GetTickCount();
+    out.seq = KillPushSeq();   // WR-15: not GetTickCount (see KillPushSeq)
     out.count = 1;
     out.ents[0].kind = KIND_KILL;
     out.ents[0].objId = objId;
