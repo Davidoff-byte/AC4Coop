@@ -16421,7 +16421,7 @@ static void DumpConfigOnce()
         { "Coop", "SyncRadiusM", 60 }, { "Coop", "TransformProbe", 0 }, { "Coop", "VPadEnable", 0 },
         { "Coop", "VPadTest", 0 }, { "Coop", "WatchDeadBit", 0 }, { "Coop", "WatchTarget", 0 },
         { "Coop", "HookFrame", 1 }, { "Coop", "HookPad", 1 }, { "Coop", "HookWindowed", 1 }, { "Coop", "ActMatchProbe", 0 }, { "Coop", "FightIntents", 0 }, { "Coop", "SpawnerIdProbe", 0 }, { "Coop", "OwnerDamage", 0 },
-        { "Coop", "HookMultiInstance", 1 },
+        { "Coop", "HookMultiInstance", 1 }, { "Coop", "FrameTimeLog", 0 },
         { "Display", "Borderless", 0 }, { "Display", "ForceWindowedMs", 5000 }, { "Display", "Fullscreen", 0 },
         { "Net", "Enabled", 0 }, { "Net", "InterpDelayMs", 100 }, { "Net", "InterpMaxExtrapMs", 100 },
         { "Net", "Interpolation", 1 }, { "Net", "LocalPort", 47801 }, { "Net", "PeerPort", 47801 },
@@ -16493,9 +16493,46 @@ static void DumpConfigOnce()
     }
 }
 
+// ---- [Coop] FrameTimeLog (I-707 rig determinism), default 0 -------------------------------------------------------
+// One "[Frame] pid=<pid> fps=<f> dtMs p50=<ms> p95=<ms> focused=0|1" line every 10 s, measured between successive
+// player-update frames of this hook. QPC + GetForegroundWindow only: no engine call, no engine read. dt is binned
+// at 0.1 ms up to 200 ms (the last bin holds everything longer), so the percentiles are exact to the bin width.
+static void FrameTimeTick() {
+    static int s_on = -1;
+    if (s_on < 0) s_on = GetPrivateProfileIntA("Coop", "FrameTimeLog", 0, Paths::Ini()) ? 1 : 0;
+    if (!s_on) return;
+    enum { kBins = 2000 };                 // 0.1 ms bins, 0..200 ms
+    static uint32_t s_hist[kBins];
+    static LARGE_INTEGER s_freq, s_prev, s_winStart;
+    static uint32_t s_n = 0;
+    LARGE_INTEGER now; QueryPerformanceCounter(&now);
+    if (!s_freq.QuadPart) { QueryPerformanceFrequency(&s_freq); s_prev = s_winStart = now; return; }
+    const int64_t dt = now.QuadPart - s_prev.QuadPart;
+    s_prev = now;
+    int64_t bin = dt * 10000 / s_freq.QuadPart;   // 0.1 ms units
+    if (bin < 0) bin = 0;
+    if (bin >= kBins) bin = kBins - 1;
+    ++s_hist[bin]; ++s_n;
+    const int64_t win = now.QuadPart - s_winStart.QuadPart;
+    if (win < s_freq.QuadPart * 10) return;
+    const uint32_t r50 = (s_n + 1) / 2, r95 = (uint32_t)(((uint64_t)s_n * 95 + 99) / 100);
+    int p50 = -1, p95 = -1; uint32_t acc = 0;
+    for (int i = 0; i < kBins && p95 < 0; ++i) {
+        acc += s_hist[i];
+        if (p50 < 0 && acc >= r50) p50 = i;
+        if (acc >= r95) p95 = i;
+    }
+    DWORD fgPid = 0; HWND fg = GetForegroundWindow();
+    if (fg) GetWindowThreadProcessId(fg, &fgPid);
+    L("[Frame] pid=%lu fps=%.1f dtMs p50=%.1f p95=%.1f focused=%d\n", GetCurrentProcessId(),
+      (double)s_n * (double)s_freq.QuadPart / (double)win, p50 / 10.0, p95 / 10.0, fgPid == GetCurrentProcessId() ? 1 : 0);
+    memset(s_hist, 0, sizeof(s_hist)); s_n = 0; s_winStart = now;
+}
+
 static void OnFrameInner(Human* updatedHuman) {
     if (!isPlayerUpdate(base(), updatedHuman)) { HumanUpdateThreadProbe(false); OwnOverlapNote(updatedHuman); return; }
     HumanUpdateThreadProbe(true);
+    FrameTimeTick();                       // [Coop] FrameTimeLog: [Frame] fps / dt p50 p95 / focused every 10 s
     InterlockedExchange(&s_playerWorkTid, (LONG)GetCurrentThreadId());
     {   // "loaded into a save" for the co-op panel: the same test as EntitySyncTick's world gate (the title menu has
         // m_CharacterList == 1). Published with a heartbeat; Phase1_InSave() reads it from the render thread.
