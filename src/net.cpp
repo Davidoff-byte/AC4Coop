@@ -51,6 +51,7 @@ namespace {
     volatile LONG      g_joinState = 0;       // join: 0 idle, 1 sending HELLO, 2 welcomed, 3 rejected, 4 timed out
     volatile LONG      g_joinGen = 0;         // join attempt generation (F8 restarts)
     uint32_t           g_lockedNonce = 0;     // host: nonce of the HELLO that locked the current guest (recv thread)
+    uint64_t           g_lockedMs = 0;        // host: GetTickCount64() of that lock (WR-22; recv thread)
     char               g_joinCodeText[16] = {0};   // the code of the current attempt, for the status line
 
     // ---- host: UPnP + STUN (slices 4-5) ------------------------------------------------------------
@@ -1602,13 +1603,20 @@ namespace {
             // endpoints): keep the path we locked and stay silent here, so the guest can only lock onto the
             // same path (it takes the first WELCOME's source). Found by the offline relay matrix (X1): a
             // re-lock here left host and guest on different paths and every game datagram was dropped.
-            if (ready && p.nonce == g_lockedNonce) return;
             // Re-lock rule: the guest slot is taken by the first HELLO. A different source may take it
             // over only if it is the same machine (same IP, new NAT port after a guest restart) or the
             // current guest has been silent for 10 s. Through the relay every guest shares the server's
             // address, so "same machine" does not apply there: only silence frees the slot.
             const uint64_t now = GetTickCount64();
             const bool silent = g_lastRecvMs == 0 || now - g_lastRecvMs > 10000;
+            // WR-22 (N4): the same-nonce rule above used to hold FOREVER, so when the locked path died (e.g. the
+            // LAN endpoint the guest reached first stops delivering) the same join attempt could never move to its
+            // other path. It now yields once the locked path has been silent for 10 s, measured from the last
+            // accepted packet or, if none arrived yet, from the lock itself (g_lastRecvMs is reset to 0 on lock,
+            // so `silent` alone would re-open the X1 crossing-HELLO race).
+            const uint64_t heardMs = g_lastRecvMs ? g_lastRecvMs : g_lockedMs;
+            const bool lockedPathSilent = now - heardMs > 10000;
+            if (ready && p.nonce == g_lockedNonce && !lockedPathSilent) return;
             const bool sameMachine = !viaRelay && !IsRelay(cur) && cur.sin_addr.s_addr == from.sin_addr.s_addr;
             if (ready && !sameMachine && !silent) {
                 static int s_full = 0;
@@ -1622,6 +1630,7 @@ namespace {
             InterlockedExchange(&g_peerReady, 0);
             PeerSet(from, slot);
             g_lockedNonce = p.nonce;
+            g_lockedMs = now;   // WR-22
             g_lastRecvMs = 0;
             InterlockedExchange(&g_linkVia, viaRelay ? 2 : 1);
             InterlockedExchange(&g_peerReady, 1);
