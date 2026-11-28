@@ -1004,6 +1004,15 @@
    "size": 19,
    "status": "unknown"
   },
+  "012DBDB0": {
+   "addr": "012DBDB0",
+   "claimed_at": null,
+   "name": "BoardingBattleActivateObjective",
+   "owner": null,
+   "receipts": [],
+   "size": 141,
+   "status": "unknown"
+  },
   "0133A4C0": {
    "addr": "0133A4C0",
    "claimed_at": "2026-11-08T12:57:24Z",

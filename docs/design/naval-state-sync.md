@@ -44,7 +44,15 @@ All `[Coop]`, all default 0, all read once at first use. Evidence: `ops/evidence
 - Negative control: a ship not in 91 → `[Board] S2e obj=… state=… - not 91, nothing posted`; BoardStartGuest=0 → the old
   raw bit write (`[Board] AFTER …`).
 
+## BoardObjectiveReplicate (guest, needs BoardObjectiveSync; built 2026-11-28, not run)
+- IDA: `sub_12DBDB0` = `__thiscall(battle, obj)`, `retn 4`, 141 B: `sub_14A9FE0(battle+0x2E8)` on obj, `sub_14AA010`
+  (Start: State 1 + side effects), then appends obj to the active list `battle+0x174` (count u16 `+0x17A`) with **no
+  duplicate check**; the append grows through the allocator.
+- Guest (`coord_sync.cpp` BoardApply): host ≥ 1 and the slot missing from `+0x174` → queued, fired by
+  `CoordSyncDeferredFire` from OnFrame outside every `__try` after re-validating the slot; host 2 with the slot active at
+  1 → the raw 2 (the engine's own final store at `0x14AA0F6`). Never a raw 1, never back to 0.
+- PASS: `[CoordS] obj activate slot=… battle=… obj=…`, then the guest posts the battle-complete event `dword_4DEE22C`
+  when the host completes. Negative control: flag 0 → the old raw store, no `obj activate` line.
+
 ## Not built
-- BoardObjectiveReplicate (evidence Q1d: activate missing slots with `sub_12DBDB0(battle, obj)`, complete with raw
-  `State = 2`): its calling convention is not written in the evidence → NEED-RE before code.
 - Guest cannon damage can still sink a bound copy (candidate "unsinkable" bit `+0x160` bit 3; other writers unknown).

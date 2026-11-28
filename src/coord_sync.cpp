@@ -289,6 +289,30 @@ void* s_applyObj = nullptr;
 // Apply is a raw uint32 store at BattleObjective+0x04. There is no setter: the class writes +0x04 itself at
 // 0x14AA033 (`= 1`) and 0x14AA0F6 (`= 2`), both hard-coded and guarded (evidence section 4). Whether such a
 // store is later overwritten by the monitors is UNPROVEN - that is what the 2 s probe below measures.
+// [Coop] BoardObjectiveReplicate (default 0, read once; needs BoardObjectiveSync): evidence naval-boarding-noclass-sink
+// Q1d. A slot the guest never activated is not in the battle's active list (+0x174, count u16 +0x17A) and does not
+// count toward completion, and a raw 1 skips Start's side effects. So: host >= 1 and the slot missing from the list ->
+// sub_12DBDB0(battle, obj) (IDA: __thiscall, retn 4; sub_14A9FE0(battle+0x2E8), sub_14AA010 Start, append to +0x174 -
+// no duplicate check, the append grows through the allocator) from OnFrame outside every __try (CoordSyncDeferredFire);
+// host 2 with the slot active and at 1 -> the raw 2 (the engine's own final store, 0x14AA0F6). Never a raw 1, never back.
+int BoardObjectiveReplicateOn() {
+    static int s = -1;
+    if (s < 0) s = GetPrivateProfileIntA("Coop", "BoardObjectiveReplicate", 0, Paths::Ini()) != 0 ? 1 : 0;
+    return s;
+}
+struct ObjActQ { void* battle; void* obj; uint8_t field; };
+ObjActQ s_objActQ[8]; int s_objActN = 0;
+long s_objActQueued = 0, s_objActFired = 0, s_objActSkip = 0, s_objDone = 0;
+bool ObjInActiveList(void* battle, void* obj) {   // plain reads; false when unreadable
+    if (!Readable((const char*)battle + 0x174, 8)) return false;
+    void** arr = *(void***)((char*)battle + 0x174);
+    const unsigned n = *(uint16_t*)((char*)battle + 0x17A);
+    if (!n) return false;
+    if (n > 64 || !Readable(arr, 4 * n)) return false;
+    for (unsigned k = 0; k < n; ++k) if (arr[k] == obj) return true;
+    return false;
+}
+
 bool BoardApply(void* ent, uint8_t field, float v) {
     (void)ent;
     void* parent = s_applyObj;
@@ -296,6 +320,24 @@ bool BoardApply(void* ent, uint8_t field, float v) {
     const int i = ObjSlotIndex(field);
     if (i < 0 || !(v >= 0.0f) || !(v <= 2.0f)) return false;   // never store a non-BattleObjectiveState
     const uint32_t st = (uint32_t)(v + 0.5f);
+    if (BoardObjectiveReplicateOn()) {
+        int r = 0;   // 1 = applied, 2 = queued an activation
+        __try {
+            if (*(uint32_t*)parent != kBoardBattleVt) return false;
+            void* obj = *(void**)((char*)parent + kObjSlotBase + 4 * i);
+            if (!obj || !Readable((const char*)obj + kObjStateOff, 4)) return false;
+            const uint32_t g = *(uint32_t*)((char*)obj + kObjStateOff);
+            const bool active = ObjInActiveList(parent, obj);
+            if (st >= 1 && !active) {
+                bool dup = false; for (int k = 0; k < s_objActN; ++k) if (s_objActQ[k].obj == obj) dup = true;
+                if (!dup && s_objActN < 8) { s_objActQ[s_objActN++] = { parent, obj, field }; ++s_objActQueued; }
+                r = 2;
+            } else if (st == 2 && active && g == 1) {
+                *(uint32_t*)((char*)obj + kObjStateOff) = 2; ++s_objDone; r = 1;
+            } else r = (g == st) ? 1 : 0;   // nothing to do (never a raw 1, never back to 0)
+        } __except (EXCEPTION_EXECUTE_HANDLER) { r = 0; }
+        return r != 0;
+    }
     int ok = 0;
     __try {
         if (*(uint32_t*)parent != kBoardBattleVt) return false;     // vtable gate, as for the hull
@@ -325,6 +367,27 @@ const CoordSchema kSchemas[] = {
 const CoordSchema* CoordSchemaFor(uint32_t vt) {
     for (const CoordSchema& s : kSchemas) if (s.vt == vt) return &s;
     return nullptr;
+}
+
+// [Coop] BoardObjectiveReplicate: the queued activations, from phase1.cpp OnFrame's player-work block (after the
+// OnFrameInner __try): validated with plain reads first, then sub_12DBDB0 outside any __try.
+void CoordSyncDeferredFire() {
+    while (s_objActN > 0) {
+        const ObjActQ q = s_objActQ[--s_objActN];
+        bool ok = false;
+        __try {
+            ok = Readable(q.battle, kObjSlotBase + 4 * kObjSlotCount) && *(uint32_t*)q.battle == kBoardBattleVt;
+            if (ok) { const int i = ObjSlotIndex(q.field); ok = i >= 0 && *(void**)((char*)q.battle + kObjSlotBase + 4 * i) == q.obj; }
+            if (ok) ok = Readable((const char*)q.obj + kObjStateOff, 4) && !ObjInActiveList(q.battle, q.obj);
+        } __except (EXCEPTION_EXECUTE_HANDLER) { ok = false; }
+        char line[160];
+        if (!ok) { ++s_objActSkip; _snprintf_s(line, sizeof(line), _TRUNCATE, "[CoordS] obj activate slot=%s skipped (gone / already active)\n", ObjSlotName(q.field)); Phase1_LogLine(line); continue; }
+        ((void(__thiscall*)(void*, void*))0x012DBDB0)(q.battle, q.obj);   // activate: bind, Start, append to +0x174
+        ++s_objActFired;
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[CoordS] obj activate slot=%s battle=%p obj=%p (queued %ld fired %ld done %ld)\n",
+                    ObjSlotName(q.field), q.battle, q.obj, s_objActQueued, s_objActFired, s_objDone);
+        Phase1_LogLine(line);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
