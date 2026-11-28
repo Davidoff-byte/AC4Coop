@@ -171,6 +171,43 @@ void TodRx(uint32_t seq, uint8_t flags, float v) {
     ++s_todRx;
 }
 
+// [Coop] CollectableProbe (default 0, read once; read-only, both copies): every 5 s, one [Collect] line per collectable
+// coordinator seen for the first time (evidence world-state-tod-collectables-coord-2026-11-27.md Q2): logic vtable
+// 0x02716B00, item = logic+0x60, mission = logic+0x6C, id = the walk's own GetObjectID result (CoordRef::objId), position
+// = the entity's m_GlobalMatrix translation (entity+0x10, M41..M43 at +0x30). No engine call; every read under __try.
+int CollectOn() { static int s = -1; if (s < 0) s = GetPrivateProfileIntA("Coop", "CollectableProbe", 0, Paths::Ini()) != 0 ? 1 : 0; return s; }
+const uint32_t kCollectLogicVt = 0x02716B00u;
+uint64_t s_colSeen[512]; int s_colSeenN = 0; DWORD s_colNext = 0; uint32_t s_colTotal = 0;
+bool CollectRead(const CoordRef& r, uint32_t* item, uint32_t* mission, float* pos) {
+    __try {
+        if (!Readable(r.logic, 0x70) || !Readable(r.ent, 0x50)) return false;
+        *item = *(const uint32_t*)((const char*)r.logic + 0x60);
+        *mission = *(const uint32_t*)((const char*)r.logic + 0x6C);
+        const float* m = (const float*)((const char*)r.ent + 0x10);
+        pos[0] = m[12]; pos[1] = m[13]; pos[2] = m[14];
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+void CollectProbeTick(DWORD now) {
+    if (s_colNext && now - s_colNext < 5000) return;
+    s_colNext = now ? now : 1;
+    static CoordRef refs[512];
+    const int n = CoordCollect(refs, 512);
+    int fresh = 0, seen = 0;
+    for (int i = 0; i < n; ++i) {
+        if (refs[i].vt != kCollectLogicVt || !refs[i].logic) continue;
+        ++seen;
+        const uint64_t id = refs[i].objId ? refs[i].objId : (uint64_t)(uintptr_t)refs[i].logic;
+        bool known = false; for (int k = 0; k < s_colSeenN; ++k) if (s_colSeen[k] == id) { known = true; break; }
+        if (known || s_colSeenN >= 512) continue;
+        uint32_t item = 0, mission = 0; float pos[3] = {};
+        if (!CollectRead(refs[i], &item, &mission, pos)) continue;
+        s_colSeen[s_colSeenN++] = id; ++fresh; ++s_colTotal;
+        Log("[Collect] id=%016llX item=%08X mission=%08X pos=(%.1f,%.1f,%.1f)\n", (unsigned long long)id, item, mission, pos[0], pos[1], pos[2]);
+    }
+    if (fresh) Log("[Collect] pass coords=%d collectables=%d new=%d total=%u\n", n, seen, fresh, s_colTotal);
+}
+
 } // namespace
 
 void WorldSync::Init() {
@@ -183,6 +220,7 @@ bool WorldSync::DrainNeeded() {
 
 void WorldSync::Tick() {
     const DWORD now = GetTickCount();
+    if (CollectOn()) CollectProbeTick(now);   // [Coop] CollectableProbe (read-only)
     if (TodOn() && Net::IntentLaneOn()) {
         const bool host = Phase1_IsEntityHost();
         if (host) TodHostTick(now); else TodGuestTick(now);
