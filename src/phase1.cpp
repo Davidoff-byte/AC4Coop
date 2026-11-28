@@ -6469,6 +6469,80 @@ static void BoardStartGuestFire() {
     s_chkObj = obj; s_chkTick = now; s_chkHull = L1.hull;
 }
 
+// ---- [Coop] ShipHurtCmd (test harness, host; default 0): put the nearest AI ship's hull at a chosen level ------------
+// The lever for the naval-state-sync checks without a naval battle. ShipHurtCmd = target hull in per-mille of the ship's
+// max (1..1000; 0 = off), fired once per change of ShipHurtSeq (the first read only arms), on the copy whose pid is
+// ShipHurtPid (0 = the host), at the nearest non-local AI ship within ShipHurtRangeM (400) of the player. The hull goes
+// through the engine's damage entry point 0x1225A10 (GcLShip vt +0x12C: clamps, posts the incapacitate event 4DEAD5C at
+// or below max * IncapacitatedHealthRatio, recomputes HealthState; ops/evidence/ship-hull-live-write-2026-11-21.md s2),
+// then the +0xD4 regen cap is held at the target (NavHoldCap) so state 91's regen does not heal it back. OnFrame,
+// outside every __try (the setter dispatches the statechart), like NavStateFire. [ShipHurt] logs the ship's object id
+// (= the guest's [ShipSt] key), position, hull and health state before / after, and again 2 s later.
+static void ShipHurtPick(float range, void** outGcl, uint64_t* outId, float* outD, float* outPos, int* outExamined) {
+    *outGcl = nullptr; *outId = 0; *outD = 0.0f; *outExamined = 0;
+    __try {
+        World* world = World::GetCurrentWorld();
+        Entity* player = world ? world->GetPlayer() : nullptr;
+        void* mgr = GetNavalManager();
+        if (!player || !mgr || !readable((char*)mgr + 0x3E8, 8)) return;
+        Entity* local = GetLocalShip();
+        const unsigned short n = *(unsigned short*)((char*)mgr + 0x3EE);
+        const float px = player->m_GlobalMatrix.M41, py = player->m_GlobalMatrix.M42;
+        float best = range * range;
+        for (int i = 0; i < (int)n && i < 128; ++i) {
+            void* hc = GetShipHandle(mgr, i);
+            Entity* se = GetShipEntity(mgr, i);
+            if (!hc || !se || !readable(se, 0x50) || *(uint32_t*)se != 0x01E4A128u || se == local || se == (Entity*)g_ghostShip) continue;
+            ++*outExamined;
+            const float dx = se->m_GlobalMatrix.M41 - px, dy = se->m_GlobalMatrix.M42 - py, d2 = dx * dx + dy * dy;
+            if (d2 >= best) continue;
+            void* gcl = ShipGcLObj(se);
+            if (!gcl || *(uint32_t*)gcl != kGcLShipVtable) continue;
+            best = d2; *outGcl = gcl; *outD = sqrtf(d2);
+            outPos[0] = se->m_GlobalMatrix.M41; outPos[1] = se->m_GlobalMatrix.M42; outPos[2] = se->m_GlobalMatrix.M43;
+            *outId = ((HandleContainer*)hc)->GetObjectID();
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { *outGcl = nullptr; }
+}
+static void ShipHurtFire() {
+    const int kAbsent = -2147483647;
+    static int s_seq = kAbsent; static DWORD s_next = 0; static void* s_chk = nullptr; static DWORD s_chkTick = 0; static uint64_t s_chkId = 0;
+    const DWORD now = GetTickCount();
+    char b0[24], b1[24];
+    if (s_chk && now - s_chkTick >= 2000) {
+        NavLocal L2;
+        if (NavRead(s_chk, &L2)) L("[ShipHurt] +2s key=%016llX hull=%.1f max=%.1f state=%s a540=%u\n", (unsigned long long)s_chkId, L2.hull, L2.max, ShipHBitsStr(L2.bits, b0, sizeof(b0)), (unsigned)L2.a540);
+        else L("[ShipHurt] +2s key=%016llX unreadable (gone)\n", (unsigned long long)s_chkId);
+        s_chk = nullptr;
+    }
+    if (now - s_next < 1000) return;
+    s_next = now;
+    const int seq = GetPrivateProfileIntA("Coop", "ShipHurtSeq", kAbsent, Paths::Ini());
+    if (seq == kAbsent) return;
+    if (s_seq == kAbsent) { s_seq = seq; return; }   // first read arms only: a stale seq in the ini never fires at start
+    if (seq == s_seq) return;
+    s_seq = seq;
+    const int pm = GetPrivateProfileIntA("Coop", "ShipHurtCmd", 0, Paths::Ini());
+    const int pid = GetPrivateProfileIntA("Coop", "ShipHurtPid", 0, Paths::Ini());
+    const int range = GetPrivateProfileIntA("Coop", "ShipHurtRangeM", 400, Paths::Ini());
+    if (pid ? (DWORD)pid != GetCurrentProcessId() : g_entHost == 0) return;   // the named copy, else the host only
+    if (pm <= 0 || pm > 1000) { L("[ShipHurt] seq=%d cmd=%d - off\n", seq, pm); return; }
+    void* gcl = nullptr; uint64_t id = 0; float d = 0.0f, pos[3] = { 0.0f, 0.0f, 0.0f }; int examined = 0;
+    ShipHurtPick((float)(range > 0 ? range : 400), &gcl, &id, &d, pos, &examined);
+    if (!gcl) { L("[ShipHurt] seq=%d no AI ship within %d m (examined %d)\n", seq, range, examined); return; }
+    NavLocal L0;
+    if (!NavRead(gcl, &L0) || !(L0.max > 0.0f)) { L("[ShipHurt] seq=%d gcl=%p unreadable\n", seq, gcl); return; }
+    const float t = L0.max * (float)pm / 1000.0f;
+    ((void (__thiscall*)(void*, float))0x01225A10)(gcl, t);   // outside any __try (NavPost's rule); unit 01225A10
+    const float after = NavHoldCap(gcl, t);
+    NavLocal L1; L1.bits = -1; L1.hull = 0.0f; L1.max = 0.0f; L1.a540 = 0;
+    NavRead(gcl, &L1);
+    L("[ShipHurt] seq=%d key=%016llX gcl=%p at (%.1f, %.1f, %.1f) d=%.0f hull %.1f -> %.1f (target %.1f, max %.1f, thr %.1f) state %s -> %s a540=%u\n",
+      seq, (unsigned long long)id, gcl, pos[0], pos[1], pos[2], d, L0.hull, after, t, L0.max, L0.thr,
+      ShipHBitsStr(L0.bits, b0, sizeof(b0)), ShipHBitsStr(L1.bits, b1, sizeof(b1)), (unsigned)L1.a540);
+    s_chk = gcl; s_chkTick = now; s_chkId = id;
+}
+
 // [Coop] ShipNoAutoSink: the redirected `call sub_A014A0` at 0x01205379 (sub_1205280 = state 95's handler; ecx = the
 // GcLShip, args = the sink event and 0, retn 8 -> __fastcall with a dummy edx). Runs on the engine's statechart path:
 // no lock, no log, no allocation - a lock-free compare against the table NavStateNote fills, then the original call.
@@ -10962,6 +11036,35 @@ static void OwnerDamageGuestPump() {
     }
 }
 
+// [Coop] PuppetAlertOnHit (default 0, re-read every 2 s; host): a guest's hit or kill applied here is a hostile act the engine
+// never saw - the life write / kill carries no attacker, so no guard is alerted (owner 2026-11-28 in Havana: guest kills,
+// "the npcs will not run to attack"; run asi f681f906: 4 guest kills applied, [Fight] combatBodies=0 the whole session, no
+// [FI] apply because kills/assassinations never enter the fight FSM). With the flag each applied guest hit (at most once per
+// PuppetAlertMs, default 1000) broadcasts PuppetAlertIds (default "8,257": the sight and fight-trigger stimuli that gave 7
+// conflicts and 13 guard hits on the puppet in docs/evidence/conflict-gate-2026-11-17.md s6 run 8) from the puppet to every
+// NPC within each id's radius, and posts 257 from the puppet to a victim that survived.
+void* Phase1_PuppetEntity();
+static LONG s_paFired = 0, s_paPosts = 0;
+static void PuppetAlertOnHit(Entity* victim, bool killed) {
+    static int s_on = 0, s_ms = 1000; static char s_ids[64] = "8,257"; static uint64_t s_cfg = 0, s_next = 0;
+    const uint64_t now = GetTickCount64();
+    if (now >= s_cfg) {
+        s_cfg = now + 2000;
+        s_on = GetPrivateProfileIntA("Coop", "PuppetAlertOnHit", 0, Paths::Ini()) != 0 ? 1 : 0;
+        s_ms = GetPrivateProfileIntA("Coop", "PuppetAlertMs", 1000, Paths::Ini()); if (s_ms < 200) s_ms = 200;
+        GetPrivateProfileStringA("Coop", "PuppetAlertIds", "8,257", s_ids, sizeof(s_ids), Paths::Ini());
+    }
+    if (!s_on || now < s_next) return;
+    void* pe = Phase1_PuppetEntity();
+    if (!pe || !readable(pe, 0xD0)) return;
+    s_next = now + (uint64_t)s_ms;
+    const int n = PuppetStim::BroadcastIds(pe, s_ids);
+    const int v = (!killed && victim) ? PuppetStim::PostFightStim(pe, victim, 257) : 0;
+    InterlockedExchangeAdd(&s_paPosts, n + v);
+    const LONG k = InterlockedIncrement(&s_paFired);
+    if (k <= 40 || (k % 20) == 0) L("[PupAlert] #%ld victim=%p killed=%d ids=%s broadcast=%d victim257=%d\n", k, (void*)victim, killed ? 1 : 0, s_ids, n, v);
+}
+
 // Host, player frame (from the intent drain): apply the delta of a guard's running total, owner decides death.
 static void OwnerDamageHostApply(uint64_t objId, uint32_t total) {
     if (s_odOn != 1 || g_entHost != 1) return;
@@ -10992,10 +11095,12 @@ static void OwnerDamageHostApply(uint64_t objId, uint32_t total) {
             const bool killed = KillGuardEntity(e);               // the proven host kill (kill relay path)
             InterlockedIncrement(&s_odHostKills);
             L("[OD] host kill objId=%016llX ent=%p life %d -> dead (+%u permille, killed=%d)\n", (unsigned long long)objId, (void*)e, cur, delta, killed ? 1 : 0);
+            PuppetAlertOnHit(e, true);                            // [Coop] PuppetAlertOnHit (default 0)
         } else {
             t_odRelay = 1; ((int (__thiscall*)(void*, int))0x19FB4C0)((void*)svc, want); t_odRelay = 0;   // CSrvNPCHealth::SetLife
             InterlockedIncrement(&s_odHostApplied);
             L("[OD] host apply objId=%016llX ent=%p life %d -> %d (max %d, +%u permille)\n", (unsigned long long)objId, (void*)e, cur, want, maxL, delta);
+            PuppetAlertOnHit(e, false);                           // [Coop] PuppetAlertOnHit (default 0)
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) { t_odRelay = 0; }
 }
@@ -18044,6 +18149,7 @@ static void __cdecl OnFrame(Human* updatedHuman) {
         CounterHostApplyFire();       // [Coop] CounterHostApply: sub_10EFC30 / sub_18480F0 / sub_64D8C0 take critical sections
         NavStateFire();               // [Coop] ShipStateSync: statechart posts / hull setter calls
         BoardStartGuestFire();        // [Coop] BoardStartGuest
+        ShipHurtFire();               // [Coop] ShipHurtCmd (test harness, default 0): hull of the nearest AI ship
         { void CoordSyncDeferredFire(); CoordSyncDeferredFire(); }   // [Coop] BoardObjectiveReplicate: sub_12DBDB0 activations
     }
     InterlockedCompareExchange(&s_playerWorkTid, 0, (LONG)GetCurrentThreadId());   // player work over (if it was ours)
@@ -18101,7 +18207,7 @@ static void DumpConfigOnce()
         { "Coop", "SeekOnSwitch", 1 }, { "Coop", "SkelAttach", 0 }, { "Coop", "ShipDump", 0 }, { "Coop", "ShipDumpFloats", 0 },
         { "Coop", "ShipGhost", 0 }, { "Coop", "ShipGhostSelfTest", 0 }, { "Coop", "ShipHPSync", 0 },
         { "Coop", "ShipPassenger", 0 }, { "Coop", "ShipRelevanceRadiusM", 1000 }, { "Coop", "ShipSync", 1 },
-        { "Coop", "ShipTest", 0 }, { "Coop", "ShipTestFracPct", 45 }, { "Coop", "ShipTestRadiusM", 250 },
+        { "Coop", "ShipTest", 0 }, { "Coop", "ShipTestFracPct", 45 }, { "Coop", "ShipTestRadiusM", 250 }, { "Coop", "SeparateShips", 0 }, { "Coop", "GuestNoShipTraffic", 0 }, { "Coop", "PuppetAlertOnHit", 0 }, { "Coop", "PuppetAlertMs", 1000 }, { "Coop", "ShipHurtCmd", 0 }, { "Coop", "ShipHurtSeq", 0 }, { "Coop", "ShipHurtPid", 0 }, { "Coop", "ShipHurtRangeM", 400 },
         { "Coop", "ActionWriterProbe", 0 }, { "Coop", "BlendTypeSafe", 0 }, { "Coop", "EntityFrameCadence", 0 }, { "Coop", "SyncBudget", 0 },
         { "Coop", "FloatProbe", 0 }, { "Coop", "FootOffsetFix", 0 }, { "Coop", "GuardActionGate", 0 }, { "Coop", "GuardActionLane", 0 }, { "Coop", "RespawnHitGraceMs", 0 }, { "Coop", "GuardStageApply", 0 }, { "Coop", "GuardStageForceEnter", 0 }, { "Coop", "CombatTimingProbe", 0 }, { "Coop", "GuardExtrapMs", 100 },
         { "Coop", "GuardInterpBuffer", 0 }, { "Coop", "GuardInterpDelayMs", 120 }, { "Coop", "InterpAdaptive", 0 }, { "Coop", "InterpAdaptiveMarginMs", 20 }, { "Coop", "GuardPhaseLock", 0 },
@@ -18170,7 +18276,7 @@ static void DumpConfigOnce()
     // M-P3-4: string keys. d == nullptr: the default depends on the call site (printed as "(absent)").
     struct S { const char* s; const char* k; const char* d; };
     static const S skeys[] = {
-        { "Coop", "PuppetFightStimIds", "257" }, { "Coop", "PuppetStimIds", "48,49" }, { "Coop", "CallTraceVt", "" },   // call_trace.cpp:70
+        { "Coop", "PuppetFightStimIds", "257" }, { "Coop", "PuppetAlertIds", "8,257" }, { "Coop", "PuppetStimIds", "48,49" }, { "Coop", "CallTraceVt", "" },   // call_trace.cpp:70
         { "Coop", "SpawnCmd", "" },                                                                   // spawn_lib.cpp
         { "Net", "BindIP", "auto" }, { "Net", "EosCode", "" }, { "Net", "EosIni", nullptr },     // <bridge dir>\eos.ini
         { "Net", "EosRelay", "allow" }, { "Net", "EosRole", nullptr },                           // "host" (net.cpp) / "" (overlay.cpp)

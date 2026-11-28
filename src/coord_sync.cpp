@@ -476,6 +476,21 @@ void PublishField(const CoordSchema* sc, uint64_t key, uint8_t field, float v) {
     Phase1_LogLine(line);
 }
 
+// [Coop] SeparateShips (default 0, read once): two-ship play. Key 0 is "the sender's own ship"; with the flag it is never
+// this machine's own Jackdaw, so the peer's sail state / hull / helm stop driving ours (owner 2026-11-28: "the ship speeds
+// of the jackdaws are tied - detach them"; the key-0 contract of coord_sync.h assumes one shared ship). Key-0 messages are
+// neither published nor applied; the peer's ship is drawn by ShipGhost. Objective / ToD keys are never 0 and pass.
+static LONG s_rxSep = 0;
+bool SeparateShipsOn() {
+    static int s = -1;
+    if (s < 0) {
+        s = GetPrivateProfileIntA("Coop", "SeparateShips", 0, Paths::Ini()) != 0 ? 1 : 0;
+        char line[128]; _snprintf_s(line, sizeof(line), _TRUNCATE, "[CoordS] SeparateShips=%d (own-ship key 0 %s)\n", s, s ? "not synced" : "synced: one shared ship");
+        Phase1_LogLine(line);
+    }
+    return s == 1;
+}
+
 // Host: walk the coordinators, and for every entry whose class has a schema and whose identity is known
 // (i.e. not kCoordKeyNone - the local ship IS key 0), publish fields 1 and 2 on change.
 void HostTick() {
@@ -498,6 +513,7 @@ void HostTick() {
         if (!sc) continue;
         const uint64_t key = sc->identity(c.ent, c.logic);
         if (key == kCoordKeyNone) continue;
+        if (key == kCoordKeyLocal && SeparateShipsOn()) continue;   // [Coop] SeparateShips: our ship is ours alone
         for (const uint8_t* f = sc->fields; f && *f; ++f) {
             if (*f == CF_HELM) continue;   // [Coop] HelmSync has its own path (below): per-ship epoch + noop
             if (IsObjField(*f) && !BoardObjectiveSyncOn()) continue;   // flag 0: not a single extra read
@@ -620,6 +636,7 @@ void HelmPublishChanged(uint64_t key, uint8_t v, bool holderIsLocal) {
 // byte, so this is safe to run at frame rate on both host and guest (the coord walk is the only expensive
 // part of the lane and it stays at 10 Hz).
 void HelmSampleLocal() {
+    if (SeparateShipsOn()) return;                        // [Coop] SeparateShips: the helm of our ship is not shared
     void* ent = CoordSyncLocalShipEntity();
     if (!ent) return;
     void* gcl = CoordSyncEntityLogic(ent);
@@ -669,6 +686,7 @@ void HelmApplyMessage(uint64_t key, uint32_t seq, uint8_t holderIsLocal, float v
         return;
     }
     const uint8_t want = (v >= 0.5f) ? 1 : 0;
+    if (key == kCoordKeyLocal && SeparateShipsOn()) { InterlockedIncrement(&s_rxSep); return; }   // [Coop] SeparateShips
     void* ent = (key == kCoordKeyLocal) ? CoordSyncLocalShipEntity() : CoordSyncProxyEntity(key);
     if (!ent) { ++s_helmBad; HelmLog(key, holderIsLocal != 0, want, seq, 0, 0, "bad"); return; }
     void* logic = CoordSyncEntityLogic(ent);
@@ -801,8 +819,8 @@ void ReportTick() {
     s_next = now;
     char line[192];
     _snprintf_s(line, sizeof(line), _TRUNCATE,
-                "[CoordS] rx stats ok=%ld stale=%ld unres=%ld bad=%ld exc=%ld hexc=%ld\n",
-                s_rxOk, s_rxStale, s_rxUnres, s_rxBad, s_rxExc, s_hullExc);
+                "[CoordS] rx stats ok=%ld stale=%ld unres=%ld bad=%ld exc=%ld hexc=%ld sepDropped=%ld\n",
+                s_rxOk, s_rxStale, s_rxUnres, s_rxBad, s_rxExc, s_hullExc, s_rxSep);
     Phase1_LogLine(line);
     _snprintf_s(line, sizeof(line), _TRUNCATE,
                 "[CoordS] obj stats ok=%ld stale=%ld revert=%ld bad=%ld gone=%ld\n",
@@ -849,6 +867,7 @@ void CoordSyncApplyMsg(uint64_t wireId, uint32_t seq, const uint8_t* payload, ui
     s_applyObj = nullptr;
     void* ent = nullptr;
     void* logic = nullptr;
+    if (wireId == kCoordKeyLocal && !objField && SeparateShipsOn()) { InterlockedIncrement(&s_rxSep); return; }   // [Coop] SeparateShips
     if (wireId == kCoordKeyLocal) {
         ent = CoordSyncLocalShipEntity();
         if (ent) logic = CoordSyncEntityLogic(ent);

@@ -15,4 +15,7 @@ namespace PuppetStim
     // [Coop] PuppetFightStim: post one stimulus `id` with the puppet as source to `receiver`, laid out as the engine's
     // sub_17B7A80 does it. Game thread only. Returns 1 when posted.
     int PostFightStim(void* puppetEntity, void* receiver, int id);
+    // [Coop] PuppetAlertOnHit: the mode-2 broadcast (one stimulus per NPC within each id's radius, the copy of the
+    // engine's broadcaster) for a comma list of ids, with the puppet as source. Game thread only. Returns posts.
+    int BroadcastIds(void* puppetEntity, const char* ids);
 }

@@ -144,6 +144,7 @@ extern "C" void __cdecl CensusDel(const uint32_t* esp)   // esp[1] = world, esp[
 }
 static int DumpWords(char* out, size_t cap, uintptr_t base, int n);   // defined below
 int SpawnShareDecide(uintptr_t req);   // defined below ([Coop] SpawnShare)
+bool GuestNoShipTrafficDecline(uintptr_t req);   // defined below ([Coop] GuestNoShipTraffic)
 void SpawnKeyNoteReq(uintptr_t req);   // defined below ([Coop] SpawnKeyBind)
 extern "C" void __cdecl SpawnKeyNoteEnt(const uint32_t* esp);
 extern "C" void __cdecl CensusReq(uintptr_t req, const uint32_t* esp)
@@ -195,6 +196,7 @@ char __fastcall DetR(void* req, void*)
     CensusReq((uintptr_t)req, ret);
     SpawnKeyNoteReq((uintptr_t)req);                          // [Coop] SpawnKeyBind: req -> spawn key
     if (SpawnShareDecide((uintptr_t)req) == 1) return 0;   // [Coop] SpawnShare: guest holds this request
+    if (GuestNoShipTrafficDecline((uintptr_t)req)) return 0;   // [Coop] GuestNoShipTraffic: no guest-only AI ships
     return ((SubmitFn)g_tR)(req);
 }
 __declspec(naked) void DetA()
@@ -597,6 +599,28 @@ int StaticKey(uintptr_t item, uint64_t* key, float* w)
 }  // namespace
 
 void SpawnShareReplayTag(int v) { t_replay = v; }   // [Coop] ShipSpawnReplay: our submit passes SpawnShareDecide
+// [Coop] GuestNoShipTraffic (default 0, re-read every 2 s): the guest declines the engine's own naval spawn requests while
+// its player is in world (request+0x0C = the owner, set by sub_79C6C0; owner vtable 0x02708E80 = the naval owner,
+// spawn_lib.cpp kOwnerNavalVt), so every AI ship on the guest is a host ship (ShipSpawnReplay builds it, ShipClassBind
+// drives it). Owner 2026-11-28: "schooners spawning in on guest but don't see them on host". Our own replays pass:
+// t_replay, and SpawnLib submits with its private owner (a copied vtable, not 0x02708E80). Declined = the request's own
+// "no" (returning 0 from 0x79B8D0, as DisableSpawns does); load-time spawns pass (Phase1_InSave).
+static volatile LONG c_gntDecl = 0; static int g_gnt = 0; static ULONGLONG g_gntNext = 0;
+bool GuestNoShipTrafficDecline(uintptr_t req)
+{
+    const ULONGLONG now = GetTickCount64();
+    if (now >= g_gntNext) { g_gntNext = now + 2000; g_gnt = GetPrivateProfileIntA("Coop", "GuestNoShipTraffic", 0, Paths::Ini()) != 0 ? 1 : 0; }
+    if (!g_gnt || t_replay || Phase1_EntityHost() || !Phase1_InSave()) return false;
+    uintptr_t owner = 0;
+    __try { owner = *(const uintptr_t*)(req + 0x0C); } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    if (ReadVt(owner) != 0x02708E80u) return false;
+    const LONG n = InterlockedIncrement(&c_gntDecl);
+    if (n <= 20 || (n % 50) == 0) {
+        char line[128]; _snprintf_s(line, sizeof(line), _TRUNCATE, "[Census] GuestNoShipTraffic: naval request %08X declined (%ld)\n", (unsigned)req, n);
+        Phase1_LogLine(line);
+    }
+    return true;
+}
 // [Coop] ShipSpawnReplay: the ctx argument DetFac recorded for this request (whole 1024 ring, newest first).
 bool SpawnCensusCtxOf(uintptr_t req, uintptr_t* ctx)
 {

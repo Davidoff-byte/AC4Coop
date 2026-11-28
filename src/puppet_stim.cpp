@@ -68,16 +68,16 @@ bool Pos(const void* e, float* p)
     return true;
 }
 
-int Fire(void* pup)
+int FireWith(void* pup, int mode, const char* idList)
 {
     char* h = *(char**)((char*)pup + 0xC8);
     if (!h) { Log("[PupStim] puppet has no handle\n"); return 0; }
     int ids[8], n = 0;
-    for (char* s = g_ids; *s && n < 8; ) { ids[n++] = atoi(s); while (*s && *s != ',') ++s; if (*s) ++s; }
+    for (const char* s = idList; *s && n < 8; ) { ids[n++] = atoi(s); while (*s && *s != ',') ++s; if (*s) ++s; }
     int posted = 0;
     for (int k = 0; k < n; ++k) {
         const int id = ids[k];
-        if (g_mode == 1) {
+        if (mode == 1) {
             char* ev = (char*)((NewEvent_t)0x00FA3300)();
             if (!ev) continue;
             *(uint32_t*)(ev + 0x10) = (uint32_t)id;
@@ -117,8 +117,16 @@ int Fire(void* pup)
     }
     return posted;
 }
+int Fire(void* pup) { return FireWith(pup, g_mode, g_ids); }
 
 }  // namespace
+
+int PuppetStim::BroadcastIds(void* pup, const char* ids)
+{
+    if (!pup || !ids || !*ids) return 0;
+    __try { return FireWith(pup, 2, ids); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { Log("[PupStim] EXCEPTION 0x%08X in BroadcastIds\n", GetExceptionCode()); return 0; }
+}
 
 // ---- [Coop] PuppetFightStim (default 1) ------------------------------------------------------------------------
 // One fight-trigger stimulus from the puppet to one guard, built exactly as the engine builds stimulus 257 for the
