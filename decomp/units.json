@@ -707,6 +707,15 @@
    "size": 211,
    "status": "unknown"
   },
+  "00A014A0": {
+   "addr": "00A014A0",
+   "claimed_at": null,
+   "name": "StatechartPostEvent",
+   "owner": null,
+   "receipts": [],
+   "size": 77,
+   "status": "unknown"
+  },
   "00A094D0": {
    "addr": "00A094D0",
    "claimed_at": null,

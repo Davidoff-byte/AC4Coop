@@ -122,6 +122,9 @@ CALL_SITES = [
     # src/pose_sync.cpp ([Coop] PoseSync): the compose call in sub_453330 redirected to ComposeThunk. The plugin
     # re-checks these 10 bytes at install time and refuses to patch on any difference.
     ("pose compose call", 0x0045349A, bytes.fromhex("52 50 E8 AF 5C 31 00 5F 5E C3"), "push edx; push eax; call sub_769150; pop edi; pop esi; retn"),
+    # [Coop] ShipNoAutoSink (src/phase1.cpp Phase1_ShipNoAutoSinkInstall): sub_1205280's > 1000 m sink post; the plugin
+    # checks the same 10 bytes and rewrites only the rel32 of the E8 at 0x01205379 (E8 22 C1 7F FF -> sub_A014A0).
+    ("ShipNoAutoSink call", 0x01205374, bytes.fromhex("6A 00 52 8B CE E8 22 C1 7F FF"), "push 0; push edx; mov ecx,esi; call sub_A014A0"),
 ]
 
 
