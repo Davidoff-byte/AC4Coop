@@ -167,6 +167,9 @@ def norm(lit):
     return lit.upper().lstrip("0").zfill(8)
 
 
+V2 = os.path.join(ROOT, "v2")   # the v2 rewrite (docs/v2/ARCHITECTURE.md R7): same rules, recursive
+
+
 def _sources():
     for fn in sorted(os.listdir(SRC)):
         if fn.endswith((".cpp", ".h")):
@@ -175,6 +178,15 @@ def _sources():
                 yield fn, open(path, encoding="utf-8", errors="replace").read()
             except OSError:
                 continue
+    if os.path.isdir(V2):
+        for dirpath, _dirs, files in sorted(os.walk(V2)):
+            for fn in sorted(files):
+                if fn.endswith((".cpp", ".h")):
+                    path = os.path.join(dirpath, fn)
+                    try:
+                        yield os.path.relpath(path, ROOT).replace("\\", "/"), open(path, encoding="utf-8", errors="replace").read()
+                    except OSError:
+                        continue
 
 
 def scan_calls(rule):

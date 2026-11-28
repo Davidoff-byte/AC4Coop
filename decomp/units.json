@@ -1,5 +1,14 @@
 {
  "units": {
+  "004061F0": {
+   "addr": "004061F0",
+   "claimed_at": null,
+   "name": "Scimitar.Memory::Allocate",
+   "owner": null,
+   "receipts": [],
+   "size": 114,
+   "status": "unknown"
+  },
   "0040D0C0": {
    "addr": "0040D0C0",
    "claimed_at": null,
@@ -16,6 +25,24 @@
    "owner": null,
    "receipts": [],
    "size": 153,
+   "status": "unknown"
+  },
+  "00423110": {
+   "addr": "00423110",
+   "claimed_at": null,
+   "name": "Scimitar.BoneHandle::GetPosition",
+   "owner": null,
+   "receipts": [],
+   "size": 20,
+   "status": "unknown"
+  },
+  "004314E0": {
+   "addr": "004314E0",
+   "claimed_at": null,
+   "name": "Scimitar.BaseEntity::SetGlobalRotation",
+   "owner": null,
+   "receipts": [],
+   "size": 313,
    "status": "unknown"
   },
   "0044DB80": {
@@ -81,6 +108,24 @@
    "size": 315,
    "status": "unknown"
   },
+  "0049DA40": {
+   "addr": "0049DA40",
+   "claimed_at": null,
+   "name": "Scimitar.BoneHandle::call",
+   "owner": null,
+   "receipts": [],
+   "size": 22,
+   "status": "unknown"
+  },
+  "0049DB10": {
+   "addr": "0049DB10",
+   "claimed_at": null,
+   "name": "Scimitar.BoneHandle::GetBoneID",
+   "owner": null,
+   "receipts": [],
+   "size": 48,
+   "status": "unknown"
+  },
   "0049DE60": {
    "addr": "0049DE60",
    "claimed_at": null,
@@ -90,6 +135,69 @@
    "size": 89,
    "status": "unknown"
   },
+  "0049DEC0": {
+   "addr": "0049DEC0",
+   "claimed_at": null,
+   "name": "Scimitar.BoneHandle::GetRotation",
+   "owner": null,
+   "receipts": [],
+   "size": 89,
+   "status": "unknown"
+  },
+  "004A1C90": {
+   "addr": "004A1C90",
+   "claimed_at": null,
+   "name": "Scimitar.BoneHandle::GetTransform",
+   "owner": null,
+   "receipts": [],
+   "size": 88,
+   "status": "unknown"
+  },
+  "004A2530": {
+   "addr": "004A2530",
+   "claimed_at": null,
+   "name": "Scimitar.BoneHandle::GetChildBoneCount",
+   "owner": null,
+   "receipts": [],
+   "size": 62,
+   "status": "unknown"
+  },
+  "004A2610": {
+   "addr": "004A2610",
+   "claimed_at": null,
+   "name": "Scimitar.BoneHandle::GetFatherIndexWithComponent",
+   "owner": null,
+   "receipts": [],
+   "size": 35,
+   "status": "unknown"
+  },
+  "004A2B70": {
+   "addr": "004A2B70",
+   "claimed_at": null,
+   "name": "Scimitar.BoneHandle::SetGlobalPositionWithComponent",
+   "owner": null,
+   "receipts": [],
+   "size": 155,
+   "status": "unknown"
+  },
+  "004A2CB0": {
+   "addr": "004A2CB0",
+   "claimed_at": null,
+   "name": "Scimitar.BoneHandle::SetLocalPositionWithComponent",
+   "owner": null,
+   "receipts": [],
+   "size": 155,
+   "status": "unknown"
+  },
+  "004A2D50": {
+   "addr": "004A2D50",
+   "claimed_at": null,
+   "name": "Scimitar.BoneHandle::SetLocalRotationWithComponent",
+   "owner": null,
+   "receipts": [],
+   "size": 155,
+   "status": "unknown"
+  },
   "004ADD10": {
    "addr": "004ADD10",
    "claimed_at": null,
@@ -97,6 +205,42 @@
    "owner": null,
    "receipts": [],
    "size": 54,
+   "status": "unknown"
+  },
+  "004AEBC0": {
+   "addr": "004AEBC0",
+   "claimed_at": null,
+   "name": "Scimitar.BoneHandle::GetFather",
+   "owner": null,
+   "receipts": [],
+   "size": 82,
+   "status": "unknown"
+  },
+  "004AEC20": {
+   "addr": "004AEC20",
+   "claimed_at": null,
+   "name": "Scimitar.BoneHandle::GetFatherIndex",
+   "owner": null,
+   "receipts": [],
+   "size": 61,
+   "status": "unknown"
+  },
+  "004AEC60": {
+   "addr": "004AEC60",
+   "claimed_at": null,
+   "name": "Scimitar.BoneHandle::HasFather",
+   "owner": null,
+   "receipts": [],
+   "size": 72,
+   "status": "unknown"
+  },
+  "004BB2B0": {
+   "addr": "004BB2B0",
+   "claimed_at": null,
+   "name": "Scimitar.BoneHandle::SetGlobalRotation",
+   "owner": null,
+   "receipts": [],
+   "size": 52,
    "status": "unknown"
   },
   "004C6380": {
@@ -141,6 +285,51 @@
    "size": 464,
    "status": "unknown"
   },
+  "0050A6D0": {
+   "addr": "0050A6D0",
+   "claimed_at": null,
+   "name": "Scimitar.Entity::ShadowFlagsChanged",
+   "owner": null,
+   "receipts": [],
+   "size": 170,
+   "status": "unknown"
+  },
+  "0050E8A0": {
+   "addr": "0050E8A0",
+   "claimed_at": null,
+   "name": "Scimitar.Entity::FlagsChanged",
+   "owner": null,
+   "receipts": [],
+   "size": 479,
+   "status": "unknown"
+  },
+  "0050EA80": {
+   "addr": "0050EA80",
+   "claimed_at": null,
+   "name": "Scimitar.Entity::SetIsHidden",
+   "owner": null,
+   "receipts": [],
+   "size": 191,
+   "status": "unknown"
+  },
+  "005131F0": {
+   "addr": "005131F0",
+   "claimed_at": null,
+   "name": "Scimitar.Entity::OnAddToWorld",
+   "owner": null,
+   "receipts": [],
+   "size": 353,
+   "status": "unknown"
+  },
+  "0051D580": {
+   "addr": "0051D580",
+   "claimed_at": null,
+   "name": "Scimitar.Entity::GetHighestParentEntity",
+   "owner": null,
+   "receipts": [],
+   "size": 115,
+   "status": "unknown"
+  },
   "005200C0": {
    "addr": "005200C0",
    "claimed_at": null,
@@ -148,6 +337,15 @@
    "owner": null,
    "receipts": [],
    "size": 51,
+   "status": "unknown"
+  },
+  "005220D0": {
+   "addr": "005220D0",
+   "claimed_at": null,
+   "name": "Scimitar.Entity::GetBehaviorComponent",
+   "owner": null,
+   "receipts": [],
+   "size": 13,
    "status": "unknown"
   },
   "005269A0": {
@@ -212,6 +410,60 @@
    "size": 139,
    "status": "claimed"
   },
+  "0052A980": {
+   "addr": "0052A980",
+   "claimed_at": null,
+   "name": "Scimitar.Entity::Duplicate",
+   "owner": null,
+   "receipts": [],
+   "size": 2035,
+   "status": "unknown"
+  },
+  "0052C2E0": {
+   "addr": "0052C2E0",
+   "claimed_at": null,
+   "name": "Scimitar.AIActor::GetCurrentContextID",
+   "owner": null,
+   "receipts": [],
+   "size": 45,
+   "status": "unknown"
+  },
+  "0052C330": {
+   "addr": "0052C330",
+   "claimed_at": null,
+   "name": "Scimitar.AIActor::ExitCurrentContext",
+   "owner": null,
+   "receipts": [],
+   "size": 45,
+   "status": "unknown"
+  },
+  "0052DF90": {
+   "addr": "0052DF90",
+   "claimed_at": null,
+   "name": "Scimitar.AIActor::TransitToContext",
+   "owner": null,
+   "receipts": [],
+   "size": 93,
+   "status": "unknown"
+  },
+  "0052DFF0": {
+   "addr": "0052DFF0",
+   "claimed_at": null,
+   "name": "Scimitar.AIActor::EnterContext",
+   "owner": null,
+   "receipts": [],
+   "size": 58,
+   "status": "unknown"
+  },
+  "0054D4D0": {
+   "addr": "0054D4D0",
+   "claimed_at": null,
+   "name": "Scimitar.World::GetCurrentWorld",
+   "owner": null,
+   "receipts": [],
+   "size": 16,
+   "status": "unknown"
+  },
   "0054EC00": {
    "addr": "0054EC00",
    "claimed_at": "2026-11-08T12:06:28Z",
@@ -226,6 +478,15 @@
    ],
    "size": 31,
    "status": "claimed"
+  },
+  "0055C570": {
+   "addr": "0055C570",
+   "claimed_at": null,
+   "name": "Scimitar.World::LoadWorldAsync",
+   "owner": null,
+   "receipts": [],
+   "size": 48,
+   "status": "unknown"
   },
   "00569560": {
    "addr": "00569560",
@@ -293,6 +554,24 @@
    "size": 94,
    "status": "claimed"
   },
+  "005FC110": {
+   "addr": "005FC110",
+   "claimed_at": null,
+   "name": "Scimitar.Human::GetActionComponent",
+   "owner": null,
+   "receipts": [],
+   "size": 20,
+   "status": "unknown"
+  },
+  "005FC130": {
+   "addr": "005FC130",
+   "claimed_at": null,
+   "name": "Scimitar.Human::GetCharacterComponent",
+   "owner": null,
+   "receipts": [],
+   "size": 20,
+   "status": "unknown"
+  },
   "005FD520": {
    "addr": "005FD520",
    "claimed_at": "2026-11-08T12:12:55Z",
@@ -332,6 +611,15 @@
    "size": 205,
    "status": "unknown"
   },
+  "0061F790": {
+   "addr": "0061F790",
+   "claimed_at": null,
+   "name": "Scimitar.InertComponent::GetStaticClassDescriptor",
+   "owner": null,
+   "receipts": [],
+   "size": 6,
+   "status": "unknown"
+  },
   "00620E40": {
    "addr": "00620E40",
    "claimed_at": null,
@@ -365,6 +653,33 @@
    "size": 421,
    "status": "claimed"
   },
+  "00639E00": {
+   "addr": "00639E00",
+   "claimed_at": null,
+   "name": "Scimitar.BaseEntity::GetFatherEntity",
+   "owner": null,
+   "receipts": [],
+   "size": 95,
+   "status": "unknown"
+  },
+  "0063C310": {
+   "addr": "0063C310",
+   "claimed_at": null,
+   "name": "Scimitar.BaseEntity::SetSight",
+   "owner": null,
+   "receipts": [],
+   "size": 169,
+   "status": "unknown"
+  },
+  "00648BA0": {
+   "addr": "00648BA0",
+   "claimed_at": null,
+   "name": "Scimitar.ActionComponent::GetStaticClassDescriptor",
+   "owner": null,
+   "receipts": [],
+   "size": 6,
+   "status": "unknown"
+  },
   "0064A020": {
    "addr": "0064A020",
    "claimed_at": null,
@@ -381,6 +696,60 @@
    "owner": null,
    "receipts": [],
    "size": 65,
+   "status": "unknown"
+  },
+  "00651840": {
+   "addr": "00651840",
+   "claimed_at": null,
+   "name": "Scimitar.ActionComponent::ActivateCharacterActionSet",
+   "owner": null,
+   "receipts": [],
+   "size": 289,
+   "status": "unknown"
+  },
+  "00652640": {
+   "addr": "00652640",
+   "claimed_at": null,
+   "name": "Scimitar.ActionComponent::SetCurrentActionRatio",
+   "owner": null,
+   "receipts": [],
+   "size": 214,
+   "status": "unknown"
+  },
+  "006528B0": {
+   "addr": "006528B0",
+   "claimed_at": null,
+   "name": "Scimitar.ActionComponent::SetTimeScale",
+   "owner": null,
+   "receipts": [],
+   "size": 196,
+   "status": "unknown"
+  },
+  "00652A40": {
+   "addr": "00652A40",
+   "claimed_at": null,
+   "name": "Scimitar.ActionComponent::SetTimeScalePersistence",
+   "owner": null,
+   "receipts": [],
+   "size": 196,
+   "status": "unknown"
+  },
+  "00652B10": {
+   "addr": "00652B10",
+   "claimed_at": null,
+   "name": "Scimitar.ActionComponent::SetBlendFactor",
+   "owner": null,
+   "receipts": [],
+   "size": 76,
+   "status": "unknown"
+  },
+  "00652D60": {
+   "addr": "00652D60",
+   "claimed_at": null,
+   "name": "Scimitar.ActionComponent::SetBlendFactorPersistence",
+   "owner": null,
+   "receipts": [],
+   "size": 190,
    "status": "unknown"
   },
   "00657BE0": {
@@ -428,6 +797,15 @@
    "size": 173,
    "status": "claimed"
   },
+  "006625D0": {
+   "addr": "006625D0",
+   "claimed_at": null,
+   "name": "Scimitar.ActionComponent::SetTargetAction",
+   "owner": null,
+   "receipts": [],
+   "size": 45,
+   "status": "unknown"
+  },
   "00666BB0": {
    "addr": "00666BB0",
    "claimed_at": null,
@@ -435,6 +813,42 @@
    "owner": null,
    "receipts": [],
    "size": 118,
+   "status": "unknown"
+  },
+  "00666C80": {
+   "addr": "00666C80",
+   "claimed_at": null,
+   "name": "Scimitar.ActionComponent::GetCurrentAction",
+   "owner": null,
+   "receipts": [],
+   "size": 61,
+   "status": "unknown"
+  },
+  "00667170": {
+   "addr": "00667170",
+   "claimed_at": null,
+   "name": "Scimitar.ActionComponent::GetCurrentActionRatio",
+   "owner": null,
+   "receipts": [],
+   "size": 37,
+   "status": "unknown"
+  },
+  "00667540": {
+   "addr": "00667540",
+   "claimed_at": null,
+   "name": "Scimitar.ActionComponent::GetTimeScale",
+   "owner": null,
+   "receipts": [],
+   "size": 32,
+   "status": "unknown"
+  },
+  "00667590": {
+   "addr": "00667590",
+   "claimed_at": null,
+   "name": "Scimitar.ActionComponent::GetBlendFactor",
+   "owner": null,
+   "receipts": [],
+   "size": 42,
    "status": "unknown"
   },
   "0066F630": {
@@ -451,6 +865,16 @@
    ],
    "size": 246,
    "status": "claimed"
+  },
+  "00671280": {
+   "addr": "00671280",
+   "claimed_at": null,
+   "name": "Scimitar.ActionComponent::SetActionKit",
+   "owner": null,
+   "receipts": [],
+   "size": 0,
+   "status": "unknown",
+   "note": "not a function start in the IDB (RULES-RE rule 2: scan for a prologue before trusting)"
   },
   "00679220": {
    "addr": "00679220",
@@ -496,6 +920,15 @@
    ],
    "size": 693,
    "status": "claimed"
+  },
+  "006BC040": {
+   "addr": "006BC040",
+   "claimed_at": null,
+   "name": "Scimitar.Hierarchy::SetGlobalMatrix",
+   "owner": null,
+   "receipts": [],
+   "size": 854,
+   "status": "unknown"
   },
   "006F5F70": {
    "addr": "006F5F70",
@@ -578,6 +1011,69 @@
    "size": 27,
    "status": "claimed"
   },
+  "0070E880": {
+   "addr": "0070E880",
+   "claimed_at": null,
+   "name": "Scimitar.World::RemoveEntity",
+   "owner": null,
+   "receipts": [],
+   "size": 20,
+   "status": "unknown"
+  },
+  "0070E930": {
+   "addr": "0070E930",
+   "claimed_at": null,
+   "name": "Scimitar.World::PauseWorld",
+   "owner": null,
+   "receipts": [],
+   "size": 40,
+   "status": "unknown"
+  },
+  "0070E960": {
+   "addr": "0070E960",
+   "claimed_at": null,
+   "name": "Scimitar.World::UnpauseWorld",
+   "owner": null,
+   "receipts": [],
+   "size": 11,
+   "status": "unknown"
+  },
+  "00711770": {
+   "addr": "00711770",
+   "claimed_at": null,
+   "name": "Scimitar.World::SetSlowdownFactor",
+   "owner": null,
+   "receipts": [],
+   "size": 105,
+   "status": "unknown"
+  },
+  "007130C0": {
+   "addr": "007130C0",
+   "claimed_at": null,
+   "name": "Scimitar.Component::SetEnabled",
+   "owner": null,
+   "receipts": [],
+   "size": 78,
+   "status": "unknown"
+  },
+  "00718820": {
+   "addr": "00718820",
+   "claimed_at": null,
+   "name": "Scimitar.World::GetWorldAlternateSourcePrefixName",
+   "owner": null,
+   "receipts": [],
+   "size": 179,
+   "status": "unknown"
+  },
+  "00718B20": {
+   "addr": "00718B20",
+   "claimed_at": null,
+   "name": "Scimitar.World::GetWorldComponentByType",
+   "owner": null,
+   "receipts": [],
+   "size": 64,
+   "status": "unknown"
+  },
   "00733FB0": {
    "addr": "00733FB0",
    "claimed_at": "2026-11-08T12:37:07Z",
@@ -592,6 +1088,33 @@
    ],
    "size": 50,
    "status": "claimed"
+  },
+  "00734500": {
+   "addr": "00734500",
+   "claimed_at": null,
+   "name": "Scimitar.PlayerPadManager::RegisterPlayer",
+   "owner": null,
+   "receipts": [],
+   "size": 16,
+   "status": "unknown"
+  },
+  "00735670": {
+   "addr": "00735670",
+   "claimed_at": null,
+   "name": "Scimitar.PhysicComponent::GetStaticClassDescriptor",
+   "owner": null,
+   "receipts": [],
+   "size": 6,
+   "status": "unknown"
+  },
+  "007357E0": {
+   "addr": "007357E0",
+   "claimed_at": null,
+   "name": "Scimitar.Flags::GetStaticClassDescriptor",
+   "owner": null,
+   "receipts": [],
+   "size": 6,
+   "status": "unknown"
   },
   "0073B4B0": {
    "addr": "0073B4B0",
@@ -701,6 +1224,51 @@
    "size": 74,
    "status": "claimed"
   },
+  "007A3BD0": {
+   "addr": "007A3BD0",
+   "claimed_at": null,
+   "name": "Scimitar.RowSelector::Duplicate",
+   "owner": null,
+   "receipts": [],
+   "size": 183,
+   "status": "unknown"
+  },
+  "007AA8E0": {
+   "addr": "007AA8E0",
+   "claimed_at": null,
+   "name": "Scimitar.CharacterController::GetStaticClassDescriptor",
+   "owner": null,
+   "receipts": [],
+   "size": 6,
+   "status": "unknown"
+  },
+  "007CCAF0": {
+   "addr": "007CCAF0",
+   "claimed_at": null,
+   "name": "Scimitar.CollisionQueryCollisionFilter::GetCollisionsEnabledAsMask",
+   "owner": null,
+   "receipts": [],
+   "size": 22,
+   "status": "unknown"
+  },
+  "0080AC30": {
+   "addr": "0080AC30",
+   "claimed_at": null,
+   "name": "Scimitar.Memory::GetAllocatorFromData",
+   "owner": null,
+   "receipts": [],
+   "size": 66,
+   "status": "unknown"
+  },
+  "0087FFD0": {
+   "addr": "0087FFD0",
+   "claimed_at": null,
+   "name": "Scimitar.Entity::ReflectionFlagsChanged",
+   "owner": null,
+   "receipts": [],
+   "size": 404,
+   "status": "unknown"
+  },
   "009F0B50": {
    "addr": "009F0B50",
    "claimed_at": "2026-11-08T12:12:53Z",
@@ -734,6 +1302,24 @@
    "size": 77,
    "status": "unknown"
   },
+  "00A07980": {
+   "addr": "00A07980",
+   "claimed_at": null,
+   "name": "Scimitar.PropertyFlags::GetClassDescriptor",
+   "owner": null,
+   "receipts": [],
+   "size": 197,
+   "status": "unknown"
+  },
+  "00A085B0": {
+   "addr": "00A085B0",
+   "claimed_at": null,
+   "name": "Scimitar.Memory::GetAllocator",
+   "owner": null,
+   "receipts": [],
+   "size": 82,
+   "status": "unknown"
+  },
   "00A094D0": {
    "addr": "00A094D0",
    "claimed_at": null,
@@ -741,6 +1327,24 @@
    "owner": null,
    "receipts": [],
    "size": 45,
+   "status": "unknown"
+  },
+  "00A0BB40": {
+   "addr": "00A0BB40",
+   "claimed_at": null,
+   "name": "Scimitar.HandleManager::FindContainer",
+   "owner": null,
+   "receipts": [],
+   "size": 73,
+   "status": "unknown"
+  },
+  "00A0BBF0": {
+   "addr": "00A0BBF0",
+   "claimed_at": null,
+   "name": "Scimitar.HandleManager::FindContainerNoLock",
+   "owner": null,
+   "receipts": [],
+   "size": 483,
    "status": "unknown"
   },
   "00A0BDE0": {
@@ -757,6 +1361,24 @@
    ],
    "size": 108,
    "status": "claimed"
+  },
+  "00A0BE50": {
+   "addr": "00A0BE50",
+   "claimed_at": null,
+   "name": "Scimitar.HandleManager::CreateReference",
+   "owner": null,
+   "receipts": [],
+   "size": 108,
+   "status": "unknown"
+  },
+  "00A0C160": {
+   "addr": "00A0C160",
+   "claimed_at": null,
+   "name": "Scimitar.HandleManager::OnHardRefCountToZero",
+   "owner": null,
+   "receipts": [],
+   "size": 266,
+   "status": "unknown"
   },
   "00A1D0D0": {
    "addr": "00A1D0D0",
@@ -797,6 +1419,51 @@
    "size": 181,
    "status": "claimed"
   },
+  "00A26F70": {
+   "addr": "00A26F70",
+   "claimed_at": null,
+   "name": "Scimitar.LoadingManager::IsLoading",
+   "owner": null,
+   "receipts": [],
+   "size": 18,
+   "status": "unknown"
+  },
+  "00A278F0": {
+   "addr": "00A278F0",
+   "claimed_at": null,
+   "name": "Scimitar.LoadingThread::GetWaitTasks",
+   "owner": null,
+   "receipts": [],
+   "size": 11,
+   "status": "unknown"
+  },
+  "00A2A6C0": {
+   "addr": "00A2A6C0",
+   "claimed_at": null,
+   "name": "Scimitar.LoadingThread::AddLoadTask_Callback",
+   "owner": null,
+   "receipts": [],
+   "size": 60,
+   "status": "unknown"
+  },
+  "00A2D5A0": {
+   "addr": "00A2D5A0",
+   "claimed_at": null,
+   "name": "Scimitar.DuplicationManager::Begin",
+   "owner": null,
+   "receipts": [],
+   "size": 184,
+   "status": "unknown"
+  },
+  "00A2F320": {
+   "addr": "00A2F320",
+   "claimed_at": null,
+   "name": "Scimitar.DuplicationManager::End",
+   "owner": null,
+   "receipts": [],
+   "size": 114,
+   "status": "unknown"
+  },
   "00A38120": {
    "addr": "00A38120",
    "claimed_at": null,
@@ -804,6 +1471,24 @@
    "owner": null,
    "receipts": [],
    "size": 65,
+   "status": "unknown"
+  },
+  "00A3FB90": {
+   "addr": "00A3FB90",
+   "claimed_at": null,
+   "name": "Scimitar.LoadingThread::GetFastLoadDataStream",
+   "owner": null,
+   "receipts": [],
+   "size": 6,
+   "status": "unknown"
+  },
+  "00A47EA0": {
+   "addr": "00A47EA0",
+   "claimed_at": null,
+   "name": "Scimitar.Memory::Free",
+   "owner": null,
+   "receipts": [],
+   "size": 51,
    "status": "unknown"
   },
   "00C4F2A0": {
@@ -950,6 +1635,15 @@
    "size": 172,
    "status": "unknown"
   },
+  "011084E0": {
+   "addr": "011084E0",
+   "claimed_at": null,
+   "name": "Scimitar.RayCast::RayCastHitTest",
+   "owner": null,
+   "receipts": [],
+   "size": 175,
+   "status": "unknown"
+  },
   "011D9380": {
    "addr": "011D9380",
    "claimed_at": null,
@@ -1011,6 +1705,24 @@
    "owner": null,
    "receipts": [],
    "size": 141,
+   "status": "unknown"
+  },
+  "01310470": {
+   "addr": "01310470",
+   "claimed_at": null,
+   "name": "Scimitar.IsGodMode",
+   "owner": null,
+   "receipts": [],
+   "size": 38,
+   "status": "unknown"
+  },
+  "01310560": {
+   "addr": "01310560",
+   "claimed_at": null,
+   "name": "Scimitar.IsInfiniteBreathMode",
+   "owner": null,
+   "receipts": [],
+   "size": 38,
    "status": "unknown"
   },
   "0133A4C0": {
@@ -1154,6 +1866,33 @@
    "size": 1362,
    "status": "unknown"
   },
+  "0169F260": {
+   "addr": "0169F260",
+   "claimed_at": null,
+   "name": "Scimitar.Human::PutHoodDown",
+   "owner": null,
+   "receipts": [],
+   "size": 349,
+   "status": "unknown"
+  },
+  "0169F3C0": {
+   "addr": "0169F3C0",
+   "claimed_at": null,
+   "name": "Scimitar.Human::PutHoodUp",
+   "owner": null,
+   "receipts": [],
+   "size": 351,
+   "status": "unknown"
+  },
+  "016F19E0": {
+   "addr": "016F19E0",
+   "claimed_at": null,
+   "name": "Scimitar.Human::GetContextByID",
+   "owner": null,
+   "receipts": [],
+   "size": 96,
+   "status": "unknown"
+  },
   "017106C0": {
    "addr": "017106C0",
    "claimed_at": "2026-11-08T12:12:51Z",
@@ -1265,6 +2004,24 @@
    "size": 0,
    "status": "unknown"
   },
+  "017FFDD0": {
+   "addr": "017FFDD0",
+   "claimed_at": null,
+   "name": "Scimitar.BhvAssassin::SwitchActorToDebugMode",
+   "owner": null,
+   "receipts": [],
+   "size": 111,
+   "status": "unknown"
+  },
+  "017FFE40": {
+   "addr": "017FFE40",
+   "claimed_at": null,
+   "name": "Scimitar.BhvAssassin::SwitchActorToGameMode",
+   "owner": null,
+   "receipts": [],
+   "size": 49,
+   "status": "unknown"
+  },
   "018480F0": {
    "addr": "018480F0",
    "claimed_at": "2026-11-27T14:40:15Z",
@@ -1368,6 +2125,33 @@
    "owner": null,
    "receipts": [],
    "size": 332,
+   "status": "unknown"
+  },
+  "01B9D030": {
+   "addr": "01B9D030",
+   "claimed_at": null,
+   "name": "Scimitar.DebugContext::Enter",
+   "owner": null,
+   "receipts": [],
+   "size": 80,
+   "status": "unknown"
+  },
+  "01B9D080": {
+   "addr": "01B9D080",
+   "claimed_at": null,
+   "name": "Scimitar.DebugContext::Exit",
+   "owner": null,
+   "receipts": [],
+   "size": 75,
+   "status": "unknown"
+  },
+  "01BA0FC0": {
+   "addr": "01BA0FC0",
+   "claimed_at": null,
+   "name": "Scimitar.DebugContext::Update",
+   "owner": null,
+   "receipts": [],
+   "size": 30,
    "status": "unknown"
   },
   "01C4FDB0": {

@@ -7,10 +7,12 @@
 # Output is UTF-8 without BOM with LF endings: the rest of src\ is LF, and a stray BOM would show up as
 # a diff on a file nobody edits by hand.
 
+param([string]$Out = 'src\build_info.h', [string[]]$DirtyPaths = @('src', 'AC4Coop.ini', 'decomp', 'tools'))
+
 $ErrorActionPreference = 'Continue'
 
 $root = Split-Path -Parent $PSScriptRoot          # tools\ -> repo root
-$out  = Join-Path $root 'src\build_info.h'
+$out  = Join-Path $root $Out
 
 function Warn([string]$msg) {
     Write-Warning ("make_build_info: " + $msg)
@@ -40,7 +42,7 @@ try {
 # A dirty README still does not count. The generated header is excluded so the stamp can never make the
 # tree dirty (it is gitignored too; the filter also covers the case of the file being tracked by mistake).
 # Untracked files under these paths count as dirty (porcelain '??').
-$dirtyPaths = @('src', 'AC4Coop.ini', 'decomp', 'tools')
+$dirtyPaths = $DirtyPaths
 try {
     $porcelain = & git -C $root status --porcelain -- @dirtyPaths 2>$null
     if ($LASTEXITCODE -eq 0) {

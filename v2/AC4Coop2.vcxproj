@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- AC4Coop v2 (docs/v2/ARCHITECTURE.md). Build from the repo root:
+       MSBuild v2\AC4Coop2.vcxproj /nologo /v:m /p:Configuration=Release /p:Platform=Win32
+       MSBuild v2\AC4Coop2.vcxproj /nologo /v:m /p:Configuration=DevTools /p:Platform=Win32
+     Output: bin\v2\<Configuration>\AC4Coop.asi. DevTools adds the pilot bridge (tools/pilot.py) and test commands. -->
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Release|Win32"><Configuration>Release</Configuration><Platform>Win32</Platform></ProjectConfiguration>
+    <ProjectConfiguration Include="DevTools|Win32"><Configuration>DevTools</Configuration><Platform>Win32</Platform></ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion>
+    <ProjectGuid>{6E0B2C1A-6F3E-4B8B-9C2E-AC4C00P20002}</ProjectGuid>
+    <RootNamespace>AC4Coop2</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>NotSet</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup>
+    <OutDir>$(ProjectDir)..\bin\v2\$(Configuration)\</OutDir>
+    <IntDir>$(ProjectDir)..\obj\v2\$(Configuration)\</IntDir>
+    <TargetName>AC4Coop</TargetName>
+    <TargetExt>.asi</TargetExt>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <Optimization>MaxSpeed</Optimization>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <ObjectFileName>$(IntDir)%(RelativeDir)</ObjectFileName>
+      <AdditionalIncludeDirectories>$(ProjectDir)core;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>WIN32;NDEBUG;_WINDOWS;_USRDLL;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+      <GenerateDebugInformation>false</GenerateDebugInformation>
+      <AdditionalOptions>/Brepro %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalDependencies>user32.lib;ws2_32.lib;bcrypt.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+    <PreBuildEvent>
+      <Command>powershell -NoProfile -ExecutionPolicy Bypass -File "$(ProjectDir)..\tools\make_build_info.ps1" -Out v2\core\build_info.h -DirtyPaths v2,decomp,tools</Command>
+    </PreBuildEvent>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='DevTools'">
+    <ClCompile>
+      <PreprocessorDefinitions>AC4COOP_DEVTOOLS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="core\main.cpp" />
+    <ClCompile Include="core\log.cpp" />
+    <ClCompile Include="core\hooks.cpp" />
+    <ClCompile Include="core\config.cpp" />
+    <ClCompile Include="core\tick.cpp" />
+    <ClCompile Include="core\paths.cpp" />
+    <ClCompile Include="core\build_gate.cpp" />
+    <ClCompile Include="core\crash_ctx.cpp" />
+    <ClCompile Include="boot\boot.cpp" />
+    <ClCompile Include="modules.cpp" />
+    <ClCompile Include="engine\world.cpp" />
+    <ClCompile Include="engine\title.cpp" />
+    <ClCompile Include="engine\Hook.cpp" />
+    <ClCompile Include="engine\HookMath.cpp" />
+    <ClCompile Include="engine\scimitar\**\*.cpp" />
+    <ClCompile Include="dev\pilot.cpp" Condition="'$(Configuration)'=='DevTools'" />
+    <ClCompile Include="dev\pilot_world.cpp" Condition="'$(Configuration)'=='DevTools'" />
+    <ClCompile Include="dev\compat.cpp" Condition="'$(Configuration)'=='DevTools'" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

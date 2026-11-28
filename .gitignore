@@ -18,3 +18,4 @@ __pycache__/
 docs/ops/bus/
 local/
 /proxy/version/out/
+/v2/core/build_info.h
