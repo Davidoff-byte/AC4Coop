@@ -25,6 +25,9 @@ Evidence: `docs/evidence/spawn-lib-2026-11-28.md` (runs, four crash root causes,
 | ship specs only from the naval owner class 0x02708E80 | ship specs of class 0x026BDE50 never built (11/11 in T5+T6) |
 | `SpawnCmdSeq` acts on a value read twice in a row (1 s apart), sentinel defaults on every re-read | a key caught mid-write reads as 0: 39 / 19 phantom commands in T5 / T6 |
 
+Naval submits carry the **real** owner while queued (the naval builder `sub_199D1F0` builds at once only for its own
+owner interface, others wait until out of view) and DetSet swaps `request+0x0C` to the private owner before the first
+owner callback (vt[4] adoption, called from `sub_5C58E0` 0x5C59BE).
 Private owner: one static zeroed object; its vtables point at a copy of the owner interface 0x02708E80 with the
 adoption / entity-removed / dtor slots ([4]–[8], [10], [11], [17]) replaced by counting no-ops; the other slots are the
 engine's own and ignore `this`. Owner classes other than 0x02708E80 are passed through unchanged (`[SpawnLib] owner class`
