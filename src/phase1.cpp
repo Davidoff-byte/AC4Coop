@@ -8928,6 +8928,12 @@ static void WideBindPrepass(const EntityPacket& pkt, World* world, Entity* playe
         HandleContainer* hc = ref->m_HandleContainer;
         if (!hc || !readable(hc, 4)) continue;
         Entity* e = (Entity*)hc->m_Object;
+        // The engine resolves a handle as h[0] & (h[2] >> 31) (IDA 0x10968C0..0x10968CA, evidence
+        // naval-boarding-noclass-sink Q2): with the sign bit clear the object is gone. Read unmasked, this walk handed a
+        // freed entity to GetEntityAI (0x6F5F70 reads *(e+0xE8)+0x1C): run 2026-11-28 08:3x guest 19068, two caught read
+        // faults at 0x6F5F88 (e+0xE8 = 0x8004 / 0x630) from WideBindPrepass. Same mask, plain reads, no engine call.
+        if (!readable((char*)hc + 8, 4) || *(const int32_t*)((char*)hc + 8) >= 0) continue;
+        if (!e || !readable(e, 0xA0)) continue;
         Component* bhv = MirrorCandidateBhv(e, player);
         if (!bhv) continue;
         if (GuestObjOfEnt((unsigned int)e)) continue;                    // already plays a host guard
