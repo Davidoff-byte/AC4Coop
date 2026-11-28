@@ -9517,6 +9517,166 @@ static int64_t OwnOffset() {
     const int64_t p = (int64_t)InterlockedCompareExchange64((volatile LONGLONG*)&s_offPrev, 0, 0);
     return c < p ? c : p;
 }
+static void ShipSortF(float* v, int n);
+// ---- [Coop] ShipLocalWater (default 0, re-read every second): synced hulls float on THIS machine's water ---------------
+// The guest drew a bound AI hull with the host's whole transform from ShipInterpDelayMs (400 ms) ago, so its Z, pitch and
+// roll belonged to the host's water at that time: in rough sea it rode above the local waves at the wrong tilt (owner,
+// 2026-11-28, guest clip of run 11:50 - a schooner with its keel out of the water). Here X, Y and heading stay the host's;
+// Z, pitch and roll come from the local water under the hull, sampled with the engine's own helper the buoyancy uses:
+//   sub_1C4FDB0 (__thiscall, one arg, retn 4, result in st0) = max(*(float*)(comp+0x28C), sub_9556B0(*(void**)(comp+0x360),
+//   &pos)), 0.0 when comp+0x360 is null; comp = a ShipPhysicComponent (vt 0x0272D378). The buoyancy force sub_1C98EE0 (in vt
+//   slot 127 sub_1CA3C30's force order) samples it at each float point: array comp+0x2E0, u16 count comp+0x2E6, stride 0x60,
+//   local point at +0, radius at +0x30, body rows comp+0x540/0x550/0x560, translation comp+0x570 (IDA, AC4BFSP.exe).
+// The plane: five samples (centre, +-ex along the hull's x, +-ey along its y; ex/ey = the float points' extent). Draft = EMA
+// (tau 0.5 s rising to 4 s) of (host Z - local plane Z) at the drawn position: the 400 ms wave change between the host's
+// sample and now is zero-mean, the host's height over its own water is not. Bits: 1 = AI hulls driven by ShipInterp (guest),
+// 2 = the peer's ship (ghost, needs ShipGhostInterp). [ShipWater] (every 5 s, any bit set): the own ship as a natural
+// reference (its Z vs the local plane: the query is the water it floats on), the AI hulls' and the ghost's host-vs-local
+// height mismatch (what the old drive showed), and the count of transforms rewritten.
+struct LwState { float draft; uint64_t t0, tLast; uint8_t have; };
+typedef float (__thiscall* LwWaterAtFn)(void* comp, const float* pos4);
+static int s_lwOn = 0; static uint64_t s_lwNext = 0;
+static void LwCfg() {
+    const uint64_t now = GetTickCount64();
+    if (now < s_lwNext) return;
+    s_lwNext = now + 1000;
+    const int v = (int)GetPrivateProfileIntA("Coop", "ShipLocalWater", -1, Paths::Ini());   // -1: key absent this read -> keep
+    if (v >= 0) { if (v != s_lwOn) L("[ShipWater] ShipLocalWater %d\n", v); s_lwOn = v; }
+}
+static bool LwOn(int bit) { LwCfg(); return (s_lwOn & bit) != 0; }
+static void* LwShipComp(void* ent) {   // the ShipPhysicComponent of a ship entity, or null
+    if (!ent || !readable(ent, 0xA0)) return nullptr;
+    __try {
+        Component* c = ((Entity*)ent)->GetComponentByType(RigidBodyComponent::GetStaticClassDescriptor());
+        if (c && readable(c, 0x600) && *(uint32_t*)c == 0x0272D378u) return c;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return nullptr;
+}
+static bool LwHasOcean(void* comp) { return comp && readable((char*)comp + 0x360, 4) && *(void**)((char*)comp + 0x360) != nullptr; }
+static bool LwWaterAt(void* comp, float x, float y, float* h) {
+    alignas(16) float p[4] = { x, y, 0.0f, 0.0f };
+    float v = 0.0f;
+    __try { v = ((LwWaterAtFn)0x01C4FDB0)(comp, p); } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    if (!(v > -1000.0f && v < 1000.0f)) return false;   // NaN / garbage
+    *h = v; return true;
+}
+static void LwExtents(void* comp, float* ex, float* ey) {   // half extent of the float points along the hull's x / y
+    *ex = 4.0f; *ey = 12.0f;
+    __try {
+        const uint16_t n = *(const uint16_t*)((const char*)comp + 0x2E6);
+        const char* base = *(const char* const*)((const char*)comp + 0x2E0);
+        if (n == 0 || n > 64 || !base || !readable((void*)base, (size_t)n * 0x60)) return;
+        float mx = 0.0f, my = 0.0f;
+        for (int i = 0; i < n; ++i) {
+            const float* lp = (const float*)(base + 0x60 * i); const float r = *(const float*)(base + 0x60 * i + 0x30) * 0.71f;
+            const float ax = fabsf(lp[0]) + (r > 0.0f && r < 20.0f ? r : 0.0f), ay = fabsf(lp[1]) + (r > 0.0f && r < 20.0f ? r : 0.0f);
+            if (ax > mx) mx = ax; if (ay > my) my = ay;
+        }
+        if (mx > 0.5f && mx < 80.0f) *ex = mx;
+        if (my > 0.5f && my < 80.0f) *ey = my;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+// Local water plane at (x, y): centre height and slopes along the level frame e0 / e1.
+static bool LwPlane(void* comp, float x, float y, const float* e0, const float* e1, float ex, float ey, float* z0, float* s0, float* s1) {
+    if (!LwHasOcean(comp)) return false;
+    float hc, a, b, c, d;
+    if (!LwWaterAt(comp, x, y, &hc) || !LwWaterAt(comp, x + e0[0] * ex, y + e0[1] * ex, &a) || !LwWaterAt(comp, x - e0[0] * ex, y - e0[1] * ex, &b) ||
+        !LwWaterAt(comp, x + e1[0] * ey, y + e1[1] * ey, &c) || !LwWaterAt(comp, x - e1[0] * ey, y - e1[1] * ey, &d)) return false;
+    const float fl = *(const float*)((const char*)comp + 0x28C);
+    if (hc == fl && a == fl && b == fl && c == fl && d == fl) return false;   // every sample is the floor: no ocean answer here
+    *z0 = (2.0f * hc + a + b + c + d) / 6.0f;
+    *s0 = (a - b) / (2.0f * ex); *s1 = (c - d) / (2.0f * ey);
+    return true;
+}
+// Level frame of a transform: e1 = its y row flattened, e0 = e1 x Z (rows: x right, y forward, z up; z = x cross y,
+// checked on the player's matrix 2026-11-28: rows (0.94,0.31,0.13) (-0.32,0.95,0.01) -> (-0.12,-0.05,0.99)).
+static bool LwLevelFrame(const HookMath::Transform& m, float* e0, float* e1) {
+    e1[0] = m.M21; e1[1] = m.M22; e1[2] = 0.0f;
+    const float l = sqrtf(e1[0] * e1[0] + e1[1] * e1[1]);
+    if (l < 0.3f) return false;
+    e1[0] /= l; e1[1] /= l;
+    e0[0] = e1[1]; e0[1] = -e1[0]; e0[2] = 0.0f;
+    return true;
+}
+static uint32_t s_lwAiApplied = 0, s_lwAiSkip = 0, s_lwGhApplied = 0, s_lwGhSkip = 0;
+static double s_lwAiRel = 0.0, s_lwAiRel2 = 0.0, s_lwGhRel = 0.0, s_lwGhRel2 = 0.0; static uint32_t s_lwAiN = 0, s_lwGhN = 0;
+static float s_lwAiDev[512]; static int s_lwAiDevN = 0; static float s_lwGhDev[512]; static int s_lwGhDevN = 0;
+// Measure (always, when called) and, with apply, rewrite m: host X, Y and heading; Z = local plane + draft; up = the
+// local water normal. which: 1 = AI hull, 2 = ghost (statistics only).
+static bool LwApply(void* comp, LwState& st, HookMath::Transform& m, uint64_t nowUs, int which, bool apply) {
+    if (m.M33 < 0.7f) return false;   // heeled far over (capsizing, sinking): keep the host's transform
+    float e0[3], e1[3];
+    if (!LwLevelFrame(m, e0, e1)) return false;
+    float ex, ey; LwExtents(comp, &ex, &ey);
+    float z0, s0, s1;
+    if (!LwPlane(comp, m.M41, m.M42, e0, e1, ex, ey, &z0, &s0, &s1)) return false;
+    const float rel = m.M43 - z0;
+    if (!st.have) { st.have = 1; st.draft = rel; st.t0 = nowUs; st.tLast = nowUs; }
+    else {
+        const float dt = (float)(double)(nowUs - st.tLast) * 1e-6f; st.tLast = nowUs;
+        const float age = (float)(double)(nowUs - st.t0) * 1e-6f;
+        const float tau = 0.5f + (age < 3.5f ? age : 3.5f);
+        if (fabsf(rel - st.draft) > 4.0f) st.draft = rel;   // sinking, beached or moved: follow the host's height
+        else if (dt > 0.0f && dt < 1.0f) st.draft += (rel - st.draft) * (dt / (tau + dt));
+    }
+    const float dev = rel - st.draft;   // what the host transform would have shown against the local water (old drive)
+    if (which == 1) { s_lwAiRel += rel; s_lwAiRel2 += (double)rel * rel; ++s_lwAiN; if (s_lwAiDevN < 512) s_lwAiDev[s_lwAiDevN++] = fabsf(dev); }
+    else { s_lwGhRel += rel; s_lwGhRel2 += (double)rel * rel; ++s_lwGhN; if (s_lwGhDevN < 512) s_lwGhDev[s_lwGhDevN++] = fabsf(dev); }
+    if (!apply) return false;
+    float n[3] = { -(s0 * e0[0] + s1 * e1[0]), -(s0 * e0[1] + s1 * e1[1]), 1.0f };
+    { const float l = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]); n[0] /= l; n[1] /= l; n[2] /= l; }
+    float f[3]; { const float d = e1[0] * n[0] + e1[1] * n[1]; f[0] = e1[0] - d * n[0]; f[1] = e1[1] - d * n[1]; f[2] = -d * n[2];
+                  const float l = sqrtf(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]); f[0] /= l; f[1] /= l; f[2] /= l; }
+    const float r[3] = { f[1] * n[2] - f[2] * n[1], f[2] * n[0] - f[0] * n[2], f[0] * n[1] - f[1] * n[0] };   // x = y cross z
+    m.M11 = r[0]; m.M12 = r[1]; m.M13 = r[2];
+    m.M21 = f[0]; m.M22 = f[1]; m.M23 = f[2];
+    m.M31 = n[0]; m.M32 = n[1]; m.M33 = n[2];
+    m.M43 = z0 + st.draft;
+    return true;
+}
+// The own ship as the natural reference: its Z vs the local plane (both copies, every frame while ShipLocalWater != 0).
+static uint32_t s_lwOwnN = 0; static double s_lwOwnZ = 0, s_lwOwnZ2 = 0, s_lwOwnP = 0, s_lwOwnP2 = 0, s_lwOwnZP = 0; static float s_lwOwnPMin = 1e9f, s_lwOwnPMax = -1e9f;
+static uint64_t s_lwLog = 0;
+static float LwP95(float* v, int n) { if (!n) return 0.0f; ShipSortF(v, n); return v[(n * 95) / 100]; }
+static void LwTick() {
+    LwCfg();
+    if (!s_lwOn) return;
+    void* ship = Phase1_PlayerShipEntity();
+    void* comp = ship ? LwShipComp(ship) : nullptr;
+    if (comp && readable(ship, 0x50)) {
+        __try {
+            const HookMath::Transform& m = ((BaseEntity*)ship)->m_GlobalMatrix;
+            float e0[3], e1[3], ex, ey, z0, s0, s1;
+            if (LwLevelFrame(m, e0, e1)) {
+                LwExtents(comp, &ex, &ey);
+                if (LwPlane(comp, m.M41, m.M42, e0, e1, ex, ey, &z0, &s0, &s1)) {
+                    const double z = m.M43;
+                    ++s_lwOwnN; s_lwOwnZ += z; s_lwOwnZ2 += z * z; s_lwOwnP += z0; s_lwOwnP2 += (double)z0 * z0; s_lwOwnZP += z * z0;
+                    if (z0 < s_lwOwnPMin) s_lwOwnPMin = z0; if (z0 > s_lwOwnPMax) s_lwOwnPMax = z0;
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+    const uint64_t ms = GetTickCount64();
+    if (ms < s_lwLog) return;
+    s_lwLog = ms + 5000;
+    double oMean = 0, oSd = 0, corr = 0;
+    if (s_lwOwnN > 1) {
+        const double n = s_lwOwnN, mz = s_lwOwnZ / n, mp = s_lwOwnP / n;
+        const double vz = s_lwOwnZ2 / n - mz * mz, vp = s_lwOwnP2 / n - mp * mp, cov = s_lwOwnZP / n - mz * mp;
+        const double vr = vz + vp - 2 * cov;   // var(z - p)
+        oMean = mz - mp; oSd = vr > 0 ? sqrt(vr) : 0; corr = (vz > 1e-9 && vp > 1e-9) ? cov / sqrt(vz * vp) : 0;
+    }
+    const double aM = s_lwAiN ? s_lwAiRel / s_lwAiN : 0, aV = s_lwAiN ? s_lwAiRel2 / s_lwAiN - aM * aM : 0;
+    const double gM = s_lwGhN ? s_lwGhRel / s_lwGhN : 0, gV = s_lwGhN ? s_lwGhRel2 / s_lwGhN - gM * gM : 0;
+    L("[ShipWater] on=%d own: n=%u rel mean=%.2f sd=%.2f corr=%.2f range=%.2f | ai: n=%u applied=%u skip=%u rel mean=%.2f sd=%.2f dev p95=%.2f | ghost: n=%u applied=%u skip=%u rel mean=%.2f sd=%.2f dev p95=%.2f\n",
+      s_lwOn, s_lwOwnN, oMean, oSd, corr, s_lwOwnN ? s_lwOwnPMax - s_lwOwnPMin : 0.0f,
+      s_lwAiN, s_lwAiApplied, s_lwAiSkip, aM, aV > 0 ? sqrt(aV) : 0.0, LwP95(s_lwAiDev, s_lwAiDevN),
+      s_lwGhN, s_lwGhApplied, s_lwGhSkip, gM, gV > 0 ? sqrt(gV) : 0.0, LwP95(s_lwGhDev, s_lwGhDevN));
+    s_lwOwnN = 0; s_lwOwnZ = s_lwOwnZ2 = s_lwOwnP = s_lwOwnP2 = s_lwOwnZP = 0; s_lwOwnPMin = 1e9f; s_lwOwnPMax = -1e9f;
+    s_lwAiApplied = s_lwAiSkip = s_lwGhApplied = s_lwGhSkip = 0; s_lwAiRel = s_lwAiRel2 = s_lwGhRel = s_lwGhRel2 = 0; s_lwAiN = s_lwGhN = 0; s_lwAiDevN = s_lwGhDevN = 0;
+}
+
 // ---- [Coop] ShipInterp (default 0, re-read every second): bound AI ships rendered on the host timeline ----------------
 // Runs T8/T15 2026-11-28: with ShipClassBind=2 a bound hull was warped to the raw host transform once per applied
 // snapshot (~10 Hz: `[Sync] scope ... captures=50` per 5 s) and the guest's own AI/physics moved it in between, so each
@@ -9531,7 +9691,7 @@ static const int SCB_RING = 8;
 // RigidBodyComponent, class names from the descriptors in dump 28300) and its m_DriveEntity before we cleared it.
 struct ScbRing { Entity* ent; ScbSnap s[SCB_RING]; uint8_t n, head; uint64_t lastPushUs; float prevObs[3], prevStep, lastW[3]; uint8_t obsN, haveW;
                  RigidBodyComponent* rbc; uint8_t driveSaved, driveOff, driveTried; uint64_t hostObj; uint32_t writes;
-                 float ap[2][3]; uint64_t at[2]; uint8_t aN; uint64_t lastFrameUs; };   // last two observed positions + their times (accel metric)
+                 float ap[2][3]; uint64_t at[2]; uint8_t aN; uint64_t lastFrameUs; LwState lw; };   // last two observed positions + their times (accel metric); lw: ShipLocalWater
 static ScbRing s_sr[64]; static int s_srN = 0;
 static int s_siOn = 0, s_siDelay = 200, s_siExtrap = 150, s_siPhysEvery = 1; static uint64_t s_siNext = 0, s_siFrame = 0;
 static void ScbInterpCfg() {
@@ -9573,7 +9733,7 @@ static bool ScbInterpPush(Entity* ent, uint64_t hostObj, uint32_t hostMs, const 
     if (feed && r.hostObj != hostObj) return false;
     // One ring = one (hull, host ship) link. Run 2026-11-28 (T17): rings keyed by hull alone mixed samples of two host
     // ships when ShipClassBind moved a hull to another host ship -> interpolation across kilometres (drift max 1529 m).
-    if (r.hostObj != hostObj) { if (r.n) ++s_ssRebind; r.n = 0; r.head = 0; r.obsN = 0; r.haveW = 0; r.writes = 0; r.aN = 0; r.hostObj = hostObj; }
+    if (r.hostObj != hostObj) { if (r.n) ++s_ssRebind; r.n = 0; r.head = 0; r.obsN = 0; r.haveW = 0; r.writes = 0; r.aN = 0; r.lw.have = 0; r.hostObj = hostObj; }
     const bool fresh = r.n == 0;
     if (!feed) r.lastPushUs = rx;
     if (r.n && hostUs <= r.s[r.head].hostUs) return true;   // the slow tick re-applies the same snapshot: nothing new, no warp
@@ -9660,7 +9820,7 @@ static void ScbDriveTake(ScbRing& r) {
         } else ++s_siDriveNone;
     } __except (EXCEPTION_EXECUTE_HANDLER) { ++s_siDriveNone; }
 }
-static uint32_t s_ssPlaced = 0, s_ssAccFrames = 0, s_ssAccJit = 0, s_ssHitch = 0; static double s_ssAccSum = 0.0;
+static uint32_t s_ssPlaced = 0, s_ssAccFrames = 0, s_ssAccJit = 0, s_ssHitch = 0, s_ssAccJitH = 0, s_ssAccJitZ = 0; static double s_ssAccSum = 0.0;
 static float s_ssAccV[1024]; static int s_ssAccVN = 0;   // apparent accelerations this window (p95)
 static int64_t s_ssOffJump = 0, s_ssOffNow = INT64_MAX;   // largest frame-to-frame change of the target offset (us); offset in use
 static void ShipSortF(float* v, int n) { for (int a = 1; a < n; ++a) { const float x = v[a]; int b = a - 1; while (b >= 0 && v[b] > x) { v[b + 1] = v[b]; --b; } v[b + 1] = x; } }
@@ -9750,10 +9910,10 @@ static void ScbInterpFrame() {
         if (r.aN == 2) {
             const double d1 = (double)(r.at[1] - r.at[0]) * 1e-6, d2 = (double)(tObs - r.at[1]) * 1e-6;
             if (d1 >= 0.005 && d1 <= 0.040 && d2 >= 0.005 && d2 <= 0.040) {
-                float v1[3], v2[3]; double sp = 0.0, acc = 0.0;
-                for (int k = 0; k < 3; ++k) { v1[k] = (float)((r.ap[1][k] - r.ap[0][k]) / d1); v2[k] = (float)((p[k] - r.ap[1][k]) / d2); sp += (double)v2[k] * v2[k]; const double dv = (double)v2[k] - v1[k]; acc += dv * dv; }
-                acc = sqrt(acc) / ((d1 + d2) * 0.5);
-                if (sp > 0.25) { ++s_ssAccFrames; s_ssAccSum += acc; if (acc > 15.0) ++s_ssAccJit; if (s_ssAccVN < 1024) s_ssAccV[s_ssAccVN++] = (float)acc; }   // moving > 0.5 m/s
+                float v1[3], v2[3]; double sp = 0.0, acc = 0.0, accH = 0.0, accZ = 0.0;
+                for (int k = 0; k < 3; ++k) { v1[k] = (float)((r.ap[1][k] - r.ap[0][k]) / d1); v2[k] = (float)((p[k] - r.ap[1][k]) / d2); sp += (double)v2[k] * v2[k]; const double dv = (double)v2[k] - v1[k]; acc += dv * dv; if (k < 2) accH += dv * dv; else accZ = dv * dv; }
+                acc = sqrt(acc) / ((d1 + d2) * 0.5); accH = sqrt(accH) / ((d1 + d2) * 0.5); accZ = sqrt(accZ) / ((d1 + d2) * 0.5);
+                if (sp > 0.25) { ++s_ssAccFrames; s_ssAccSum += acc; if (acc > 15.0) ++s_ssAccJit; if (accH > 15.0) ++s_ssAccJitH; if (accZ > 15.0) ++s_ssAccJitZ; if (s_ssAccVN < 1024) s_ssAccV[s_ssAccVN++] = (float)acc; }   // moving > 0.5 m/s
             } else ++s_ssHitch;
             r.ap[0][0] = r.ap[1][0]; r.ap[0][1] = r.ap[1][1]; r.ap[0][2] = r.ap[1][2]; r.at[0] = r.at[1];
             r.ap[1][0] = p[0]; r.ap[1][1] = p[1]; r.ap[1][2] = p[2]; r.at[1] = tObs;
@@ -9776,7 +9936,10 @@ static void ScbInterpFrame() {
         HookMath::Quaternion q; q.x = quat[0]; q.y = quat[1]; q.z = quat[2]; q.w = quat[3];
         HookMath::Transform m; HookMath::ToMatrix(&q, &m);
         m.M41 = pos[0]; m.M42 = pos[1]; m.M43 = pos[2];
-        __try { e->SetGlobalMatrixInternal(&m, physFrame); ++s_ssWrites; ++r.writes; r.lastW[0] = pos[0]; r.lastW[1] = pos[1]; r.lastW[2] = pos[2]; r.haveW = 1; }
+        if (s_lwOn && r.rbc) {   // [Coop] ShipLocalWater bit 1: Z, pitch, roll from the local water (always measured while any bit is set)
+            if (LwApply(r.rbc, r.lw, m, now, 1, LwOn(1))) ++s_lwAiApplied; else if (LwOn(1)) ++s_lwAiSkip;
+        }
+        __try { e->SetGlobalMatrixInternal(&m, physFrame); ++s_ssWrites; ++r.writes; r.lastW[0] = m.M41; r.lastW[1] = m.M42; r.lastW[2] = m.M43; r.haveW = 1; }
         __except (EXCEPTION_EXECUTE_HANDLER) { r.lastPushUs = 0; }
     }
     const uint64_t ms = GetTickCount64();
@@ -9790,8 +9953,17 @@ static void ScbInterpFrame() {
             L("[ShipSmooth] mode=%s rings=%d accFrames=%u jitter(>15m/s2)=%u (%.1f%%) accMean=%.1f accP95=%.1f hitch=%u | movingFrames=%u jerky=%u (%.1f%%) pops>1m=%u placed=%u rebind=%u | writes=%u underrun=%u spline=%u linear=%u fed=%u offMs=%.1f offJumpMaxMs=%.1f drift mean=%.3f p95=%.3f max=%.3f delayMs=%d physEvery=%d | driveOff=%u restored=%u noRbc=%u\n",
               s_siOn == 2 ? "spline" : s_siOn ? "interp" : "snap", s_srN, s_ssAccFrames, s_ssAccJit, s_ssAccFrames ? 100.0 * s_ssAccJit / s_ssAccFrames : 0.0, s_ssAccFrames ? s_ssAccSum / s_ssAccFrames : 0.0, accP95, s_ssHitch, s_ssFrames, s_ssJerky, s_ssFrames ? 100.0 * s_ssJerky / s_ssFrames : 0.0, s_ssPops, s_ssPlaced, s_ssRebind,
               s_ssWrites, s_ssUnder, s_ssSpline, s_ssLinear, s_sfFed, s_ssOffNow == INT64_MAX ? -1.0 : s_ssOffNow / 1000.0, s_ssOffJump / 1000.0, s_ssDriftN ? s_ssDrift / s_ssDriftN : 0.0, p95, s_ssDriftMax, s_siDelay, s_siPhysEvery, s_siDriveOff, s_siDriveRestored, s_siDriveNone);
+            L("[ShipSmooth] split: hJit(>15m/s2)=%u (%.1f%%) zJit=%u (%.1f%%) of accFrames=%u localWater=%d\n", s_ssAccJitH, s_ssAccFrames ? 100.0 * s_ssAccJitH / s_ssAccFrames : 0.0, s_ssAccJitZ, s_ssAccFrames ? 100.0 * s_ssAccJitZ / s_ssAccFrames : 0.0, s_ssAccFrames, s_lwOn);
+            // [ShipNear] (test harness, read-only): the driven hull nearest to the local player's ship, for camera placement.
+            if (s_lwOn) {
+                void* own = Phase1_PlayerShipEntity(); float op[2] = { 0, 0 }; bool ok = false;
+                __try { if (own && readable(own, 0x50)) { op[0] = ((BaseEntity*)own)->m_GlobalMatrix.M41; op[1] = ((BaseEntity*)own)->m_GlobalMatrix.M42; ok = true; } } __except (EXCEPTION_EXECUTE_HANDLER) {}
+                int bi = -1; float bd = 1e9f;
+                for (int i = 0; ok && i < s_srN; ++i) { if (!s_sr[i].haveW) continue; const float dx = s_sr[i].lastW[0] - op[0], dy = s_sr[i].lastW[1] - op[1], d = sqrtf(dx * dx + dy * dy); if (d < bd) { bd = d; bi = i; } }
+                if (bi >= 0) L("[ShipNear] hull=%p at (%.1f, %.1f) d=%.0f own=(%.1f, %.1f)\n", (void*)s_sr[bi].ent, s_sr[bi].lastW[0], s_sr[bi].lastW[1], bd, op[0], op[1]);
+            }
         }
-        s_ssFrames = s_ssJerky = s_ssPops = s_ssUnder = s_ssWrites = s_ssPlaced = s_ssRebind = 0; s_ssAccFrames = s_ssAccJit = s_ssHitch = 0; s_ssAccSum = 0.0; s_ssDrift = 0.0; s_ssDriftMax = 0.0f; s_ssDriftN = 0;
+        s_ssFrames = s_ssJerky = s_ssPops = s_ssUnder = s_ssWrites = s_ssPlaced = s_ssRebind = 0; s_ssAccFrames = s_ssAccJit = s_ssHitch = s_ssAccJitH = s_ssAccJitZ = 0; s_ssAccSum = 0.0; s_ssDrift = 0.0; s_ssDriftMax = 0.0f; s_ssDriftN = 0;
         s_ssAccVN = 0; s_ssSpline = s_ssLinear = s_sfFed = 0; s_ssOffJump = 0;
     }
 }
@@ -9805,7 +9977,7 @@ static void ScbInterpFrame() {
 // 2 s window (the OwnOffsetNote rule, own state: on the host no entity snapshots feed OwnOffset), and the ghost is sampled
 // every frame at now - ShipGhostDelayMs: position lerp (x, y, z), rotation nlerp, > 30 m apart = step; past the newest
 // sample extrapolated for at most ShipGhostExtrapMs, then held. [GhostSmooth] (every 5 s, both modes): the ghost as drawn.
-struct GhSnap { int64_t hostUs; float pos[3], quat[4]; };
+struct GhSnap { int64_t hostUs; float pos[3], quat[4]; float lp[3], lr[9]; uint8_t hasLocal; };   // lp/lr: the peer's deck pose (PuppetOnGhost)
 static const int GH_RING = 16;
 static GhSnap s_gh[GH_RING]; static int s_ghN = 0, s_ghHead = 0;
 static uint32_t s_ghBaseMs = 0, s_ghLastMs = 0; static bool s_ghBaseSet = false; static uint64_t s_ghWorld = 0;
@@ -9814,10 +9986,29 @@ static int s_giOn = 0, s_giDelay = 150, s_giExtrap = 150, s_giMinGap = 90; stati
 // ShipGhostInterp=2: packets closer than ShipGhostMinGapMs are averaged into one sample (time and position), then a
 // cubic Hermite runs through the samples. Run 2026-11-28 05:20 (asi 85159A69): mode 1 (linear through every ~28 Hz packet)
 // still had 20 % of frames > 15 m/s^2 - the kink at each packet carries the sender's capture-time noise.
-struct GhAcc { int n; int64_t t0; double t, p[3]; float q[4]; };   // q: sign-aligned sum (mean rotation of the bucket)
+struct GhAcc { int n; int64_t t0; double t, p[3]; float q[4]; int nl; double lp[3]; float lr[9]; };   // q: sign-aligned sum (mean rotation of the bucket)
+static int s_pogOn = 0;   // [Coop] PuppetOnGhost, read in GhostInterpCfg
+// [Coop] PuppetOnGhost: the peer's player matrix in its own ship's frame, from ONE packet (row vectors: world = local x R
+// + t, R = ToMatrix(shipQuat) - the conversion the ghost drive uses): lp_j = (p - t) . R_j, lr_i = (P_i . R_0, P_i . R_1,
+// P_i . R_2). The ghost ring carries it with the ship pose, so hull and helmsman are sampled from the same samples.
+static bool GhLocalOf(const PlayerState& s, float* lp, float* lr) {
+    HookMath::Quaternion q; q.x = s.shipQuat[0]; q.y = s.shipQuat[1]; q.z = s.shipQuat[2]; q.w = s.shipQuat[3];
+    const float n2 = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
+    if (!(n2 > 0.5f && n2 < 1.5f)) return false;
+    HookMath::Transform R; HookMath::ToMatrix(&q, &R);
+    const float Rr[3][3] = { { R.M11, R.M12, R.M13 }, { R.M21, R.M22, R.M23 }, { R.M31, R.M32, R.M33 } };
+    const float d[3] = { s.matrix.M41 - s.shipPos[0], s.matrix.M42 - s.shipPos[1], s.matrix.M43 - s.shipPos[2] };
+    if (!(d[0] * d[0] + d[1] * d[1] + d[2] * d[2] < 100.0f * 100.0f)) return false;   // not on its deck
+    const float P[3][3] = { { s.matrix.M11, s.matrix.M12, s.matrix.M13 }, { s.matrix.M21, s.matrix.M22, s.matrix.M23 }, { s.matrix.M31, s.matrix.M32, s.matrix.M33 } };
+    for (int j = 0; j < 3; ++j) lp[j] = d[0] * Rr[j][0] + d[1] * Rr[j][1] + d[2] * Rr[j][2];
+    for (int i = 0; i < 3; ++i) for (int j = 0; j < 3; ++j) lr[3 * i + j] = P[i][0] * Rr[j][0] + P[i][1] * Rr[j][1] + P[i][2] * Rr[j][2];
+    return true;
+}
 static GhAcc s_gha = {};
 static void GhAccAdd(const PlayerState& s, int64_t hostUs) {
-    if (!s_gha.n) { s_gha.t0 = hostUs; s_gha.t = 0.0; for (int k = 0; k < 3; ++k) s_gha.p[k] = 0.0; for (int k = 0; k < 4; ++k) s_gha.q[k] = 0.0f; }
+    if (!s_gha.n) { s_gha.t0 = hostUs; s_gha.t = 0.0; for (int k = 0; k < 3; ++k) s_gha.p[k] = 0.0; for (int k = 0; k < 4; ++k) s_gha.q[k] = 0.0f;
+                    s_gha.nl = 0; for (int k = 0; k < 3; ++k) s_gha.lp[k] = 0.0; for (int k = 0; k < 9; ++k) s_gha.lr[k] = 0.0f; }
+    { float lp[3], lr[9]; if (GhLocalOf(s, lp, lr)) { ++s_gha.nl; for (int k = 0; k < 3; ++k) s_gha.lp[k] += lp[k]; for (int k = 0; k < 9; ++k) s_gha.lr[k] += lr[k]; } }
     float d = 0.0f; for (int k = 0; k < 4; ++k) d += s_gha.q[k] * s.shipQuat[k];
     const float sg = d < 0.0f ? -1.0f : 1.0f;
     ++s_gha.n; s_gha.t += (double)hostUs;
@@ -9830,6 +10021,10 @@ static void GhostInterpCfg() {
     const uint64_t now = GetTickCount64();
     if (now < s_giNext) return;
     s_giNext = now + 1000;
+    {   // [Coop] PuppetOnGhost (see GhostPlaceOnDeck)
+        const int pog = (int)GetPrivateProfileIntA("Coop", "PuppetOnGhost", -1, Paths::Ini());
+        if (pog >= 0) { if ((pog != 0) != (s_pogOn != 0)) L("[PupDeck] PuppetOnGhost=%d\n", pog != 0 ? 1 : 0); s_pogOn = pog != 0; }
+    }
     const int on = (int)GetPrivateProfileIntA("Coop", "ShipGhostInterp", -1, Paths::Ini());   // -1: key absent this read -> keep
     if (on < 0) return;
     const int mode = on > 2 ? 2 : on;   // 1 = linear through every packet, 2 = averaged samples + cubic Hermite
@@ -9854,6 +10049,7 @@ static void GhostRingPush(const PlayerState& s, uint64_t rxUs) {
     if (off < s_ghOffCur) s_ghOffCur = off;
     if (s_ghN && hostUs <= s_gh[s_ghHead].hostUs) return;   // same capture (CaptureAtWrite) or reordered: nothing new
     float pos[3] = { s.shipPos[0], s.shipPos[1], s.shipPos[2] }, quat[4] = { s.shipQuat[0], s.shipQuat[1], s.shipQuat[2], s.shipQuat[3] };
+    float lp[3] = {}, lr[9] = {}; bool hl = GhLocalOf(s, lp, lr);
     int64_t ts = hostUs;
     if (s_giOn == 2 && s_giMinGap > 0) {   // average the packets of one ShipGhostMinGapMs bucket into one sample
         if (s_gha.n && (hostUs - s_gha.t0 >= (int64_t)s_giMinGap * 1000 || !ShipNear(pos, s_gh[s_ghHead].pos))) {
@@ -9861,6 +10057,8 @@ static void GhostRingPush(const PlayerState& s, uint64_t rxUs) {
             for (int k = 0; k < 3; ++k) pos[k] = (float)(s_gha.p[k] / s_gha.n);
             float qn = 0.0f; for (int k = 0; k < 4; ++k) qn += s_gha.q[k] * s_gha.q[k]; qn = sqrtf(qn);
             for (int k = 0; k < 4; ++k) quat[k] = qn > 1e-6f ? s_gha.q[k] / qn : s.shipQuat[k];
+            hl = s_gha.nl > 0;
+            if (hl) { for (int k = 0; k < 3; ++k) lp[k] = (float)(s_gha.lp[k] / s_gha.nl); for (int k = 0; k < 9; ++k) lr[k] = s_gha.lr[k] / (float)s_gha.nl; }
             s_gha.n = 0;
             GhAccAdd(s, hostUs);
             if (s_ghN && ts <= s_gh[s_ghHead].hostUs) return;
@@ -9873,11 +10071,30 @@ static void GhostRingPush(const PlayerState& s, uint64_t rxUs) {
     GhSnap& g = s_gh[s_ghHead]; g.hostUs = ts;
     for (int k = 0; k < 3; ++k) g.pos[k] = pos[k];
     for (int k = 0; k < 4; ++k) g.quat[k] = quat[k];
+    g.hasLocal = hl ? 1 : 0;
+    for (int k = 0; k < 3; ++k) g.lp[k] = lp[k];
+    for (int k = 0; k < 9; ++k) g.lr[k] = lr[k];
     if (s_ghN < GH_RING) ++s_ghN;
     ++s_gsPushed;
 }
-static bool GhostSample(uint64_t nowUs, float* pos, float* quat, bool* under) {
+static void GhLocalMix(const GhSnap* a, const GhSnap* b, float f, float* lp, float* lr, bool* hasLocal) {   // deck pose at f in [a, b]
+    if (!hasLocal) return;
+    const GhSnap* x = (a && a->hasLocal) ? a : nullptr; const GhSnap* y = (b && b->hasLocal) ? b : nullptr;
+    if (!x && !y) { *hasLocal = false; return; }
+    if (!x) x = y;
+    if (!y) y = x;
+    for (int k = 0; k < 3; ++k) lp[k] = x->lp[k] + (y->lp[k] - x->lp[k]) * f;
+    for (int i = 0; i < 3; ++i) {   // rows lerped, renormalised (the lerpState rule for the puppet's own basis)
+        float n = 0.0f;
+        for (int j = 0; j < 3; ++j) { lr[3 * i + j] = x->lr[3 * i + j] + (y->lr[3 * i + j] - x->lr[3 * i + j]) * f; n += lr[3 * i + j] * lr[3 * i + j]; }
+        n = sqrtf(n);
+        if (n > 1e-6f) for (int j = 0; j < 3; ++j) lr[3 * i + j] /= n;
+    }
+    *hasLocal = true;
+}
+static bool GhostSample(uint64_t nowUs, float* pos, float* quat, bool* under, float* lp = nullptr, float* lr = nullptr, bool* hasLocal = nullptr) {
     *under = false;
+    if (hasLocal) *hasLocal = false;
     if (!s_ghN) return false;
     const int64_t off = s_ghOffCur < s_ghOffPrev ? s_ghOffCur : s_ghOffPrev;
     if (off == INT64_MAX) return false;
@@ -9888,12 +10105,13 @@ static bool GhostSample(uint64_t nowUs, float* pos, float* quat, bool* under) {
         if (s.hostUs <= T) { a = &s; if (k + 1 < s_ghN) prev = &s_gh[(s_ghHead - k - 1 + GH_RING) % GH_RING]; break; }
         next = b; b = &s;
     }
-    if (!a) { for (int k = 0; k < 3; ++k) pos[k] = b->pos[k]; for (int k = 0; k < 4; ++k) quat[k] = b->quat[k]; return true; }
+    if (!a) { for (int k = 0; k < 3; ++k) pos[k] = b->pos[k]; for (int k = 0; k < 4; ++k) quat[k] = b->quat[k]; GhLocalMix(b, b, 0.0f, lp, lr, hasLocal); return true; }
     if (b) {
         const float f = (float)(double)(T - a->hostUs) / (float)(double)(b->hostUs - a->hostUs);
         const float dx = b->pos[0] - a->pos[0], dy = b->pos[1] - a->pos[1], dz = b->pos[2] - a->pos[2];
         const bool jump = dx * dx + dy * dy + dz * dz > 900.0f;   // > 30 m between two samples: a teleport, never glide
         for (int k = 0; k < 3; ++k) pos[k] = jump ? b->pos[k] : a->pos[k] + (b->pos[k] - a->pos[k]) * f;
+        GhLocalMix(jump ? b : a, b, jump ? 0.0f : f, lp, lr, hasLocal);
         if (!jump && s_giOn == 2) {
             if (prev && next && b->hostUs > prev->hostUs && next->hostUs > a->hostUs && ShipNear(prev->pos, a->pos) && ShipNear(b->pos, next->pos)) {
                 ShipHermite(prev->pos, prev->hostUs, a->pos, a->hostUs, b->pos, b->hostUs, next->pos, next->hostUs, f, pos); ++s_gsSpline;
@@ -9911,6 +10129,7 @@ static bool GhostSample(uint64_t nowUs, float* pos, float* quat, bool* under) {
         if (dx * dx + dy * dy + dz * dz <= 900.0f) for (int k = 0; k < 3; ++k) pos[k] = a->pos[k] + (a->pos[k] - prev->pos[k]) * ((float)(double)ex / dt);
     }
     for (int k = 0; k < 4; ++k) quat[k] = a->quat[k];
+    GhLocalMix(a, a, 0.0f, lp, lr, hasLocal);
     return true;
 }
 // [GhostSmooth]: the ghost's m_GlobalMatrix translation after our write, once per drive frame. Same definitions as
@@ -9961,6 +10180,129 @@ static void GhostSmoothNote(const float* p, uint64_t now) {
         s_gsAccVN = 0; s_gsSpline = s_gsLinear = 0;
     }
 }
+// One ghost pose per frame (s_ghFrameNo, counted in OnFrameInner): the drive and the puppet's deck placement use the
+// same sample. g_ghostCmd* (declared with g_ghostSync*) receive it.
+static uint32_t s_ghFrameNo = 0, s_ghCmdFrame = 0xFFFFFFFFu; static bool s_ghCmdOk = false, s_ghCmdHasLocal = false;
+static float s_ghCmdLp[3], s_ghCmdLr[9];
+// [Coop] ShipLocalWater bit 2: the ghost's commanded Z / tilt come from the local water (LwApply); its Z is then final and
+// the use sites take it as is instead of MirroredShipZ (GhostCmdZ).
+static bool s_ghCmdLw = false; static LwState s_ghLw;
+static float GhostCmdZ(float z) { return s_ghCmdLw ? z : MirroredShipZ(z); }
+static bool GhostCmdThisFrame(uint64_t nowUs) {
+    if (s_ghCmdFrame == s_ghFrameNo) return s_ghCmdOk;
+    s_ghCmdFrame = s_ghFrameNo;
+    float gp[3], gq[4]; bool gu = false, hl = false;
+    s_ghCmdOk = GhostSample(nowUs, gp, gq, &gu, s_ghCmdLp, s_ghCmdLr, &hl);
+    s_ghCmdHasLocal = s_ghCmdOk && hl;
+    s_ghCmdLw = false;
+    if (s_ghCmdOk && s_lwOn && g_ghostShip && gp[2] != 0.0f) {   // gp[2] = the sender's ship Z (0 = not reported)
+        void* comp = LwShipComp((void*)g_ghostShip);
+        if (!LwHasOcean(comp)) { void* own = Phase1_PlayerShipEntity(); void* oc = own ? LwShipComp(own) : nullptr; if (LwHasOcean(oc)) comp = oc; }
+        if (LwHasOcean(comp)) {
+            HookMath::Quaternion q; q.x = gq[0]; q.y = gq[1]; q.z = gq[2]; q.w = gq[3];
+            HookMath::Transform m; HookMath::ToMatrix(&q, &m); m.M41 = gp[0]; m.M42 = gp[1]; m.M43 = gp[2];
+            if (LwApply(comp, s_ghLw, m, nowUs, 2, LwOn(2))) {
+                HookMath::FromMatrix(&m, &q); gq[0] = q.x; gq[1] = q.y; gq[2] = q.z; gq[3] = q.w; gp[2] = m.M43; s_ghCmdLw = true; ++s_lwGhApplied;
+            } else if (LwOn(2)) ++s_lwGhSkip;
+        }
+    }
+    if (s_ghCmdOk) { for (int k = 0; k < 3; ++k) g_ghostCmdPos[k] = gp[k]; for (int k = 0; k < 4; ++k) g_ghostCmdQuat[k] = gq[k]; if (gu) ++s_gsUnder; }
+    return s_ghCmdOk;
+}
+// [Coop] PuppetOnGhost (default 0, re-read every second with ShipGhostInterp): while the peer is aboard its ship, the
+// puppet is drawn at (its deck pose from the ring) x (this frame's ghost pose) instead of at its own buffered world
+// position: the ghost (sender timeline, ShipGhostDelayMs) and the puppet buffer (arrival stamps, InterpDelayMs) are
+// different clocks, so a helmsman drawn from the buffer drifts off his own wheel by (delay difference) x speed.
+static bool PuppetOnGhostOn() { GhostInterpCfg(); return s_pogOn != 0; }
+static void GhostPlaceOnDeck(HookMath::Transform& m) {
+    HookMath::Quaternion q; q.x = g_ghostCmdQuat[0]; q.y = g_ghostCmdQuat[1]; q.z = g_ghostCmdQuat[2]; q.w = g_ghostCmdQuat[3];
+    HookMath::Transform G; HookMath::ToMatrix(&q, &G);
+    const float Rg[3][3] = { { G.M11, G.M12, G.M13 }, { G.M21, G.M22, G.M23 }, { G.M31, G.M32, G.M33 } };
+    const float tg[3] = { g_ghostCmdPos[0], g_ghostCmdPos[1], GhostCmdZ(g_ghostCmdPos[2]) };   // the drive's own Z rule
+    float w[3], r[3][3];
+    for (int k = 0; k < 3; ++k) w[k] = tg[k] + s_ghCmdLp[0] * Rg[0][k] + s_ghCmdLp[1] * Rg[1][k] + s_ghCmdLp[2] * Rg[2][k];
+    for (int i = 0; i < 3; ++i) for (int k = 0; k < 3; ++k) r[i][k] = s_ghCmdLr[3 * i] * Rg[0][k] + s_ghCmdLr[3 * i + 1] * Rg[1][k] + s_ghCmdLr[3 * i + 2] * Rg[2][k];
+    m.M11 = r[0][0]; m.M12 = r[0][1]; m.M13 = r[0][2];
+    m.M21 = r[1][0]; m.M22 = r[1][1]; m.M23 = r[1][2];
+    m.M31 = r[2][0]; m.M32 = r[2][1]; m.M33 = r[2][2];
+    m.M41 = w[0]; m.M42 = w[1]; m.M43 = w[2];
+}
+// [PupDeck] (every 5 s, both modes): the puppet's drawn position in the ghost's drawn frame, per drive frame while the
+// peer is aboard. A helmsman standing still should not move in that frame: slip = |rel - previous rel| per frame.
+static bool s_pdAboard = false; static float s_pdPrev[3]; static int s_pdHave = 0;
+static uint32_t s_pdFrames = 0, s_pdSlip5 = 0, s_pdPlaced = 0; static float s_pdSlipV[1024]; static int s_pdSlipN = 0; static double s_pdSlipSum = 0.0; static uint64_t s_pdLog = 0;
+static void PupDeckNote(void* puppet, void* ghost) {
+    if (!s_pdAboard || !puppet || !ghost || !readable(puppet, 0x50) || !readable(ghost, 0x50)) { s_pdHave = 0; return; }
+    const float* pm = (const float*)((const char*)puppet + 0x10); const float* gm = (const float*)((const char*)ghost + 0x10);
+    const float d[3] = { pm[12] - gm[12], pm[13] - gm[13], pm[14] - gm[14] };
+    float rel[3];
+    for (int j = 0; j < 3; ++j) rel[j] = d[0] * gm[4 * j] + d[1] * gm[4 * j + 1] + d[2] * gm[4 * j + 2];
+    if (!(rel[0] * rel[0] + rel[1] * rel[1] + rel[2] * rel[2] < 100.0f * 100.0f)) { s_pdHave = 0; return; }
+    if (s_pdHave) {
+        const float sx = rel[0] - s_pdPrev[0], sy = rel[1] - s_pdPrev[1], sz = rel[2] - s_pdPrev[2];
+        const float slip = sqrtf(sx * sx + sy * sy + sz * sz);
+        ++s_pdFrames; s_pdSlipSum += slip; if (slip > 0.05f) ++s_pdSlip5; if (s_pdSlipN < 1024) s_pdSlipV[s_pdSlipN++] = slip;
+    }
+    for (int j = 0; j < 3; ++j) s_pdPrev[j] = rel[j];
+    s_pdHave = 1;
+    const uint64_t ms = GetTickCount64();
+    if (ms >= s_pdLog) {
+        s_pdLog = ms + 5000;
+        if (s_pdFrames) {
+            float p95 = 0.0f;
+            if (s_pdSlipN) { ShipSortF(s_pdSlipV, s_pdSlipN); p95 = s_pdSlipV[(s_pdSlipN * 95) / 100]; }
+            L("[PupDeck] mode=%s frames=%u slip>5cm=%u (%.1f%%) slipMean=%.3f p95=%.3f placed=%u rel=(%.2f, %.2f, %.2f)\n", s_pogOn ? "ondeck" : "buffer",
+              s_pdFrames, s_pdSlip5, 100.0 * s_pdSlip5 / s_pdFrames, s_pdSlipSum / s_pdFrames, p95, s_pdPlaced, rel[0], rel[1], rel[2]);
+        }
+        s_pdFrames = s_pdSlip5 = s_pdPlaced = 0; s_pdSlipSum = 0.0; s_pdSlipN = 0;
+    }
+}
+// [PupSmooth] (every 5 s, read-only): the puppet as drawn, once per frame after the apply - the [GhostSmooth] definitions
+// (jerky = |step - previous step| > max(25 %, 5 cm); apparent acceleration > 15 m/s^2 from three frames with dt 5..40 ms,
+// moving > 0.5 m/s; pops = steps > 1 m), split by whether the peer is aboard its ship.
+static float s_psPrev[3], s_psPrevStep, s_psAp[2][3]; static uint64_t s_psAt[2]; static int s_psObsN = 0, s_psAN = 0;
+static uint32_t s_psFrames = 0, s_psJerky = 0, s_psPops = 0, s_psAcc = 0, s_psAccJit = 0, s_psHitch = 0, s_psShip = 0;
+static float s_psAccV[1024]; static int s_psAccVN = 0; static uint64_t s_psLog = 0;
+static void PupSmoothNote(void* puppet, uint64_t now, bool aboard) {
+    if (!puppet || !readable(puppet, 0x50)) { s_psObsN = 0; s_psAN = 0; return; }
+    const float* m = (const float*)((const char*)puppet + 0x10); const float p[3] = { m[12], m[13], m[14] };
+    if (aboard) ++s_psShip;
+    if (s_psObsN) {
+        const float dx = p[0] - s_psPrev[0], dy = p[1] - s_psPrev[1], dz = p[2] - s_psPrev[2];
+        const float step = sqrtf(dx * dx + dy * dy + dz * dz);
+        if (s_psObsN > 1) {
+            const float big = step > s_psPrevStep ? step : s_psPrevStep;
+            if (big > 0.02f) { ++s_psFrames; if (fabsf(step - s_psPrevStep) > (0.25f * big > 0.05f ? 0.25f * big : 0.05f)) ++s_psJerky; }
+            if (step > 1.0f) ++s_psPops;
+        }
+        s_psPrevStep = step;
+    }
+    for (int k = 0; k < 3; ++k) s_psPrev[k] = p[k];
+    if (s_psObsN < 2) ++s_psObsN;
+    if (s_psAN == 2) {
+        const double d1 = (double)(s_psAt[1] - s_psAt[0]) * 1e-6, d2 = (double)(now - s_psAt[1]) * 1e-6;
+        if (d1 >= 0.005 && d1 <= 0.040 && d2 >= 0.005 && d2 <= 0.040) {
+            double sp = 0.0, acc = 0.0;
+            for (int k = 0; k < 3; ++k) { const double v1 = (s_psAp[1][k] - s_psAp[0][k]) / d1, v2 = (p[k] - s_psAp[1][k]) / d2; sp += v2 * v2; acc += (v2 - v1) * (v2 - v1); }
+            acc = sqrt(acc) / ((d1 + d2) * 0.5);
+            if (sp > 0.25) { ++s_psAcc; if (acc > 15.0) ++s_psAccJit; if (s_psAccVN < 1024) s_psAccV[s_psAccVN++] = (float)acc; }
+        } else ++s_psHitch;
+        for (int k = 0; k < 3; ++k) { s_psAp[0][k] = s_psAp[1][k]; s_psAp[1][k] = p[k]; }
+        s_psAt[0] = s_psAt[1]; s_psAt[1] = now;
+    } else { for (int k = 0; k < 3; ++k) s_psAp[s_psAN][k] = p[k]; s_psAt[s_psAN] = now; ++s_psAN; }
+    const uint64_t ms = GetTickCount64();
+    if (ms >= s_psLog) {
+        s_psLog = ms + 5000;
+        if (s_psFrames || s_psAcc) {
+            float p95 = 0.0f;
+            if (s_psAccVN) { ShipSortF(s_psAccV, s_psAccVN); p95 = s_psAccV[(s_psAccVN * 95) / 100]; }
+            L("[PupSmooth] aboardFrames=%u ondeck=%d accFrames=%u jitter(>15m/s2)=%u (%.1f%%) accP95=%.1f hitch=%u | movingFrames=%u jerky=%u (%.1f%%) pops>1m=%u\n",
+              s_psShip, s_pogOn, s_psAcc, s_psAccJit, s_psAcc ? 100.0 * s_psAccJit / s_psAcc : 0.0, p95, s_psHitch, s_psFrames, s_psJerky, s_psFrames ? 100.0 * s_psJerky / s_psFrames : 0.0, s_psPops);
+        }
+        s_psFrames = s_psJerky = s_psPops = s_psAcc = s_psAccJit = s_psHitch = s_psShip = 0; s_psAccVN = 0;
+    }
+}
+
 static float OwnLerpRatio(float a, float b, float f, bool* wrapped) {
     *wrapped = b < a;                     // the clip looped between the two samples
     if (*wrapped) b += 1.0f;
@@ -15694,7 +16036,13 @@ static void CorpseLatchTick() {
                 ((Component*)c.bhv)->SetEnabled(false);
                 ok = 1;
             }
-            Human* h = AIEntityHelper::GetHuman((Entity*)c.ent);
+            // The corpse can be gone by now (despawn / world change): run 2026-11-28 05:09 guest 24216, a caught execute
+            // fault in GetHuman (sub_13905A0 -> sub_7026E0 -> sub_6FCC10 vt[5]) on a freed body. Same gate as the puppet
+            // handle check: the entity's own handle (+0xC8) must still name it with the valid bit set.
+            const uintptr_t ce = (uintptr_t)c.ent;
+            const uintptr_t ch = (ce && readable((void*)ce, 0xCC)) ? *(const uintptr_t*)(ce + 0xC8) : 0;
+            const bool alive = ch && readable((void*)ch, 12) && *(const uintptr_t*)ch == ce && *(const int32_t*)(ch + 8) < 0;
+            Human* h = alive ? AIEntityHelper::GetHuman((Entity*)c.ent) : nullptr;
             if (h && readable(h, 4)) {
                 CharacterController* cc = (CharacterController*)h->GetCharacterComponent();
                 if (readable(cc, 0x600)) cc->m_DriveEntity = false;
@@ -17731,7 +18079,7 @@ static void DumpConfigOnce()
         // The Tune* values are floats (read with strtod, see ShipTuningTick); the dump shows the integer part.
         { "Coop", "TuneConeAngle", 120 }, { "Coop", "TuneConeRange", 350 }, { "Coop", "TuneMaxTime", 30 },
         { "Coop", "TuneAggroTime", 30 }, { "Coop", "TuneHull", 0 },
-        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 }, { "Coop", "WeaponSync", 0 }, { "Coop", "ShipPeerZ", 0 }, { "Coop", "ShipBindProbe", 0 }, { "Coop", "ShipSpawnProbe", 0 }, { "Coop", "ShipSpawnFire", 0 }, { "Coop", "ShipSpawnFirePid", 0 }, { "Coop", "SpawnCensus", 0 }, { "Coop", "SpawnReplayFire", 0 }, { "Coop", "SpawnReplayFirePid", 0 }, { "Coop", "SpawnShare", 0 }, { "Coop", "SpawnKeyBind", 0 }, { "Coop", "SpawnLib", 0 }, { "Coop", "SpawnLibFollow", 1 }, { "Coop", "SpawnLibBusy", 1 }, { "Coop", "SpawnCmdSeq", 0 }, { "Coop", "SpawnCmdPid", 0 }, { "Coop", "ShipClassBind", 0 }, { "Coop", "ShipInterp", 0 }, { "Coop", "ShipInterpDelayMs", 200 }, { "Coop", "ShipExtrapMs", 150 }, { "Coop", "ShipInterpPhysEvery", 1 }, { "Coop", "ShipGhostInterp", 0 }, { "Coop", "ShipGhostDelayMs", 150 }, { "Coop", "ShipGhostExtrapMs", 150 }, { "Coop", "ShipGhostMinGapMs", 90 }, { "Coop", "SpawnLibLateRestore", 0 }, { "Coop", "PchanSoftStop", 0 }, { "Coop", "PadScanFrom1", 0 }, { "Coop", "CollectableProbe", 0 }, { "Coop", "BoardObjectiveReplicate", 0 }, { "Coop", "ShipClassBindSteal", 0 }, { "Coop", "SpawnShareRadiusM", 150 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "TableEvict", 0 }, { "Coop", "UsedEntAllPaths", 0 }, { "Coop", "PuppetSeqResync", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "FastTravelCrashFix", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 }, { "Coop", "PuppetListener", 0 }, { "Coop", "PuppetListenerAttach", 0 }, { "Coop", "PuppetMaxLife", 0 }, { "Coop", "ConflictProbe", 0 }, { "Coop", "OwnSnapAtTarget", 0 }, { "Coop", "PuppetWorldDropRef", 0 }, { "Coop", "PadIdPreferOffered", 0 }, { "Coop", "GuardPerceivePuppet", 0 }, { "Coop", "ShipClassFix", 0 }, { "Coop", "ShipClassProbe", 0 }, { "Coop", "ShipStateSync", 0 }, { "Coop", "ShipNoAutoSink", 0 }, { "Coop", "BoardStartGuest", 0 }, { "Coop", "CallTraceVt", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "TimeOfDaySync", 0 },
+        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 }, { "Coop", "WeaponSync", 0 }, { "Coop", "ShipPeerZ", 0 }, { "Coop", "ShipBindProbe", 0 }, { "Coop", "ShipSpawnProbe", 0 }, { "Coop", "ShipSpawnFire", 0 }, { "Coop", "ShipSpawnFirePid", 0 }, { "Coop", "SpawnCensus", 0 }, { "Coop", "SpawnReplayFire", 0 }, { "Coop", "SpawnReplayFirePid", 0 }, { "Coop", "SpawnShare", 0 }, { "Coop", "SpawnKeyBind", 0 }, { "Coop", "SpawnLib", 0 }, { "Coop", "SpawnLibFollow", 1 }, { "Coop", "SpawnLibBusy", 1 }, { "Coop", "SpawnCmdSeq", 0 }, { "Coop", "SpawnCmdPid", 0 }, { "Coop", "ShipClassBind", 0 }, { "Coop", "ShipInterp", 0 }, { "Coop", "ShipInterpDelayMs", 200 }, { "Coop", "ShipExtrapMs", 150 }, { "Coop", "ShipInterpPhysEvery", 1 }, { "Coop", "ShipGhostInterp", 0 }, { "Coop", "ShipGhostDelayMs", 150 }, { "Coop", "ShipGhostExtrapMs", 150 }, { "Coop", "ShipGhostMinGapMs", 90 }, { "Coop", "SpawnLibLateRestore", 0 }, { "Coop", "PchanSoftStop", 0 }, { "Coop", "PadScanFrom1", 0 }, { "Coop", "CollectableProbe", 0 }, { "Coop", "BoardObjectiveReplicate", 0 }, { "Coop", "PuppetOnGhost", 0 }, { "Coop", "ShipLocalWater", 0 }, { "Coop", "ShipClassBindSteal", 0 }, { "Coop", "SpawnShareRadiusM", 150 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "TableEvict", 0 }, { "Coop", "UsedEntAllPaths", 0 }, { "Coop", "PuppetSeqResync", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "FastTravelCrashFix", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 }, { "Coop", "PuppetListener", 0 }, { "Coop", "PuppetListenerAttach", 0 }, { "Coop", "PuppetMaxLife", 0 }, { "Coop", "ConflictProbe", 0 }, { "Coop", "OwnSnapAtTarget", 0 }, { "Coop", "PuppetWorldDropRef", 0 }, { "Coop", "PadIdPreferOffered", 0 }, { "Coop", "GuardPerceivePuppet", 0 }, { "Coop", "ShipClassFix", 0 }, { "Coop", "ShipClassProbe", 0 }, { "Coop", "ShipStateSync", 0 }, { "Coop", "ShipNoAutoSink", 0 }, { "Coop", "BoardStartGuest", 0 }, { "Coop", "CallTraceVt", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "TimeOfDaySync", 0 },
         { "Coop", "ShipSpawnReplay", 0 },
         { "Coop", "ShipFields", 0 }, { "Coop", "HelmBoth", 0 }, { "Coop", "BoardingForce", 0 }, { "Coop", "PlayerFrameFallback", 0 },
         { "Coop", "CounterProbe", 0 }, { "Coop", "CounterSync", 0 }, { "Coop", "CounterHostApply", 0 }, { "Coop", "CounterGuestVeto", 0 }, { "Coop", "CounterVetoMs", 1500 },
@@ -18275,6 +18623,7 @@ static void OnFrameInner(Human* updatedHuman) {
     // [Coop] ShipInterp: every frame, guest only. EntitySyncTick runs on every 6th frame (slowTick, unless
     // EntityFrameCadence) - run T18 measured the writer at ~20 Hz there, i.e. hulls still stepping every few frames.
     if (Net::Enabled() && g_entHost == 0) ScbInterpFrame();
+    if (Net::Enabled()) LwTick();                               // [Coop] ShipLocalWater (default 0): [ShipWater] reference + log
     if (Net::Enabled()) {
         EntitySyncTick();   // host broadcasts entity transforms; peer mirrors them (synced worlds)
         // Capture only succeeds in a real playable world (not title/whiteroom). Require it to be
@@ -18295,6 +18644,7 @@ static void OnFrameInner(Human* updatedHuman) {
 
         uint64_t now = GetTickCount64();
         uint64_t nowUs = NowUs();         // microsecond clock for the interpolation buffer only
+        ++s_ghFrameNo;                    // [Coop] PuppetOnGhost / ShipGhostInterp: one ghost pose per frame (GhostCmdThisFrame)
         bool loading = engineLoading();   // engine streaming/tearing down a world
 
         // Pull every player packet queued since the last frame (last-wins would drop samples exactly
@@ -18631,8 +18981,15 @@ static void OnFrameInner(Human* updatedHuman) {
                             s_passengerWasOn = false;
                             L("[Ship] passenger: peer off ship -> normal placement\n");
                         }
-                        Phase1::ApplyRemoteState(remote);
-                        NoteAppliedPos(remote.matrix.M41, remote.matrix.M42, remote.matrix.M43, (int)remote.contextId);
+                        // [Coop] PuppetOnGhost: aboard its ship, the peer is drawn on the ghost's deck from the ghost's own sample.
+                        s_pdAboard = remote.shipValid && s_shipGhost && g_ghostShip != nullptr;
+                        const PlayerState* use = &remote; PlayerState onDeck;
+                        if (s_pdAboard && g_ghostHasSync && PuppetOnGhostOn() && GhostInterpOn() && GhostCmdThisFrame(OwnNowUs()) && s_ghCmdHasLocal) {
+                            onDeck = remote; GhostPlaceOnDeck(onDeck.matrix); use = &onDeck; ++s_pdPlaced;
+                        }
+                        Phase1::ApplyRemoteState(*use);
+                        NoteAppliedPos(use->matrix.M41, use->matrix.M42, use->matrix.M43, (int)use->contextId);
+                        PupSmoothNote((void*)g_puppet, OwnNowUs(), s_pdAboard);   // [PupSmooth] (read-only)
                     }
                 }
             }
@@ -18695,12 +19052,11 @@ static void OnFrameInner(Human* updatedHuman) {
         // Drive it ourselves every frame to the peer's ship position + heading (render-only, no physics).
         if (g_ghostShip && g_ghostHasSync) {
             // [Coop] ShipGhostInterp=1: the sender-timeline sample (GhostSample) instead of the puppet buffer's state.
-            for (int k = 0; k < 3; ++k) g_ghostCmdPos[k] = g_ghostSyncPos[k];
-            for (int k = 0; k < 4; ++k) g_ghostCmdQuat[k] = g_ghostSyncQuat[k];
             const uint64_t ghNowUs = OwnNowUs();
-            if (GhostInterpOn()) {
-                float gp[3], gq[4]; bool gu = false;
-                if (GhostSample(ghNowUs, gp, gq, &gu)) { for (int k = 0; k < 3; ++k) g_ghostCmdPos[k] = gp[k]; for (int k = 0; k < 4; ++k) g_ghostCmdQuat[k] = gq[k]; if (gu) ++s_gsUnder; }
+            if (!(GhostInterpOn() && GhostCmdThisFrame(ghNowUs))) {   // the frame's sample (shared with the puppet's deck placement)
+                for (int k = 0; k < 3; ++k) g_ghostCmdPos[k] = g_ghostSyncPos[k];
+                for (int k = 0; k < 4; ++k) g_ghostCmdQuat[k] = g_ghostSyncQuat[k];
+                s_ghCmdLw = false;
             }
             g_ghostCmdValid = true; g_ghostCmdShip = g_ghostShip;   // a new ghost uses g_ghostSync* until its first drive
             HookMath::Quaternion q;
@@ -18711,7 +19067,7 @@ static void OnFrameInner(Human* updatedHuman) {
             // X/Y and the quaternion are sender-authoritative, but m.M43 must use this machine's water
             // height at the peer's XZ - taking the peer's hull Z would make vertical lead horizontal by
             // the ~100 ms render delay. The solo F12 self-test below also uses the local Z.
-            m.M41 = g_ghostCmdPos[0]; m.M42 = g_ghostCmdPos[1]; m.M43 = MirroredShipZ(g_ghostCmdPos[2]);   // [Coop] ShipPeerZ (see MirroredShipZ)
+            m.M41 = g_ghostCmdPos[0]; m.M42 = g_ghostCmdPos[1]; m.M43 = GhostCmdZ(g_ghostCmdPos[2]);   // [Coop] ShipPeerZ (see MirroredShipZ) / ShipLocalWater
             // [Coop] ShipHPSync: apply a pending hull HP; a fresh ghost is normally spawned after the packet
             // that carried the value, so this cannot live only on the receive path.
             if (ShipHPSyncEnabled() && g_ghostShip && g_ghostSyncHP != g_ghostAppliedHP) {
@@ -18726,6 +19082,7 @@ static void OnFrameInner(Human* updatedHuman) {
             __try {
                 ((Entity*)g_ghostShip)->SetGlobalMatrixInternal(&m, true);
                 if (readable((void*)g_ghostShip, 0x50)) { const float* gm = (const float*)&((BaseEntity*)g_ghostShip)->m_GlobalMatrix; GhostSmoothNote(gm + 12, ghNowUs); }   // [GhostSmooth]
+                PupDeckNote((void*)g_puppet, (void*)g_ghostShip);   // [PupDeck]
                 { static int n = 0; if ((n++ & 0x3F) == 0)
                     L("[ShipSync] driving ghost to (%.1f, %.1f, %.1f)\n", m.M41, m.M42, m.M43); }
                 // --- [GhostPose] MEASUREMENT ONLY (1 Hz, no behaviour change): commanded yaw from the
@@ -18867,7 +19224,7 @@ static void LogSetGlobalMatrixBody(uint32_t thisEnt, uint32_t sgmMatrix, uint32_
         m[0] = tm.M11;  m[1] = tm.M12;  m[2]  = tm.M13;
         m[4] = tm.M21;  m[5] = tm.M22;  m[6]  = tm.M23;
         m[8] = tm.M31;  m[9] = tm.M32;  m[10] = tm.M33;
-        m[12] = gcp[0]; m[13] = gcp[1]; m[14] = MirroredShipZ(gcp[2]);   // [Coop] ShipPeerZ
+        m[12] = gcp[0]; m[13] = gcp[1]; m[14] = gcUse ? GhostCmdZ(gcp[2]) : MirroredShipZ(gcp[2]);   // [Coop] ShipPeerZ / ShipLocalWater
         { static int g_shipDriveLog = 0; if ((g_shipDriveLog++ & 0x3F) == 0)
             L("[ShipSync] driving ghost to (%.1f, %.1f, %.1f) peerZ=%.2f localZ=%.2f\n", g_ghostSyncPos[0], g_ghostSyncPos[1], m[14], g_ghostSyncPos[2], g_localShipZ); }
         return;

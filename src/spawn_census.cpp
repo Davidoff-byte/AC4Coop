@@ -341,7 +341,12 @@ void SpawnCensusInit()
     int ShipSpawnReplayInitFlag(); void ShipSpawnReplaySetHooked(bool);
     const bool ssr = ShipSpawnReplayInitFlag() != 0;   // [Coop] ShipSpawnReplay needs DetFac + DetSrc + DetSet
     int SpawnLibInitFlag(); void SpawnLibSetHooked(bool);
-    g_libFlag = SpawnLibInitFlag() != 0;               // [Coop] SpawnLib (spawn_lib.cpp) needs DetFac + DetSrc + DetR + DetSet
+    // [Coop] SpawnLib (spawn_lib.cpp) needs DetFac + DetSrc + DetR + DetSet. ShipSpawnReplay submits through SpawnLibSubmit
+    // (private owner + slot borrow), whose safety hooks - DetSet owner swap and late slot restore, SpecDtor redirect,
+    // RequestDtor tracking - only exist when SpawnLib's hooks are installed: an install ini with ShipSpawnReplay=1 and no
+    // SpawnLib key (found 2026-11-28) ran replays without them. Replays now install the hooks; SpawnLib=0 still keeps
+    // on-demand / follow spawning off (SpawnLibOn reads the key itself).
+    g_libFlag = SpawnLibInitFlag() != 0 || ssr;
     if (!census && !g_keyBind && !shareFlag && !ssr && !g_libFlag) return;   // SpawnKeyBind / SpawnShare need the request hooks below
     const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)GameModuleBase;
     const IMAGE_NT_HEADERS32* nt = (const IMAGE_NT_HEADERS32*)(GameModuleBase + dos->e_lfanew);
