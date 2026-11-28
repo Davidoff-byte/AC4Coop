@@ -1241,6 +1241,9 @@ static void*   g_ghostShip = nullptr;        // the spawned ghost ship entity
 static uint64_t g_ghostObjId = 0;            // its stable object id (0 = unknown) - liveness probe
 static float   g_ghostSyncPos[3] = {0,0,0};  // peer's ship world position (x,y,z)
 static float   g_ghostSyncQuat[4] = {0,0,0,1}; // peer's ship rotation quaternion (x,y,z,w)
+// [Coop] ShipGhostInterp: the transform the drive commanded this frame (= g_ghostSync* with the flag off); the
+// SetGlobalMatrixInternal render override and [GhostPose] use it, so both see what was written.
+static float   g_ghostCmdPos[3] = {0,0,0}, g_ghostCmdQuat[4] = {0,0,0,1}; static bool g_ghostCmdValid = false; static void* g_ghostCmdShip = nullptr;
 static float   g_ghostSyncHP = 0.0f;        // [ShipHPSync] peer's ship hull HP (GcLShip+0xD0)
 static float   g_ghostAppliedHP = -1.0f;    // hull HP last written to the ghost (-1 = not applied yet)
 static float   g_ghostPeerMaxHP = 0.0f;     // [GhostProxy] peer's ship MAX hull HP (GcLShip+0xB4); 0 = unknown
@@ -5915,6 +5918,8 @@ static Entity* ShipClassBindFor(const EntityState& es, Entity* const* live, cons
     }
     return nullptr;
 }
+static bool ScbInterpOn();                                                                      // [Coop] ShipInterp (below)
+static bool ScbInterpPush(Entity* ent, uint64_t hostObj, uint32_t hostMs, const float* pos, const float* quat, bool feed = false);   // false: write now
 static void ApplyShips(const EntityPacket& pkt) {
     if (!ShipSyncEnabled()) { SyncTargetsPublishEmpty(); return; }
     void* mgr = GetNavalManager();
@@ -6033,7 +6038,10 @@ static void ApplyShips(const EntityPacket& pkt) {
             // on the player thread, once per applied snapshot. Run 2026-11-25 15:xx: the SgmDetour render override never
             // reached AI ships (err mean 360-425 m in mode 1 and with the physics flag) - their pose does not pass the
             // hook. The ghost ship does, which is why ghost driving works. Same call as pilot.py teleport --ship.
-            if (scbMode == 2) {
+            // [Coop] ShipInterp=1: record the host-timestamped sample only; ScbInterpFrame warps the hull every frame on the
+            // host timeline (the first sample of a new binding still warps here, so the hull is placed at once).
+            const bool scbRing = scbMode == 2 && pkt.hostMs && ScbInterpPush(ent, es.objId, pkt.hostMs, es.pos, es.quat);   // recorded in both modes ([ShipSmooth])
+            if (scbMode == 2 && !(ScbInterpOn() && scbRing)) {
                 HookMath::Quaternion q; q.x = es.quat[0]; q.y = es.quat[1]; q.z = es.quat[2]; q.w = es.quat[3];
                 HookMath::Transform m; HookMath::ToMatrix(&q, &m);
                 m.M41 = es.pos[0]; m.M42 = es.pos[1]; m.M43 = es.pos[2];
@@ -9073,6 +9081,445 @@ static int64_t OwnOffset() {
     const int64_t c = (int64_t)InterlockedCompareExchange64((volatile LONGLONG*)&s_offCur, 0, 0);
     const int64_t p = (int64_t)InterlockedCompareExchange64((volatile LONGLONG*)&s_offPrev, 0, 0);
     return c < p ? c : p;
+}
+// ---- [Coop] ShipInterp (default 0, re-read every second): bound AI ships rendered on the host timeline ----------------
+// Runs T8/T15 2026-11-28: with ShipClassBind=2 a bound hull was warped to the raw host transform once per applied
+// snapshot (~10 Hz: `[Sync] scope ... captures=50` per 5 s) and the guest's own AI/physics moved it in between, so each
+// warp was a visible jump (s_scbErr mean 0.36-0.60 m, max 1.8 m) and the slow tick re-applied the previous snapshot.
+// Now ApplyShips only records host-timestamped samples (OwnHostUs: the guard buffer's host timeline and clock offset) and
+// ScbInterpFrame warps every bound hull every frame to the sample at (now - ShipInterpDelayMs): position lerp, rotation
+// nlerp, > 30 m apart = step; past the newest sample extrapolated for at most ShipExtrapMs, then held.
+// [ShipSmooth] (every 5 s, both modes, for A/B): per-frame step of the hull as the engine left it before our write.
+struct ScbSnap { int64_t hostUs; float pos[3], quat[4]; };
+static const int SCB_RING = 8;
+// rbc/driveSaved/driveOff: the hull's ShipPhysicComponent (ShipPhysicComponent -> AbstractWatercraftPhysicComponent ->
+// RigidBodyComponent, class names from the descriptors in dump 28300) and its m_DriveEntity before we cleared it.
+struct ScbRing { Entity* ent; ScbSnap s[SCB_RING]; uint8_t n, head; uint64_t lastPushUs; float prevObs[3], prevStep, lastW[3]; uint8_t obsN, haveW;
+                 RigidBodyComponent* rbc; uint8_t driveSaved, driveOff, driveTried; uint64_t hostObj; uint32_t writes;
+                 float ap[2][3]; uint64_t at[2]; uint8_t aN; uint64_t lastFrameUs; };   // last two observed positions + their times (accel metric)
+static ScbRing s_sr[64]; static int s_srN = 0;
+static int s_siOn = 0, s_siDelay = 200, s_siExtrap = 150, s_siPhysEvery = 1; static uint64_t s_siNext = 0, s_siFrame = 0;
+static void ScbInterpCfg() {
+    const uint64_t now = GetTickCount64();
+    if (now < s_siNext) return;
+    s_siNext = now + 1000;
+    const int on = (int)GetPrivateProfileIntA("Coop", "ShipInterp", -1, Paths::Ini());   // -1: key absent this read (ini rewrite) -> keep
+    if (on >= 0) {
+        const int mode = on > 2 ? 2 : on;   // 1 = linear segments, 2 = cubic Hermite through the samples (ScbSample)
+        if (mode != s_siOn) L("[ShipInterp] mode %d\n", mode);
+        s_siOn = mode;
+        s_siDelay = (int)GetPrivateProfileIntA("Coop", "ShipInterpDelayMs", 200, Paths::Ini());
+        s_siExtrap = (int)GetPrivateProfileIntA("Coop", "ShipExtrapMs", 150, Paths::Ini());
+        // ShipInterpPhysEvery: 1 = every per-frame write moves the physics body too; N = only every Nth frame, the frames
+        // between are render-only writes (run 2026-11-28 at sea: per-frame physics warps were pulled 0.7-0.9 m/frame back).
+        s_siPhysEvery = (int)GetPrivateProfileIntA("Coop", "ShipInterpPhysEvery", 1, Paths::Ini()); if (s_siPhysEvery < 1) s_siPhysEvery = 1; if (s_siPhysEvery > 60) s_siPhysEvery = 60;
+        if (s_siDelay < 20) s_siDelay = 20; if (s_siDelay > 1000) s_siDelay = 1000;
+        if (s_siExtrap < 0) s_siExtrap = 0; if (s_siExtrap > 1000) s_siExtrap = 1000;
+    }
+}
+static bool ScbInterpOn() { ScbInterpCfg(); return s_siOn != 0; }
+static int ScbRingOf(Entity* ent, bool create) {
+    for (int i = 0; i < s_srN; ++i) if (s_sr[i].ent == ent) return i;
+    if (!create || s_srN >= 64) return -1;
+    ScbRing& r = s_sr[s_srN]; memset(&r, 0, sizeof(r)); r.ent = ent;
+    return s_srN++;
+}
+static uint32_t s_ssRebind = 0;
+static bool ScbInterpPush(Entity* ent, uint64_t hostObj, uint32_t hostMs, const float* pos, const float* quat, bool feed) {   // ApplyShips / ScbFeed, player thread
+    const int64_t hostUs = OwnHostUs(hostMs);
+    const uint64_t rx = OwnNowUs();
+    // feed (ScbFeed, every frame): samples only. The clock offset stays the one ApplyShips and the guard lane note
+    // (a lower offset from the prompt feed would move the guards' render time too), and only ApplyShips (the binding
+    // authority) creates, re-keys or keeps a ring alive.
+    if (!feed) { AcquireSRWLockExclusive(&s_ownLock); OwnOffsetNote(hostUs, rx); ReleaseSRWLockExclusive(&s_ownLock); }   // same timeline as guards
+    const int i = ScbRingOf(ent, !feed);
+    if (i < 0) return false;
+    ScbRing& r = s_sr[i];
+    if (feed && r.hostObj != hostObj) return false;
+    // One ring = one (hull, host ship) link. Run 2026-11-28 (T17): rings keyed by hull alone mixed samples of two host
+    // ships when ShipClassBind moved a hull to another host ship -> interpolation across kilometres (drift max 1529 m).
+    if (r.hostObj != hostObj) { if (r.n) ++s_ssRebind; r.n = 0; r.head = 0; r.obsN = 0; r.haveW = 0; r.writes = 0; r.aN = 0; r.hostObj = hostObj; }
+    const bool fresh = r.n == 0;
+    if (!feed) r.lastPushUs = rx;
+    if (r.n && hostUs <= r.s[r.head].hostUs) return true;   // the slow tick re-applies the same snapshot: nothing new, no warp
+    r.head = (uint8_t)((r.head + 1) % SCB_RING);
+    ScbSnap& s = r.s[r.head]; s.hostUs = hostUs;
+    for (int k = 0; k < 3; ++k) s.pos[k] = pos[k];
+    for (int k = 0; k < 4; ++k) s.quat[k] = quat[k];
+    if (r.n < SCB_RING) ++r.n;
+    // A new binding is placed by ScbInterpFrame (holding its first sample), not here at the newest one: placing it at the
+    // newest and then rendering ShipInterpDelayMs behind stepped it backwards (T17 interp pops). With ShipInterp off the
+    // caller keeps warping per snapshot as before.
+    (void)fresh;
+    return true;
+}
+// Cubic Hermite between a (ta) and b (tb) at fraction f; tangents by finite differences over the real stamps
+// (non-uniform Catmull-Rom, the PuppetSplineInterp rule): m_a = (b - p) / (tb - tp), m_b = (n - a) / (tn - ta), scaled
+// to the segment. Velocity is continuous at every sample, so the kink a linear path has at each sample is gone.
+static void ShipHermite(const float* p, int64_t tp, const float* a, int64_t ta, const float* b, int64_t tb, const float* n, int64_t tn, float f, float* out) {
+    const float seg = (float)(double)(tb - ta);
+    const float sa = seg / (float)(double)(tb - tp), sb = seg / (float)(double)(tn - ta);
+    const float t2 = f * f, t3 = t2 * f;
+    const float h00 = 2 * t3 - 3 * t2 + 1, h10 = t3 - 2 * t2 + f, h01 = -2 * t3 + 3 * t2, h11 = t3 - t2;
+    for (int k = 0; k < 3; ++k) out[k] = h00 * a[k] + h10 * (b[k] - p[k]) * sa + h01 * b[k] + h11 * (n[k] - a[k]) * sb;
+}
+static bool ShipNear(const float* a, const float* b) { const float dx = b[0] - a[0], dy = b[1] - a[1], dz = b[2] - a[2]; return dx * dx + dy * dy + dz * dz <= 900.0f; }   // <= 30 m
+static uint32_t s_ssSpline = 0, s_ssLinear = 0;
+static bool ScbSample(const ScbRing& r, uint64_t nowUs, int64_t off, float* pos, float* quat, bool* under) {
+    *under = false;
+    if (!r.n) return false;
+    if (off == INT64_MAX) return false;
+    const int64_t T = (int64_t)nowUs - off - (int64_t)s_siDelay * 1000;
+    const ScbSnap* a = nullptr; const ScbSnap* b = nullptr; const ScbSnap* prev = nullptr; const ScbSnap* next = nullptr;
+    for (int k = 0; k < r.n; ++k) {   // newest .. oldest; next = the sample after b
+        const ScbSnap& s = r.s[(r.head - k + SCB_RING) % SCB_RING];
+        if (s.hostUs <= T) { a = &s; if (k + 1 < r.n) prev = &r.s[(r.head - k - 1 + SCB_RING) % SCB_RING]; break; }
+        next = b; b = &s;
+    }
+    if (!a) { for (int k = 0; k < 3; ++k) pos[k] = b->pos[k]; for (int k = 0; k < 4; ++k) quat[k] = b->quat[k]; return true; }
+    if (b) {
+        const float f = (float)(double)(T - a->hostUs) / (float)(double)(b->hostUs - a->hostUs);
+        const float dx = b->pos[0] - a->pos[0], dy = b->pos[1] - a->pos[1], dz = b->pos[2] - a->pos[2];
+        const bool jump = dx * dx + dy * dy + dz * dz > 900.0f;   // > 30 m between two samples: a teleport, never glide
+        for (int k = 0; k < 3; ++k) pos[k] = jump ? b->pos[k] : a->pos[k] + (b->pos[k] - a->pos[k]) * f;
+        if (!jump && s_siOn == 2) {   // [Coop] ShipInterp=2: spline when both neighbours exist and none is a step
+            if (prev && next && b->hostUs > prev->hostUs && next->hostUs > a->hostUs && ShipNear(prev->pos, a->pos) && ShipNear(b->pos, next->pos)) {
+                ShipHermite(prev->pos, prev->hostUs, a->pos, a->hostUs, b->pos, b->hostUs, next->pos, next->hostUs, f, pos); ++s_ssSpline;
+            } else ++s_ssLinear;
+        }
+        if (jump) for (int k = 0; k < 4; ++k) quat[k] = b->quat[k]; else OwnQuatNlerp(a->quat, b->quat, f, quat);
+        return true;
+    }
+    *under = true;   // past the newest sample: extrapolate along the last segment, bounded
+    int64_t ex = T - a->hostUs; const int64_t exMax = (int64_t)s_siExtrap * 1000; if (ex > exMax) ex = exMax;
+    for (int k = 0; k < 3; ++k) pos[k] = a->pos[k];
+    if (prev && a->hostUs > prev->hostUs) {
+        const float dt = (float)(double)(a->hostUs - prev->hostUs);
+        const float dx = a->pos[0] - prev->pos[0], dy = a->pos[1] - prev->pos[1], dz = a->pos[2] - prev->pos[2];
+        if (dx * dx + dy * dy + dz * dz <= 900.0f) for (int k = 0; k < 3; ++k) pos[k] = a->pos[k] + (a->pos[k] - prev->pos[k]) * ((float)(double)ex / dt);
+    }
+    for (int k = 0; k < 4; ++k) quat[k] = a->quat[k];
+    return true;
+}
+// The hull's own simulation (buoyancy, AI sail/rudder forces) writes the entity from the rigid body while
+// m_DriveEntity is true, so a per-frame warp is pulled back every frame (run 2026-11-28 at sea: 0.7-0.9 m/frame, p95
+// 2.0 m). Same remedy as the driven guard mirrors (character controller m_DriveEntity=false, phase1.cpp:12531/14705):
+// while ShipInterp drives a bound hull, its ShipPhysicComponent no longer drives the entity; the per-frame warp with
+// physics keeps the body on the hull. Restored when the binding ends or ShipInterp goes off.
+static uint32_t s_siDriveOff = 0, s_siDriveRestored = 0, s_siDriveNone = 0;
+static void ScbDriveRestore(ScbRing& r) {
+    if (!r.driveOff) return;
+    r.driveOff = 0;
+    __try {
+        if (r.ent && readable(r.ent, 0xA0) && *(uint32_t*)r.ent == 0x01E4A128u && r.rbc && readable(r.rbc, 0x600)) { r.rbc->m_DriveEntity = r.driveSaved != 0; ++s_siDriveRestored; }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+static void ScbDriveTake(ScbRing& r) {
+    if (r.driveOff || r.driveTried) return;
+    r.driveTried = 1;
+    __try {
+        Component* c = r.ent->GetComponentByType(RigidBodyComponent::GetStaticClassDescriptor());
+        if (c && readable(c, 0x600) && *(uint32_t*)c == 0x0272D378u) {   // ShipPhysicComponent vtable (dump 28300, component [19])
+            r.rbc = (RigidBodyComponent*)c; r.driveSaved = r.rbc->m_DriveEntity ? 1 : 0; r.rbc->m_DriveEntity = false; r.driveOff = 1; ++s_siDriveOff;
+            static int s_dl = 0; if (s_dl++ < 20) L("[ShipInterp] hull %p: ShipPhysicComponent %p m_DriveEntity %d -> 0\n", (void*)r.ent, (void*)c, (int)r.driveSaved);
+        } else ++s_siDriveNone;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { ++s_siDriveNone; }
+}
+static uint32_t s_ssPlaced = 0, s_ssAccFrames = 0, s_ssAccJit = 0, s_ssHitch = 0; static double s_ssAccSum = 0.0;
+static float s_ssAccV[1024]; static int s_ssAccVN = 0;   // apparent accelerations this window (p95)
+static int64_t s_ssOffJump = 0, s_ssOffNow = INT64_MAX;   // largest frame-to-frame change of the target offset (us); offset in use
+static void ShipSortF(float* v, int n) { for (int a = 1; a < n; ++a) { const float x = v[a]; int b = a - 1; while (b >= 0 && v[b] > x) { v[b + 1] = v[b]; --b; } v[b + 1] = x; } }
+// Every frame: the newest entity snapshot's ship records go into the bound rings on the frame it arrives. ApplyShips sees
+// a snapshot only on EntitySyncTick's slow tick (every 6th frame): run 2026-11-28 05:00 (asi 85159A69), 200 ms delay,
+// 17 % of interp frames were extrapolated past the newest sample. Feed-only pushes (ScbInterpPush feed = true).
+static EntityPacket s_sfPkt; static uint32_t s_sfLastMs = 0, s_sfFed = 0;
+// Ships' own clock offset: the minimum (arrival frame - host capture) over the current and previous 2 s window, from
+// ScbFeed (it sees each snapshot on the frame it arrives). The shared OwnOffset is noted at ApplyShips' slow tick
+// (0-5 frames late) and by the guard lane; its window min moved by up to ~100 ms, which renders as an out-and-back
+// step of v * dOff - run 2026-11-28 06:10 (asi 117D9734): 10 pops > 1 m in spline mode, in pairs, engine drift 0.
+static int64_t s_sfOffCur = INT64_MAX, s_sfOffPrev = INT64_MAX; static uint64_t s_sfOffWin = 0;
+static int64_t ScbFeedOffset() { return s_sfOffCur < s_sfOffPrev ? s_sfOffCur : s_sfOffPrev; }
+static void ScbFeed() {
+    if (!s_siOn || !s_srN) return;
+    if (!Net::GetEntities(s_sfPkt) || s_sfPkt.protoVer != NET_PROTO_VER || !s_sfPkt.hostMs || s_sfPkt.hostMs == s_sfLastMs) return;
+    s_sfLastMs = s_sfPkt.hostMs;
+    { const uint64_t rx = OwnNowUs(); const int64_t hu = OwnHostUs(s_sfPkt.hostMs);
+      if (rx - s_sfOffWin > 2000000) { s_sfOffPrev = s_sfOffCur; s_sfOffCur = INT64_MAX; s_sfOffWin = rx; }
+      const int64_t o = (int64_t)rx - hu; if (o < s_sfOffCur) s_sfOffCur = o; }
+    const uint32_t n = s_sfPkt.count < (uint32_t)MAX_SYNC_ENTITIES ? s_sfPkt.count : (uint32_t)MAX_SYNC_ENTITIES;
+    for (int i = 0; i < s_srN; ++i) {
+        for (uint32_t k = 0; k < n; ++k) {
+            const EntityState& es = s_sfPkt.ents[k];
+            if (es.objId != s_sr[i].hostObj) continue;
+            if (ScbInterpPush(s_sr[i].ent, es.objId, s_sfPkt.hostMs, es.pos, es.quat, true)) ++s_sfFed;
+            break;
+        }
+    }
+}
+static uint32_t s_ssFrames = 0, s_ssJerky = 0, s_ssPops = 0, s_ssUnder = 0, s_ssWrites = 0; static double s_ssDrift = 0.0; static float s_ssDriftMax = 0.0f;
+static float s_ssDriftV[512]; static int s_ssDriftN = 0; static uint64_t s_ssLog = 0;
+// Guest, EntitySyncTick, every frame (player thread). Measures in both modes; writes only with ShipInterp=1.
+static void ScbInterpFrame() {
+    ScbInterpCfg();
+    if (ShipClassBindMode() != 2) return;
+    const uint64_t now = OwnNowUs();
+    const bool physFrame = (++s_siFrame % (uint64_t)s_siPhysEvery) == 0;
+    for (int i = 0; i < s_srN; ) {   // drop rings whose hull is no longer bound / in the snapshots
+        if (now - s_sr[i].lastPushUs > 500000) { ScbDriveRestore(s_sr[i]); s_sr[i] = s_sr[--s_srN]; } else ++i;
+    }
+    ScbFeed();
+    // Render offset: the ships' prompt offset when known (else the shared one), slewed by at most 5 % of the elapsed
+    // time, so a change of the window minimum becomes a short 5 % speed change instead of an out-and-back step.
+    static int64_t s_siOffS = INT64_MAX, s_siOffTgtPrev = INT64_MAX; static uint64_t s_siOffT = 0;
+    {
+        int64_t tgt = ScbFeedOffset(); if (tgt == INT64_MAX) tgt = OwnOffset();
+        if (tgt != INT64_MAX) {
+            if (s_siOffTgtPrev != INT64_MAX) { const int64_t d = tgt - s_siOffTgtPrev; const int64_t ad = d < 0 ? -d : d; if (ad > s_ssOffJump) s_ssOffJump = ad; }
+            s_siOffTgtPrev = tgt;
+            const int64_t dt = s_siOffT && now > s_siOffT ? (int64_t)(now - s_siOffT) : 0;
+            if (s_siOffS == INT64_MAX || dt <= 0 || tgt - s_siOffS > 1000000 || s_siOffS - tgt > 1000000) s_siOffS = tgt;
+            else { const int64_t mx = dt / 20, d = tgt - s_siOffS; s_siOffS += d > mx ? mx : (d < -mx ? -mx : d); }
+        }
+        s_siOffT = now; s_ssOffNow = s_siOffS;
+    }
+    for (int i = 0; i < s_srN; ++i) {
+        ScbRing& r = s_sr[i];
+        Entity* e = r.ent;
+        if (!e || !readable(e, 0xA0) || *(uint32_t*)e != 0x01E4A128u) { r.lastPushUs = 0; continue; }
+        float p[3]; __try { p[0] = e->m_GlobalMatrix.M41; p[1] = e->m_GlobalMatrix.M42; p[2] = e->m_GlobalMatrix.M43; } __except (EXCEPTION_EXECUTE_HANDLER) { r.lastPushUs = 0; continue; }
+        // p is what the previous frame left (our write, or the engine's update in that frame): stamp it with that frame's
+        // time. Stamping it with this frame's time (as until asi 85159A69) turns frame-time variation into apparent
+        // acceleration: synthetic control, linear 8 m/s, frame dt +-2..8 ms -> 87-97 % "jitter" vs 0 % aligned.
+        const uint64_t tObs = r.lastFrameUs ? r.lastFrameUs : now; r.lastFrameUs = now;
+        // smoothness of what the screen shows: the hull as the engine left it this frame
+        if (r.obsN) {
+            const float dx = p[0] - r.prevObs[0], dy = p[1] - r.prevObs[1], dz = p[2] - r.prevObs[2];
+            const float step = sqrtf(dx * dx + dy * dy + dz * dz);
+            if (r.obsN > 1) {
+                const float big = step > r.prevStep ? step : r.prevStep;
+                if (big > 0.02f) { ++s_ssFrames; if (fabsf(step - r.prevStep) > (0.25f * big > 0.05f ? 0.25f * big : 0.05f)) ++s_ssJerky; }
+                if (step > 1.0f) {
+                    if (!s_siOn || r.writes > 30) {
+                        ++s_ssPops;
+                        static int s_popLog = 0;
+                        if (s_siOn && s_popLog++ < 40) L("[ShipPop] hull=%p host=%016llX step=%.2f n=%u writes=%u offMs=%.1f offJumpMaxMs=%.1f\n", (void*)r.ent, (unsigned long long)r.hostObj, step, (unsigned)r.n, r.writes, s_ssOffNow == INT64_MAX ? -1.0 : s_ssOffNow / 1000.0, s_ssOffJump / 1000.0);
+                    } else ++s_ssPlaced;   // a fresh binding's placement is not a pop
+                }
+            }
+            r.prevStep = step;
+        }
+        r.prevObs[0] = p[0]; r.prevObs[1] = p[1]; r.prevObs[2] = p[2]; if (r.obsN < 2) ++r.obsN;
+        // Apparent acceleration from three consecutive observed positions (frame time from QPC). A sailing ship changes
+        // velocity by < 2 m/s^2; a snapshot snap shows up as tens of m/s^2. Frames with dt outside 5..40 ms (hitches
+        // with two copies on one PC) are not judged.
+        if (r.aN == 2) {
+            const double d1 = (double)(r.at[1] - r.at[0]) * 1e-6, d2 = (double)(tObs - r.at[1]) * 1e-6;
+            if (d1 >= 0.005 && d1 <= 0.040 && d2 >= 0.005 && d2 <= 0.040) {
+                float v1[3], v2[3]; double sp = 0.0, acc = 0.0;
+                for (int k = 0; k < 3; ++k) { v1[k] = (float)((r.ap[1][k] - r.ap[0][k]) / d1); v2[k] = (float)((p[k] - r.ap[1][k]) / d2); sp += (double)v2[k] * v2[k]; const double dv = (double)v2[k] - v1[k]; acc += dv * dv; }
+                acc = sqrt(acc) / ((d1 + d2) * 0.5);
+                if (sp > 0.25) { ++s_ssAccFrames; s_ssAccSum += acc; if (acc > 15.0) ++s_ssAccJit; if (s_ssAccVN < 1024) s_ssAccV[s_ssAccVN++] = (float)acc; }   // moving > 0.5 m/s
+            } else ++s_ssHitch;
+            r.ap[0][0] = r.ap[1][0]; r.ap[0][1] = r.ap[1][1]; r.ap[0][2] = r.ap[1][2]; r.at[0] = r.at[1];
+            r.ap[1][0] = p[0]; r.ap[1][1] = p[1]; r.ap[1][2] = p[2]; r.at[1] = tObs;
+        } else { r.ap[r.aN][0] = p[0]; r.ap[r.aN][1] = p[1]; r.ap[r.aN][2] = p[2]; r.at[r.aN] = tObs; ++r.aN; }
+        if (!s_siOn) { r.haveW = 0; ScbDriveRestore(r); r.driveTried = 0; continue; }
+        ScbDriveTake(r);
+        if (r.haveW) {   // drift: how far the engine moved the hull since our last write (one frame)
+            const float dx = p[0] - r.lastW[0], dy = p[1] - r.lastW[1], dz = p[2] - r.lastW[2];
+            const float d = sqrtf(dx * dx + dy * dy + dz * dz);
+            s_ssDrift += d; if (d > s_ssDriftMax) s_ssDriftMax = d; if (s_ssDriftN < 512) s_ssDriftV[s_ssDriftN++] = d;
+        }
+        float pos[3], quat[4]; bool under = false;
+        if (!ScbSample(r, now, s_siOffS, pos, quat, &under)) continue;
+        if (under) ++s_ssUnder;
+        HookMath::Quaternion q; q.x = quat[0]; q.y = quat[1]; q.z = quat[2]; q.w = quat[3];
+        HookMath::Transform m; HookMath::ToMatrix(&q, &m);
+        m.M41 = pos[0]; m.M42 = pos[1]; m.M43 = pos[2];
+        __try { e->SetGlobalMatrixInternal(&m, physFrame); ++s_ssWrites; ++r.writes; r.lastW[0] = pos[0]; r.lastW[1] = pos[1]; r.lastW[2] = pos[2]; r.haveW = 1; }
+        __except (EXCEPTION_EXECUTE_HANDLER) { r.lastPushUs = 0; }
+    }
+    const uint64_t ms = GetTickCount64();
+    if (ms >= s_ssLog) {
+        s_ssLog = ms + 5000;
+        if (s_ssFrames || s_ssWrites) {
+            float p95 = 0.0f;
+            if (s_ssDriftN) { for (int a = 1; a < s_ssDriftN; ++a) { const float v = s_ssDriftV[a]; int b = a - 1; while (b >= 0 && s_ssDriftV[b] > v) { s_ssDriftV[b + 1] = s_ssDriftV[b]; --b; } s_ssDriftV[b + 1] = v; } p95 = s_ssDriftV[(s_ssDriftN * 95) / 100]; }
+            float accP95 = 0.0f;
+            if (s_ssAccVN) { ShipSortF(s_ssAccV, s_ssAccVN); accP95 = s_ssAccV[(s_ssAccVN * 95) / 100]; }
+            L("[ShipSmooth] mode=%s rings=%d accFrames=%u jitter(>15m/s2)=%u (%.1f%%) accMean=%.1f accP95=%.1f hitch=%u | movingFrames=%u jerky=%u (%.1f%%) pops>1m=%u placed=%u rebind=%u | writes=%u underrun=%u spline=%u linear=%u fed=%u offMs=%.1f offJumpMaxMs=%.1f drift mean=%.3f p95=%.3f max=%.3f delayMs=%d physEvery=%d | driveOff=%u restored=%u noRbc=%u\n",
+              s_siOn == 2 ? "spline" : s_siOn ? "interp" : "snap", s_srN, s_ssAccFrames, s_ssAccJit, s_ssAccFrames ? 100.0 * s_ssAccJit / s_ssAccFrames : 0.0, s_ssAccFrames ? s_ssAccSum / s_ssAccFrames : 0.0, accP95, s_ssHitch, s_ssFrames, s_ssJerky, s_ssFrames ? 100.0 * s_ssJerky / s_ssFrames : 0.0, s_ssPops, s_ssPlaced, s_ssRebind,
+              s_ssWrites, s_ssUnder, s_ssSpline, s_ssLinear, s_sfFed, s_ssOffNow == INT64_MAX ? -1.0 : s_ssOffNow / 1000.0, s_ssOffJump / 1000.0, s_ssDriftN ? s_ssDrift / s_ssDriftN : 0.0, p95, s_ssDriftMax, s_siDelay, s_siPhysEvery, s_siDriveOff, s_siDriveRestored, s_siDriveNone);
+        }
+        s_ssFrames = s_ssJerky = s_ssPops = s_ssUnder = s_ssWrites = s_ssPlaced = s_ssRebind = 0; s_ssAccFrames = s_ssAccJit = s_ssHitch = 0; s_ssAccSum = 0.0; s_ssDrift = 0.0; s_ssDriftMax = 0.0f; s_ssDriftN = 0;
+        s_ssAccVN = 0; s_ssSpline = s_ssLinear = s_sfFed = 0; s_ssOffJump = 0;
+    }
+}
+
+// ---- [Coop] ShipGhostInterp (default 0, re-read every second): the peer's ship (ghost) on the sender's timeline ------
+// The ghost was driven from the puppet buffer (ComputeInterpolated, phase1.cpp PushSnapshot): with PuppetHostTime=0 each
+// packet is stamped with the frame that drained it, so the sender's frame-time jitter and receive batching become uneven
+// speed on a hull sailing at 5-15 m/s, and lerpState keeps the newer sample's Z (a step per packet with ShipPeerZ=1).
+// Here every drained packet's ship transform is stamped with the sender's capture time (PlayerState::hostTimeMs, proto 14,
+// QPC ms - the clock of OwnNowUs) mapped onto this clock by the minimum (receive - capture) over the current and previous
+// 2 s window (the OwnOffsetNote rule, own state: on the host no entity snapshots feed OwnOffset), and the ghost is sampled
+// every frame at now - ShipGhostDelayMs: position lerp (x, y, z), rotation nlerp, > 30 m apart = step; past the newest
+// sample extrapolated for at most ShipGhostExtrapMs, then held. [GhostSmooth] (every 5 s, both modes): the ghost as drawn.
+struct GhSnap { int64_t hostUs; float pos[3], quat[4]; };
+static const int GH_RING = 16;
+static GhSnap s_gh[GH_RING]; static int s_ghN = 0, s_ghHead = 0;
+static uint32_t s_ghBaseMs = 0, s_ghLastMs = 0; static bool s_ghBaseSet = false; static uint64_t s_ghWorld = 0;
+static int64_t s_ghOffCur = INT64_MAX, s_ghOffPrev = INT64_MAX; static uint64_t s_ghOffWinUs = 0;
+static int s_giOn = 0, s_giDelay = 150, s_giExtrap = 150, s_giMinGap = 90; static uint64_t s_giNext = 0;
+// ShipGhostInterp=2: packets closer than ShipGhostMinGapMs are averaged into one sample (time and position), then a
+// cubic Hermite runs through the samples. Run 2026-11-28 05:20 (asi 85159A69): mode 1 (linear through every ~28 Hz packet)
+// still had 20 % of frames > 15 m/s^2 - the kink at each packet carries the sender's capture-time noise.
+struct GhAcc { int n; int64_t t0; double t, p[3]; float q[4]; };   // q: sign-aligned sum (mean rotation of the bucket)
+static GhAcc s_gha = {};
+static void GhAccAdd(const PlayerState& s, int64_t hostUs) {
+    if (!s_gha.n) { s_gha.t0 = hostUs; s_gha.t = 0.0; for (int k = 0; k < 3; ++k) s_gha.p[k] = 0.0; for (int k = 0; k < 4; ++k) s_gha.q[k] = 0.0f; }
+    float d = 0.0f; for (int k = 0; k < 4; ++k) d += s_gha.q[k] * s.shipQuat[k];
+    const float sg = d < 0.0f ? -1.0f : 1.0f;
+    ++s_gha.n; s_gha.t += (double)hostUs;
+    for (int k = 0; k < 3; ++k) s_gha.p[k] += s.shipPos[k];
+    for (int k = 0; k < 4; ++k) s_gha.q[k] += sg * s.shipQuat[k];
+}
+static uint32_t s_gsPushed = 0, s_gsReset = 0, s_gsSpline = 0, s_gsLinear = 0;
+static float s_gsAccV[1024]; static int s_gsAccVN = 0;   // apparent accelerations this window (p95)
+static void GhostInterpCfg() {
+    const uint64_t now = GetTickCount64();
+    if (now < s_giNext) return;
+    s_giNext = now + 1000;
+    const int on = (int)GetPrivateProfileIntA("Coop", "ShipGhostInterp", -1, Paths::Ini());   // -1: key absent this read -> keep
+    if (on < 0) return;
+    const int mode = on > 2 ? 2 : on;   // 1 = linear through every packet, 2 = averaged samples + cubic Hermite
+    if (mode != s_giOn) { L("[GhostInterp] mode %d\n", mode); s_gha.n = 0; }
+    s_giOn = mode;
+    s_giMinGap = (int)GetPrivateProfileIntA("Coop", "ShipGhostMinGapMs", 90, Paths::Ini()); if (s_giMinGap < 0) s_giMinGap = 0; if (s_giMinGap > 500) s_giMinGap = 500;
+    s_giDelay = (int)GetPrivateProfileIntA("Coop", "ShipGhostDelayMs", 150, Paths::Ini()); if (s_giDelay < 20) s_giDelay = 20; if (s_giDelay > 1000) s_giDelay = 1000;
+    s_giExtrap = (int)GetPrivateProfileIntA("Coop", "ShipGhostExtrapMs", 150, Paths::Ini()); if (s_giExtrap < 0) s_giExtrap = 0; if (s_giExtrap > 1000) s_giExtrap = 1000;
+}
+static bool GhostInterpOn() { GhostInterpCfg(); return s_giOn != 0; }
+// Drain loop (player thread): one received packet. Recorded in both modes.
+static void GhostRingPush(const PlayerState& s, uint64_t rxUs) {
+    if (!s.valid || !s.shipValid || !s.hostTimeMs) return;
+    if (!s_ghBaseSet || (int32_t)(s.hostTimeMs - s_ghLastMs) < -10000 || s.worldId != s_ghWorld) {   // first / sender restart / world change
+        s_ghBaseMs = s.hostTimeMs; s_ghBaseSet = true; s_ghN = 0; s_ghHead = 0; s_ghWorld = s.worldId;
+        s_ghOffCur = INT64_MAX; s_ghOffPrev = INT64_MAX; s_ghOffWinUs = 0; ++s_gsReset; s_gha.n = 0;
+    }
+    s_ghLastMs = s.hostTimeMs;
+    const int64_t hostUs = (int64_t)(int32_t)(s.hostTimeMs - s_ghBaseMs) * 1000;
+    if (rxUs - s_ghOffWinUs > 2000000) { s_ghOffPrev = s_ghOffCur; s_ghOffCur = INT64_MAX; s_ghOffWinUs = rxUs; }
+    const int64_t off = (int64_t)rxUs - hostUs;
+    if (off < s_ghOffCur) s_ghOffCur = off;
+    if (s_ghN && hostUs <= s_gh[s_ghHead].hostUs) return;   // same capture (CaptureAtWrite) or reordered: nothing new
+    float pos[3] = { s.shipPos[0], s.shipPos[1], s.shipPos[2] }, quat[4] = { s.shipQuat[0], s.shipQuat[1], s.shipQuat[2], s.shipQuat[3] };
+    int64_t ts = hostUs;
+    if (s_giOn == 2 && s_giMinGap > 0) {   // average the packets of one ShipGhostMinGapMs bucket into one sample
+        if (s_gha.n && (hostUs - s_gha.t0 >= (int64_t)s_giMinGap * 1000 || !ShipNear(pos, s_gh[s_ghHead].pos))) {
+            ts = (int64_t)(s_gha.t / s_gha.n);   // close the bucket: its mean goes into the ring, this packet opens the next
+            for (int k = 0; k < 3; ++k) pos[k] = (float)(s_gha.p[k] / s_gha.n);
+            float qn = 0.0f; for (int k = 0; k < 4; ++k) qn += s_gha.q[k] * s_gha.q[k]; qn = sqrtf(qn);
+            for (int k = 0; k < 4; ++k) quat[k] = qn > 1e-6f ? s_gha.q[k] / qn : s.shipQuat[k];
+            s_gha.n = 0;
+            GhAccAdd(s, hostUs);
+            if (s_ghN && ts <= s_gh[s_ghHead].hostUs) return;
+        } else {
+            GhAccAdd(s, hostUs);
+            if (s_ghN) return;   // the first packet of all goes in at once, so the ghost has a pose
+        }
+    }
+    s_ghHead = s_ghN ? (s_ghHead + 1) % GH_RING : 0;
+    GhSnap& g = s_gh[s_ghHead]; g.hostUs = ts;
+    for (int k = 0; k < 3; ++k) g.pos[k] = pos[k];
+    for (int k = 0; k < 4; ++k) g.quat[k] = quat[k];
+    if (s_ghN < GH_RING) ++s_ghN;
+    ++s_gsPushed;
+}
+static bool GhostSample(uint64_t nowUs, float* pos, float* quat, bool* under) {
+    *under = false;
+    if (!s_ghN) return false;
+    const int64_t off = s_ghOffCur < s_ghOffPrev ? s_ghOffCur : s_ghOffPrev;
+    if (off == INT64_MAX) return false;
+    const int64_t T = (int64_t)nowUs - off - (int64_t)s_giDelay * 1000;
+    const GhSnap* a = nullptr; const GhSnap* b = nullptr; const GhSnap* prev = nullptr; const GhSnap* next = nullptr;
+    for (int k = 0; k < s_ghN; ++k) {   // newest .. oldest; next = the sample after b
+        const GhSnap& s = s_gh[(s_ghHead - k + GH_RING) % GH_RING];
+        if (s.hostUs <= T) { a = &s; if (k + 1 < s_ghN) prev = &s_gh[(s_ghHead - k - 1 + GH_RING) % GH_RING]; break; }
+        next = b; b = &s;
+    }
+    if (!a) { for (int k = 0; k < 3; ++k) pos[k] = b->pos[k]; for (int k = 0; k < 4; ++k) quat[k] = b->quat[k]; return true; }
+    if (b) {
+        const float f = (float)(double)(T - a->hostUs) / (float)(double)(b->hostUs - a->hostUs);
+        const float dx = b->pos[0] - a->pos[0], dy = b->pos[1] - a->pos[1], dz = b->pos[2] - a->pos[2];
+        const bool jump = dx * dx + dy * dy + dz * dz > 900.0f;   // > 30 m between two samples: a teleport, never glide
+        for (int k = 0; k < 3; ++k) pos[k] = jump ? b->pos[k] : a->pos[k] + (b->pos[k] - a->pos[k]) * f;
+        if (!jump && s_giOn == 2) {
+            if (prev && next && b->hostUs > prev->hostUs && next->hostUs > a->hostUs && ShipNear(prev->pos, a->pos) && ShipNear(b->pos, next->pos)) {
+                ShipHermite(prev->pos, prev->hostUs, a->pos, a->hostUs, b->pos, b->hostUs, next->pos, next->hostUs, f, pos); ++s_gsSpline;
+            } else ++s_gsLinear;
+        }
+        if (jump) for (int k = 0; k < 4; ++k) quat[k] = b->quat[k]; else OwnQuatNlerp(a->quat, b->quat, f, quat);
+        return true;
+    }
+    *under = true;
+    int64_t ex = T - a->hostUs; const int64_t exMax = (int64_t)s_giExtrap * 1000; if (ex > exMax) ex = exMax;
+    for (int k = 0; k < 3; ++k) pos[k] = a->pos[k];
+    if (prev && a->hostUs > prev->hostUs) {
+        const float dt = (float)(double)(a->hostUs - prev->hostUs);
+        const float dx = a->pos[0] - prev->pos[0], dy = a->pos[1] - prev->pos[1], dz = a->pos[2] - prev->pos[2];
+        if (dx * dx + dy * dy + dz * dz <= 900.0f) for (int k = 0; k < 3; ++k) pos[k] = a->pos[k] + (a->pos[k] - prev->pos[k]) * ((float)(double)ex / dt);
+    }
+    for (int k = 0; k < 4; ++k) quat[k] = a->quat[k];
+    return true;
+}
+// [GhostSmooth]: the ghost's m_GlobalMatrix translation after our write, once per drive frame. Same definitions as
+// [ShipSmooth]: jerky = |step - previous step| > max(25 %, 5 cm); apparent acceleration > 15 m/s^2 from three
+// consecutive frames (frame dt 5..40 ms, moving > 0.5 m/s); zJit = the same test on the vertical axis alone.
+static float s_gsPrev[3], s_gsPrevStep; static int s_gsObsN = 0; static float s_gsAp[2][3]; static uint64_t s_gsAt[2]; static int s_gsAN = 0;
+static uint32_t s_gsFrames = 0, s_gsJerky = 0, s_gsPops = 0, s_gsAccFrames = 0, s_gsAccJit = 0, s_gsZJit = 0, s_gsHitch = 0, s_gsUnder = 0, s_gsDrives = 0;
+static double s_gsAccSum = 0.0; static uint64_t s_gsLog = 0;
+static void GhostSmoothNote(const float* p, uint64_t now) {
+    ++s_gsDrives;
+    if (s_gsObsN) {
+        const float dx = p[0] - s_gsPrev[0], dy = p[1] - s_gsPrev[1], dz = p[2] - s_gsPrev[2];
+        const float step = sqrtf(dx * dx + dy * dy + dz * dz);
+        if (s_gsObsN > 1) {
+            const float big = step > s_gsPrevStep ? step : s_gsPrevStep;
+            if (big > 0.02f) { ++s_gsFrames; if (fabsf(step - s_gsPrevStep) > (0.25f * big > 0.05f ? 0.25f * big : 0.05f)) ++s_gsJerky; }
+            if (step > 1.0f) ++s_gsPops;
+        }
+        s_gsPrevStep = step;
+    }
+    for (int k = 0; k < 3; ++k) s_gsPrev[k] = p[k];
+    if (s_gsObsN < 2) ++s_gsObsN;
+    if (s_gsAN == 2) {
+        const double d1 = (double)(s_gsAt[1] - s_gsAt[0]) * 1e-6, d2 = (double)(now - s_gsAt[1]) * 1e-6;
+        if (d1 >= 0.005 && d1 <= 0.040 && d2 >= 0.005 && d2 <= 0.040) {
+            double sp = 0.0, acc = 0.0, az = 0.0;
+            for (int k = 0; k < 3; ++k) {
+                const double v1 = (s_gsAp[1][k] - s_gsAp[0][k]) / d1, v2 = (p[k] - s_gsAp[1][k]) / d2;
+                sp += v2 * v2; acc += (v2 - v1) * (v2 - v1); if (k == 2) az = fabs(v2 - v1);
+            }
+            const double h = (d1 + d2) * 0.5; acc = sqrt(acc) / h; az /= h;
+            if (sp > 0.25) { ++s_gsAccFrames; s_gsAccSum += acc; if (acc > 15.0) ++s_gsAccJit; if (az > 15.0) ++s_gsZJit; if (s_gsAccVN < 1024) s_gsAccV[s_gsAccVN++] = (float)acc; }
+        } else ++s_gsHitch;
+        for (int k = 0; k < 3; ++k) { s_gsAp[0][k] = s_gsAp[1][k]; s_gsAp[1][k] = p[k]; }
+        s_gsAt[0] = s_gsAt[1]; s_gsAt[1] = now;
+    } else { for (int k = 0; k < 3; ++k) s_gsAp[s_gsAN][k] = p[k]; s_gsAt[s_gsAN] = now; ++s_gsAN; }
+    const uint64_t ms = GetTickCount64();
+    if (ms >= s_gsLog) {
+        s_gsLog = ms + 5000;
+        const int64_t off = s_ghOffCur < s_ghOffPrev ? s_ghOffCur : s_ghOffPrev;
+        float accP95 = 0.0f;
+        if (s_gsAccVN) { ShipSortF(s_gsAccV, s_gsAccVN); accP95 = s_gsAccV[(s_gsAccVN * 95) / 100]; }
+        L("[GhostSmooth] mode=%s drives=%u accFrames=%u jitter(>15m/s2)=%u (%.1f%%) zJit=%u (%.1f%%) accMean=%.1f accP95=%.1f hitch=%u | movingFrames=%u jerky=%u (%.1f%%) pops>1m=%u | ring=%d pushed=%u reset=%u underrun=%u spline=%u linear=%u delayMs=%d gapMs=%d offMs=%.1f\n",
+          s_giOn == 2 ? "spline" : s_giOn ? "interp" : "puppet", s_gsDrives, s_gsAccFrames, s_gsAccJit, s_gsAccFrames ? 100.0 * s_gsAccJit / s_gsAccFrames : 0.0, s_gsZJit, s_gsAccFrames ? 100.0 * s_gsZJit / s_gsAccFrames : 0.0,
+          s_gsAccFrames ? s_gsAccSum / s_gsAccFrames : 0.0, accP95, s_gsHitch, s_gsFrames, s_gsJerky, s_gsFrames ? 100.0 * s_gsJerky / s_gsFrames : 0.0, s_gsPops,
+          s_ghN, s_gsPushed, s_gsReset, s_gsUnder, s_gsSpline, s_gsLinear, s_giDelay, s_giMinGap, off == INT64_MAX ? -1.0 : off / 1000.0);
+        s_gsFrames = s_gsJerky = s_gsPops = s_gsAccFrames = s_gsAccJit = s_gsZJit = s_gsHitch = s_gsUnder = s_gsDrives = s_gsPushed = 0; s_gsAccSum = 0.0;
+        s_gsAccVN = 0; s_gsSpline = s_gsLinear = 0;
+    }
 }
 static float OwnLerpRatio(float a, float b, float f, bool* wrapped) {
     *wrapped = b < a;                     // the clip looped between the two samples
@@ -16583,7 +17030,7 @@ static void DumpConfigOnce()
         // The Tune* values are floats (read with strtod, see ShipTuningTick); the dump shows the integer part.
         { "Coop", "TuneConeAngle", 120 }, { "Coop", "TuneConeRange", 350 }, { "Coop", "TuneMaxTime", 30 },
         { "Coop", "TuneAggroTime", 30 }, { "Coop", "TuneHull", 0 },
-        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 }, { "Coop", "WeaponSync", 0 }, { "Coop", "ShipPeerZ", 0 }, { "Coop", "ShipBindProbe", 0 }, { "Coop", "ShipSpawnProbe", 0 }, { "Coop", "ShipSpawnFire", 0 }, { "Coop", "ShipSpawnFirePid", 0 }, { "Coop", "SpawnCensus", 0 }, { "Coop", "SpawnReplayFire", 0 }, { "Coop", "SpawnReplayFirePid", 0 }, { "Coop", "SpawnShare", 0 }, { "Coop", "SpawnKeyBind", 0 }, { "Coop", "SpawnLib", 0 }, { "Coop", "SpawnLibFollow", 1 }, { "Coop", "SpawnLibBusy", 1 }, { "Coop", "SpawnCmdSeq", 0 }, { "Coop", "SpawnCmdPid", 0 }, { "Coop", "ShipClassBind", 0 }, { "Coop", "ShipClassBindSteal", 0 }, { "Coop", "SpawnShareRadiusM", 150 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "TableEvict", 0 }, { "Coop", "UsedEntAllPaths", 0 }, { "Coop", "PuppetSeqResync", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "FastTravelCrashFix", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 }, { "Coop", "PuppetListener", 0 }, { "Coop", "PuppetListenerAttach", 0 }, { "Coop", "PuppetMaxLife", 0 }, { "Coop", "ConflictProbe", 0 }, { "Coop", "OwnSnapAtTarget", 0 }, { "Coop", "PuppetWorldDropRef", 0 }, { "Coop", "PadIdPreferOffered", 0 }, { "Coop", "GuardPerceivePuppet", 0 },
+        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 }, { "Coop", "WeaponSync", 0 }, { "Coop", "ShipPeerZ", 0 }, { "Coop", "ShipBindProbe", 0 }, { "Coop", "ShipSpawnProbe", 0 }, { "Coop", "ShipSpawnFire", 0 }, { "Coop", "ShipSpawnFirePid", 0 }, { "Coop", "SpawnCensus", 0 }, { "Coop", "SpawnReplayFire", 0 }, { "Coop", "SpawnReplayFirePid", 0 }, { "Coop", "SpawnShare", 0 }, { "Coop", "SpawnKeyBind", 0 }, { "Coop", "SpawnLib", 0 }, { "Coop", "SpawnLibFollow", 1 }, { "Coop", "SpawnLibBusy", 1 }, { "Coop", "SpawnCmdSeq", 0 }, { "Coop", "SpawnCmdPid", 0 }, { "Coop", "ShipClassBind", 0 }, { "Coop", "ShipInterp", 0 }, { "Coop", "ShipInterpDelayMs", 200 }, { "Coop", "ShipExtrapMs", 150 }, { "Coop", "ShipInterpPhysEvery", 1 }, { "Coop", "ShipGhostInterp", 0 }, { "Coop", "ShipGhostDelayMs", 150 }, { "Coop", "ShipGhostExtrapMs", 150 }, { "Coop", "ShipGhostMinGapMs", 90 }, { "Coop", "ShipClassBindSteal", 0 }, { "Coop", "SpawnShareRadiusM", 150 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "TableEvict", 0 }, { "Coop", "UsedEntAllPaths", 0 }, { "Coop", "PuppetSeqResync", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "FastTravelCrashFix", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 }, { "Coop", "PuppetListener", 0 }, { "Coop", "PuppetListenerAttach", 0 }, { "Coop", "PuppetMaxLife", 0 }, { "Coop", "ConflictProbe", 0 }, { "Coop", "OwnSnapAtTarget", 0 }, { "Coop", "PuppetWorldDropRef", 0 }, { "Coop", "PadIdPreferOffered", 0 }, { "Coop", "GuardPerceivePuppet", 0 },
         { "Coop", "ShipSpawnReplay", 0 },
         { "Coop", "ShipFields", 0 }, { "Coop", "HelmBoth", 0 }, { "Coop", "BoardingForce", 0 }, { "Coop", "PlayerFrameFallback", 0 },
         { "Coop", "CombatTest", 0 }, { "Coop", "CrashContext", 0 }, { "Coop", "CorpseKeepSec", 30 }, { "Coop", "CrowdProbeIntegrate", 1 },
@@ -17122,6 +17569,9 @@ static void OnFrameInner(Human* updatedHuman) {
     { extern void FortDamageTestTick(); FortDamageTestTick(); } // [Coop] FortDamageTest (default 0): one-shot damage->disable->phase oracle
     CoordSyncTick();                                            // [Coop] CoordSync (default 0): host publishes GcLShip fields
     PoseSync::Tick((Entity*)updatedHuman, g_puppet);            // [Coop] PoseSync (default 0): no-op unless set
+    // [Coop] ShipInterp: every frame, guest only. EntitySyncTick runs on every 6th frame (slowTick, unless
+    // EntityFrameCadence) - run T18 measured the writer at ~20 Hz there, i.e. hulls still stepping every few frames.
+    if (Net::Enabled() && g_entHost == 0) ScbInterpFrame();
     if (Net::Enabled()) {
         EntitySyncTick();   // host broadcasts entity transforms; peer mirrors them (synced worlds)
         // Capture only succeeds in a real playable world (not title/whiteroom). Require it to be
@@ -17214,6 +17664,7 @@ static void OnFrameInner(Human* updatedHuman) {
                 if (nb > 1) ++s_batchExtra;
             }
         }
+        if (gotRaw && protoOk && s_shipGhost) { const uint64_t rxUs = OwnNowUs(); for (int i = 0; i < nb; ++i) GhostRingPush(batch[i], rxUs); }   // [Coop] ShipGhostInterp
         // Peer is "present" only with a recent fresh same-world packet AND (Feature #3) a live receive
         // timer — covers world change, disconnect, silence and unexpected-source drops, where GetRemote
         // keeps returning a stale last packet forever. With NetStrictPeer=0 the timer arm is inert, so
@@ -17540,15 +17991,24 @@ static void OnFrameInner(Human* updatedHuman) {
         // so the engine never writes its transform and the SetGlobalMatrixInternal hook can't fire for it.
         // Drive it ourselves every frame to the peer's ship position + heading (render-only, no physics).
         if (g_ghostShip && g_ghostHasSync) {
+            // [Coop] ShipGhostInterp=1: the sender-timeline sample (GhostSample) instead of the puppet buffer's state.
+            for (int k = 0; k < 3; ++k) g_ghostCmdPos[k] = g_ghostSyncPos[k];
+            for (int k = 0; k < 4; ++k) g_ghostCmdQuat[k] = g_ghostSyncQuat[k];
+            const uint64_t ghNowUs = OwnNowUs();
+            if (GhostInterpOn()) {
+                float gp[3], gq[4]; bool gu = false;
+                if (GhostSample(ghNowUs, gp, gq, &gu)) { for (int k = 0; k < 3; ++k) g_ghostCmdPos[k] = gp[k]; for (int k = 0; k < 4; ++k) g_ghostCmdQuat[k] = gq[k]; if (gu) ++s_gsUnder; }
+            }
+            g_ghostCmdValid = true; g_ghostCmdShip = g_ghostShip;   // a new ghost uses g_ghostSync* until its first drive
             HookMath::Quaternion q;
-            q.x = g_ghostSyncQuat[0]; q.y = g_ghostSyncQuat[1]; q.z = g_ghostSyncQuat[2]; q.w = g_ghostSyncQuat[3];
+            q.x = g_ghostCmdQuat[0]; q.y = g_ghostCmdQuat[1]; q.z = g_ghostCmdQuat[2]; q.w = g_ghostCmdQuat[3];
             HookMath::Transform m;
             HookMath::ToMatrix(&q, &m);
             // Authority (C4, decided in ops/evidence/authority-model.md): Z stays DERIVED-LOCAL.
             // X/Y and the quaternion are sender-authoritative, but m.M43 must use this machine's water
             // height at the peer's XZ - taking the peer's hull Z would make vertical lead horizontal by
             // the ~100 ms render delay. The solo F12 self-test below also uses the local Z.
-            m.M41 = g_ghostSyncPos[0]; m.M42 = g_ghostSyncPos[1]; m.M43 = MirroredShipZ(g_ghostSyncPos[2]);   // [Coop] ShipPeerZ (see MirroredShipZ)
+            m.M41 = g_ghostCmdPos[0]; m.M42 = g_ghostCmdPos[1]; m.M43 = MirroredShipZ(g_ghostCmdPos[2]);   // [Coop] ShipPeerZ (see MirroredShipZ)
             // [Coop] ShipHPSync: apply a pending hull HP; a fresh ghost is normally spawned after the packet
             // that carried the value, so this cannot live only on the receive path.
             if (ShipHPSyncEnabled() && g_ghostShip && g_ghostSyncHP != g_ghostAppliedHP) {
@@ -17562,6 +18022,7 @@ static void OnFrameInner(Human* updatedHuman) {
             }
             __try {
                 ((Entity*)g_ghostShip)->SetGlobalMatrixInternal(&m, true);
+                if (readable((void*)g_ghostShip, 0x50)) { const float* gm = (const float*)&((BaseEntity*)g_ghostShip)->m_GlobalMatrix; GhostSmoothNote(gm + 12, ghNowUs); }   // [GhostSmooth]
                 { static int n = 0; if ((n++ & 0x3F) == 0)
                     L("[ShipSync] driving ghost to (%.1f, %.1f, %.1f)\n", m.M41, m.M42, m.M43); }
                 // --- [GhostPose] MEASUREMENT ONLY (1 Hz, no behaviour change): commanded yaw from the
@@ -17576,8 +18037,8 @@ static void OnFrameInner(Human* updatedHuman) {
                 { static DWORD s_poseNext = 0; const DWORD poseNow = GetTickCount();
                   if (!s_poseNext || poseNow - s_poseNext >= 1000) {
                       s_poseNext = poseNow;
-                      const float qx = g_ghostSyncQuat[0], qy = g_ghostSyncQuat[1];
-                      const float qz = g_ghostSyncQuat[2], qw = g_ghostSyncQuat[3];
+                      const float qx = g_ghostCmdQuat[0], qy = g_ghostCmdQuat[1];   // what the drive commanded
+                      const float qz = g_ghostCmdQuat[2], qw = g_ghostCmdQuat[3];
                       const float qlen2 = qx*qx + qy*qy + qz*qz + qw*qw;
                       __try {
                           if (qlen2 < 0.5f || qlen2 > 1.5f) {
@@ -17694,13 +18155,16 @@ static void LogSetGlobalMatrixBody(uint32_t thisEnt, uint32_t sgmMatrix, uint32_
         // Use ToMatrix; never hand-build. The hand-built form used the TRANSPOSED off-diagonals, which
         // only looked right because FromMatrix used to return the conjugate - two errors cancelling
         // (audit 2026-11-20). One convention, one function.
-        HookMath::Quaternion q; q.x = g_ghostSyncQuat[0]; q.y = g_ghostSyncQuat[1];
-                                q.z = g_ghostSyncQuat[2]; q.w = g_ghostSyncQuat[3];
+        const bool gcUse = g_ghostCmdValid && g_ghostCmdShip == g_ghostShip;   // [Coop] ShipGhostInterp: what the drive commanded
+        const float* gcq = gcUse ? g_ghostCmdQuat : g_ghostSyncQuat;
+        const float* gcp = gcUse ? g_ghostCmdPos : g_ghostSyncPos;
+        HookMath::Quaternion q; q.x = gcq[0]; q.y = gcq[1];
+                                q.z = gcq[2]; q.w = gcq[3];
         HookMath::Transform tm; HookMath::ToMatrix(&q, &tm);
         m[0] = tm.M11;  m[1] = tm.M12;  m[2]  = tm.M13;
         m[4] = tm.M21;  m[5] = tm.M22;  m[6]  = tm.M23;
         m[8] = tm.M31;  m[9] = tm.M32;  m[10] = tm.M33;
-        m[12] = g_ghostSyncPos[0]; m[13] = g_ghostSyncPos[1]; m[14] = MirroredShipZ(g_ghostSyncPos[2]);   // [Coop] ShipPeerZ
+        m[12] = gcp[0]; m[13] = gcp[1]; m[14] = MirroredShipZ(gcp[2]);   // [Coop] ShipPeerZ
         { static int g_shipDriveLog = 0; if ((g_shipDriveLog++ & 0x3F) == 0)
             L("[ShipSync] driving ghost to (%.1f, %.1f, %.1f) peerZ=%.2f localZ=%.2f\n", g_ghostSyncPos[0], g_ghostSyncPos[1], m[14], g_ghostSyncPos[2], g_localShipZ); }
         return;
