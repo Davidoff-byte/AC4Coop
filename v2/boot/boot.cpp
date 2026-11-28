@@ -91,16 +91,47 @@ char __fastcall MySlotHover(void* self, void*, uint32_t hovered) {
     engine::title::TryContinue(self, hovered, Cfg().autoContinueSlot);
     return r;
 }
+
+// The module that owns `p`, as a full path ("" if none). Pure kernel32 queries.
+void ModuleOf(const void* p, wchar_t* path, DWORD cap) {
+    HMODULE m = nullptr; path[0] = 0;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)p, &m) && m)
+        GetModuleFileNameW(m, path, cap);
+}
+
+// True if `path` is version.dll in the game's own folder: our proxy (proxy/version), which hooks the same CreateMutexW
+// slot before any ASI loads and appends _mi<pid> itself (docs/evidence/single-instance-guard-2026-11-15.md, live 19:16).
+bool IsOurVersionProxy(const wchar_t* path) {
+    wchar_t exe[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    const wchar_t* ps = wcsrchr(path, L'\\'); const wchar_t* es = wcsrchr(exe, L'\\');
+    if (!ps || !es || ps - path != es - exe) return false;
+    return _wcsnicmp(path, exe, (size_t)(ps - path)) == 0 && _wcsicmp(ps + 1, L"version.dll") == 0;
+}
+
+void InstallMultiInstance() {
+    void** slot = FindImportSlot("kernel32.dll", "CreateMutexW");
+    if (!slot) { LOGE("[Boot] CreateMutexW import not found\n"); return; }
+    uintptr_t expect = (uintptr_t)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "CreateMutexW");
+    void* cur = nullptr;
+    if (mem::Read(slot, &cur, sizeof(cur)) && (uintptr_t)cur != expect) {
+        wchar_t owner[MAX_PATH]; ModuleOf(cur, owner, MAX_PATH);
+        if (IsOurVersionProxy(owner)) {
+            // Chain: game -> ours (_ac4coop_<pid>) -> proxy (_mi<pid>) -> kernel32. Either rename alone defeats the guard.
+            LOGI("[Boot] CreateMutexW slot already hooked by %ls (our proxy); chaining\n", owner);
+            expect = (uintptr_t)cur;
+        } else {
+            LOGE("[Boot] CreateMutexW slot holds %p owned by '%ls', not kernel32 %p\n", cur, owner[0] ? owner : L"?", (void*)expect);
+        }
+    }
+    hooks::PointerSlot("boot", "CreateMutexW", slot, (void*)&MyCreateMutexW, (void**)&g_createMutexW, expect);
+}
+
 }  // namespace
 
 void InstallEarly() {
     const Config& c = Cfg();
-    if (c.multiInstance) {
-        void** slot = FindImportSlot("kernel32.dll", "CreateMutexW");
-        FARPROC real = GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "CreateMutexW");
-        if (slot) hooks::PointerSlot("boot", "CreateMutexW", slot, (void*)&MyCreateMutexW, (void**)&g_createMutexW, (uintptr_t)real);
-        else LOGE("[Boot] CreateMutexW import not found\n");
-    }
+    if (c.multiInstance) InstallMultiInstance();
     if (!c.fullscreen) {
         static const uint8_t kStyle[6] = { 0x81, 0xC6, 0x00, 0x00, 0xCA, 0x00 };   // add esi, 0xCA0000
         g_borderless = c.borderless ? 1u : 0u;

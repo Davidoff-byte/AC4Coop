@@ -42,7 +42,9 @@ try {
 # A dirty README still does not count. The generated header is excluded so the stamp can never make the
 # tree dirty (it is gitignored too; the filter also covers the case of the file being tracked by mistake).
 # Untracked files under these paths count as dirty (porcelain '??').
-$dirtyPaths = $DirtyPaths
+# `powershell -File ... -DirtyPaths v2,decomp,tools` passes ONE string "v2,decomp,tools" (no array parsing under -File),
+# which matched no path and stamped tree=clean on a dirty tree (v2 boot logs 2026-11-28). Split on commas.
+$dirtyPaths = @($DirtyPaths | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 try {
     $porcelain = & git -C $root status --porcelain -- @dirtyPaths 2>$null
     if ($LASTEXITCODE -eq 0) {

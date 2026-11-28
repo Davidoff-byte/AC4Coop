@@ -23,10 +23,11 @@ struct Key {
     size_t      cap;          // string capacity
     const char* evidence;     // why this default
     uint8_t     fromIni;      // set by LoadConfig
+    uint8_t     bad;          // an int key whose ini text is not a number (the default is used)
 };
 
-#define I(sec, k, field, def, ev) { sec, k, kInt, def, nullptr, offsetof(Config, field), 0, ev, 0 }
-#define S(sec, k, field, def, ev) { sec, k, kStr, 0, def, offsetof(Config, field), sizeof(Config::field), ev, 0 }
+#define I(sec, k, field, def, ev) { sec, k, kInt, def, nullptr, offsetof(Config, field), 0, ev, 0, 0 }
+#define S(sec, k, field, def, ev) { sec, k, kStr, 0, def, offsetof(Config, field), sizeof(Config::field), ev, 0, 0 }
 
 Key g_keys[] = {
     I("Display",  "Fullscreen",       fullscreen,       0,    "windowed for two copies on one PC (v1 s0-two-copy-rig)"),
@@ -69,6 +70,42 @@ Key g_keys[] = {
 #undef I
 #undef S
 
+bool Known(const char* section, const char* key) {
+    for (const Key& k : g_keys) if (_stricmp(k.section, section) == 0 && _stricmp(k.key, key) == 0) return true;
+    return false;
+}
+
+// R5: keys in the ini that v2 does not read are ignored, and reported once: a count per section at info, every name at
+// debug. A v1 ini (358 keys) installed under v2 shows up here instead of silently half-applying.
+void ReportUnknown() {
+    if (!g_ini[0] || GetFileAttributesA(g_ini) == INVALID_FILE_ATTRIBUTES) return;
+    static char secs[8192], body[65536];
+    if (!GetPrivateProfileSectionNamesA(secs, sizeof(secs), g_ini)) return;
+    unsigned total = 0;
+    char summary[400] = {}; size_t used = 0;
+    for (const char* s = secs; *s; s += strlen(s) + 1) {
+        unsigned n = 0;
+        if (GetPrivateProfileSectionA(s, body, sizeof(body), g_ini)) {
+            for (const char* e = body; *e; e += strlen(e) + 1) {
+                if (*e == ';' || *e == '#') continue;
+                const char* eq = strchr(e, '=');
+                char key[96] = {};
+                strncpy_s(key, e, eq ? (size_t)(eq - e) : strlen(e));
+                for (size_t i = strlen(key); i > 0 && (key[i - 1] == ' ' || key[i - 1] == '\t'); --i) key[i - 1] = 0;
+                if (!key[0] || Known(s, key)) continue;
+                ++n;
+                LOGD("[Config] ignored [%s] %s\n", s, key);
+            }
+        }
+        if (!n) continue;
+        total += n;
+        const int w = _snprintf_s(summary + used, sizeof(summary) - used, _TRUNCATE, "%s[%s] %u", used ? ", " : "", s, n);
+        if (w > 0) used += (size_t)w;
+    }
+    if (total) LOGW("[Config] %u ini key(s) are not v2 keys and are ignored: %s\n", total, summary);
+    else LOGI("[Config] no unknown ini keys\n");
+}
+
 }  // namespace
 
 const Config& Cfg() { return g_cfg; }
@@ -84,7 +121,10 @@ void LoadConfig(const char* iniPath) {
         k.fromIni = present ? 1 : 0;
         if (k.type == kInt) {
             int v = k.defInt;
-            if (present) { char* end = nullptr; const long p = strtol(buf, &end, 0); if (end != buf) v = (int)p; }
+            if (present) {
+                char* end = nullptr; const long p = strtol(buf, &end, 0);
+                if (end != buf) v = (int)p; else k.bad = 1;
+            }
             memcpy(field, &v, sizeof(v));
         } else {
             strncpy_s(field, k.cap, present ? buf : k.defStr, _TRUNCATE);
@@ -98,7 +138,9 @@ void LogConfig() {
         const char* field = (const char*)&g_cfg + k.offset;
         if (k.type == kInt) LOGI("[Config] %c [%s] %s=%d  ; %s\n", k.fromIni ? '*' : ' ', k.section, k.key, *(const int*)field, k.evidence);
         else LOGI("[Config] %c [%s] %s=%s  ; %s\n", k.fromIni ? '*' : ' ', k.section, k.key, field, k.evidence);
+        if (k.bad) LOGW("[Config] [%s] %s: the ini value is not a number; the default is used\n", k.section, k.key);
     }
+    ReportUnknown();
 }
 
 }  // namespace v2

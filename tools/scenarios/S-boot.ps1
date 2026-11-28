@@ -1,5 +1,6 @@
 # S-boot (docs/v2/ARCHITECTURE.md s9): two copies on this PC boot into the world with an ASI and stay alive.
-#   tools\scenarios\S-boot.ps1 -Asi bin\v2\DevTools\AC4Coop.asi [-Minutes 10] [-SaveFrom <dir with *.save>]
+#   tools\scenarios\S-boot.ps1 -Asi bin\v2\DevTools\AC4Coop.asi [-Ini v2\AC4Coop.ini] [-Minutes 10] [-SaveFrom <dir with *.save>]
+# -Ini installs that ini for the run (restored after) with [Pilot] Enabled=1, so the pilot can drive the boot.
 # PASS iff, on both copies:
 #   B1 the log names the build ("[Build] asi=<sha256 of -Asi>")
 #   B2 "[Init] done: N hook site(s), 0 refused" and the manifest has every expected site (-Sites)
@@ -7,10 +8,12 @@
 #   B4 median "[Stats] tick hz" >= 20 over the soak
 #   B5 both processes alive after -Minutes, no AC4Coop_crashctx_<pid>_*.txt, no dump
 # Saves, ini and ASI are backed up first and restored in every case. Started from the exe, never Steam. Rig lock held.
+# The display is kept awake for the run (tools\keep_awake.ps1): asleep, the copies run at ~30 fps instead of ~60.
 param(
   [Parameter(Mandatory)][string]$Asi,
   [int]$Minutes = 10,
   [string]$SaveFrom = '',
+  [string]$Ini = '',
   [string[]]$Sites = @('tick/HumanUpdate', 'boot/CreateMutexW', 'boot/WindowStyle', 'boot/NoPause', 'boot/BinkOpen', 'boot/TitleStartUpdate', 'boot/TitleSlotHover'),
   [string]$GameDir = $(if ($env:AC4_GAME_DIR) { $env:AC4_GAME_DIR } else { "D:\SteamLibrary\steamapps\common\Assassin's Creed IV Black Flag" })
 )
@@ -26,11 +29,21 @@ $bk = "D:\AC4-RE\deploy-backups\$(Get-Date -Format yyyyMMdd-HHmmss)-S-boot"
 New-Item -ItemType Directory -Force $bk | Out-Null
 Set-Content $lock "S-boot $Asi $(Get-Date -Format s)"
 $results = [ordered]@{}; $ids = @()
+$awake = Start-Process powershell -ArgumentList @('-NoProfile', '-File', (Join-Path $tools 'keep_awake.ps1'), '-Minutes', ($Minutes + 20)) -WindowStyle Hidden -PassThru
 try {
   Copy-Item $ini, $gameAsi $bk -Force
   if (Test-Path $saves) { Copy-Item $saves (Join-Path $bk 'save3dmgames') -Recurse -Force }
   if ($SaveFrom) { Copy-Item (Join-Path $SaveFrom '*.save') $saves -Force }
   Copy-Item $Asi $gameAsi -Force
+  if ($Ini) {
+    # [Pilot] Enabled=1 in the installed copy; no BOM (GetPrivateProfileStringA would not see the first section).
+    $sec = ''; $lines = foreach ($l in (Get-Content $Ini)) {
+      if ($l -match '^\s*\[(.+)\]') { $sec = $Matches[1] }
+      if ($sec -eq 'Pilot' -and $l -match '^\s*Enabled\s*=') { 'Enabled=1' } else { $l }
+    }
+    [IO.File]::WriteAllLines($ini, [string[]]$lines, (New-Object Text.UTF8Encoding $false))
+    "ini $Ini -> game ([Pilot] Enabled=1)"
+  }
   "asi $($asiHash.Substring(0,16)) -> game; backup $bk"
   $a = Start-Process -FilePath $exe -WorkingDirectory $GameDir -PassThru; Start-Sleep 6
   $b = Start-Process -FilePath $exe -WorkingDirectory $GameDir -PassThru
@@ -58,7 +71,7 @@ try {
     $txt = if (Test-Path $log) { Get-Content $log } else { @() }
     $b1 = [bool]($txt | Select-String -SimpleMatch "[Build] asi=$asiHash")
     $init = $txt | Select-String '\[Init\] done: (\d+) hook site\(s\), (\d+) refused' | Select-Object -Last 1
-    $missing = @($Sites | Where-Object { -not ($txt | Select-String -SimpleMatch ("[Hooks]   " + ($_ -split '/')[0])) -or -not ($txt | Select-String -Pattern ([regex]::Escape(($_ -split '/')[1]))) })
+    $missing = @($Sites | Where-Object { $o, $n = $_ -split '/'; -not ($txt | Select-String -Pattern ('\[Hooks\]\s+' + [regex]::Escape($o) + '\s+' + [regex]::Escape($n) + '\s')) })
     $b2 = $init -and $init.Matches[0].Groups[2].Value -eq '0' -and $missing.Count -eq 0
     $b3 = [bool]($txt | Select-String '\[Tick\] in world')
     $hz = @($txt | Select-String '\[Stats\] tick hz=([\d.]+)' | ForEach-Object { [double]$_.Matches[0].Groups[1].Value } | Sort-Object)
@@ -75,6 +88,7 @@ try {
   Copy-Item (Join-Path $bk 'AC4Coop.ini') $ini -Force; Copy-Item (Join-Path $bk 'AC4Coop.asi') $gameAsi -Force
   if (Test-Path (Join-Path $bk 'save3dmgames')) { Copy-Item (Join-Path $bk 'save3dmgames\*') $saves -Recurse -Force }
   Remove-Item $lock -ErrorAction SilentlyContinue
+  if ($awake) { $awake | Stop-Process -Force -ErrorAction SilentlyContinue }
   "restored ini/asi/saves; lock released"
 }
 $pass = $true

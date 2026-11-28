@@ -37,8 +37,18 @@ std::atomic<int>      g_inWorld{0};
 std::atomic<uint64_t> g_lastResolveUs{0};
 std::atomic<int>      g_fallback{0};
 
+// Fallback frame clock. At the helm the player's update stops reaching the hook (v1 b52ce83, ctx 25). Wall time alone
+// cannot tell that from a hitch: after a 150 ms stall the first update of any Human looks like "player silent 150 ms"
+// (2026-11-28 boot logs: 1-5 false fallbacks per 5 s). So frames are counted with a witness, one non-player Human
+// (one update per frame): the player missed kFallbackFrames of its updates = the player is being skipped. A hitch
+// stalls the witness too, so it adds at most one or two.
+constexpr int         kFallbackFrames = 6;   // ~100 ms at 60 fps (v1's 100 ms)
+std::atomic<void*>    g_witness{nullptr};    // compared only, never dereferenced
+std::atomic<int>      g_witnessFrames{0};    // witness updates since the player's last update
+std::atomic<uint64_t> g_witnessUs{0};
+
 // stats (tick thread)
-uint64_t g_statT0 = 0, g_statTicks = 0, g_statFallback = 0, g_statMaxUs = 0;
+uint64_t g_statT0 = 0, g_statTicks = 0, g_statFallback = 0, g_statMaxUs = 0, g_statEpisodes = 0;
 
 void DrainCommands() {
     for (;;) {
@@ -68,7 +78,9 @@ void RunTick(void* human, bool fallback) {
     }
     if (fallback != (g_fallback.load() != 0)) {
         g_fallback.store(fallback ? 1 : 0);
-        LOGW("[Tick] fallback %s (player update %s the hook)\n", fallback ? "on" : "off", fallback ? "stopped reaching" : "reaches");
+        if (fallback) ++g_statEpisodes;
+        LOGW("[Tick] fallback %s (player update %s the hook; witness frames %d)\n", fallback ? "on" : "off",
+             fallback ? "stopped reaching" : "reaches", g_witnessFrames.load());
     }
     DrainCommands();
     for (int i = 0; i < g_modN; ++i) g_mods[i].fn(human, t0);   // fixed order, no SEH (R2)
@@ -81,16 +93,17 @@ void RunTick(void* human, bool fallback) {
     if (!g_statT0) g_statT0 = t1;
     if (t1 - g_statT0 >= 5000000) {
         const double s = (double)(t1 - g_statT0) / 1e6;
-        LOGI("[Stats] tick hz=%.1f fallback=%llu maxUs=%llu cmdDropped=%u logDropped=%u\n", g_statTicks / s,
-             (unsigned long long)g_statFallback, (unsigned long long)g_statMaxUs, g_cmdDropped.load(), log::Dropped());
-        g_statT0 = t1; g_statTicks = g_statFallback = g_statMaxUs = 0;
+        LOGI("[Stats] tick hz=%.1f fallback=%llu episodes=%llu maxUs=%llu cmdDropped=%u logDropped=%u\n", g_statTicks / s,
+             (unsigned long long)g_statFallback, (unsigned long long)g_statEpisodes, (unsigned long long)g_statMaxUs,
+             g_cmdDropped.load(), log::Dropped());
+        g_statT0 = t1; g_statTicks = g_statFallback = g_statMaxUs = g_statEpisodes = 0;
     }
     g_inTick.store(0);
 }
 
 void __cdecl OnHumanUpdate(void* human) {
     void* player = g_player.load(std::memory_order_relaxed);
-    if (human && human == player) { RunTick(human, false); return; }
+    if (human && human == player) { g_witnessFrames.store(0); RunTick(human, false); return; }
     const uint64_t now = clock::NowUs();
     if (!player) {
         // Find the player: read-only engine getters, at most every 250 ms across all threads.
@@ -103,9 +116,15 @@ void __cdecl OnHumanUpdate(void* human) {
         if (ph && ph == human) RunTick(human, false);
         return;
     }
-    // Fallback: the player's update has not reached the hook for 100 ms (seen at the helm, v1 b52ce83).
-    const uint64_t lt = g_lastTickUs.load();
-    if (lt && now - lt > 100000) RunTick(player, true);
+    // Fallback (see g_witness): once the player missed kFallbackFrames witness frames, every witness update runs a tick,
+    // until the player's own update comes back and resets the count.
+    void* w = g_witness.load(std::memory_order_relaxed);
+    if (w == human) {
+        g_witnessUs.store(now, std::memory_order_relaxed);
+        if (g_witnessFrames.fetch_add(1) + 1 >= kFallbackFrames) RunTick(player, true);
+    } else if (!w || now - g_witnessUs.load(std::memory_order_relaxed) > 250000) {   // none yet, or it stopped updating
+        if (g_witness.compare_exchange_strong(w, human)) { g_witnessUs.store(now); g_witnessFrames.store(0); }
+    }
     for (int i = 0; i < g_ownN; ++i) g_own[i].fn(human);
 }
 
