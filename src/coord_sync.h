@@ -65,6 +65,13 @@ enum CoordField : uint8_t {
     // GcLShip+0xD0 HullHealth, written through the engine setter 0x01225A10 (never a raw store: that skips
     // the +0x520 mirror and sub_1220B60, ship-tuning-2026-11-21.md Q3).
     CF_TUNE_HULL = 18,
+    // World state (src/world_sync.cpp; consumed there, never reaches CoordSyncApplyMsg).
+    // ops/evidence/world-state-tod-collectables-coord-2026-11-27.md Q1.3 / Q2.4 / Q3.
+    CF_TOD_HOURS = 19,     // [Coop] TimeOfDaySync: value = host TimeOfDayManager hours, wireId = world_sync kTodKey
+    CF_COLL_DONE = 20,     // reserved for [Coop] CollectableSync (NEED-RE in this slice: never sent)
+    CF_TRIGGER = 21,       // [Coop] CoordTriggerRelay: wireId = owner entity id, rsv[0..1] = host trigger index (u16 LE),
+                           // rsv[2] = class tag (1 Docking, 2 Interact, 3 MiniFight, 4 Entice), value = trigger hash bits
+                           // (0 = the host could not name the index)
 };
 
 struct CoordSchema {

@@ -125,6 +125,9 @@ CALL_SITES = [
     # [Coop] ShipNoAutoSink (src/phase1.cpp Phase1_ShipNoAutoSinkInstall): sub_1205280's > 1000 m sink post; the plugin
     # checks the same 10 bytes and rewrites only the rel32 of the E8 at 0x01205379 (E8 22 C1 7F FF -> sub_A014A0).
     ("ShipNoAutoSink call", 0x01205374, bytes.fromhex("6A 00 52 8B CE E8 22 C1 7F FF"), "push 0; push edx; mov ecx,esi; call sub_A014A0"),
+    # src/world_sync.cpp ([Coop] TimeOfDaySync): the guest calls 0x0040D0C0 only when TimeOfDayManager vtable slot
+    # +0x6C (cell 0x01E3F8E4) holds it; the plugin re-reads the cell live before every call.
+    ("ToD setter vt cell", 0x01E3F8E4, bytes.fromhex("C0 D0 40 00"), "TimeOfDayManager vt+0x6C = 0x0040D0C0"),
 ]
 
 
