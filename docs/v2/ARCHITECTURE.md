@@ -66,16 +66,24 @@ Fallback: if the player's update stops reaching the hook (seen at the helm, b52c
 Every key, its default and its evidence line are listed in `v2/core/config.cpp`; `tools/ini_keys.py` checks the template
 against it.
 
-## 5. Net protocol v2 (`net/codec`)
-- One UDP socket. Datagram header (16 B): magic `AC42` (u32) · proto (u16) · sender peer id (u8) · type (u8) · seq (u32)
-  · ack (u16) + ack bits (u16, reliable channel only).
+## 5. Net protocol v2 (`net/codec`, `net/reliable`; unit tests in `v2/tests`)
+- One UDP socket, owned by the net thread: it alone sends, receives, runs the handshake, the clock and the reliable
+  channel. The game tick hands it state bodies and events through SPSC rings (`core/spsc.h`) and drains decoded records
+  and events from SPSC rings the other way; nothing is shared under a lock.
+- Datagram header (16 B): magic `AC42` (u32) · proto (u16) · sender peer id (u8) · type (u8) · seq (u32, per sender
+  toward one receiver, from 1) · evAck (u32, cumulative: every event of the receiver's stream up to it was delivered).
+  Datagrams stay ≤ 1200 B (no IP fragmentation).
 - Types:
   - `HELLO/WELCOME/BYE`: handshake, peer id assignment, role.
-  - `CLOCK`: PeerClock ping/pong.
-  - `STATE`: unreliable, newest wins per object. Body: host-time stamp (u64 µs) + records {NetId u32, kind u8, field mask u16,
-    fields}.
-  - `EVENTS`: reliable, ordered per sender; acked with ack + bits; resend after max(2 × RTT, 50 ms). Records {type u16,
-    NetId u32, len u8, payload ≤ 64 B}.
+  - `CLOCK`: PeerClock ping/pong (t0, t1, t2 in each side's local µs).
+  - `STATE`: unreliable, newest wins per object; a datagram older than the newest seen from that peer is dropped. Body:
+    host-time stamp (u64 µs) + count (u8) + records {NetId u32, kind u8, field mask u16, len u8, data ≤ 64 B}; `len`
+    lets a receiver skip kinds it does not know.
+  - `EVENTS`: reliable, ordered per sender. Body: firstSeq (u32) + count (u8) + the contiguous run of events {type u16,
+    NetId u32, len u8, data ≤ 64 B}; count 0 = a pure ack. Go-back-N: the receiver delivers only the next seq; when the
+    oldest unacked event has waited max(2 × RTT, 50 ms), the sender rewinds to it. Window 256 events. Measured offline
+    (`reliable_*` tests): every event once, in order, intact at 0/2/10/40 % loss with duplicates and reordering; resend
+    overhead at 2 % loss, 30 ± 2 ms: 143 % at 1000 events/s (each loss resends the in-flight run), 10.7 % at 50 events/s.
 - **Link state**: a peer is live while any datagram arrived in the last 500 ms; `[Net] link down/up` only on that edge, with
   the gap in ms. (Fixes W-P3-1.)
 - **NetId**: u32 = owner peer id (8 bits) << 24 | owner counter. Events `Spawned{NetId, kind, binding}` and
