@@ -108,6 +108,15 @@
    "size": 110,
    "status": "unknown"
   },
+  "004C7700": {
+   "addr": "004C7700",
+   "claimed_at": null,
+   "name": "ActionControllerStop",
+   "owner": null,
+   "receipts": [],
+   "size": 967,
+   "status": "unknown"
+  },
   "00503330": {
    "addr": "00503330",
    "claimed_at": "2026-11-08T19:48:44Z",

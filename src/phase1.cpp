@@ -2816,7 +2816,12 @@ static void PchanApply(Human* h, uint32_t primaryAlias) {   // the puppet's own 
             // The controller is the key-table entry (sub_666BB0; the same object, sub_E10E50 reads its +40).
             if (!todo[j].ours || curAlias != todo[j].ours) { InterlockedIncrement(&s_pchIdleC); continue; }
             void* ctrl = ((void* (__thiscall*)(void*, int, int))0x00666BB0)(ac, ch, ly);
-            if (ctrl) ((void(__thiscall*)(void*))0x004ADD10)(ctrl);
+            // [Coop] PchanSoftStop (default 0): the engine's own per-controller stop instead of the hard reset - sub_4C7700
+            // (thiscall ctrl, char, int; retn 8; engine site 0x65205F via sub_652080 -> sub_651FE0(i, 0, 0)), evidence
+            // ops/evidence/need-re-closure-presence-2026-11-27.md Q2. UNVERIFIED live.
+            static int s_pchSoft = -1; if (s_pchSoft < 0) s_pchSoft = GetPrivateProfileIntA("Coop", "PchanSoftStop", 0, Paths::Ini()) != 0 ? 1 : 0;
+            if (ctrl && s_pchSoft) ((void(__thiscall*)(void*, int, int))0x004C7700)(ctrl, 0, 0);
+            else if (ctrl) ((void(__thiscall*)(void*))0x004ADD10)(ctrl);
             InterlockedIncrement(&s_pchReleaseC);
             AcquireSRWLockExclusive(&s_pchLock);
             if (todo[j].slot < s_pchRxN && s_pchRx[todo[j].slot].key == todo[j].key) s_pchRx[todo[j].slot].ours = 0;
@@ -12068,6 +12073,12 @@ void CounterHostApplyFire() {
           (type >= 20 && type <= 22) ? " fallback=OwnerDamage" : " fallback=log");
         return;
     }
+    // S2 crash audit (ops/evidence/combat-counter-sync-design-2026-11-27.md, addendum): the five callees are safe only for
+    // response types 16..23 and a valid puppet handle (h != 0, h != &dword_4DD5F8C, h[0] == puppet, (int)h[2] < 0; the
+    // unchecked lock xadd at 0x184DAB1). The type checked is the one that would be posted (control mode posts 0).
+    const uint32_t postType = control ? 0u : type;
+    if (postType < 16 || postType > 23) { InterlockedIncrement(&s_ctrGate); L("[CTR] apply refused type=%u\n", postType); return; }
+    if (!ph || ph == 0x04DD5F8Cu) { InterlockedIncrement(&s_ctrGate); L("[CTR] apply refused handle\n"); return; }
     char* f = ((char* (__cdecl*)())0x010EFC30)();   // FightDamageEvent (takes unk_2AC1FCC)
     if (!f || !CtrFill(f, q.a, q.b, ph, control)) { InterlockedIncrement(&s_ctrApplyFail); L("[CTR] host apply guard=%016llX -> FDE build failed\n", (unsigned long long)q.id); return; }
     char* e = ((char* (__cdecl*)())0x018480F0)();   // FightDamageResponseEvent (takes unk_2AC1FCC)
@@ -17713,7 +17724,7 @@ static void DumpConfigOnce()
         // The Tune* values are floats (read with strtod, see ShipTuningTick); the dump shows the integer part.
         { "Coop", "TuneConeAngle", 120 }, { "Coop", "TuneConeRange", 350 }, { "Coop", "TuneMaxTime", 30 },
         { "Coop", "TuneAggroTime", 30 }, { "Coop", "TuneHull", 0 },
-        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 }, { "Coop", "WeaponSync", 0 }, { "Coop", "ShipPeerZ", 0 }, { "Coop", "ShipBindProbe", 0 }, { "Coop", "ShipSpawnProbe", 0 }, { "Coop", "ShipSpawnFire", 0 }, { "Coop", "ShipSpawnFirePid", 0 }, { "Coop", "SpawnCensus", 0 }, { "Coop", "SpawnReplayFire", 0 }, { "Coop", "SpawnReplayFirePid", 0 }, { "Coop", "SpawnShare", 0 }, { "Coop", "SpawnKeyBind", 0 }, { "Coop", "SpawnLib", 0 }, { "Coop", "SpawnLibFollow", 1 }, { "Coop", "SpawnLibBusy", 1 }, { "Coop", "SpawnCmdSeq", 0 }, { "Coop", "SpawnCmdPid", 0 }, { "Coop", "ShipClassBind", 0 }, { "Coop", "ShipInterp", 0 }, { "Coop", "ShipInterpDelayMs", 200 }, { "Coop", "ShipExtrapMs", 150 }, { "Coop", "ShipInterpPhysEvery", 1 }, { "Coop", "ShipGhostInterp", 0 }, { "Coop", "ShipGhostDelayMs", 150 }, { "Coop", "ShipGhostExtrapMs", 150 }, { "Coop", "ShipGhostMinGapMs", 90 }, { "Coop", "SpawnLibLateRestore", 0 }, { "Coop", "ShipClassBindSteal", 0 }, { "Coop", "SpawnShareRadiusM", 150 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "TableEvict", 0 }, { "Coop", "UsedEntAllPaths", 0 }, { "Coop", "PuppetSeqResync", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "FastTravelCrashFix", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 }, { "Coop", "PuppetListener", 0 }, { "Coop", "PuppetListenerAttach", 0 }, { "Coop", "PuppetMaxLife", 0 }, { "Coop", "ConflictProbe", 0 }, { "Coop", "OwnSnapAtTarget", 0 }, { "Coop", "PuppetWorldDropRef", 0 }, { "Coop", "PadIdPreferOffered", 0 }, { "Coop", "GuardPerceivePuppet", 0 }, { "Coop", "ShipClassFix", 0 }, { "Coop", "ShipClassProbe", 0 }, { "Coop", "ShipStateSync", 0 }, { "Coop", "ShipNoAutoSink", 0 }, { "Coop", "BoardStartGuest", 0 }, { "Coop", "CallTraceVt", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "TimeOfDaySync", 0 },
+        { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 }, { "Coop", "WeaponSync", 0 }, { "Coop", "ShipPeerZ", 0 }, { "Coop", "ShipBindProbe", 0 }, { "Coop", "ShipSpawnProbe", 0 }, { "Coop", "ShipSpawnFire", 0 }, { "Coop", "ShipSpawnFirePid", 0 }, { "Coop", "SpawnCensus", 0 }, { "Coop", "SpawnReplayFire", 0 }, { "Coop", "SpawnReplayFirePid", 0 }, { "Coop", "SpawnShare", 0 }, { "Coop", "SpawnKeyBind", 0 }, { "Coop", "SpawnLib", 0 }, { "Coop", "SpawnLibFollow", 1 }, { "Coop", "SpawnLibBusy", 1 }, { "Coop", "SpawnCmdSeq", 0 }, { "Coop", "SpawnCmdPid", 0 }, { "Coop", "ShipClassBind", 0 }, { "Coop", "ShipInterp", 0 }, { "Coop", "ShipInterpDelayMs", 200 }, { "Coop", "ShipExtrapMs", 150 }, { "Coop", "ShipInterpPhysEvery", 1 }, { "Coop", "ShipGhostInterp", 0 }, { "Coop", "ShipGhostDelayMs", 150 }, { "Coop", "ShipGhostExtrapMs", 150 }, { "Coop", "ShipGhostMinGapMs", 90 }, { "Coop", "SpawnLibLateRestore", 0 }, { "Coop", "PchanSoftStop", 0 }, { "Coop", "PadScanFrom1", 0 }, { "Coop", "ShipClassBindSteal", 0 }, { "Coop", "SpawnShareRadiusM", 150 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "TableEvict", 0 }, { "Coop", "UsedEntAllPaths", 0 }, { "Coop", "PuppetSeqResync", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "FastTravelCrashFix", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 }, { "Coop", "PuppetListener", 0 }, { "Coop", "PuppetListenerAttach", 0 }, { "Coop", "PuppetMaxLife", 0 }, { "Coop", "ConflictProbe", 0 }, { "Coop", "OwnSnapAtTarget", 0 }, { "Coop", "PuppetWorldDropRef", 0 }, { "Coop", "PadIdPreferOffered", 0 }, { "Coop", "GuardPerceivePuppet", 0 }, { "Coop", "ShipClassFix", 0 }, { "Coop", "ShipClassProbe", 0 }, { "Coop", "ShipStateSync", 0 }, { "Coop", "ShipNoAutoSink", 0 }, { "Coop", "BoardStartGuest", 0 }, { "Coop", "CallTraceVt", 0 }, { "Coop", "BindRadiusM", 0 }, { "Coop", "TimeOfDaySync", 0 },
         { "Coop", "ShipSpawnReplay", 0 },
         { "Coop", "ShipFields", 0 }, { "Coop", "HelmBoth", 0 }, { "Coop", "BoardingForce", 0 }, { "Coop", "PlayerFrameFallback", 0 },
         { "Coop", "CounterProbe", 0 }, { "Coop", "CounterSync", 0 }, { "Coop", "CounterHostApply", 0 }, { "Coop", "CounterGuestVeto", 0 }, { "Coop", "CounterVetoMs", 1500 },
@@ -18949,7 +18960,9 @@ static GetUnusedPad_t g_origGetUnusedPad = nullptr;
 // tests this[id] for each listed id). With the flag the original runs first and its answer - an offered AND empty slot,
 // per its contract - is used; the forced scan remains only for "no offered slot free" (returning 0 there makes the
 // caller use slot 0 = the player's pad). NEED RE for a full fix: what the candidate list holds when it has no free id.
+// RE 2026-11-27: engine candidate list is exactly {0} (sub_76BF10 returns 1) - PadIdPreferOffered cannot help; see need-re-closure-presence
 static int s_padPreferOffered = 0;
+static int s_padScanFrom1 = 0;   // [Coop] PadScanFrom1 (default 0): the forced scan uses 1..7 (pad 0 is the player's), fails when full
 static char __fastcall MyGetUnusedPadID(void* padMgr, void* edx, uint8_t* out) {
     if (g_blockReg && s_padPreferOffered && g_origGetUnusedPad(padMgr, edx, out)) {
         char msg[64]; wsprintfA(msg, "[Phase1] GetUnusedPadID -> offered pad %d\n", (int)*out);
@@ -18957,7 +18970,7 @@ static char __fastcall MyGetUnusedPadID(void* padMgr, void* edx, uint8_t* out) {
         return 1;
     }
     if (g_blockReg) {                                  // a puppet exists -> give it its own slot
-        for (int i = 0; i < 8; ++i) {
+        for (int i = s_padScanFrom1 ? 1 : 0; i < 8; ++i) {   // pad tables hold 8 slots (ids 0..7), need-re-closure-presence Q3
             if (((void**)padMgr)[i] == nullptr) {
                 *out = (uint8_t)i;
                 char msg[64]; wsprintfA(msg, "[Phase1] GetUnusedPadID -> forced empty pad %d\n", i);
@@ -18972,6 +18985,7 @@ static char __fastcall MyGetUnusedPadID(void* padMgr, void* edx, uint8_t* out) {
 static void InstallGetUnusedPadHook() {
     uintptr_t fn = base() + 0x344CF0;                  // PlayerPadManager::GetUnusedPadID
     s_padPreferOffered = GetPrivateProfileIntA("Coop", "PadIdPreferOffered", 0, Paths::Ini()) != 0 ? 1 : 0;   // WR-20
+    s_padScanFrom1 = GetPrivateProfileIntA("Coop", "PadScanFrom1", 0, Paths::Ini()) != 0 ? 1 : 0;
     g_origGetUnusedPad = (GetUnusedPad_t)buildTrampoline(fn, 6);
     patchJmp(fn, (void*)&MyGetUnusedPadID, 6);
     OutputDebugStringA("[Phase1] GetUnusedPadID hook installed\n");
