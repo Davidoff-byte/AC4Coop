@@ -189,7 +189,7 @@ void ShipSpawnReplayFrame(void* const* live, const uint32_t* liveCls, int liveN,
             uint64_t host = 0;
             if (got == g_fly.cls) { ++c_classOk; host = g_fly.host; }
             else {   // class not fixed per spec (addendum): give it to a pending host record of the class built, if any
-                ++c_classMiss;
+                ++c_classMiss; NoteFail(g_fly.cls, now);   // a miss counts toward GaveUp: run 2026-11-28 guest 28276 replayed 9 class-1/2 hulls for one class-3 host ship
                 for (int q = 0; q < g_qN; ++q) if (g_q[q].cls == got && ResOfHost(g_q[q].host) < 0) { host = g_q[q].host; break; }
                 _snprintf_s(line, sizeof(line), _TRUNCATE, "[ShipSpawnReplay] classMiss want=%u got=%u ent=%08X -> host=%016llX\n", g_fly.cls, got, (unsigned)c.ent, (unsigned long long)host);
                 Phase1_LogLine(line);
@@ -254,7 +254,7 @@ void ShipSpawnReplayFire()
         const uint32_t cls = g_q[i].cls;
         if (cls < 64 && !g_spec[cls].valid) {   // [Coop] SpawnLib: newest VALID spec of this class, else of any ship class
             uintptr_t sp = 0, spv = 0, ow = 0, owv = 0, cx = 0; uint32_t gc = 0;
-            if (SpawnLibPickShip(cls, &sp, &spv, &ow, &owv, &cx, &gc)) {
+            if (SpawnLibPickShip(cls, &sp, &spv, &ow, &owv, &cx, &gc) && (gc == cls || gc == 0)) {   // never a spec of another known class
                 g_spec[cls] = { sp, spv, ow, owv, cx, now, 1, 1 };
                 char ln[200]; _snprintf_s(ln, sizeof(ln), _TRUNCATE, "[ShipSpawnReplay] spec from SpawnLib want=%u libClass=%u spec=%08X owner=%08X\n", cls, gc, (unsigned)sp, (unsigned)ow);
                 Phase1_LogLine(ln);
@@ -287,7 +287,7 @@ void ShipSpawnReplayFire()
         // freed -> AV 0x1C27B15 (sub_1C27A90 <- sub_1C4BDC0 <- sub_1972150). Swap in an idle SpawnLib spec for the next fire.
         ++c_busy;
         uintptr_t sp = 0, spv = 0, ow = 0, owv = 0, cx = 0; uint32_t gc = 0;
-        if (SpawnLibPickShip(wq.cls, &sp, &spv, &ow, &owv, &cx, &gc)) s = { sp, spv, ow, owv, cx, now, 1, 1 };
+        if (SpawnLibPickShip(wq.cls, &sp, &spv, &ow, &owv, &cx, &gc) && (gc == wq.cls || gc == 0)) s = { sp, spv, ow, owv, cx, now, 1, 1 };
         return;
     }
     // Submit through spawn_lib.cpp SubmitPrivate: private owner for the naval owner class (no engine adoption; T3 crash

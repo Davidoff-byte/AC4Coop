@@ -164,6 +164,15 @@ uintptr_t __fastcall FoS4(uintptr_t, uintptr_t, uintptr_t, uintptr_t) { Interloc
 FO_STUB2(5) FO_STUB2(6) FO_STUB2(7) FO_STUB2(8) FO_STUB2(10) FO_STUB2(11)
 #undef FO_STUB2
 uintptr_t __fastcall FoS17(uintptr_t self, uintptr_t, uint32_t) { InterlockedIncrement(&c_fo[17]); return self; }   // retn 4
+// [19]: "release the request to the client after completion?" The naval client (vtable 0x0270B310) overrides the two
+// completion methods - slot 5 sub_1982900 (after sub_5C58E0) and slot 37 sub_1982940 (after sub_5C5FC0) - and calls
+// sub_5BCBE0(req) (+0x24 = 3, +0x2C = 4, queued on the client's type-3 list +0x4C) when req+0x30 != 0 && owner vt[19]().
+// The naval owner's own [19] is sub_169EB60 (return 0): it keeps its requests (type 1) and disposes them itself. We do
+// not, so our requests go back to the client. Run 2026-11-28 guest 29212 (crash H) died with [19] = 0 in the world unload
+// (sub_718650 -> listeners -> sub_48F5D0 -> sub_48BAE0) on a freed replay request still listed; our requests then also
+// sat in the real owner's container (fixed later in SubmitPrivate), so which of the two freed it is not separated.
+// No arguments, plain retn (like sub_169EB60).
+uint8_t __fastcall FoS19(uintptr_t, uintptr_t) { InterlockedIncrement(&c_fo[19]); return 1; }
 uintptr_t g_foVt[24] = {};
 alignas(16) uint8_t g_foObj[0x400] = {};   // the private owner object (zeroed); interface pointer = g_foObj + 8
 uintptr_t PrivateOwnerFor(uintptr_t real)   // player thread; real validated by the caller
@@ -174,6 +183,12 @@ uintptr_t PrivateOwnerFor(uintptr_t real)   // player thread; real validated by 
         memcpy(g_foVt, (const void*)kOwnerNavalVt, sizeof(g_foVt));
         g_foVt[4] = (uintptr_t)&FoS4; g_foVt[5] = (uintptr_t)&FoS5; g_foVt[6] = (uintptr_t)&FoS6; g_foVt[7] = (uintptr_t)&FoS7;
         g_foVt[8] = (uintptr_t)&FoS8; g_foVt[10] = (uintptr_t)&FoS10; g_foVt[11] = (uintptr_t)&FoS11; g_foVt[17] = (uintptr_t)&FoS17;
+        // [19] = 1: our requests go back to the client (its own disposal path; T17 + run 2026-11-28 04:32 survived fast
+        // travels with it). Released requests sit in the client's type-3 list +0x4C, which sub_198F080 (client vt[23]
+        // sub_1991F70) walks every tick: req vt[2] -> spec, sub_4EFD00(spec) = spec+0x24 -> [+0x14] (0x198F274). A
+        // borrowed spec freed by its engine owner while our released request still pointed at it -> AV 0x198F274 (guest
+        // 24636, at sea, before any travel). So built requests stay in g_inf and SpawnLibSpecDying re-points them too.
+        g_foVt[19] = (uintptr_t)&FoS19;
         for (int i = 0; i < 3; ++i) *(uintptr_t*)(g_foObj + 4 * i) = (uintptr_t)g_foVt;
     }
     ++c_foUsed;
@@ -186,16 +201,23 @@ Borrow g_bw[32] = {}; volatile LONG g_bwNext = 0;
 // Our submitted, not yet built requests (any owner). A spec can be freed while one of them is queued (run T5 guest 29392:
 // spec FC63CA20 freed with our request FC124C40 still queued -> sub_199D1F0 read its position params, AV 0x69D0A5).
 // The spec dtor sub_501DF0 (detoured in spawn_census.cpp) never touches the request in +0x3C, so we redirect.
-struct Inf { volatile uintptr_t req; volatile uintptr_t spec; int kind; uint32_t cls; ULONGLONG t; uintptr_t realOwner, privOwner; };
-constexpr int kInf = 256;   // no expiry: run T7 host 28300 - our request FC21EF40 stayed queued > 12 s, its entry had expired, the
+struct Inf { volatile uintptr_t req; volatile uintptr_t spec; int kind; uint32_t cls; ULONGLONG t; uintptr_t realOwner, privOwner; int built; };
+constexpr int kInf = 1024;   // no expiry: run T7 host 28300 - our request FC21EF40 stayed queued > 12 s, its entry had expired, the
                             // spec was freed later and the manager built it -> AV 0x69D0A5. Entries leave at build or when dead.
 Inf g_inf[kInf] = {}; volatile LONG g_infNext = 0;
 uintptr_t g_ourShips[64] = {}; int g_ourShipsN = 0;   // our built ships (player thread), crew diagnostics
 bool IsOurShip(uintptr_t s) { for (int i = 0; i < g_ourShipsN; ++i) if (g_ourShips[i] == s) return true; return false; }
 uintptr_t g_pendAny = 0; int g_pendKind = 0; uint32_t g_pendCls = 0; uintptr_t g_pendReal = 0, g_pendPriv = 0;   // set around our submit (player thread)
 volatile LONG c_dying = 0, c_redir = 0, c_redirFail = 0, c_ownerSwap = 0, c_ownerSwapMiss = 0; LONG c_bwEarly = 0, c_infDead = 0;
-constexpr ULONGLONG kBorrowEarlyMs = 3000;
-int InfCount() { int n = 0; for (int i = 0; i < kInf; ++i) n += g_inf[i].req != 0; return n; }   // unbuilt after 3 s: give the slot back now (the private owner cannot pair it)
+constexpr ULONGLONG kBorrowEarlyMs = 3000;   // unbuilt after 3 s: give the slot back now (the private owner cannot pair it)
+int InfCount() { int n = 0; for (int i = 0; i < kInf; ++i) n += g_inf[i].req != 0; return n; }
+int InfBuilt() { int n = 0; for (int i = 0; i < kInf; ++i) n += g_inf[i].req != 0 && g_inf[i].built; return n; }
+volatile LONG g_infLock = 0; LONG c_reqDtor = 0, c_redirOwned = 0;
+struct InfGuard { InfGuard() { while (InterlockedCompareExchange(&g_infLock, 1, 0) != 0) YieldProcessor(); } ~InfGuard() { InterlockedExchange(&g_infLock, 0); } };
+int InfSlot() {   // a free entry if there is one, else the next one round-robin
+    for (int k = 0; k < kInf; ++k) { const int i = (int)((InterlockedIncrement(&g_infNext) - 1) & (kInf - 1)); if (!g_inf[i].req) return i; }
+    return (int)((InterlockedIncrement(&g_infNext) - 1) & (kInf - 1));
+}
 void BorrowRestore(uintptr_t req)   // DetSet (manager job thread) at build, or SpawnLibFire (player thread) 3 s after submit
 {
     for (int i = 0; i < 32; ++i) {
@@ -227,9 +249,15 @@ uintptr_t SubmitPrivate(uintptr_t spec, uintptr_t owner, uintptr_t ctx, int* pri
     g_pendAny = spec; g_pendKind = SpecKindRaw(spec); g_pendCls = 0; g_pendReal = *priv ? owner : 0; g_pendPriv = *priv ? po : 0;
     { Spin s; for (int i = 0; i < g_libN; ++i) if (g_lib[i].spec == spec && g_lib[i].cls) { g_pendCls = g_lib[i].cls; break; } }
     g_ourReq = 0; t_tag = 1; SpawnShareReplayTag(1);
-    *submitted = ((char(__cdecl*)(uintptr_t, uintptr_t, uintptr_t, uint32_t, uint32_t))0x00569560)(spec, owner, ctx, 0, 0);   // real owner (see above)
+    // Submit with the PRIVATE owner: sub_79B8D0 appends the request to [req+0Ch]+4 (the owner's container, sub_48A390 at
+    // 0x79B8F7), and a request of ours left in the real naval owner's container crashed both copies (runs 2026-11-28
+    // guest 28276 / host 16964: sub_1978B50 walked owner+0x0C and called a freed request's vt[2], AV 0x1425954; host dump:
+    // the list held exactly our 3 requests). Only after the submit does req+0x0C become the real owner, so the naval
+    // builder (sub_199D1F0) takes its build-now path; DetSet swaps it back before any owner callback.
+    *submitted = ((char(__cdecl*)(uintptr_t, uintptr_t, uintptr_t, uint32_t, uint32_t))0x00569560)(spec, po, ctx, 0, 0);
     SpawnShareReplayTag(0); t_tag = 0; g_pendSpec = 0; g_pendAny = 0;
     const uintptr_t req = g_ourReq; g_ourReq = 0;
+    if (*priv && req && Readable(req, 0x14)) InterlockedCompareExchange((volatile LONG*)(req + 0x0C), (LONG)owner, (LONG)po);
     return req;
 }
 
@@ -322,7 +350,7 @@ void SpawnLibNoteFac(uintptr_t req)
     if (!t_tag || !req) return;
     g_ourReq = req;
     if (g_pendSpec) { Borrow& b = g_bw[(InterlockedIncrement(&g_bwNext) - 1) & 31]; b.spec = g_pendSpec; b.old = g_pendOld; b.t = GetTickCount64(); MemoryBarrier(); b.req = req; g_pendSpec = 0; }
-    if (g_pendAny) { Inf& f = g_inf[(InterlockedIncrement(&g_infNext) - 1) & (kInf - 1)]; f.spec = g_pendAny; f.kind = g_pendKind; f.cls = g_pendCls; f.t = GetTickCount64(); f.realOwner = g_pendReal; f.privOwner = g_pendPriv; MemoryBarrier(); f.req = req; g_pendAny = 0; }
+    if (g_pendAny) { InfGuard gd; Inf& f = g_inf[InfSlot()]; f.spec = g_pendAny; f.kind = g_pendKind; f.cls = g_pendCls; f.t = GetTickCount64(); f.realOwner = g_pendReal; f.privOwner = g_pendPriv; f.built = 0; MemoryBarrier(); f.req = req; g_pendAny = 0; }
 }
 // SpawnKeyNoteReq (submit, game threads): one submitted request with its factory args; key = static spawn key or 0.
 void SpawnLibNoteSubmit(uintptr_t item, uintptr_t owner, uintptr_t ctx, uint64_t key)
@@ -357,7 +385,7 @@ extern "C" void SpawnLibNoteBuilt(uintptr_t req, uintptr_t ent)   // C linkage: 
             if ((uintptr_t)InterlockedCompareExchange((volatile LONG*)(req + 0x0C), (LONG)f.privOwner, (LONG)f.realOwner) == f.realOwner) InterlockedIncrement(&c_ownerSwap);
             else InterlockedIncrement(&c_ownerSwapMiss);
         }
-        f.req = 0;   // built: never redirected afterwards
+        f.built = 1;   // kept: a built request still holds its spec (+0x10) until the client disposes it
     }
     BorrowRestore(req);
     if (g_fly.active && req == g_fly.req) { g_fly.ent = ent; g_fly.tBuilt = GetTickCount64(); }
@@ -378,18 +406,31 @@ extern "C" void SpawnLibSpecDying(uintptr_t spec)
 {
     if (!g_installed || !spec) return;
     { Spin s; for (int i = 0; i < g_libN; ++i) if (g_lib[i].spec == spec) g_lib[i].bad = 1; }
+    InfGuard gd;   // vs SpawnLibReqDying (request dtor, any thread): never write into a request being destroyed
     for (int i = 0; i < kInf; ++i) {
         Inf& f = g_inf[i];
         const uintptr_t req = f.req;
         if (!req || f.spec != spec) continue;
         InterlockedIncrement(&c_dying);
         for (int j = 0; j < 32; ++j) if (g_bw[j].req == req) g_bw[j].req = 0;
+        // +0x31 = the request owns its spec (request dtor sub_79C640: sub_A1E800(spec)); such a request must keep it
+        if (Readable(req, 0x34) && *(const uint8_t*)(req + 0x31)) { InterlockedIncrement(&c_redirOwned); continue; }
         LibE e;
         const bool have = (f.cls && Pick(f.kind, 0, f.cls, &e, false, spec)) || Pick(f.kind, 0, 0, &e, false, spec);
         if (have && Readable(req, 0x14) && *(const uint32_t*)req == 0x01E6D77Cu && *(const uintptr_t*)(req + 0x10) == spec) {
             InterlockedExchange((volatile LONG*)(req + 0x10), (LONG)e.spec); f.spec = e.spec; InterlockedIncrement(&c_redir);
         } else InterlockedIncrement(&c_redirFail);
     }
+}
+
+// spawn_census.cpp DetReqDtor: sub_79C640 (SpawningRequest dtor body, thiscall ecx = request; from the deleting dtor
+// vt[1] sub_79DA90 and from sub_549F10) entry, any thread. Our request is leaving: drop its entry before the body runs
+// (the body reads +0x10's +0x3C and may end the spec, which calls SpawnLibSpecDying on this thread).
+extern "C" void SpawnLibReqDying(uintptr_t req)
+{
+    if (!g_installed || !req) return;
+    InfGuard gd;
+    for (int i = 0; i < kInf; ++i) if (g_inf[i].req == req) { g_inf[i].req = 0; ++c_reqDtor; }
 }
 
 void SpawnLibNoteOurShip(uintptr_t ent) { if (ent && g_ourShipsN < 64) g_ourShips[g_ourShipsN++] = ent; }   // ship_spawn_replay.cpp: crew diagnostics
@@ -492,6 +533,7 @@ void SpawnLibFire()
     if (now >= s_maint) {
         s_maint = now + 1000;
         for (int i = 0; i < 32; ++i) { Borrow& b = g_bw[i]; const uintptr_t r = b.req; if (r && now - b.t >= kBorrowEarlyMs) { BorrowRestore(r); ++c_bwEarly; } }
+        InfGuard gd;   // fallback only: the request dtor hook (SpawnLibReqDying) drops entries exactly
         for (int i = 0; i < kInf; ++i) {
             Inf& f = g_inf[i]; const uintptr_t r = f.req;
             if (r && now - f.t > 15000 && !(Readable(r, 0x14) && *(const uint32_t*)r == 0x01E6D77Cu && *(const uintptr_t*)(r + 0x10) == f.spec)) { f.req = 0; ++c_infDead; }
@@ -570,8 +612,8 @@ void SpawnLibFire()
         int ships = 0, npcs = 0, keyed = 0, learned = 0, idleS = 0, idleN = 0, armS = 0, armN = 0;
         { Spin s; for (int i = 0; i < g_libN; ++i) { if (g_lib[i].bad) continue; const bool rd = Readable(g_lib[i].spec, 0x40); const int idle = rd && *(const uintptr_t*)(g_lib[i].spec + 0x3C) == 0; const int arm = rd && SpecArmed(g_lib[i].spec);
             if (g_lib[i].kind == K_SHIP) { ++ships; learned += g_lib[i].cls != 0; idleS += idle; armS += arm; } else { ++npcs; keyed += g_lib[i].key != 0; idleN += idle; armN += arm; } } }
-        Log("[SpawnLib] stats lib ships=%d (classKnown %d idle %d armed %d) npcs=%d (keyed %d idle %d armed %d) | want=%ld cmd=%ld follow=%ld fired=%ld submit0=%ld built=%ld placed=%ld noSpec=%ld failed=%ld badSpec=%ld busySkip=%ld unarmedSkip=%ld busyState(1/2/4/6/9/other/bad)=%ld/%ld/%ld/%ld/%ld/%ld/%ld pol=%ld queue=%d | owner priv=%ld real=%ld slot restored=%ld kept=%ld | ownerSwap=%ld miss=%ld vt4caller=%08X | early=%ld | queued=%d dead=%ld specDying=%ld redirected=%ld redirectFail=%ld | privCalls(4/5/6/7/8/10/11/17)=%ld/%ld/%ld/%ld/%ld/%ld/%ld/%ld\n",
-            ships, learned, idleS, armS, npcs, keyed, idleN, armN, c_want, c_cmd, c_follow, c_fired, c_submit0, c_built, c_placed, c_noSpec, c_failed, c_badSpec, c_busy, c_unarmed, c_st[0], c_st[1], c_st[2], c_st[3], c_st[4], c_st[5], c_st[6], g_busyPol, g_qN, c_foUsed, c_realOwner, c_bwRestored, c_bwKept, c_ownerSwap, c_ownerSwapMiss, (unsigned)g_fo4Caller, c_bwEarly, InfCount(), c_infDead, c_dying, c_redir, c_redirFail, c_fo[4], c_fo[5], c_fo[6], c_fo[7], c_fo[8], c_fo[10], c_fo[11], c_fo[17]);
+        Log("[SpawnLib] stats lib ships=%d (classKnown %d idle %d armed %d) npcs=%d (keyed %d idle %d armed %d) | want=%ld cmd=%ld follow=%ld fired=%ld submit0=%ld built=%ld placed=%ld noSpec=%ld failed=%ld badSpec=%ld busySkip=%ld unarmedSkip=%ld busyState(1/2/4/6/9/other/bad)=%ld/%ld/%ld/%ld/%ld/%ld/%ld pol=%ld queue=%d | owner priv=%ld real=%ld slot restored=%ld kept=%ld | ownerSwap=%ld miss=%ld vt4caller=%08X | early=%ld | tracked=%d built=%d reqDtor=%ld dead=%ld specDying=%ld redirected=%ld redirectFail=%ld owned=%ld | privCalls(4/5/6/7/8/10/11/17/19)=%ld/%ld/%ld/%ld/%ld/%ld/%ld/%ld/%ld\n",
+            ships, learned, idleS, armS, npcs, keyed, idleN, armN, c_want, c_cmd, c_follow, c_fired, c_submit0, c_built, c_placed, c_noSpec, c_failed, c_badSpec, c_busy, c_unarmed, c_st[0], c_st[1], c_st[2], c_st[3], c_st[4], c_st[5], c_st[6], g_busyPol, g_qN, c_foUsed, c_realOwner, c_bwRestored, c_bwKept, c_ownerSwap, c_ownerSwapMiss, (unsigned)g_fo4Caller, c_bwEarly, InfCount(), InfBuilt(), c_reqDtor, c_infDead, c_dying, c_redir, c_redirFail, c_redirOwned, c_fo[4], c_fo[5], c_fo[6], c_fo[7], c_fo[8], c_fo[10], c_fo[11], c_fo[17], c_fo[19]);
     }
     // 4. fire at most one request
     if (g_fly.active || g_qN == 0 || now - g_lastFire < kGapMs) return;

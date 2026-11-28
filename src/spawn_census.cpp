@@ -286,6 +286,20 @@ __declspec(naked) void DetSpecDtor()
             jmp dword ptr [g_tSpecDt] }
 }
 
+// [Coop] SpawnLib: sub_79C640 = SpawningRequest dtor body (thiscall, ecx = request; IDA: called by the deleting dtor
+// vt[1] sub_79DA90 at 0x79DA96 and by sub_549F10 at 0x549F56). Our request table drops the entry before the body runs.
+DWORD g_tReqDt = 0;
+extern "C" void SpawnLibReqDying(uintptr_t req);   // spawn_lib.cpp
+__declspec(naked) void DetReqDtor()
+{
+    __asm { pushad
+            push ecx
+            call SpawnLibReqDying
+            add esp, 4
+            popad
+            jmp dword ptr [g_tReqDt] }
+}
+
 bool Install(uintptr_t va, const BYTE* pro, int n, void* det, DWORD* slot, const char* name)
 {
     BYTE* site = (BYTE*)(GameModuleBase + (va - 0x00400000));
@@ -354,7 +368,10 @@ void SpawnCensusInit()
     // sub_501DF0 prologue (IDA): 55 push ebp / 8B EC mov ebp,esp / 51 push ecx / 53 push ebx / 56 push esi (6 bytes)
     static const BYTE pSpecDt[6] = { 0x55, 0x8B, 0xEC, 0x51, 0x53, 0x56 };
     const bool specDt = g_libFlag && Install(0x00501DF0, pSpecDt, 6, (void*)&DetSpecDtor, &g_tSpecDt, "SpecDtor");
-    if (g_libFlag) { g_libFlag = fac && src && set && r && specDt; SpawnLibSetHooked(g_libFlag); }
+    // sub_79C640 prologue (IDA): 55 push ebp / 8B EC mov ebp,esp / 51 push ecx / 56 push esi / 8B F1 mov esi,ecx (7 bytes)
+    static const BYTE pReqDt[7] = { 0x55, 0x8B, 0xEC, 0x51, 0x56, 0x8B, 0xF1 };
+    const bool reqDt = g_libFlag && Install(0x0079C640, pReqDt, 7, (void*)&DetReqDtor, &g_tReqDt, "RequestDtor");
+    if (g_libFlag) { g_libFlag = fac && src && set && r && specDt && reqDt; SpawnLibSetHooked(g_libFlag); }
     g_keyBind = g_keyBind && r && fac && src && set;
     g_share = shareFlag && r && fac && src;   // the lane is checked at use: Net::Init runs after this init (run 2026-11-25 13:5x)
     { char rb[32]; GetPrivateProfileStringA("Coop", "SpawnShareRadiusM", "150", rb, sizeof(rb), Paths::Ini()); g_shareR = (float)atof(rb); }
