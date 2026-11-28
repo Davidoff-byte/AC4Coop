@@ -818,6 +818,18 @@ int SpawnCrewOfShip(uintptr_t ship, uintptr_t* out, int* kinds, float* loc3, int
     }
     return n;
 }
+// spawn_lib.cpp crew census: distinct ship anchors (EntityGroup vt 0x01E4A128) of built entities in the EK ring.
+int SpawnCrewAnchors(uintptr_t* out, int cap)
+{
+    const LONG pos = g_ekPos; int n = 0;
+    for (int i = 0; i < kEK && n < cap; ++i) {
+        const EK& e = g_ek[(pos - 1 - i) & (kEK - 1)];
+        if (!e.ent || !e.anc || e.avt != 0x01E4A128u) continue;
+        bool dup = false; for (int j = 0; j < n; ++j) if (out[j] == e.anc) { dup = true; break; }
+        if (!dup) out[n++] = e.anc;
+    }
+    return n;
+}
 uint64_t SpawnKeyForHostObj(uint64_t obj)
 {
     const LONG pos = g_hkPos;
