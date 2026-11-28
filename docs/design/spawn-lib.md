@@ -24,6 +24,7 @@ Evidence: `docs/evidence/spawn-lib-2026-11-28.md` (runs, four crash root causes,
 | a spec dying under one of our queued requests → request re-pointed to a live substitute (detour `sub_501DF0`) | E (T5 guest): encounter freed the spec while our request was queued, AV 0x69D0A5 |
 | …and under one of our **built** requests too, until the request's own dtor (detour `sub_79C640`) | 0x198F274 (guest 24636): the client's released-list walk read a freed borrowed spec |
 | naval submits go into the private owner's container, never the real owner's | 0x1425954 (guest 28276, host 16964): `sub_1978B50` walked freed requests of ours in the real owner's list |
+| the borrowed slot goes back at completion (`SpawnLibLateRestore=1`: private owner vt[4]/vt[10]), not at DetSet | not a crash: completion places `spec+0x3C`'s entity at the spawn point; given back early, that was the old live ship (4/4 one-frame jumps of 65–775 m, both copies; 0/4 with the flag; evidence s16) |
 | ship specs only from the naval owner class 0x02708E80 | ship specs of class 0x026BDE50 never built (11/11 in T5+T6) |
 | `SpawnCmdSeq` acts on a value read twice in a row (1 s apart), sentinel defaults on every re-read | a key caught mid-write reads as 0: 39 / 19 phantom commands in T5 / T6 |
 

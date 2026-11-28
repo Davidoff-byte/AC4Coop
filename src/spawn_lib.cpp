@@ -57,6 +57,8 @@ struct Spin { Spin() { while (InterlockedExchange(&g_libLock, 1)) YieldProcessor
 
 bool g_installed = false;
 volatile LONG g_on = 0, g_follow = 1, g_busyPol = 1;   // [Coop] SpawnLibBusy (see SpecUsable)
+volatile LONG g_lateRestore = 0;   // [Coop] SpawnLibLateRestore (default 0): give the borrowed spec slot back at completion, not at DetSet
+volatile ULONGLONG g_lastOurBuildMs = 0;   // GetTickCount64 of our last build (DetSet), for [ShipDisp] in phase1.cpp
 __declspec(thread) int t_tag = 0;
 volatile uintptr_t g_ourReq = 0;
 
@@ -160,8 +162,17 @@ constexpr uint32_t kOwnerNavalVt = 0x02708E80u;
 volatile LONG c_fo[24] = {}; LONG c_foUsed = 0, c_realOwner = 0, c_bwRestored = 0, c_bwKept = 0;
 volatile uintptr_t g_fo4Caller = 0;   // first return address seen in FoS4 (which engine code calls owner vt[4])
 #define FO_STUB2(i) uintptr_t __fastcall FoS##i(uintptr_t, uintptr_t, uintptr_t, uintptr_t) { InterlockedIncrement(&c_fo[i]); return 0; }
-uintptr_t __fastcall FoS4(uintptr_t, uintptr_t, uintptr_t, uintptr_t) { InterlockedIncrement(&c_fo[4]); if (!g_fo4Caller) g_fo4Caller = (uintptr_t)_ReturnAddress(); return 0; }
-FO_STUB2(5) FO_STUB2(6) FO_STUB2(7) FO_STUB2(8) FO_STUB2(10) FO_STUB2(11)
+// [4] (sub_5C58E0 0x5C59BE) and [10] (sub_5C5FC0 0x5C60DA) are the adoption calls at the end of completion, both
+// push (request, entity). With SpawnLibLateRestore the borrowed slot goes back here: completion first runs the
+// spec's placement for "the spec's current request's entity" (spec vt[21] sub_4F70A0 = spec+0x3C -> req+0x34 handle;
+// position object vt[22] sub_19DD110 -> sub_56AD00), and a slot already given back at DetSet made that the OLD
+// request's live ship: run 2026-11-28 07:40 (asi D8C38B53), the displaced hull 3E6F60F0 was exactly the old request's
+// handle object, moved ~775 m to the spawn point 31 ms after each of our builds.
+void BorrowRestore(uintptr_t req);
+volatile LONG c_lateRestore = 0;
+uintptr_t __fastcall FoS4(uintptr_t, uintptr_t, uintptr_t req, uintptr_t) { InterlockedIncrement(&c_fo[4]); if (!g_fo4Caller) g_fo4Caller = (uintptr_t)_ReturnAddress(); if (g_lateRestore) { BorrowRestore(req); InterlockedIncrement(&c_lateRestore); } return 0; }
+uintptr_t __fastcall FoS10(uintptr_t, uintptr_t, uintptr_t req, uintptr_t) { InterlockedIncrement(&c_fo[10]); if (g_lateRestore) { BorrowRestore(req); InterlockedIncrement(&c_lateRestore); } return 0; }
+FO_STUB2(5) FO_STUB2(6) FO_STUB2(7) FO_STUB2(8) FO_STUB2(11)
 #undef FO_STUB2
 uintptr_t __fastcall FoS17(uintptr_t self, uintptr_t, uint32_t) { InterlockedIncrement(&c_fo[17]); return self; }   // retn 4
 // [19]: "release the request to the client after completion?" The naval client (vtable 0x0270B310) overrides the two
@@ -217,6 +228,37 @@ struct InfGuard { InfGuard() { while (InterlockedCompareExchange(&g_infLock, 1, 
 int InfSlot() {   // a free entry if there is one, else the next one round-robin
     for (int k = 0; k < kInf; ++k) { const int i = (int)((InterlockedIncrement(&g_infNext) - 1) & (kInf - 1)); if (!g_inf[i].req) return i; }
     return (int)((InterlockedIncrement(&g_infNext) - 1) & (kInf - 1));
+}
+// DetSet, our builds (first 24): the spec's spawn objects and the borrowed slot's previous request + its entity handle.
+// Run 07:40: spec+0x34 is 0 on naval specs (the job's 0x5C57E3 test skips it); +0x28 = position object vt 0x0270FC58.
+void Log(const char* fmt, ...);   // below
+// Old-ship watch: the borrowed slot's previous request's entity and where it was at our build; SpawnLibFire (player
+// thread) reports it if it jumps > 30 m within 1 s (both copies, any build of ours).
+struct OldWatch { volatile uintptr_t ent; float p[3]; ULONGLONG t; };
+OldWatch g_ow[16] = {}; volatile LONG g_owNext = 0; LONG c_owMoved = 0, c_owStill = 0;
+void BuildProbe(uintptr_t req, uintptr_t sp, uintptr_t cb)   // DetSet, our builds: classes of the spec's spawn objects (first 24)
+{
+    {   // every build: watch the old request's live ship
+        uintptr_t old = 0; for (int j = 0; j < 32; ++j) if (g_bw[j].req == req) { old = g_bw[j].old; break; }
+        const uintptr_t oh = (old && Readable(old, 0x38)) ? *(const uintptr_t*)(old + 0x34) : 0;
+        const uintptr_t oe = (oh && Readable(oh, 0x0C) && (*(const int32_t*)(oh + 8) < 0)) ? *(const uintptr_t*)oh : 0;
+        if (oe && Readable(oe, 0x50) && *(const uint32_t*)oe == kShipVt) {
+            OldWatch& w = g_ow[(InterlockedIncrement(&g_owNext) - 1) & 15];
+            w.ent = 0; const float* m = (const float*)(oe + 0x10); w.p[0] = m[12]; w.p[1] = m[13]; w.p[2] = m[14]; w.t = GetTickCount64(); MemoryBarrier(); w.ent = oe;
+        }
+    }
+    static volatile LONG s_n = 0;
+    if (InterlockedIncrement(&s_n) > 24) return;
+    auto vt = [](uintptr_t o, int slot) -> uintptr_t { if (!o || !Readable(o, 4)) return 0; const uintptr_t v = *(const uintptr_t*)o; return (slot >= 0 && Readable(v + 4 * slot, 4)) ? *(const uintptr_t*)(v + 4 * slot) : v; };
+    const uintptr_t pp = *(const uintptr_t*)(sp + 0x28);
+    const uintptr_t h = Readable(req, 0x38) ? *(const uintptr_t*)(req + 0x34) : 0;
+    const uintptr_t hObj = (h && Readable(h, 0x0C)) ? *(const uintptr_t*)h : 0, hFl = (h && Readable(h, 0x0C)) ? *(const uintptr_t*)(h + 8) : 0;
+    uintptr_t old = 0; for (int j = 0; j < 32; ++j) if (g_bw[j].req == req) { old = g_bw[j].old; break; }
+    const uintptr_t oh = (old && Readable(old, 0x38)) ? *(const uintptr_t*)(old + 0x34) : 0;
+    const uintptr_t ohObj = (oh && Readable(oh, 0x0C)) ? *(const uintptr_t*)oh : 0, ohFl = (oh && Readable(oh, 0x0C)) ? *(const uintptr_t*)(oh + 8) : 0;
+    Log("[SpawnLib] build probe req=%08X spec=%08X +28=%08X vt=%08X vt22=%08X | +34=%08X vt=%08X vt20=%08X | reqHandle=%08X obj=%08X fl=%08X | old=%08X handle=%08X obj=%08X fl=%08X\n",
+        (unsigned)req, (unsigned)sp, (unsigned)pp, (unsigned)vt(pp, -1), (unsigned)vt(pp, 22), (unsigned)cb, (unsigned)vt(cb, -1), (unsigned)vt(cb, 20),
+        (unsigned)h, (unsigned)hObj, (unsigned)hFl, (unsigned)old, (unsigned)oh, (unsigned)ohObj, (unsigned)ohFl);
 }
 void BorrowRestore(uintptr_t req)   // DetSet (manager job thread) at build, or SpawnLibFire (player thread) 3 s after submit
 {
@@ -340,6 +382,7 @@ bool SpawnLibOn()
             InterlockedExchange(&g_on, on != 0 ? 1 : 0);
             InterlockedExchange(&g_follow, GetPrivateProfileIntA("Coop", "SpawnLibFollow", 1, Paths::Ini()) != 0 ? 1 : 0);
             InterlockedExchange(&g_busyPol, GetPrivateProfileIntA("Coop", "SpawnLibBusy", 1, Paths::Ini()));
+            InterlockedExchange(&g_lateRestore, GetPrivateProfileIntA("Coop", "SpawnLibLateRestore", 0, Paths::Ini()) != 0 ? 1 : 0);
         }
     }
     return g_on != 0;
@@ -386,8 +429,10 @@ extern "C" void SpawnLibNoteBuilt(uintptr_t req, uintptr_t ent)   // C linkage: 
             else InterlockedIncrement(&c_ownerSwapMiss);
         }
         f.built = 1;   // kept: a built request still holds its spec (+0x10) until the client disposes it
+        if (f.privOwner && Readable(f.spec, 0x40)) BuildProbe(req, f.spec, *(const uintptr_t*)(f.spec + 0x34));
+        g_lastOurBuildMs = GetTickCount64();
     }
-    BorrowRestore(req);
+    if (!g_lateRestore) BorrowRestore(req);   // SpawnLibLateRestore: at completion (FoS4 / FoS10); 3 s fallback in SpawnLibFire
     if (g_fly.active && req == g_fly.req) { g_fly.ent = ent; g_fly.tBuilt = GetTickCount64(); }
     uint32_t cls = 0; uintptr_t spec = 0;
     if (!ReadBuiltShip(req, ent, &cls, &spec) || !cls || !spec) return;
@@ -433,6 +478,7 @@ extern "C" void SpawnLibReqDying(uintptr_t req)
     for (int i = 0; i < kInf; ++i) if (g_inf[i].req == req) { g_inf[i].req = 0; ++c_reqDtor; }
 }
 
+ULONGLONG SpawnLibLastBuildMs() { return g_lastOurBuildMs; }   // phase1.cpp [ShipDisp]
 void SpawnLibNoteOurShip(uintptr_t ent) { if (ent && g_ourShipsN < 64) g_ourShips[g_ourShipsN++] = ent; }   // ship_spawn_replay.cpp: crew diagnostics
 
 // ---- ship spec supply for ship_spawn_replay.cpp (player thread) ------------------------------------------------------
@@ -528,6 +574,16 @@ void SpawnLibFire()
             g_fly.active = 0;
         }
     }
+    // 2a. old-ship watch (see BuildProbe)
+    for (int i = 0; i < 16; ++i) {
+        OldWatch& w = g_ow[i]; const uintptr_t e = w.ent;
+        if (!e) continue;
+        if (now - w.t > 1000) { w.ent = 0; ++c_owStill; continue; }
+        if (!Readable(e, 0x50) || *(const uint32_t*)e != kShipVt) { w.ent = 0; continue; }
+        const float* m = (const float*)(e + 0x10); const float dx = m[12] - w.p[0], dy = m[13] - w.p[1], dz = m[14] - w.p[2];
+        const float d = sqrtf(dx * dx + dy * dy + dz * dz);
+        if (d > 30.0f) { ++c_owMoved; Log("[SpawnLib] old ship moved ent=%08X d=%.1f to=(%.1f, %.1f, %.1f) msAfterBuild=%llu late=%ld\n", (unsigned)e, d, m[12], m[13], m[14], now - w.t, g_lateRestore); w.ent = 0; }
+    }
     // 2b. our queued requests: give the borrowed slot back after 3 s; drop table entries whose request is dead (vt gone)
     static ULONGLONG s_maint = 0;
     if (now >= s_maint) {
@@ -612,8 +668,8 @@ void SpawnLibFire()
         int ships = 0, npcs = 0, keyed = 0, learned = 0, idleS = 0, idleN = 0, armS = 0, armN = 0;
         { Spin s; for (int i = 0; i < g_libN; ++i) { if (g_lib[i].bad) continue; const bool rd = Readable(g_lib[i].spec, 0x40); const int idle = rd && *(const uintptr_t*)(g_lib[i].spec + 0x3C) == 0; const int arm = rd && SpecArmed(g_lib[i].spec);
             if (g_lib[i].kind == K_SHIP) { ++ships; learned += g_lib[i].cls != 0; idleS += idle; armS += arm; } else { ++npcs; keyed += g_lib[i].key != 0; idleN += idle; armN += arm; } } }
-        Log("[SpawnLib] stats lib ships=%d (classKnown %d idle %d armed %d) npcs=%d (keyed %d idle %d armed %d) | want=%ld cmd=%ld follow=%ld fired=%ld submit0=%ld built=%ld placed=%ld noSpec=%ld failed=%ld badSpec=%ld busySkip=%ld unarmedSkip=%ld busyState(1/2/4/6/9/other/bad)=%ld/%ld/%ld/%ld/%ld/%ld/%ld pol=%ld queue=%d | owner priv=%ld real=%ld slot restored=%ld kept=%ld | ownerSwap=%ld miss=%ld vt4caller=%08X | early=%ld | tracked=%d built=%d reqDtor=%ld dead=%ld specDying=%ld redirected=%ld redirectFail=%ld owned=%ld | privCalls(4/5/6/7/8/10/11/17/19)=%ld/%ld/%ld/%ld/%ld/%ld/%ld/%ld/%ld\n",
-            ships, learned, idleS, armS, npcs, keyed, idleN, armN, c_want, c_cmd, c_follow, c_fired, c_submit0, c_built, c_placed, c_noSpec, c_failed, c_badSpec, c_busy, c_unarmed, c_st[0], c_st[1], c_st[2], c_st[3], c_st[4], c_st[5], c_st[6], g_busyPol, g_qN, c_foUsed, c_realOwner, c_bwRestored, c_bwKept, c_ownerSwap, c_ownerSwapMiss, (unsigned)g_fo4Caller, c_bwEarly, InfCount(), InfBuilt(), c_reqDtor, c_infDead, c_dying, c_redir, c_redirFail, c_redirOwned, c_fo[4], c_fo[5], c_fo[6], c_fo[7], c_fo[8], c_fo[10], c_fo[11], c_fo[17], c_fo[19]);
+        Log("[SpawnLib] stats lib ships=%d (classKnown %d idle %d armed %d) npcs=%d (keyed %d idle %d armed %d) | want=%ld cmd=%ld follow=%ld fired=%ld submit0=%ld built=%ld placed=%ld noSpec=%ld failed=%ld badSpec=%ld busySkip=%ld unarmedSkip=%ld busyState(1/2/4/6/9/other/bad)=%ld/%ld/%ld/%ld/%ld/%ld/%ld pol=%ld queue=%d | owner priv=%ld real=%ld slot restored=%ld kept=%ld | ownerSwap=%ld miss=%ld vt4caller=%08X | early=%ld | tracked=%d built=%d reqDtor=%ld dead=%ld specDying=%ld redirected=%ld redirectFail=%ld owned=%ld | lateRestore=%ld oldShip moved=%ld still=%ld | privCalls(4/5/6/7/8/10/11/17/19)=%ld/%ld/%ld/%ld/%ld/%ld/%ld/%ld/%ld\n",
+            ships, learned, idleS, armS, npcs, keyed, idleN, armN, c_want, c_cmd, c_follow, c_fired, c_submit0, c_built, c_placed, c_noSpec, c_failed, c_badSpec, c_busy, c_unarmed, c_st[0], c_st[1], c_st[2], c_st[3], c_st[4], c_st[5], c_st[6], g_busyPol, g_qN, c_foUsed, c_realOwner, c_bwRestored, c_bwKept, c_ownerSwap, c_ownerSwapMiss, (unsigned)g_fo4Caller, c_bwEarly, InfCount(), InfBuilt(), c_reqDtor, c_infDead, c_dying, c_redir, c_redirFail, c_redirOwned, c_lateRestore, c_owMoved, c_owStill, c_fo[4], c_fo[5], c_fo[6], c_fo[7], c_fo[8], c_fo[10], c_fo[11], c_fo[17], c_fo[19]);
     }
     // 4. fire at most one request
     if (g_fly.active || g_qN == 0 || now - g_lastFire < kGapMs) return;
