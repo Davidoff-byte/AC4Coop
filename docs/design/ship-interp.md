@@ -58,6 +58,21 @@ Two flags, both `[Coop]`, both re-read every second, both default 0:
   ghost gets a packet every sender frame: 90 ms buckets at 250 ms gave 0.0 %. Changing a delay live steps every hull
   by v × Δdelay once (two 1 m pops at the 400→300 switch).
 
+- **PuppetOnGhost** (`[Coop]`, re-read every second, needs `ShipGhostInterp`). The ring also carries the peer's deck
+  pose per sample (player matrix × inverse ship matrix of the same packet; bucket-averaged like the ship pose). While the
+  peer is aboard, the puppet is placed at deck pose × the frame's ghost pose (`GhostPlaceOnDeck`), so the helmsman stays
+  on his own hull whatever the two buffers' clocks do. A/B (evidence s17): deck slip > 5 cm 20.6 % → 5.2 %, p95
+  0.101 → 0.028 m at 0.9 m/s.
+
+- **ShipLocalWater** (`[Coop]`, re-read every second, default 0; bits 1 = AI hulls, 2 = the peer's ship, 4 = measure only).
+  The host's Z, pitch and roll belong to the host's water ShipInterpDelayMs ago; on the guest's water they put a hull up to
+  ~4 m (p95) off the surface in a heavy swell (evidence `ship-local-water-2026-11-28.md`, W2). With the flag, X, Y and
+  heading stay the sender's and Z, pitch, roll come from the local water: five samples (centre, ±ex, ±ey over the hull's
+  float points) through the engine's `sub_1C4FDB0` (ShipPhysicComponent → `sub_9556B0`, the query the buoyancy uses),
+  Z = plane + draft (EMA of sender Z − local plane). The ghost's commanded pose is rewritten in `GhostCmdThisFrame`, so the
+  PuppetOnGhost deck placement tilts with it; `GhostCmdZ` replaces `MirroredShipZ` while it applies. Built; the query and
+  the defect are measured live, the fix's effect is not (W3 not run).
+
 ## Measurement (both modes, for A/B)
 - `[ShipSmooth]` (guest, every 5 s) and `[GhostSmooth]` (both copies, every 5 s): the hull as the engine left it
   (AI) / as drawn after our write (ghost), per frame. `jerky` = |step − previous step| > max(25 %, 5 cm); `jitter` =
@@ -67,6 +82,10 @@ Two flags, both `[Coop]`, both re-read every second, both default 0:
   write (one frame), `underrun`, `spline`/`linear` sample counts, `fed`, the offset in use and the largest
   frame-to-frame change of its target; `[ShipPop]` lines name the hull of each pop. `accP95` = 95th percentile of the
   apparent acceleration per window.
+- `[ShipSmooth] split` (asi 640A9181+): the same acceleration test on the horizontal plane (`hJit`) and the vertical axis
+  (`zJit`) alone. `[ShipWater]` (any ShipLocalWater bit): own ship vs the local plane (corr, rel sd), AI / ghost `dev` p95.
+  `[ShipNear]`: the driven hull nearest to the own ship (test harness). Display state sets the frame rate (~30 fps asleep,
+  ~60 fps awake) and with it the sample rate: compare runs at the same state.
 - `[ShipSmooth]` reads the hull before its own write, i.e. what the previous frame left; until asi 85159A69 it stamped
   that with the current frame's time. Synthetic control (linear 8 m/s, frame dt ±2/4/8 ms): 87/94/97 % false jitter
   with that stamp, 0 % with the producing frame's stamp (fixed since asi 117D9734).
