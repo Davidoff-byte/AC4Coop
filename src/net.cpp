@@ -3242,7 +3242,7 @@ bool PoseLaneOn() { return g_enabled && g_poseOn; }
 
 void SendPose(const void* dgram, int len) {
     if (!PoseLaneOn() || !dgram || len <= 0 || len > POSE_DGRAM_MAX) return;
-    if (InterlockedCompareExchange(&g_peerReady, 0, 0) == 0) return;   // lobby: no peer yet
+    if (InterlockedCompareExchange(&g_peers[0].ready, 0, 0) == 0) return;   // lobby: no peer yet (multi-guest S2: g_peers[0].ready, was g_peerReady)
     uint16_t slot = 0;
     const sockaddr_in peer = PeerCopy(&slot);
     SendRaw(dgram, len, peer, slot);
