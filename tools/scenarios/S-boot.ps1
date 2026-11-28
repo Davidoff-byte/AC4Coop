@@ -13,14 +13,14 @@ param(
   [Parameter(Mandatory)][string]$Asi,
   [int]$Minutes = 10,
   [string]$SaveFrom = '',
-  [string]$Ini = '',
+  [string]$Ini = '',   # PowerShell names ignore case: never name another variable $ini (2026-11-28: it overwrote this one)
   [string[]]$Sites = @('tick/HumanUpdate', 'boot/CreateMutexW', 'boot/WindowStyle', 'boot/NoPause', 'boot/BinkOpen', 'boot/TitleStartUpdate', 'boot/TitleSlotHover'),
   [string]$GameDir = $(if ($env:AC4_GAME_DIR) { $env:AC4_GAME_DIR } else { "D:\SteamLibrary\steamapps\common\Assassin's Creed IV Black Flag" })
 )
 $ErrorActionPreference = 'Stop'
 $tools = Split-Path (Split-Path $MyInvocation.MyCommand.Path)
 $lock = 'D:\AC4-RE\rig.lock'
-$exe = Join-Path $GameDir 'AC4BFSP.exe'; $ini = Join-Path $GameDir 'AC4Coop.ini'; $gameAsi = Join-Path $GameDir 'AC4Coop.asi'
+$exe = Join-Path $GameDir 'AC4BFSP.exe'; $gameIni = Join-Path $GameDir 'AC4Coop.ini'; $gameAsi = Join-Path $GameDir 'AC4Coop.asi'
 $saves = Join-Path $GameDir 'save3dmgames'
 if (Get-Process AC4BFSP -ErrorAction SilentlyContinue) { throw 'AC4BFSP already running' }
 if (Test-Path $lock) { throw "rig locked: $(Get-Content $lock)" }
@@ -31,7 +31,7 @@ Set-Content $lock "S-boot $Asi $(Get-Date -Format s)"
 $results = [ordered]@{}; $ids = @()
 $awake = Start-Process powershell -ArgumentList @('-NoProfile', '-File', (Join-Path $tools 'keep_awake.ps1'), '-Minutes', ($Minutes + 20)) -WindowStyle Hidden -PassThru
 try {
-  Copy-Item $ini, $gameAsi $bk -Force
+  Copy-Item $gameIni, $gameAsi $bk -Force
   if (Test-Path $saves) { Copy-Item $saves (Join-Path $bk 'save3dmgames') -Recurse -Force }
   if ($SaveFrom) { Copy-Item (Join-Path $SaveFrom '*.save') $saves -Force }
   Copy-Item $Asi $gameAsi -Force
@@ -41,7 +41,7 @@ try {
       if ($l -match '^\s*\[(.+)\]') { $sec = $Matches[1] }
       if ($sec -eq 'Pilot' -and $l -match '^\s*Enabled\s*=') { 'Enabled=1' } else { $l }
     }
-    [IO.File]::WriteAllLines($ini, [string[]]$lines, (New-Object Text.UTF8Encoding $false))
+    [IO.File]::WriteAllLines($gameIni, [string[]]$lines, (New-Object Text.UTF8Encoding $false))
     "ini $Ini -> game ([Pilot] Enabled=1)"
   }
   "asi $($asiHash.Substring(0,16)) -> game; backup $bk"
@@ -85,7 +85,7 @@ try {
 } finally {
   Get-Process AC4BFSP -ErrorAction SilentlyContinue | ForEach-Object { [void]$_.CloseMainWindow() }; Start-Sleep 8
   Get-Process AC4BFSP -ErrorAction SilentlyContinue | Stop-Process -Force; Start-Sleep 2
-  Copy-Item (Join-Path $bk 'AC4Coop.ini') $ini -Force; Copy-Item (Join-Path $bk 'AC4Coop.asi') $gameAsi -Force
+  Copy-Item (Join-Path $bk 'AC4Coop.ini') $gameIni -Force; Copy-Item (Join-Path $bk 'AC4Coop.asi') $gameAsi -Force
   if (Test-Path (Join-Path $bk 'save3dmgames')) { Copy-Item (Join-Path $bk 'save3dmgames\*') $saves -Recurse -Force }
   Remove-Item $lock -ErrorAction SilentlyContinue
   if ($awake) { $awake | Stop-Process -Force -ErrorAction SilentlyContinue }
