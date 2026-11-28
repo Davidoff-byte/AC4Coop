@@ -40,7 +40,7 @@ NET_MAGIC = 0x43344341         # 'AC4C'  netstate.h
 NET_ENTITY_MAGIC = 0x45344341  # 'AC4E'  netstate.h
 NET_LOBBY_MAGIC = 0x4C344341   # 'AC4L'  netstate.h
 NET_INTENT_MAGIC = 0x49344341  # 'AC4I'  netstate.h, proto 15 intention lane
-NET_PROTO_VER = 18   # 18: wave-1121 bump (pose lane 'AC4P' + perceive GAL 18 B); 17: IC_ACTION payload may carry 2 perception bytes (lane payload only) + pose lane 'AC4P'; 16: datagram budget 1170 B (EOS); 15: intention lane datagram 'AC4I'; PlayerState, entity header (36 B) and LobbyPacket unchanged
+NET_PROTO_VER = 18   # 18: wave-1121 bump (pose lane 'AC4P' + perceive GAL 18 B; IC_ATK_A/B also guest -> host, [Coop] CounterSync, lane payload only); 17: IC_ACTION payload may carry 2 perception bytes (lane payload only) + pose lane 'AC4P'; 16: datagram budget 1170 B (EOS); 15: intention lane datagram 'AC4I'; PlayerState, entity header (36 B) and LobbyPacket unchanged
 SIZEOF_PLAYERSTATE = 576       # netstate.h static_assert
 
 # ---- proto 15 intention lane (src/netstate.h IntentWireHeader, src/net.cpp IntentPut*/IntentParse) ----

@@ -1,0 +1,22 @@
+NewFightDamageResponseEvent @ 0x18480F0  (size 152)   -- probe receipt, no cl 16.00.40219.01 on this machine
+measured 2026-11-27 (counter-sync S2) against the pinned binary; IDA 9.3 session 76541c37 (private copy of AC4BFSP.exe.i64)
+
+claim
+    cdecl, no arguments, plain `retn` at 0x1848187; returns the new event in eax (esi).
+    EnterCriticalSection(unk_2AC1FCC) via sub_D587F0 at entry, LeaveCriticalSection via sub_AC6580 (0x184817E) at exit:
+    LOCK-TAKING -> never call under __try (a swallowed fault would leave the section held).
+    body: sub_418A80(16, 4) = 16-byte block; ctor sub_18A6280 (sub_650DF0 base, [2] = 0, [3] = 0, vt 0x026FF89C =
+    FightDamageResponseEvent per COMBAT-RE.md:31); appended to the engine event pool dword_2AC1FBC (count word_2AC1FC2).
+    sub_10EFC30 (FightDamageEvent, 0x170 B) has the same shape and takes the same section.
+    caller pattern (sub_18DA720, disasm 0x18DA738..0x18DA74F): e = sub_18480F0(); e[2] = fde[0x54]; e[3] = fde + 0x70;
+    sub_64D8C0(ecx = e, attacker)  where attacker = desc+0x10, the same value sub_16551A0 passes as sub_18BD690's last
+    (attacker) argument.
+
+use in the plugin
+    src/phase1.cpp CounterHostApplyFire ([Coop] CounterHostApply): host, player-update thread, called from OnFrame AFTER
+    the OnFrameInner __try and outside every __try, after lock-free validation of the guard, the puppet handle and the
+    guard's Ground path; then sub_64D8C0(e, guard) (also outside __try; it takes EnterCriticalSection(dword_2AC1FA0)).
+
+limit of this receipt
+    proves bytes + body only. Pool ownership / release of the event and of the host-built FDE is UNVERIFIED (the plugin
+    never frees either, as AttackForward_Post already does). Live behaviour (guard -> 528) is UNVERIFIED.

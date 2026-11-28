@@ -160,6 +160,8 @@ static const uint32_t NET_MAGIC = 0x43344341; // 'AC4C'
 // offset, so both peers MUST run the same build. Bump this whenever the layout changes.
 static const uint32_t NET_PROTO_VER = 18;  // 18: integration wave 1121 bump (one bump for the wave): pose lane 'AC4P',
                                            //     perceive GAL 18 B payload; later branches of this wave also target 18
+                                           //     + counter-sync: IC_ATK_A / IC_ATK_B also flow guest -> host on wireId 'AVATARO3' ([Coop] CounterSync,
+                                           //       phase1.cpp CtrA/CtrB, 32 B each): a counter/block result; datagram unchanged
                                            // 17: IC_ACTION (GuardActionLane) payload may be 18 B: + u8 perception stage,
                                            //     u8 targetIsPuppet ([Coop] GuardPerceivePuppet, phase1.cpp GalPayloadP);
                                            //     the 16 B payload is still sent with the flag off and still accepted
@@ -356,7 +358,8 @@ enum IntentChannel : uint8_t {
     IC_DAMAGE    = 6,   // guest -> host damage request on a host-owned guard ([Coop] OwnerDamage, S9): running total
     IC_PDAMAGE   = 7,   // host -> owner: a guard's hit on that player's puppet ([Coop] PlayerDamageRelay): running total
     IC_ATK_A     = 8,   // host -> owner: [Coop] AttackForward part A (seq, bytes, f336, f60, f5C)
-    IC_ATK_B     = 9,   //                part B (seq, f110 f124 f128 f120 f11C f114 f130)
+    IC_ATK_B     = 9,   //                part B (seq, f110 f124 f128 f120 f11C f114 f130). Proto 18: A + B also guest -> host
+                        //                on wireId 'AVATARO3' = one [Coop] CounterSync result (phase1.cpp CtrA / CtrB)
     IC_ATK_C     = 10,  //                part C (seq, dir xy, pos xyz, f50)
     IC_SHIP      = 11,  // host -> guest: a ship's SailState as a memento ([Coop] SailSync,
                         //                docs/design/sail-memento.md). Payload IntentShipMemento.

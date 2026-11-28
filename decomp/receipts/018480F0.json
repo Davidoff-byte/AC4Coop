@@ -1,0 +1,15 @@
+{
+ "unit": "018480F0",
+ "addr": "0x018480F0",
+ "size": 152,
+ "name": "NewFightDamageResponseEvent",
+ "submitted_at": "2026-11-27T14:40:15Z",
+ "original_sha": "cefdb0c3b05c4092b01de49b21bbd32523b204525596fdb482669bbdebea8ade",
+ "candidate_src_sha": "cd90ffc5c6ce87b35dd73bac10a99b4948c6d9b2f789b16318047ca45988c670",
+ "candidate_src": "018480F0.cpp",
+ "arm": "probe",
+ "verdict": "UNVERIFIED-EVIDENCE",
+ "detail": "no object supplied: the pinned compiler (cl 16.00.40219.01) is not installed, so byte equality cannot be checked. Recorded as evidence only - never a match.",
+ "evidence": "018480F0.txt",
+ "evidence_sha": "22e3c0f8836c805fd49e3f51262f8fb511fd52b7fa85e62594362ad453bb09f2"
+}

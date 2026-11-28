@@ -426,7 +426,7 @@ void* AttackForward_Build(void* attacker, const AtkFields& a)
     } __except (AfFaultNote(GetExceptionInformation())) { return nullptr; }
 }
 
-bool AttackForward_Post(void* victim, void* attacker, const AtkFields& a)
+bool AttackForward_Post(void* victim, void* attacker, const AtkFields& a, void** outFde)
 {
     __try {
         char* f = ((char* (__cdecl*)())0x010EFC30)();
@@ -447,6 +447,7 @@ bool AttackForward_Post(void* victim, void* attacker, const AtkFields& a)
         t_afPosting = 1;
         ((void(__thiscall*)(void*, void*))0x0064D8C0)(f, victim);
         t_afPosting = 0;
+        if (outFde) *outFde = f;
         return true;
     } __except (AfFaultNote(GetExceptionInformation())) { t_afPosting = 0; return false; }
 }

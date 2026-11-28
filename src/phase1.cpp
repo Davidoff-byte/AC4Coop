@@ -11451,6 +11451,213 @@ static AfQ s_afQ[64]; static LONG s_afHead = 0, s_afTail = 0; static SRWLOCK s_a
 static struct { uintptr_t att; ULONGLONG ms0, ms1; } s_afRecent[16]; static int s_afRecentI = 0;
 static volatile LONG s_afSeen[2] = {}, s_afTx[2] = {}, s_afRx[2] = {}, s_afPost[2] = {}, s_afUnres = 0, s_afFail = 0, s_afDropped = 0, s_afFallback = 0;
 
+// ---- [Coop] CounterProbe / CounterSync / CounterHostApply / CounterGuestVeto (all default 0, read once at load) --------
+// Defender-resolved counters: ops/evidence/combat-counter-sync-design-2026-11-27.md, docs/design/counter-sync.md. The
+// guest's engine decides each forwarded attack against its own input buffer (sub_185DA80 -> interface 78 slot 11/12 ->
+// sub_184C9D0 / sub_1862530). AttackForward_Post's dispatch is synchronous, so when it returns the FDE's
+// FightDamageResponse R (fde+0x70) holds the decision: type fde+0x90 (= R+0x20) 20/21/22 counter-kill (sub_1861EC0),
+// 16/17/18/23 block family; phase fde+0x54 (sub_1861EC0 sets 1 on a counter-kill).
+static int g_ctrProbe = 0, g_ctrSync = 0, g_ctrVeto = 0, g_ctrVetoMs = 1500;
+// [Coop] CounterSync wire (proto 18): guest -> host, IC_ATK_A + IC_ATK_B on ONE key (wireId kCtrWire, like kPdrWire), so the
+// host's per-guard ForgetIntents (AttackForwardHostPump, 2 s idle) never drops this key's receive order. Joined by
+// (seq, guard low 32). IntentMsg.hostMs = the decision time on the host clock (PeerClock::HostUs / 1000), 0 = no estimate.
+static const uint64_t kCtrWire = 0x4156415441524F33ull;   // 'AVATARO3': the guest avatar's defence results
+#pragma pack(push, 1)
+struct CtrA { uint64_t guard; uint32_t seq; uint8_t phase, type, postedPh, b48, b49, b4A, b4B, rsv; uint32_t r24, r28, r2C; };
+struct CtrB { uint32_t seq, guardLo, r30, r38, r3C, r40, r44, r4C; };
+#pragma pack(pop)
+static_assert(sizeof(CtrA) == 32 && sizeof(CtrB) == 32, "CounterSync payloads are wire layouts");
+struct CtrResp { uint32_t phase, type, r24, r28, r2C, r30, r38, r3C, r40, r44, r4C; uint8_t b48, b49, b4A, b4B; };
+static bool CtrRead(const void* fde, CtrResp& r) {   // plain reads of the FDE the engine just handled; no engine calls
+    __try {
+        const char* p = (const char*)fde;
+        auto D = [&](int o) { return *(const uint32_t*)(p + o); };
+        r.phase = D(0x54); r.type = D(0x90); r.r24 = D(0x94); r.r28 = D(0x98); r.r2C = D(0x9C); r.r30 = D(0xA0);
+        r.r38 = D(0xA8); r.r3C = D(0xAC); r.r40 = D(0xB0); r.r44 = D(0xB4); r.r4C = D(0xBC);
+        r.b48 = (uint8_t)p[0xB8]; r.b49 = (uint8_t)p[0xB9]; r.b4A = (uint8_t)p[0xBA]; r.b4B = (uint8_t)p[0xBB];
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+static volatile LONG s_ctrSeen = 0, s_ctrResp = 0, s_ctrKill = 0, s_ctrDup = 0, s_ctrTx = 0, s_ctrTxFail = 0, s_ctrRx = 0, s_ctrStale = 0;
+static struct { uint64_t id; uint32_t seq; } s_ctrDone[16]; static int s_ctrDoneI = 0;   // (guard, AF seq) already resolved
+static bool CtrGuestOn() { return g_ctrProbe != 0 || g_ctrSync != 0 || g_ctrVeto != 0; }
+// Guest: ship one resolved response to the host (S1).
+static void CounterGuestTx(uint64_t id, uint32_t seq, int postedPh, const CtrResp& r) {
+    if (!g_ctrSync || g_entHost == 1) return;
+    CtrA a = { id, seq, (uint8_t)r.phase, (uint8_t)r.type, (uint8_t)postedPh, r.b48, r.b49, r.b4A, r.b4B, 0, r.r24, r.r28, r.r2C };
+    CtrB b = { seq, (uint32_t)id, r.r30, r.r38, r.r3C, r.r40, r.r44, r.r4C };
+    uint64_t hu = 0;
+    const uint32_t hostMs = PeerClock::HostUs(&hu) ? (uint32_t)(hu / 1000) : 0;
+    const bool ok = Net::PublishIntent(0, kCtrWire, IC_ATK_A, hostMs, &a, 32) && Net::PublishIntent(0, kCtrWire, IC_ATK_B, hostMs, &b, 32);
+    InterlockedIncrement(ok ? &s_ctrTx : &s_ctrTxFail);
+    if (ok) Net::PumpIntents();
+    static LONG s_lines = 0;
+    if (InterlockedIncrement(&s_lines) <= 400)
+        L("[CTR] guest tx guard=%016llX seq=%u type=%u ph=%u hostMs=%u ok=%d\n", (unsigned long long)id, seq, r.type, r.phase, hostMs, ok ? 1 : 0);
+}
+// Guest, player frame, right after AttackForward_Post(.., &f) returned for guard `id`, AF event `seq`. True = the post
+// resolved to a response (type != 0) for the first time for this (guard, seq).
+static bool CounterGuestPosted(uint64_t id, uint32_t seq, int postedPh, void* f) {
+    CtrResp r;
+    if (!f || !CtrRead(f, r)) return false;
+    InterlockedIncrement(&s_ctrSeen);
+    if (r.type == 0) return false;
+    for (int i = 0; i < 16; ++i) if (s_ctrDone[i].id == id && s_ctrDone[i].seq == seq) { InterlockedIncrement(&s_ctrDup); return false; }
+    s_ctrDone[s_ctrDoneI].id = id; s_ctrDone[s_ctrDoneI].seq = seq; s_ctrDoneI = (s_ctrDoneI + 1) & 15;
+    InterlockedIncrement(&s_ctrResp);
+    if (r.type >= 20 && r.type <= 22) InterlockedIncrement(&s_ctrKill);
+    static LONG s_lines = 0;
+    if (g_ctrProbe && InterlockedIncrement(&s_lines) <= 400)
+        L("[CTR] guest resp guard=%016llX seq=%u ph=%u type=%u var=%u posted=%d r28=%u r2C=%u r30=%u b4B=%u\n", (unsigned long long)id,
+          seq, r.phase, r.type, r.r40, postedPh, r.r28, r.r2C, r.r30, r.b4B);
+    CounterGuestTx(id, seq, postedPh, r);   // [Coop] CounterSync
+    return true;
+}
+// Host: (guard, AF seq) -> publish time, so a CounterSync result can be dated without PeerClock and stale replays dropped.
+static struct { uint64_t id; uint32_t seq; ULONGLONG ms; } s_ctrTxRing[256]; static int s_ctrTxRingI = 0;
+static bool CtrHostPath(uint64_t id, uint16_t p[6]) {   // the guard's Ground path now (host)
+    Entity* e = FiResolve(id);
+    Human* h = e ? AIEntityHelper::GetHuman(e) : nullptr;
+    char* hg = h ? FiHumanGround(h) : nullptr;
+    return hg && FiPath(hg, p, nullptr);
+}
+static void CounterHostResolved(const CtrA& a, const CtrB& b, uint32_t hostMs);   // S2 (below the drain helpers)
+// Host, player frame (lane drain): one half of a result; both halves -> CounterHostResolved.
+static struct { uint32_t seq, lo; uint8_t mask; CtrA a; CtrB b; uint32_t hostMs; } s_ctrAsm[8]; static int s_ctrAsmI = 0;
+static void CounterHostRx(const Net::IntentMsg& m) {
+    if (!g_ctrSync || g_entHost != 1 || m.len != 32) return;
+    CtrA a = {}; CtrB b = {}; uint32_t seq, lo;
+    if (m.channel == IC_ATK_A) { memcpy(&a, m.payload, 32); seq = a.seq; lo = (uint32_t)a.guard; }
+    else { memcpy(&b, m.payload, 32); seq = b.seq; lo = b.guardLo; }
+    int k = -1;
+    for (int i = 0; i < 8; ++i) if (s_ctrAsm[i].mask && s_ctrAsm[i].seq == seq && s_ctrAsm[i].lo == lo) { k = i; break; }
+    if (k < 0) { k = s_ctrAsmI; s_ctrAsmI = (s_ctrAsmI + 1) & 7; s_ctrAsm[k].seq = seq; s_ctrAsm[k].lo = lo; s_ctrAsm[k].mask = 0; }
+    if (m.channel == IC_ATK_A) { s_ctrAsm[k].a = a; s_ctrAsm[k].mask |= 1; } else { s_ctrAsm[k].b = b; s_ctrAsm[k].mask |= 2; }
+    s_ctrAsm[k].hostMs = m.hostMs;
+    if (s_ctrAsm[k].mask != 3) return;
+    s_ctrAsm[k].mask = 0;
+    InterlockedIncrement(&s_ctrRx);
+    const CtrA& ra = s_ctrAsm[k].a;
+    const ULONGLONG now = GetTickCount64();
+    long long rt = -1;
+    for (int i = 0; i < 256; ++i) if (s_ctrTxRing[i].id == ra.guard && s_ctrTxRing[i].seq == ra.seq) { rt = (long long)(now - s_ctrTxRing[i].ms); break; }
+    long long age = -1; uint64_t hu = 0;
+    if (s_ctrAsm[k].hostMs && PeerClock::HostUs(&hu)) age = (long long)(int32_t)((uint32_t)(hu / 1000) - s_ctrAsm[k].hostMs);
+    uint16_t p[6] = {}; const bool have = CtrHostPath(ra.guard, p);
+    const bool stale = rt < 0 || rt > 2000;   // not an attack we forwarded in the last 2 s: a replay to a rejoined peer, or lost
+    if (stale) InterlockedIncrement(&s_ctrStale);
+    static LONG s_lines = 0;
+    if (InterlockedIncrement(&s_lines) <= 400)
+        L("[CTR] host rx guard=%016llX seq=%u type=%u ph=%u age=%lldms rt=%lldms path=%u/%u%s%s\n", (unsigned long long)ra.guard, ra.seq, ra.type,
+          ra.phase, age, rt, p[4], p[5], have ? "" : " (no path)", stale ? " STALE (dropped)" : "");
+    if (!stale) CounterHostResolved(ra, s_ctrAsm[k].b, s_ctrAsm[k].hostMs);
+}
+// Host, player frame (AttackForwardHostPump): the guard's Ground path at each forwarded warning / hit to the puppet.
+static void CounterHostTxNote(uintptr_t att, uint64_t id, uint32_t seq, int ph) {
+    if (g_ctrSync) { s_ctrTxRing[s_ctrTxRingI].id = id; s_ctrTxRing[s_ctrTxRingI].seq = seq; s_ctrTxRing[s_ctrTxRingI].ms = GetTickCount64(); s_ctrTxRingI = (s_ctrTxRingI + 1) & 255; }
+    if (!g_ctrProbe) return;
+    static LONG s_lines = 0;
+    if (InterlockedIncrement(&s_lines) > 400) return;
+    Human* h = AIEntityHelper::GetHuman((Entity*)att);
+    char* hg = h ? FiHumanGround(h) : nullptr; uint16_t p[6] = {};
+    const bool have = hg && FiPath(hg, p, nullptr);
+    L("[CTR] host atk guard=%016llX seq=%u ph=%d path=%u/%u/%u/%u/%u/%u%s\n", (unsigned long long)id, seq, ph, p[0], p[1], p[2], p[3], p[4],
+      p[5], have ? "" : " (unreadable)");
+}
+// ---- S2 [Coop] CounterHostApply (default 0; 1 = apply, 2 = negative control: the same post with type 0, phase 1) ------
+// Rebuild what sub_18DA720 does at 0x18DA72F..0x18DA74F for the guest's decision: f = sub_10EFC30() (a ctor'd FDE gives a
+// ctor'd FightDamageResponse R at f+0x70, ctor sub_18BDC40), R from the wire, R+0x34 = the puppet's handle (refcount as
+// 0x185DAA6..0x185DB06), f+0x54 = phase; e = sub_18480F0(); e[2] = f[0x54]; e[3] = f+0x70; sub_64D8C0(e, guard). The guard's
+// CSHumanFightInteractions slot 19 (sub_1809C10) then runs IHG 182-185 and 207 Can / 208 Do (-> 528 per the design).
+// sub_10EFC30 / sub_18480F0 take EnterCriticalSection(unk_2AC1FCC), sub_64D8C0 takes dword_2AC1FA0 (IDA 76541c37): all three
+// run from OnFrame AFTER the OnFrameInner __try, outside every __try (as ShipSpawnReplayFire); validation is lock-free first.
+static int g_ctrApply = 0;
+static volatile LONG s_ctrQueued = 0, s_ctrGate = 0, s_ctrApplied = 0, s_ctrApplyOk = 0, s_ctrApplyFail = 0, s_ctrUnsupported = 0, s_ctrHandleZero = 0;
+struct CtrApplyQ { uint64_t id; Entity* guard; Human* human; CtrA a; CtrB b; ULONGLONG ms; };
+static CtrApplyQ s_ctrQ[8]; static int s_ctrQN = 0;
+static struct { int on, okNow; uint64_t id; Human* human; uint32_t type; uint16_t before[6]; } s_ctrCheck = {};
+static void CounterHostResolved(const CtrA& a, const CtrB& b, uint32_t) {   // host, player frame (lane drain, inside its __try)
+    if (!g_ctrApply || g_entHost != 1) return;
+    if (a.type == 5) { InterlockedIncrement(&s_ctrUnsupported); return; }   // R+0x50 (sub_181B850 path) is not carried in v1
+    Entity* e = FiResolve(a.guard);
+    Human* h = e ? AIEntityHelper::GetHuman(e) : nullptr;
+    if (!e || !h || s_ctrQN >= 8) { InterlockedIncrement(&s_ctrApplyFail); L("[CTR] host apply guard=%016llX seq=%u -> not queued (%s)\n", (unsigned long long)a.guard, a.seq, s_ctrQN >= 8 ? "queue full" : "no guard"); return; }
+    s_ctrQ[s_ctrQN].id = a.guard; s_ctrQ[s_ctrQN].guard = e; s_ctrQ[s_ctrQN].human = h; s_ctrQ[s_ctrQN].a = a; s_ctrQ[s_ctrQN].b = b; s_ctrQ[s_ctrQN].ms = GetTickCount64();
+    ++s_ctrQN; InterlockedIncrement(&s_ctrQueued);
+}
+static bool CtrPathOf(Human* h, uint16_t p[6]) { char* hg = h ? FiHumanGround(h) : nullptr; return hg && FiPath(hg, p, nullptr); }   // readable() probes only
+static bool CtrHas528(const uint16_t p[6]) { for (int i = 0; i < 6; ++i) if (p[i] == 528) return true; return false; }
+// Plain field writes into the FDE we just allocated + the handle refcount (interlocked, as 0x185DAB0..0x185DAD2). No engine
+// call: if the old handle's count reaches 0 it is NOT freed (sub_A094D0 not called; counted) - the ctor's is the null handle.
+static bool CtrFill(char* f, const CtrA& a, const CtrB& b, uintptr_t hnd, bool control) {
+    __try {
+        char* R = f + 0x70;
+        auto SD = [&](int o, uint32_t v) { *(uint32_t*)(R + o) = v; };
+        SD(0x20, control ? 0u : a.type); SD(0x24, a.r24); SD(0x28, a.r28); SD(0x2C, a.r2C); SD(0x30, b.r30); SD(0x38, b.r38);
+        SD(0x3C, b.r3C); SD(0x40, b.r40); SD(0x44, b.r44); SD(0x4C, b.r4C);
+        R[0x48] = (char)a.b48; R[0x49] = (char)a.b49; R[0x4A] = (char)a.b4A; R[0x4B] = (char)a.b4B;
+        *(uint32_t*)(f + 0x54) = control ? 1u : (a.phase ? 1u : 0u);
+        InterlockedIncrement((volatile LONG*)(hnd + 4));
+        const uintptr_t old = (uintptr_t)InterlockedExchange((volatile LONG*)(R + 0x34), (LONG)hnd);
+        if (old && InterlockedDecrement((volatile LONG*)(old + 4)) == 0) InterlockedIncrement(&s_ctrHandleZero);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+static bool CtrFillEvt(char* e, char* f) {
+    __try {
+        if (*(uint32_t*)e != 0x026FF89Cu) return false;   // FightDamageResponseEvent vt (ctor sub_18A6280)
+        *(uint32_t*)(e + 8) = *(uint32_t*)(f + 0x54); *(char**)(e + 0xC) = f + 0x70;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+// Host, OnFrame after the OnFrameInner __try (player-update thread only). NO __try here on purpose. One apply per frame.
+void CounterHostApplyFire() {
+    if (!g_ctrApply || g_entHost != 1) return;
+    if (s_ctrCheck.on) {   // the frame after an apply: did the guard reach 528?
+        uint16_t p[6] = {};
+        const bool have = CtrPathOf(s_ctrCheck.human, p), ok = s_ctrCheck.okNow || (have && CtrHas528(p));
+        if (ok && s_ctrCheck.type) InterlockedIncrement(&s_ctrApplyOk);
+        L("[CTR] host apply+1f guard=%016llX type=%u path %u/%u -> %u/%u ok=%d\n", (unsigned long long)s_ctrCheck.id, s_ctrCheck.type,
+          s_ctrCheck.before[4], s_ctrCheck.before[5], p[4], p[5], ok ? 1 : 0);
+        s_ctrCheck.on = 0;
+    }
+    if (!s_ctrQN) return;
+    const CtrApplyQ q = s_ctrQ[0];
+    for (int i = 1; i < s_ctrQN; ++i) s_ctrQ[i - 1] = s_ctrQ[i];
+    --s_ctrQN;
+    const bool control = g_ctrApply == 2;
+    // Lock-free validation: guard body (vt + own handle), Ground path gate, puppet handle (entity = [h+8] < 0 ? [h] : 0).
+    const uintptr_t g = (uintptr_t)q.guard;
+    bool ok = readable(q.guard, 0xCC) && *(const uint32_t*)g == 0x01E4CE90u;
+    if (ok) { const uintptr_t gh = *(const uintptr_t*)(g + 0xC8); ok = readable((void*)gh, 12) && *(const uintptr_t*)gh == g; }
+    uint16_t before[6] = {};
+    const bool havePath = ok && CtrPathOf(q.human, before);
+    const uintptr_t pup = (uintptr_t)Phase1_PuppetEntity();
+    uintptr_t ph = 0;
+    if (pup && readable((void*)pup, 0xCC)) { ph = *(const uintptr_t*)(pup + 0xC8); if (!readable((void*)ph, 12) || *(const uintptr_t*)ph != pup || *(const int*)(ph + 8) >= 0) ph = 0; }
+    const uint32_t type = q.a.type;
+    const bool gate = havePath && ((before[4] == 173 && (before[5] == 180 || before[5] == 186 || type == 24)) || before[4] == 217);
+    if (!ok || !ph || !gate || GetTickCount64() - q.ms > 500) {
+        InterlockedIncrement(&s_ctrGate);
+        L("[CTR] host apply guard=%016llX type=%u seq=%u path %u/%u -> skipped (%s)%s\n", (unsigned long long)q.id, type, q.a.seq, before[4], before[5],
+          !ok ? "guard gone" : !ph ? "no puppet handle" : !gate ? "gate: not 173/180|186, 173+type24, 217" : "queued > 500 ms",
+          (type >= 20 && type <= 22) ? " fallback=OwnerDamage" : " fallback=log");
+        return;
+    }
+    char* f = ((char* (__cdecl*)())0x010EFC30)();   // FightDamageEvent (takes unk_2AC1FCC)
+    if (!f || !CtrFill(f, q.a, q.b, ph, control)) { InterlockedIncrement(&s_ctrApplyFail); L("[CTR] host apply guard=%016llX -> FDE build failed\n", (unsigned long long)q.id); return; }
+    char* e = ((char* (__cdecl*)())0x018480F0)();   // FightDamageResponseEvent (takes unk_2AC1FCC)
+    if (!e || !CtrFillEvt(e, f)) { InterlockedIncrement(&s_ctrApplyFail); L("[CTR] host apply guard=%016llX -> response event build failed\n", (unsigned long long)q.id); return; }
+    ((void(__thiscall*)(void*, void*))0x0064D8C0)(e, q.guard);   // synchronous: sub_1809C10 on the guard (takes dword_2AC1FA0)
+    InterlockedIncrement(&s_ctrApplied);
+    uint16_t after[6] = {};
+    CtrPathOf(q.human, after);
+    const uint32_t sentType = control ? 0u : type;
+    L("[CTR] host apply guard=%016llX type=%u ph=%u seq=%u%s path %u/%u -> %u/%u ok=%d\n", (unsigned long long)q.id, sentType, control ? 1u : q.a.phase,
+      q.a.seq, control ? " CONTROL" : "", before[4], before[5], after[4], after[5], CtrHas528(after) ? 1 : 0);
+    s_ctrCheck.on = 1; s_ctrCheck.okNow = CtrHas528(after) ? 1 : 0; s_ctrCheck.id = q.id; s_ctrCheck.human = q.human; s_ctrCheck.type = sentType; memcpy(s_ctrCheck.before, before, sizeof(before));
+}
+
 // Host, any thread (the attacker's event post).
 void Phase1_PuppetAttackPosted(uintptr_t att, const AtkFields& a) {
     if (!AfOn() || g_entHost != 1) return;
@@ -11497,6 +11704,7 @@ static void AttackForwardHostPump() {
         static LONG s_lines = 0;
         if ((a.phase || s_lines < 40) && InterlockedIncrement(&s_lines) <= 300)
             L("[AF] tx %s guard=%016llX seq=%u type=%u sub=%u ok=%d\n", a.phase ? "HIT" : "warn", (unsigned long long)id, seq, a.type, a.sub, ok ? 1 : 0);
+        CounterHostTxNote(q.att, id, seq, a.phase ? 1 : 0);   // [Coop] CounterProbe / CounterSync
         int k = -1; for (int i = 0; i < s_liveN; ++i) if (s_live[i].id == id) { k = i; break; }
         if (k < 0 && s_liveN < 32) { k = s_liveN++; s_live[k].id = id; }
         if (k >= 0) s_live[k].ms = now;
@@ -11508,8 +11716,28 @@ static void AttackForwardHostPump() {
 
 // Owner (guest): assemble the three parts, then keep / post the attack.
 static struct { uint64_t id; uint32_t seq; uint8_t mask; AtkFields a; } s_afAsm[16]; static int s_afAsmI = 0;
-static struct { uint64_t id; unsigned int ent; AtkFields a; ULONGLONG ms; bool live; } s_afAct[16];
+static struct { uint64_t id; unsigned int ent; AtkFields a; ULONGLONG ms; bool live; uint32_t seq; } s_afAct[16];
 static uint32_t s_afCtpSeq = 0, s_afCtpMs = 0;   // [Coop] CombatTimingProbe: seq / publish time of the event being delivered
+// [Coop] CounterGuestVeto (S3, default 0): the AF slot k's attack was just resolved by the local engine (type != 0, first
+// time for its seq): stop re-posting that warning and drop this guard's forwarded HITs for [Coop] CounterVetoMs (1500).
+static struct { uint64_t id; uint32_t seq; ULONGLONG until; } s_ctrVetoT[16]; static int s_ctrVetoI = 0;
+static volatile LONG s_ctrVetoed = 0, s_ctrVetoSet = 0;
+static void CounterGuestResolved(int k) {
+    if (!g_ctrVeto || k < 0 || k >= 16) return;
+    s_afAct[k].live = false;
+    const uint64_t id = s_afAct[k].id;
+    int v = -1;
+    for (int i = 0; i < 16; ++i) if (s_ctrVetoT[i].id == id) { v = i; break; }
+    if (v < 0) { v = s_ctrVetoI; s_ctrVetoI = (s_ctrVetoI + 1) & 15; }
+    s_ctrVetoT[v].id = id; s_ctrVetoT[v].seq = s_afAct[k].seq; s_ctrVetoT[v].until = GetTickCount64() + (ULONGLONG)g_ctrVetoMs;
+    InterlockedIncrement(&s_ctrVetoSet);
+}
+static int CounterVetoFor(uint64_t id) {   // index of a live veto for this guard, -1 = none
+    if (!g_ctrVeto) return -1;
+    const ULONGLONG now = GetTickCount64();
+    for (int i = 0; i < 16; ++i) if (s_ctrVetoT[i].id == id && now < s_ctrVetoT[i].until) return i;
+    return -1;
+}
 static void AttackForwardOwnerDeliver(uint64_t id, const AtkFields& a) {
     const int ph = a.phase ? 1 : 0;
     if (s_ownerHitStale) { InterlockedIncrement(&s_graceDropped); return; }   // [Coop] RespawnHitGraceMs
@@ -11529,12 +11757,23 @@ static void AttackForwardOwnerDeliver(uint64_t id, const AtkFields& a) {
                                                 ph ? (fb ? " -> applied as a DamageEvent" : " lost") : "");
         return;
     }
+    if (ph) {   // [Coop] CounterGuestVeto: this guard's attack was countered / blocked here; its later HIT does not land
+        const int v = CounterVetoFor(id);
+        if (v >= 0) {
+            InterlockedIncrement(&s_ctrVetoed);
+            L("[AF] owner HIT vetoed guard=%016llX (countered seq=%u) seq=%u | life %d\n", (unsigned long long)id, s_ctrVetoT[v].seq, s_afCtpSeq, PdrPlayerLife(pl));
+            return;
+        }
+    }
     int k = -1, freeK = -1;
     for (int i = 0; i < 16; ++i) { if (s_afAct[i].live && s_afAct[i].id == id) { k = i; break; } if (!s_afAct[i].live && freeK < 0) freeK = i; }
     if (k < 0) k = freeK >= 0 ? freeK : 0;
     s_afAct[k].id = id; s_afAct[k].ent = (unsigned int)att; s_afAct[k].a = a; s_afAct[k].ms = GetTickCount64(); s_afAct[k].live = (ph == 0);
+    s_afAct[k].seq = s_afCtpSeq;
     const int ctpLife = CombatTiming::On() ? PdrPlayerLife(pl) : -1;
-    const bool ok = AttackForward_Post(pl, att, a);
+    void* ctrF = nullptr;
+    const bool ok = AttackForward_Post(pl, att, a, CtrGuestOn() ? &ctrF : nullptr);
+    if (ok && ctrF && CounterGuestPosted(id, s_afCtpSeq, ph, ctrF)) CounterGuestResolved(k);   // [Coop] Counter*
     if (CombatTiming::On()) CombatTiming::GuestAtk(id, s_afCtpSeq, ph, s_afCtpMs, att, pl, ok, ctpLife);
     InterlockedIncrement(ok ? &s_afPost[ph] : &s_afFail);
     if (ph) L("[AF] owner HIT posted guard=%016llX copy=%08X type=%u sub=%u ok=%d | life %d\n", (unsigned long long)id, (unsigned)att, a.type, a.sub, ok ? 1 : 0, PdrPlayerLife(pl));
@@ -11571,7 +11810,9 @@ static void AttackForwardOwnerTick() {
     for (int i = 0; i < 16; ++i) {
         if (!s_afAct[i].live) continue;
         if (now - s_afAct[i].ms > 250 || GuestObjEntGone(s_afAct[i].ent) || MirrorKilledLocally((void*)s_afAct[i].ent)) { s_afAct[i].live = false; continue; }
-        if (AttackForward_Post(pl, (void*)s_afAct[i].ent, s_afAct[i].a)) InterlockedIncrement(&s_afPost[0]); else InterlockedIncrement(&s_afFail);
+        void* ctrF = nullptr;
+        if (AttackForward_Post(pl, (void*)s_afAct[i].ent, s_afAct[i].a, CtrGuestOn() ? &ctrF : nullptr)) InterlockedIncrement(&s_afPost[0]); else InterlockedIncrement(&s_afFail);
+        if (ctrF && CounterGuestPosted(s_afAct[i].id, s_afAct[i].seq, 0, ctrF)) CounterGuestResolved(i);   // [Coop] Counter*
         CombatTiming::GuestAtkRepost();   // [Coop] CombatTimingProbe
     }
 }
@@ -11579,6 +11820,13 @@ static void AttackForwardReport() {
     if (s_afOn != 1) return;
     L("[AF] stats seen warn/hit=%ld/%ld tx=%ld/%ld dropped=%ld | rx=%ld/%ld posted=%ld/%ld unresolved=%ld (hits applied as DamageEvent %ld) failed=%ld\n",
       s_afSeen[0], s_afSeen[1], s_afTx[0], s_afTx[1], s_afDropped, s_afRx[0], s_afRx[1], s_afPost[0], s_afPost[1], s_afUnres, s_afFallback, s_afFail);
+    if (CtrGuestOn())
+        L("[CTR] stats guest examined=%ld resp=%ld counterKill=%ld dup=%ld tx=%ld txFail=%ld | host rx=%ld stale=%ld\n", s_ctrSeen, s_ctrResp,
+          s_ctrKill, s_ctrDup, s_ctrTx, s_ctrTxFail, s_ctrRx, s_ctrStale);
+    if (g_ctrVeto) L("[CTR] stats guest veto set=%ld hitsVetoed=%ld vetoMs=%d\n", s_ctrVetoSet, s_ctrVetoed, g_ctrVetoMs);
+    if (g_ctrApply)
+        L("[CTR] stats host apply queued=%ld applied=%ld ok528=%ld gateSkip=%ld failed=%ld unsupported(type5)=%ld handleZero=%ld mode=%d\n", s_ctrQueued,
+          s_ctrApplied, s_ctrApplyOk, s_ctrGate, s_ctrApplyFail, s_ctrUnsupported, s_ctrHandleZero, g_ctrApply);
 }
 
 bool SpawnShareOn(); void SpawnShareRx(uint64_t key, const uint8_t* payload, uint8_t len);   // spawn_census.cpp ([Coop] SpawnShare / SpawnKeyBind)
@@ -11586,12 +11834,14 @@ bool SpawnShareOn(); void SpawnShareRx(uint64_t key, const uint8_t* payload, uin
 static void FightIntentDrain() {
     const bool fi = FightIntentsOn();
     if (!fi && !(OwnerDamageOn() && Net::IntentLaneOn()) && !(PdrOn() && Net::IntentLaneOn()) && !(AfOn() && Net::IntentLaneOn())
-        && !SailSyncOn() && !CoordSyncOn() && !(g_guardActLane && Net::IntentLaneOn()) && !(Brain::On() && Net::IntentLaneOn()) && !(PchanOn() && Net::IntentLaneOn()) && !SpawnShareOn()) return;   // [Coop] SailSync/CoordSync/GuardActionLane keep the lane drained with every fight flag off
+        && !SailSyncOn() && !CoordSyncOn() && !(g_guardActLane && Net::IntentLaneOn()) && !(Brain::On() && Net::IntentLaneOn()) && !(PchanOn() && Net::IntentLaneOn()) && !SpawnShareOn()
+        && !(g_ctrSync && Net::IntentLaneOn())) return;   // [Coop] SailSync/CoordSync/GuardActionLane keep the lane drained with every fight flag off
     OwnerHitStalePoll();   // [Coop] RespawnHitGraceMs
     Net::IntentMsg m;
     while (Net::PollIntent(m)) {
         if (m.channel == IC_SHIP) { SailApplyMsg(m); continue; }   // [Coop] SailSync, docs/design/sail-memento.md
         if (m.channel == IC_COORD) { CoordSyncApplyMsg(m.wireId, m.seq, m.payload, m.len); continue; }   // [Coop] CoordSync
+        if ((m.channel == IC_ATK_A || m.channel == IC_ATK_B) && m.wireId == kCtrWire) { CounterHostRx(m); continue; }      // [Coop] CounterSync (guest -> host)
         if (m.channel == IC_ATK_A || m.channel == IC_ATK_B || m.channel == IC_ATK_C) { AttackForwardOwnerRx(m); continue; }   // [Coop] AttackForward
         if (m.channel == IC_BRAIN) { Brain::OnIntent(m.wireId, m.seq, m.flags, m.payload, m.len); continue; }                 // [Coop] Brain
         if (m.channel == IC_ACTION) { GalGuestRx(m); continue; }                                                              // [Coop] GuardActionLane
@@ -17001,6 +17251,7 @@ static void __cdecl OnFrame(Human* updatedHuman) {
         HostilityRefreshDeferred();   // CaptureGuards' hostility cache (no-op unless queued)
         ShipSpawnReplayFire();        // [Coop] ShipSpawnReplay (no-op unless queued)
         { void SpawnLibFire(); SpawnLibFire(); }   // [Coop] SpawnLib: on-demand / follow spawns (no-op unless queued)
+        CounterHostApplyFire();       // [Coop] CounterHostApply: sub_10EFC30 / sub_18480F0 / sub_64D8C0 take critical sections
     }
     InterlockedCompareExchange(&s_playerWorkTid, 0, (LONG)GetCurrentThreadId());   // player work over (if it was ours)
 }
@@ -17038,6 +17289,7 @@ static void DumpConfigOnce()
         { "Coop", "ActionDeathLog", 0 }, { "Coop", "AiOffProbe", 0 }, { "Coop", "GroundTickProbe", 0 }, { "Coop", "CopyCmdTest", 0 }, { "Coop", "PeerClock", 0 }, { "Coop", "PeerClockSkewMs", 0 }, { "Coop", "Brain", 0 }, { "Coop", "BrainDelayMs", 0 }, { "Coop", "BrainTest", 0 }, { "Coop", "BrainTestDelayMs", 150 }, { "Coop", "BrainOff", 0 }, { "Coop", "Brain115Probe", 0 }, { "Coop", "Brain115Suppress", 0 }, { "Coop", "Brain115Watch", 0 }, { "Coop", "BrainHitSync", 0 }, { "Coop", "BrainChartSync", 0 }, { "Coop", "BrainPlayoutMs", 0 }, { "Coop", "BrainPuppet", 0 }, { "Coop", "BrainEnterProbe", 0 }, { "Coop", "BrainCensus", 0 }, { "Coop", "BrainReact", 0 }, { "Coop", "BrainActIdSync", 0 }, { "Coop", "BrainPathAuthority", 0 }, { "Coop", "BrainPathSetMs", 0 }, { "Coop", "BrainBlockSync", 0 }, { "Coop", "PuppetFightCarry", 0 }, { "Coop", "PuppetChannels", 0 }, { "Coop", "ClimbProbe", 0 }, { "Coop", "PuppetSplineInterp", 0 }, { "Coop", "CaptureAtWrite", 0 }, { "Coop", "PuppetCollisionLayer", 40 }, { "Coop", "PuppetUpdatePhysics", 0 }, { "Coop", "WeaponSync", 0 }, { "Coop", "ShipPeerZ", 0 }, { "Coop", "ShipBindProbe", 0 }, { "Coop", "ShipSpawnProbe", 0 }, { "Coop", "ShipSpawnFire", 0 }, { "Coop", "ShipSpawnFirePid", 0 }, { "Coop", "SpawnCensus", 0 }, { "Coop", "SpawnReplayFire", 0 }, { "Coop", "SpawnReplayFirePid", 0 }, { "Coop", "SpawnShare", 0 }, { "Coop", "SpawnKeyBind", 0 }, { "Coop", "SpawnLib", 0 }, { "Coop", "SpawnLibFollow", 1 }, { "Coop", "SpawnLibBusy", 1 }, { "Coop", "SpawnCmdSeq", 0 }, { "Coop", "SpawnCmdPid", 0 }, { "Coop", "ShipClassBind", 0 }, { "Coop", "ShipInterp", 0 }, { "Coop", "ShipInterpDelayMs", 200 }, { "Coop", "ShipExtrapMs", 150 }, { "Coop", "ShipInterpPhysEvery", 1 }, { "Coop", "ShipGhostInterp", 0 }, { "Coop", "ShipGhostDelayMs", 150 }, { "Coop", "ShipGhostExtrapMs", 150 }, { "Coop", "ShipGhostMinGapMs", 90 }, { "Coop", "SpawnLibLateRestore", 0 }, { "Coop", "ShipClassBindSteal", 0 }, { "Coop", "SpawnShareRadiusM", 150 }, { "Coop", "BindDiag", 0 }, { "Coop", "BindRequireArch", 0 }, { "Coop", "BoardableTest", 0 }, { "Coop", "BoardProbe", 0 }, { "Coop", "BoardProbeRange", 200 }, { "Coop", "TableEvict", 0 }, { "Coop", "UsedEntAllPaths", 0 }, { "Coop", "PuppetSeqResync", 0 }, { "Coop", "ShipMirror", 0 }, { "Coop", "ShipMirrorForceProxy", 0 }, { "Coop", "ProxySkipWalk", 1 }, { "Coop", "WalkNullGuard", 1 }, { "Coop", "WalkNullGuardExt", 0 }, { "Coop", "ShipMirrorInstantiate", 1 }, { "Coop", "FastTravelCrashFix", 1 }, { "Coop", "PuppetBuildRecover", 0 }, { "Coop", "CombatObserve", 0 }, { "Coop", "PuppetListener", 0 }, { "Coop", "PuppetListenerAttach", 0 }, { "Coop", "PuppetMaxLife", 0 }, { "Coop", "ConflictProbe", 0 }, { "Coop", "OwnSnapAtTarget", 0 }, { "Coop", "PuppetWorldDropRef", 0 }, { "Coop", "PadIdPreferOffered", 0 }, { "Coop", "GuardPerceivePuppet", 0 },
         { "Coop", "ShipSpawnReplay", 0 },
         { "Coop", "ShipFields", 0 }, { "Coop", "HelmBoth", 0 }, { "Coop", "BoardingForce", 0 }, { "Coop", "PlayerFrameFallback", 0 },
+        { "Coop", "CounterProbe", 0 }, { "Coop", "CounterSync", 0 }, { "Coop", "CounterHostApply", 0 }, { "Coop", "CounterGuestVeto", 0 }, { "Coop", "CounterVetoMs", 1500 },
         { "Coop", "CombatTest", 0 }, { "Coop", "CrashContext", 0 }, { "Coop", "CorpseKeepSec", 30 }, { "Coop", "CrowdProbeIntegrate", 1 },
         { "Coop", "CrowdProbeLiveKeys", 1 }, { "Coop", "Diag", 0 },
         { "Coop", "DisableCrowd", 0 }, { "Coop", "DisablePuppetAI", 1 }, { "Coop", "DisableSpawns", 0 },
@@ -18415,6 +18667,14 @@ void Phase1::InstallFrameHook() {
     g_snapHz = GetPrivateProfileIntA("Net", "SnapshotHz", 20, Paths::Ini());
     g_guardActLane = GetPrivateProfileIntA("Coop", "GuardActionLane", 0, Paths::Ini()) != 0 ? 1 : 0;   // default 0 until verified live
     g_respawnGraceMs = GetPrivateProfileIntA("Coop", "RespawnHitGraceMs", 0, Paths::Ini());            // default 0 = off
+    g_ctrProbe = GetPrivateProfileIntA("Coop", "CounterProbe", 0, Paths::Ini()) != 0 ? 1 : 0;          // default 0 (docs/design/counter-sync.md S0)
+    g_ctrSync = GetPrivateProfileIntA("Coop", "CounterSync", 0, Paths::Ini()) != 0 ? 1 : 0;            // default 0 (S1 wire)
+    g_ctrApply = GetPrivateProfileIntA("Coop", "CounterHostApply", 0, Paths::Ini());                   // default 0 (S2; 2 = control)
+    if (g_ctrApply < 0 || g_ctrApply > 2 || !g_ctrSync) g_ctrApply = 0;
+    g_ctrVeto = GetPrivateProfileIntA("Coop", "CounterGuestVeto", 0, Paths::Ini()) != 0 ? 1 : 0;       // default 0 (S3)
+    g_ctrVetoMs = GetPrivateProfileIntA("Coop", "CounterVetoMs", 1500, Paths::Ini());
+    if (g_ctrVetoMs < 0) g_ctrVetoMs = 0;
+    if (g_ctrVetoMs > 10000) g_ctrVetoMs = 10000;
     if (g_snapHz < 1) g_snapHz = 1;
     if (g_snapHz > 60) g_snapHz = 60;
     g_driveContext = GetPrivateProfileIntA("Coop", "DriveContext", 0, Paths::Ini());
